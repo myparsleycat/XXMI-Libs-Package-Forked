@@ -1684,6 +1684,37 @@ public:
 	void run(CommandListState*) override;
 };
 
+// A run of adjacent "$variable = <constant>" / "x = <constant>" lines. Mods
+// reset their variables this way, and with a few hundred mods installed the
+// [Present] command list alone holds thousands of them. Run one by one each
+// costs a walk from the command to its expression to the operand, all of it
+// memory that has gone cold since the previous frame, whereas the values laid
+// out side by side in here are read in a single pass.
+class ConstantAssignmentBatch : public CommandListCommand {
+public:
+	struct Assignment {
+		// Variable to assign, or NULL for the ini param below:
+		CommandListVariable *var;
+		int param_idx;
+		float DirectX::XMFLOAT4::*param_component;
+		float val;
+	};
+
+	std::vector<Assignment> assignments;
+	// The merged lines, which run in place of the above while they have
+	// lines of their own to write to the frame analysis or debug log:
+	std::vector<std::shared_ptr<AssignmentCommand>> commands;
+
+	ConstantAssignmentBatch()
+	{
+		leaves_bindings_alone = true;
+	}
+
+	void run(CommandListState*) override;
+};
+
+void merge_constant_assignment_batches(CommandList *command_list);
+
 class PoolVariableOperation : public AssignmentCommand {
 public:
 	ResourceCopyTarget dst;

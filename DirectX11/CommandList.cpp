@@ -823,6 +823,7 @@ void optimise_command_lists(HackerDevice *device)
 	for (CommandList *command_list : registered_command_lists) {
 		merge_shader_resource_batches(command_list);
 		merge_check_texture_override_batches(command_list);
+		merge_constant_assignment_batches(command_list);
 	}
 
 	Profiling::update_cto_warning(!ignore_cto_post);
@@ -13799,6 +13800,117 @@ void merge_check_texture_override_batches(CommandList *command_list)
 }
 
 #pragma endregion CheckTextureOverrideBatches
+
+
+#pragma region ConstantAssignmentBatches
+
+void ConstantAssignmentBatch::run(CommandListState *state)
+{
+	bool params_changed = false;
+
+	if (G->analyse_frame || gLogDebug) {
+		for (auto &command : commands)
+			command->run(state);
+		return;
+	}
+
+	// Same as VariableAssignment::run() and ParamOverride::run():
+	for (const Assignment &assignment : assignments) {
+		if (assignment.var) {
+			float orig = assignment.var->fval;
+
+			assignment.var->fval = assignment.val;
+
+			if ((assignment.var->flags & VariableFlags::PERSIST) && assignment.val != orig)
+				G->user_config_dirty = true;
+		} else {
+			float *dest = &(G->iniParams[assignment.param_idx].*assignment.param_component);
+			float orig = *dest;
+
+			*dest = assignment.val;
+
+			params_changed |= (assignment.val != orig);
+		}
+	}
+
+	state->update_params |= params_changed;
+}
+
+// Fills in the assignment if the command assigns a value that is the same
+// every time it runs, which after the expressions have been optimised means
+// that a lone value operand is all that is left of its expression.
+static bool is_constant_assignment(CommandListCommand *command, ConstantAssignmentBatch::Assignment *assignment)
+{
+	AssignmentCommand *assignment_command;
+
+	if (VariableAssignment *variable = dynamic_cast<VariableAssignment*>(command)) {
+		assignment_command = variable;
+		assignment->var = variable->var;
+		assignment->param_idx = 0;
+		assignment->param_component = NULL;
+	} else if (ParamOverride *param = dynamic_cast<ParamOverride*>(command)) {
+		assignment_command = param;
+		assignment->var = NULL;
+		assignment->param_idx = param->param_idx;
+		assignment->param_component = param->param_component;
+	} else {
+		return false;
+	}
+
+	CommandListOperand *operand = dynamic_cast<CommandListOperand*>(assignment_command->expression.evaluatable.get());
+	if (!operand || operand->type != ParamOverrideType::VALUE)
+		return false;
+
+	assignment->val = operand->val;
+	return true;
+}
+
+// Optimiser pass: replaces every run of two or more adjacent constant
+// assignments with a batch. Any other command ends the run. The order of
+// commands is preserved, so a variable assigned twice still ends up with the
+// last value.
+void merge_constant_assignment_batches(CommandList *command_list)
+{
+	CommandList::Commands out;
+	std::shared_ptr<ConstantAssignmentBatch> batch;
+
+	auto flush = [&]() {
+		if (!batch)
+			return;
+
+		if (batch->commands.size() == 1) {
+			out.push_back(batch->commands[0]);
+		} else {
+			// Shown by the command profiler in place of the individual lines:
+			batch->ini_line = batch->commands[0]->ini_line + L" ... +" + std::to_wstring(batch->commands.size() - 1);
+			out.push_back(batch);
+		}
+		batch.reset();
+	};
+
+	for (auto &command : command_list->commands) {
+		ConstantAssignmentBatch::Assignment assignment;
+
+		if (!is_constant_assignment(command.get(), &assignment)) {
+			flush();
+			out.push_back(command);
+			continue;
+		}
+
+		if (!batch)
+			batch = std::make_shared<ConstantAssignmentBatch>();
+		batch->assignments.push_back(assignment);
+		batch->commands.push_back(std::static_pointer_cast<AssignmentCommand>(command));
+	}
+	flush();
+
+	if (out.size() != command_list->commands.size()) {
+		LogInfo("Merged constant assignments into batches in [%S], %Iu commands fewer\n", command_list->ini_section.c_str(), command_list->commands.size() - out.size());
+		command_list->commands = std::move(out);
+	}
+}
+
+#pragma endregion ConstantAssignmentBatches
 
 
 #pragma region SlotRangeCopyOperation
