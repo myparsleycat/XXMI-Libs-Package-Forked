@@ -2189,13 +2189,16 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 			//	memcpy(&handle_info->descBuf, pDesc, sizeof(D3D11_BUFFER_DESC));
 
 		LeaveCriticalSection(&G->mResourcesLock);
-		EnterCriticalSectionPretty(&G->mCriticalSection);
-			// For stat collection and hash contamination tracking:
-			if (G->hunting && pDesc) {
+		// For stat collection and hash contamination tracking. Checked
+		// before taking the lock so that creating resources does not
+		// queue up behind the render thread when there is nothing to
+		// record:
+		if (G->hunting && pDesc) {
+			EnterCriticalSectionPretty(&G->mCriticalSection);
 				G->mResourceInfo[hash] = *pDesc;
 				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			}
-		LeaveCriticalSection(&G->mCriticalSection);
+			LeaveCriticalSection(&G->mCriticalSection);
+		}
 	}
 	return hr;
 }
@@ -2243,14 +2246,13 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 			// if (pDesc)
 			// 	memcpy(&handle_info->desc1D, pDesc, sizeof(D3D11_TEXTURE1D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);
-		EnterCriticalSectionPretty(&G->mCriticalSection);
-
-			// For stat collection and hash contamination tracking:
-			if (G->hunting && pDesc) {
+		// For stat collection and hash contamination tracking:
+		if (G->hunting && pDesc) {
+			EnterCriticalSectionPretty(&G->mCriticalSection);
 				G->mResourceInfo[hash] = *pDesc;
 				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			}
-		LeaveCriticalSection(&G->mCriticalSection);
+			LeaveCriticalSection(&G->mCriticalSection);
+		}
 	}
 	return hr;
 }
@@ -2358,12 +2360,12 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 			if (pDesc)
 				memcpy(&handle_info->desc2D, pDesc, sizeof(D3D11_TEXTURE2D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);
-		EnterCriticalSectionPretty(&G->mCriticalSection);
-			if (G->hunting && pDesc) {
+		if (G->hunting && pDesc) {
+			EnterCriticalSectionPretty(&G->mCriticalSection);
 				G->mResourceInfo[hash] = *pDesc;
 				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			}
-		LeaveCriticalSection(&G->mCriticalSection);
+			LeaveCriticalSection(&G->mCriticalSection);
+		}
 	}
 
 	return hr;
@@ -2428,12 +2430,12 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 			if (pDesc)
 				memcpy(&handle_info->desc3D, pDesc, sizeof(D3D11_TEXTURE3D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);
-		EnterCriticalSectionPretty(&G->mCriticalSection);
-			if (G->hunting && pDesc) {
+		if (G->hunting && pDesc) {
+			EnterCriticalSectionPretty(&G->mCriticalSection);
 				G->mResourceInfo[hash] = *pDesc;
 				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			}
-		LeaveCriticalSection(&G->mCriticalSection);
+			LeaveCriticalSection(&G->mCriticalSection);
+		}
 	}
 
 	LogInfo("  returns result = %x\n", hr);
