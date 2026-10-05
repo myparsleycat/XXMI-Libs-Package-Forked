@@ -588,8 +588,10 @@ void optimise_command_lists(HackerDevice *device)
 		// nice if this sort of thing worked more generally.
 	} while (making_progress);
 
-	for (CommandList *command_list : registered_command_lists)
+	for (CommandList *command_list : registered_command_lists) {
 		merge_shader_resource_batches(command_list);
+		merge_check_texture_override_batches(command_list);
+	}
 
 	Profiling::update_cto_warning(!ignore_cto_post);
 
@@ -1382,9 +1384,6 @@ static bool is_static_pipeline_slot(const ResourceCopyTarget &target)
 void CheckTextureOverrideCommand::run(CommandListState *state)
 {
 	TextureOverrideMatches matches;
-	ResourceCopyTarget *saved_this = NULL;
-	bool saved_post;
-	unsigned i;
 
 	// This command usually sits in both the pre and post command lists of
 	// whatever runs it, which makes every draw call look up the same
@@ -1405,6 +1404,15 @@ void CheckTextureOverrideCommand::run(CommandListState *state)
 
 	if (memoise && matches.empty())
 		state->mHackerContext->NoteCheckTextureOverrideMiss(this, state->call_info);
+
+	RunMatches(state, matches);
+}
+
+void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOverrideMatches &matches)
+{
+	ResourceCopyTarget *saved_this = NULL;
+	bool saved_post;
+	unsigned i;
 
 	saved_this = state->this_target;
 	state->this_target = &target;
@@ -10289,6 +10297,16 @@ void ResourceCopyTarget::FindTextureOverrides(CommandListState *state, bool *res
 	if (!resource)
 		return;
 
+	FindTextureOverridesForResource(state, resource, stride, offset, format, matches);
+
+	resource->Release();
+	if (view)
+		view->Release();
+}
+
+void ResourceCopyTarget::FindTextureOverridesForResource(CommandListState *state, ID3D11Resource *resource,
+		UINT stride, UINT offset, DXGI_FORMAT format, TextureOverrideMatches *matches)
+{
 	// For vertex and index buffers the game may pack multiple meshes into
 	// one buffer and bind them at different offsets. In that case the base
 	// resource hash alone is not enough – we must use the same region data hash 
@@ -10368,10 +10386,6 @@ void ResourceCopyTarget::FindTextureOverrides(CommandListState *state, bool *res
 	}
 
 	//COMMAND_LIST_LOG(state, "  found texture hash = %08llx\n", hash);
-
-	resource->Release();
-	if (view)
-		view->Release();
 }
 
 float ResourceCopyTarget::GetResourceId(CommandListState* state)
@@ -12912,6 +12926,229 @@ void merge_shader_resource_batches(CommandList *command_list)
 }
 
 #pragma endregion ShaderResourceBatches
+
+
+#pragma region CheckTextureOverrideBatches
+
+void CheckTextureOverrideBatch::run(CommandListState *state)
+{
+	HackerContext *context = state->mHackerContext;
+	ID3D11DeviceContext1 *mOrigContext1 = state->mOrigContext1;
+	// Views for t slots, buffers for vb and ib slots. Only the entries of
+	// the fetches marked in fetched are valid, and those hold a reference:
+	ID3D11ShaderResourceView *views[MAX_BINDINGS];
+	ID3D11Buffer *buffers[MAX_BINDINGS];
+	UINT strides[MAX_BINDINGS], offsets[MAX_BINDINGS];
+	DXGI_FORMAT formats[MAX_BINDINGS];
+	uint32_t fetched = 0;
+
+	auto release = [&]() {
+		for (size_t f = 0; fetched; f++, fetched >>= 1) {
+			if (!(fetched & 1))
+				continue;
+			const Fetch &fetch = fetches[f];
+			for (unsigned b = fetch.first_binding; b < fetch.first_binding + fetch.count; b++) {
+				if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE) {
+					if (views[b])
+						views[b]->Release();
+				} else if (buffers[b]) {
+					buffers[b]->Release();
+				}
+			}
+		}
+	};
+
+	for (size_t i = 0; i < checks.size() && !state->aborted; i++) {
+		CheckTextureOverrideCommand *command = checks[i].command.get();
+		const Fetch &fetch = fetches[checks[i].fetch];
+		unsigned b = checks[i].binding;
+		ID3D11Resource *resource = NULL;
+		UINT stride = 0, offset = 0;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		TextureOverrideMatches matches;
+
+		// Same as CheckTextureOverrideCommand::run(), every merged line
+		// names a static pipeline slot. In a post command list this is
+		// usually how all of them end, without reading any bindings:
+		if (context->CheckTextureOverrideMissed(command, state->call_info)) {
+			COMMAND_LIST_LOG(state, "%S: matched nothing earlier in this draw call\n", command->ini_line.c_str());
+			continue;
+		}
+
+		COMMAND_LIST_LOG(state, "%S\n", command->ini_line.c_str());
+
+		if (!(fetched & (1u << checks[i].fetch))) {
+			switch (fetch.type) {
+				case ResourceCopyTargetType::SHADER_RESOURCE:
+					GetShaderResourcesBatch(mOrigContext1, fetch.shader_type, fetch.first_slot, fetch.count, &views[fetch.first_binding]);
+					break;
+				case ResourceCopyTargetType::VERTEX_BUFFER:
+					mOrigContext1->IAGetVertexBuffers(fetch.first_slot, fetch.count, &buffers[fetch.first_binding],
+							&strides[fetch.first_binding], &offsets[fetch.first_binding]);
+					break;
+				default: // INDEX_BUFFER
+					mOrigContext1->IAGetIndexBuffer(&buffers[fetch.first_binding], &formats[fetch.first_binding], &offsets[fetch.first_binding]);
+					break;
+			}
+			fetched |= 1u << checks[i].fetch;
+		}
+
+		// What GetResource() would have returned for the slot:
+		switch (fetch.type) {
+			case ResourceCopyTargetType::SHADER_RESOURCE:
+				if (views[b])
+					views[b]->GetResource(&resource);
+				break;
+			case ResourceCopyTargetType::VERTEX_BUFFER:
+				resource = buffers[b];
+				stride = strides[b];
+				offset = offsets[b];
+				break;
+			default: // INDEX_BUFFER
+				resource = buffers[b];
+				format = formats[b];
+				offset = offsets[b];
+				break;
+		}
+
+		if (resource) {
+			command->target.FindTextureOverridesForResource(state, resource, stride, offset, format, &matches);
+			if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE)
+				resource->Release();
+		}
+
+		if (matches.empty()) {
+			context->NoteCheckTextureOverrideMiss(command, state->call_info);
+			continue;
+		}
+
+		// The command lists about to run may bind anything anywhere, so
+		// nothing read so far can be trusted for the lines that follow.
+		// Drop it all, which also makes those lines fetch again:
+		release();
+		command->RunMatches(state, matches);
+	}
+
+	release();
+}
+
+static bool is_batchable_check(const CheckTextureOverrideCommand *command)
+{
+	const ResourceCopyTarget &target = command->target;
+
+	if (!is_static_pipeline_slot(target))
+		return false;
+
+	switch (target.type) {
+		case ResourceCopyTargetType::SHADER_RESOURCE:
+			return target.shader_type && wcschr(L"vhdgpc", target.shader_type);
+		case ResourceCopyTargetType::VERTEX_BUFFER:
+		case ResourceCopyTargetType::INDEX_BUFFER:
+			return true;
+		default:
+			return false;
+	}
+}
+
+// Turns a run of batchable checktextureoverride commands into one batch and
+// appends it to out. All t slots of a stage are read with a single call that
+// spans from the lowest to the highest slot checked, likewise all vb slots.
+// A run where that saves no call (no two lines share a stage / kind), or that
+// would have to read more slots than a batch holds, is appended unchanged.
+static void emit_check_texture_override_batch(const std::vector<std::shared_ptr<CheckTextureOverrideCommand>> &run, CommandList::Commands &out)
+{
+	auto batch = std::make_shared<CheckTextureOverrideBatch>();
+	std::vector<unsigned> last_slots, uses;
+	unsigned bindings = 0;
+	bool saves_calls = false;
+
+	for (auto &command : run) {
+		const ResourceCopyTarget &target = command->target;
+		bool is_srv = target.type == ResourceCopyTargetType::SHADER_RESOURCE;
+		// Only t slots belong to a stage, and there is just the one ib:
+		wchar_t shader_type = is_srv ? target.shader_type : L'\0';
+		unsigned slot = (target.type == ResourceCopyTargetType::INDEX_BUFFER) ? 0 : target.slot;
+		size_t f;
+
+		for (f = 0; f < batch->fetches.size(); f++) {
+			if (batch->fetches[f].type == target.type && batch->fetches[f].shader_type == shader_type)
+				break;
+		}
+		if (f == batch->fetches.size()) {
+			batch->fetches.push_back({target.type, shader_type, slot, 0, 0});
+			last_slots.push_back(slot);
+			uses.push_back(0);
+		}
+
+		batch->fetches[f].first_slot = min(batch->fetches[f].first_slot, slot);
+		last_slots[f] = max(last_slots[f], slot);
+		if (++uses[f] > 1)
+			saves_calls = true;
+
+		// Binding indices are filled in below, once the ranges are known:
+		batch->checks.push_back({command, (unsigned)f, slot});
+	}
+
+	for (size_t f = 0; f < batch->fetches.size(); f++) {
+		batch->fetches[f].count = last_slots[f] - batch->fetches[f].first_slot + 1;
+		batch->fetches[f].first_binding = bindings;
+		bindings += batch->fetches[f].count;
+	}
+
+	if (!saves_calls || bindings > CheckTextureOverrideBatch::MAX_BINDINGS) {
+		out.insert(out.end(), run.begin(), run.end());
+		return;
+	}
+
+	for (auto &check : batch->checks) {
+		const CheckTextureOverrideBatch::Fetch &fetch = batch->fetches[check.fetch];
+		check.binding = fetch.first_binding + (check.binding - fetch.first_slot);
+	}
+
+	// Shown by the command profiler in place of the individual lines:
+	batch->ini_line = run[0]->ini_line + L" ... +" + std::to_wstring(run.size() - 1);
+	out.push_back(batch);
+}
+
+// Optimiser pass: replaces every run of two or more adjacent batchable
+// checktextureoverride commands with a batch. Any other command ends the
+// run, since it may change what the slots hold. The order of commands is
+// preserved, and the merged commands themselves stay shared between the pre
+// and post command lists, which HackerContext::CheckTextureOverrideMissed()
+// depends on to recognise them.
+void merge_check_texture_override_batches(CommandList *command_list)
+{
+	CommandList::Commands out;
+	std::vector<std::shared_ptr<CheckTextureOverrideCommand>> run;
+
+	auto flush = [&]() {
+		if (run.size() == 1)
+			out.push_back(run[0]);
+		else if (run.size() > 1)
+			emit_check_texture_override_batch(run, out);
+		run.clear();
+	};
+
+	for (auto &command : command_list->commands) {
+		auto check = std::dynamic_pointer_cast<CheckTextureOverrideCommand>(command);
+
+		if (check && is_batchable_check(check.get())) {
+			run.push_back(check);
+			continue;
+		}
+
+		flush();
+		out.push_back(command);
+	}
+	flush();
+
+	if (out.size() != command_list->commands.size()) {
+		LogInfo("Merged checktextureoverride commands into batches in [%S], %Iu commands fewer\n", command_list->ini_section.c_str(), command_list->commands.size() - out.size());
+		command_list->commands = std::move(out);
+	}
+}
+
+#pragma endregion CheckTextureOverrideBatches
 
 
 #pragma region SlotRangeCopyOperation

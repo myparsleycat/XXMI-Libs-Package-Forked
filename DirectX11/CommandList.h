@@ -1085,6 +1085,15 @@ public:
 			CommandListState *state,
 			bool *resource_found,
 			TextureOverrideMatches *matches);
+	// As above, for a caller that already knows what the target holds.
+	// stride, offset and format as GetResource() reports them:
+	void FindTextureOverridesForResource(
+			CommandListState *state,
+			ID3D11Resource *resource,
+			UINT stride,
+			UINT offset,
+			DXGI_FORMAT format,
+			TextureOverrideMatches *matches);
 
 	float GetResourceId(CommandListState* state);
 	float GetPoolId();
@@ -1716,7 +1725,48 @@ public:
 
 	void run(CommandListState*) override;
 	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
+
+	// Runs the command lists of the TextureOverride sections that matched:
+	void RunMatches(CommandListState *state, TextureOverrideMatches &matches);
 };
+
+// A run of adjacent "checktextureoverride = <slot>" lines for t, vb and ib
+// slots. These tend to come several to a command list that runs for a large
+// share of all draw calls and nearly always match nothing, so rather than
+// each line asking DirectX for its own slot, the slots of a kind are read
+// with one XXGetShaderResources / IAGetVertexBuffers call for the lot.
+class CheckTextureOverrideBatch : public CommandListCommand {
+public:
+	// One call into DirectX, filling count entries from first_binding on:
+	struct Fetch {
+		ResourceCopyTargetType type;
+		wchar_t shader_type;
+		unsigned first_slot;
+		unsigned count;
+		unsigned first_binding;
+	};
+	// One of the merged lines, and where its slot ends up:
+	struct Check {
+		std::shared_ptr<CheckTextureOverrideCommand> command;
+		unsigned fetch;
+		unsigned binding;
+	};
+	// Slots read by all fetches of a batch together. Also bounds the number
+	// of fetches, which run() relies on to track them in a bitmask:
+	static const unsigned MAX_BINDINGS = 32;
+
+	std::vector<Fetch> fetches;
+	std::vector<Check> checks;
+
+	CheckTextureOverrideBatch()
+	{
+		leaves_bindings_alone = true;
+	}
+
+	void run(CommandListState*) override;
+};
+
+void merge_check_texture_override_batches(CommandList *command_list);
 
 enum class DrawCommandType {
 	INVALID,
