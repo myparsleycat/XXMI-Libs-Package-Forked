@@ -2535,15 +2535,14 @@ vector<string> stringToLines(const char* start, size_t size)
 		if (*pStart == 0) {
 			break;
 		}
-		string s(pStart, pEnd++);
-		pStart = pEnd;
-		lines.push_back(s);
+		lines.emplace_back(pStart, pEnd);
+		pStart = ++pEnd;
 		if (pStart >= pRealEnd) {
 			break;
 		}
 	}
 	for (unsigned int i = 0; i < lines.size(); i++) {
-		string s = lines[i];
+		string &s = lines[i];
 		// Bug fixed: This would not strip carriage returns from DOS
 		// style newlines if they were the only character on the line,
 		// corrupting the resulting shader binary. -DarkStarSword
@@ -2560,8 +2559,6 @@ vector<string> stringToLines(const char* start, size_t size)
 		// gotcha go away.
 		while (s.size() >= 1 && s[s.size() - 1] == ' ')
 			s.erase(--s.end());
-
-		lines[i] = s;
 	}
 	return lines;
 }
@@ -3051,10 +3048,12 @@ HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *commen
 			hexdump_instruction(s, v, lines, &i, &multiLines, line_byte_offset, hexdump);
 	}
 	ret->clear();
+	size_t asmTextSize = lines.size();
+	for (size_t i = 0; i < lines.size(); i++)
+		asmTextSize += lines[i].size();
+	ret->reserve(asmTextSize);
 	for (size_t i = 0; i < lines.size(); i++) {
-		for (size_t j = 0; j < lines[i].size(); j++) {
-			ret->insert(ret->end(), lines[i][j]);
-		}
+		ret->insert(ret->end(), lines[i].begin(), lines[i].end());
 		ret->insert(ret->end(), '\n');
 	}
 
