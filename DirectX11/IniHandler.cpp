@@ -4751,6 +4751,8 @@ void LoadConfigFile()
 				(DataCacheBindFlagNames, setting, NULL);
 	}
 
+	G->async_resource_loading = GetIniBool(L"Rendering", L"async_resource_loading", true, NULL);
+
 	G->track_region_hashes = GetIniBool(L"Rendering", L"track_region_hashes", false, NULL);
 	// Force enable IB and VB data caching, since efficient region hashing requires data to be in RAM.
 	if (G->track_region_hashes) {

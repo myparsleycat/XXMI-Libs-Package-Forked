@@ -871,7 +871,8 @@ void ClearNotices()
 
 void LogOverlayW(LogLevel level, wchar_t *fmt, ...)
 {
-	bool show_overlay_message = (level == LOG_INFO) || G->gShowWarnings;
+	bool show_overlay_message = ((level == LOG_INFO) || G->gShowWarnings)
+		&& !get_tls()->suppress_overlay_notices;
 
 	if (!show_overlay_message && gLogVerbosity < LogVerbosity::WARNING)
 		return;
@@ -911,7 +912,8 @@ void LogOverlayW(LogLevel level, wchar_t *fmt, ...)
 // format string correctly and convert the result to a wide string.
 void LogOverlay(LogLevel level, char *fmt, ...)
 {
-	bool show_overlay_message = (level == LOG_INFO) || G->gShowWarnings;
+	bool show_overlay_message = ((level == LOG_INFO) || G->gShowWarnings)
+		&& !get_tls()->suppress_overlay_notices;
 
 	if (!show_overlay_message && gLogVerbosity < LogVerbosity::WARNING)
 		return;

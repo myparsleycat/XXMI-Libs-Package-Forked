@@ -27,6 +27,8 @@ class HackerDevice;
 class HackerContext;
 enum class FrameAnalysisOptions;
 class ResourceCopyTarget;
+class CommandList;
+struct CustomResourceLoad;
 
 struct InputLayoutElementOverride {
 	struct Match {
@@ -87,6 +89,17 @@ public:
 	int recursion;
 	int extra_indent;
 	LARGE_INTEGER profiling_time_recursive;
+
+	// The command list this invocation was started for, or that of the
+	// TextureOverride section currently running inside it. When one of its
+	// commands has to load a custom resource from a file, the files the rest
+	// of it needs are preloaded alongside, see CustomResource::Preload():
+	CommandList *preload_scope = NULL;
+	// The scope (and which of its pre and post command lists) that has
+	// had this done already, so that it is only done once however many of
+	// its resources turn out to be used for the first time:
+	CommandList *preloaded_scope = NULL;
+	bool preloaded_post = false;
 
 	// Anything that needs to be updated at the end of the command list:
 	bool update_params;
@@ -588,6 +601,11 @@ public:
 	wstring filename;
 	bool substantiated;
 
+	// Set while the file is being, or has been, loaded on a worker thread
+	// ahead of the first use. Substantiate() takes it from here. Only
+	// accessed with the preload lock held:
+	std::shared_ptr<CustomResourceLoad> preload;
+
 	// Used to override description when copying or synthesise resources
 	// from scratch:
 	CustomResourceType override_type;
@@ -619,6 +637,7 @@ public:
 	void SetHandleInfo(ID3D11Resource* source, size_t offset, size_t data_size);
 	ResourceHandleInfo* GetHandleInfo();
 	void Substantiate(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags);
+	void Preload(HackerDevice *mHackerDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags);
 	void OverrideBufferDesc(D3D11_BUFFER_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE1D_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE2D_DESC *desc);
@@ -633,6 +652,10 @@ private:
 	DirectX::WIC_LOADER_FLAGS GetWICFlags(wstring filename);
 	void LoadFromFile(ID3D11Device *mOrigDevice);
 	void LoadBufferFromFile(ID3D11Device *mOrigDevice);
+	bool AdoptPreload(ID3D11Device *mOrigDevice);
+	void DropPreload();
+	static bool StartPreloadThreads();
+	static void PreloadThread();
 	void SubstantiateBuffer(ID3D11Device *mOrigDevice, void **buf, DWORD size);
 	void SubstantiateTexture1D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture2D(ID3D11Device *mOrigDevice);
@@ -1059,6 +1082,9 @@ public:
 	unsigned RangeLimit();
 
 	void SetCustomResource(CustomResource* resource);
+	// The custom resource this target always resolves to, if it does not
+	// depend on the state of the command list (NULL for pool elements):
+	CustomResource* StaticCustomResource() const { return static_custom_resource; }
 
 	template<typename StaticT, typename Getter>
 	StaticT* GetPoolObject(StaticT* static_object, CommandListState* state, bool is_assignment, Getter getter);
@@ -1269,6 +1295,7 @@ public:
 
 	void run(CommandListState*) override;
 	bool optimise(HackerDevice *device) override;
+	CustomResource* StaticSource(D3D11_BIND_FLAG *bind_flags);
 
 private:
 	// One cached view per slot for binds that need a view of the slot's
@@ -1943,6 +1970,10 @@ void RunViewCommandList(HackerDevice *mHackerDevice,
 		HackerContext *mHackerContext,
 		CommandList *command_list, ID3D11View *view,
 		bool post);
+
+// Called when the game creates a resource with this hash: the files used by
+// any TextureOverride sections for it start loading in the background.
+void RequestTextureOverridePreload(uint32_t hash);
 
 bool ParseRunExplicitCommandList(const wchar_t *section,
 		const wchar_t *key, wstring *val,
