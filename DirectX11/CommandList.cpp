@@ -12935,19 +12935,22 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 	HackerContext *context = state->mHackerContext;
 	ID3D11DeviceContext1 *mOrigContext1 = state->mOrigContext1;
 	// Views for t slots, buffers for vb and ib slots. Only the entries of
-	// the fetches marked in fetched are valid, and those hold a reference:
+	// the fetches marked in fetched are valid, and those hold a reference.
+	// held_first and held_count, by fetch, are the entries it read:
 	ID3D11ShaderResourceView *views[MAX_BINDINGS];
 	ID3D11Buffer *buffers[MAX_BINDINGS];
 	UINT strides[MAX_BINDINGS], offsets[MAX_BINDINGS];
 	DXGI_FORMAT formats[MAX_BINDINGS];
+	unsigned held_first[MAX_BINDINGS], held_count[MAX_BINDINGS];
 	uint32_t fetched = 0;
+	bool matched = false;
 
 	auto release = [&]() {
 		for (size_t f = 0; fetched; f++, fetched >>= 1) {
 			if (!(fetched & 1))
 				continue;
 			const Fetch &fetch = fetches[f];
-			for (unsigned b = fetch.first_binding; b < fetch.first_binding + fetch.count; b++) {
+			for (unsigned b = held_first[f]; b < held_first[f] + held_count[f]; b++) {
 				if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE) {
 					if (views[b])
 						views[b]->Release();
@@ -12978,18 +12981,36 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		COMMAND_LIST_LOG(state, "%S\n", command->ini_line.c_str());
 
 		if (!(fetched & (1u << checks[i].fetch))) {
+			unsigned first = fetch.first_binding, last = fetch.first_binding + fetch.count - 1;
+
+			// Reading the slots again after a match, the lines that
+			// have had their turn no longer need theirs:
+			if (matched) {
+				first = last = b;
+				for (size_t j = i + 1; j < checks.size(); j++) {
+					if (checks[j].fetch != checks[i].fetch)
+						continue;
+					first = min(first, checks[j].binding);
+					last = max(last, checks[j].binding);
+				}
+			}
+
+			UINT slot = fetch.first_slot + (first - fetch.first_binding);
+			UINT count = last - first + 1;
+
 			switch (fetch.type) {
 				case ResourceCopyTargetType::SHADER_RESOURCE:
-					GetShaderResourcesBatch(mOrigContext1, fetch.shader_type, fetch.first_slot, fetch.count, &views[fetch.first_binding]);
+					GetShaderResourcesBatch(mOrigContext1, fetch.shader_type, slot, count, &views[first]);
 					break;
 				case ResourceCopyTargetType::VERTEX_BUFFER:
-					mOrigContext1->IAGetVertexBuffers(fetch.first_slot, fetch.count, &buffers[fetch.first_binding],
-							&strides[fetch.first_binding], &offsets[fetch.first_binding]);
+					mOrigContext1->IAGetVertexBuffers(slot, count, &buffers[first], &strides[first], &offsets[first]);
 					break;
 				default: // INDEX_BUFFER
-					mOrigContext1->IAGetIndexBuffer(&buffers[fetch.first_binding], &formats[fetch.first_binding], &offsets[fetch.first_binding]);
+					mOrigContext1->IAGetIndexBuffer(&buffers[first], &formats[first], &offsets[first]);
 					break;
 			}
+			held_first[checks[i].fetch] = first;
+			held_count[checks[i].fetch] = count;
 			fetched |= 1u << checks[i].fetch;
 		}
 
@@ -13026,6 +13047,7 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		// nothing read so far can be trusted for the lines that follow.
 		// Drop it all, which also makes those lines fetch again:
 		release();
+		matched = true;
 		command->RunMatches(state, matches);
 	}
 
