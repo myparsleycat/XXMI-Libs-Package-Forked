@@ -1125,6 +1125,7 @@ static void RevertMissingShaders()
 		// the processed flag so that any updated patterns in the ini
 		// will be [re]applied:
 		i->second.deferred_replacement_candidate = true;
+		G->deferred_shader_generation++;
 	}
 }
 

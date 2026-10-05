@@ -1623,7 +1623,10 @@ STDMETHODIMP HackerDevice::CreateUnorderedAccessView(THIS_
 	/* [annotation] */
 	__out_opt  ID3D11UnorderedAccessView **ppUAView)
 {
-	if (pDesc) {
+	// The override lookup below only ever has an effect when some
+	// TextureOverride resizes UAVs, and it takes the global lock and walks
+	// the resource's candidate list, so skip it otherwise:
+	if (pDesc && G->any_override_num_elements) {
 		TextureOverrideMatches matches;
 		
 		find_texture_overrides_for_resource(pResource, &matches, NULL);

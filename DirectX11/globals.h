@@ -497,6 +497,15 @@ struct Globals
 	bool track_region_hashes;
 	DataCacheBindFlags cache_resource_data = (DataCacheBindFlags)0;
 	bool track_implicit_index_buffers;
+	// Set while parsing TextureOverride sections when any of them asks for
+	// behaviour that has to be checked on hot per-call paths (buffer
+	// resizing, UAV resizing, expand_region_copy, deny_cpu_read). Those
+	// paths can then skip their resource lookups entirely when nothing uses
+	// the option:
+	bool any_override_byte_width;
+	bool any_override_num_elements;
+	bool any_expand_region_copy;
+	bool any_deny_cpu_read;
 	bool allow_buffer_resize;
 	int texture_hash_version;
 	int EXPORT_HLSL;		// 0=off, 1=HLSL only, 2=HLSL+OriginalASM, 3= HLSL+OriginalASM+recompiledASM
@@ -585,6 +594,12 @@ struct Globals
 	ShaderMap mShaders;										// All shaders ever registered with CreateXXXShader
 	ShaderReloadMap mReloadedShaders;						// Shaders that were reloaded live from ShaderFixes
 	ShaderReplacementMap mOriginalShaders;					// When MarkingMode=Original, switch to original. Also used for show_original and shader reversion
+	// Bumped whenever shaders that already went through deferred ShaderRegex
+	// analysis can become candidates for it again (config reload, shaders
+	// reverted from ShaderFixes). Contexts only recheck a bound shader for
+	// deferred analysis when it is bound, so this tells them to recheck the
+	// shaders that are still bound from before:
+	unsigned deferred_shader_generation;
 
 	std::set<UINT64> mVisitedComputeShaders;
 	UINT64 mSelectedComputeShader;
@@ -688,6 +703,7 @@ struct Globals
 		mSelectedHullShader(-1),
 		mSelectedHullShaderPos(-1),
 		mPinkingShader(0),
+		deferred_shader_generation(0),
 
 		hunting(HUNTING_MODE_DISABLED),
 		overlay_buffer_hash_lifetime(-1),
@@ -711,6 +727,10 @@ struct Globals
 		shader_hash_type(ShaderHashType::FNV),
 		track_region_hashes(false),
 		track_implicit_index_buffers(false),
+		any_override_byte_width(false),
+		any_override_num_elements(false),
+		any_expand_region_copy(false),
+		any_deny_cpu_read(false),
 		allow_buffer_resize(true),
 		texture_hash_version(0),
 		EXPORT_SHADERS(false),

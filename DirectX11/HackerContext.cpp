@@ -86,6 +86,13 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mCurrentDomainShaderHandle = NULL;
 	mCurrentHullShader = 0;
 	mCurrentHullShaderHandle = NULL;
+	mVertexShaderDeferredPending = false;
+	mHullShaderDeferredPending = false;
+	mDomainShaderDeferredPending = false;
+	mGeometryShaderDeferredPending = false;
+	mPixelShaderDeferredPending = false;
+	mComputeShaderDeferredPending = false;
+	mDeferredShaderGeneration = G->deferred_shader_generation;
 	mCurrentDepthTarget = NULL;
 	mCurrentPSUAVStartSlot = 0;
 	mCurrentPSNumUAVs = 0;
@@ -700,6 +707,24 @@ out_drop:
 	LeaveCriticalSection(&G->mCriticalSection);
 }
 
+void HackerContext::UpdateDeferredShaderGeneration()
+{
+	if (mDeferredShaderGeneration == G->deferred_shader_generation)
+		return;
+
+	// Shaders that were already analysed may be candidates again, and the
+	// game need not bind them again before its next draw, so recheck
+	// whatever is bound to every stage. DeferredShaderReplacement() is
+	// still the one to decide under the lock:
+	mDeferredShaderGeneration = G->deferred_shader_generation;
+	mVertexShaderDeferredPending = true;
+	mHullShaderDeferredPending = true;
+	mDomainShaderDeferredPending = true;
+	mGeometryShaderDeferredPending = true;
+	mPixelShaderDeferredPending = true;
+	mComputeShaderDeferredPending = true;
+}
+
 void HackerContext::DeferredShaderReplacementBeforeDraw()
 {
 	Profiling::State profiling_state;
@@ -707,43 +732,54 @@ void HackerContext::DeferredShaderReplacementBeforeDraw()
 	if (shader_regex_groups.empty())
 		return;
 
+	UpdateDeferredShaderGeneration();
+
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
 
-	if (mCurrentVertexShaderHandle) {
+	// Each bound shader only needs to go through this once: whatever the
+	// outcome, DeferredShaderReplacement() marks it processed (or it was
+	// never a candidate), so further calls for it would just take the lock
+	// to find that out again.
+	if (mCurrentVertexShaderHandle && mVertexShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11VertexShader,
 			&ID3D11DeviceContext::VSGetShader,
 			&ID3D11DeviceContext::VSSetShader,
 			&ID3D11Device::CreateVertexShader>
 			(mCurrentVertexShaderHandle, mCurrentVertexShader, L"vs");
+		mVertexShaderDeferredPending = false;
 	}
-	if (mCurrentHullShaderHandle) {
+	if (mCurrentHullShaderHandle && mHullShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11HullShader,
 			&ID3D11DeviceContext::HSGetShader,
 			&ID3D11DeviceContext::HSSetShader,
 			&ID3D11Device::CreateHullShader>
 			(mCurrentHullShaderHandle, mCurrentHullShader, L"hs");
+		mHullShaderDeferredPending = false;
 	}
-	if (mCurrentDomainShaderHandle) {
+	if (mCurrentDomainShaderHandle && mDomainShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11DomainShader,
 			&ID3D11DeviceContext::DSGetShader,
 			&ID3D11DeviceContext::DSSetShader,
 			&ID3D11Device::CreateDomainShader>
 			(mCurrentDomainShaderHandle, mCurrentDomainShader, L"ds");
+		mDomainShaderDeferredPending = false;
 	}
-	if (mCurrentGeometryShaderHandle) {
+	if (mCurrentGeometryShaderHandle && mGeometryShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11GeometryShader,
 			&ID3D11DeviceContext::GSGetShader,
 			&ID3D11DeviceContext::GSSetShader,
 			&ID3D11Device::CreateGeometryShader>
 			(mCurrentGeometryShaderHandle, mCurrentGeometryShader, L"gs");
+		mGeometryShaderDeferredPending = false;
 	}
-	if (mCurrentPixelShaderHandle) {
+	if (mCurrentPixelShaderHandle && mPixelShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11PixelShader,
 			&ID3D11DeviceContext::PSGetShader,
 			&ID3D11DeviceContext::PSSetShader,
 			&ID3D11Device::CreatePixelShader>
 			(mCurrentPixelShaderHandle, mCurrentPixelShader, L"ps");
+		mPixelShaderDeferredPending = false;
 	}
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
@@ -755,7 +791,9 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
 	if (shader_regex_groups.empty())
 		return;
 
-	if (!mCurrentComputeShaderHandle)
+	UpdateDeferredShaderGeneration();
+
+	if (!mCurrentComputeShaderHandle || !mComputeShaderDeferredPending)
 		return;
 
 	DeferredShaderReplacement<ID3D11ComputeShader,
@@ -763,6 +801,7 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
 		&ID3D11DeviceContext::CSSetShader,
 		&ID3D11Device::CreateComputeShader>
 		(mCurrentComputeShaderHandle, mCurrentComputeShader, L"cs");
+	mComputeShaderDeferredPending = false;
 }
 
 static UINT NextPow2(UINT v)
@@ -1318,7 +1357,7 @@ bool HackerContext::MapDenyCPURead(
 	if (Subresource != 0)
 		return false;
 
-	if (G->mTextureOverrideMap.empty())
+	if (!G->any_deny_cpu_read)
 		return false;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
@@ -1348,6 +1387,21 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 		UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
 		D3D11_MAPPED_SUBRESOURCE *pMappedResource)
 {
+	// Fast path: when nothing can track or divert this mapping there is
+	// nothing to do, and everything below (GetType, GetDesc, hash lookups
+	// under the global lock) is pure overhead on a call that games make very
+	// frequently. The conditions mirror what the slow path would find:
+	// MapTrackResourceHashUpdate() does nothing when not hunting and
+	// track_texture_updates != 1, MapTrackRegionHashes() needs
+	// cache_resource_data and MapDenyCPURead() needs a TextureOverride
+	// with deny_cpu_read (merely having TextureOverrides, as every mod
+	// does, is not enough for it to do anything):
+	if (G->hunting == HUNTING_MODE_DISABLED
+	 && G->track_texture_updates != 1
+	 && G->cache_resource_data == DataCacheBindFlags::INVALID
+	 && !G->any_deny_cpu_read)
+		return;
+
 	D3D11_RESOURCE_DIMENSION dim;
 	ID3D11Buffer *buf = NULL;
 	ID3D11Texture1D *tex1d = NULL;
@@ -1656,7 +1710,8 @@ STDMETHODIMP_(void) HackerContext::GSSetShader(THIS_
 		 &G->mVisitedGeometryShaders,
 		 G->mSelectedGeometryShader,
 		 &mCurrentGeometryShader,
-		 &mCurrentGeometryShaderHandle);
+		 &mCurrentGeometryShaderHandle,
+		 &mGeometryShaderDeferredPending);
 }
 
 STDMETHODIMP_(void) HackerContext::IASetPrimitiveTopology(THIS_
@@ -1896,6 +1951,13 @@ bool HackerContext::ExpandRegionCopy(ID3D11Resource *pDstResource, UINT DstX,
 	uint32_t srcHash, dstHash;
 	TextureOverrideMap::iterator i;
 
+	// Fast path: resolving the hash below costs two GetType/GetDesc pairs,
+	// a trip through the global lock and two resource map lookups on every
+	// single copy. None of that is needed when no TextureOverride asked for
+	// this behaviour, which is the normal case:
+	if (!G->any_expand_region_copy)
+		return false;
+
 	if (!pSrcResource || !pDstResource || !pSrcBox)
 		return false;
 
@@ -2047,7 +2109,11 @@ STDMETHODIMP_(void) HackerContext::CopyResource(THIS_
 		ClearResourceRegionHashCache(pDstResource);
 
 	TextureOverrideMatches matches;
-	find_texture_overrides_for_resource(pDstResource, &matches, NULL);
+	// The lookup below takes the global lock and walks the resource's cached
+	// candidate list, and its only purpose here is to find an
+	// override_byte_width, so skip it when no TextureOverride sets one:
+	if (G->any_override_byte_width)
+		find_texture_overrides_for_resource(pDstResource, &matches, NULL);
 
 	if (!matches.empty()) {
 		// Use CopySubresourceRegion when copying to resized buffer
@@ -2248,7 +2314,8 @@ STDMETHODIMP_(void) HackerContext::HSSetShader(THIS_
 		 &G->mVisitedHullShaders,
 		 G->mSelectedHullShader,
 		 &mCurrentHullShader,
-		 &mCurrentHullShaderHandle);
+		 &mCurrentHullShaderHandle,
+		 &mHullShaderDeferredPending);
 }
 
 STDMETHODIMP_(void) HackerContext::HSSetSamplers(THIS_
@@ -2296,7 +2363,8 @@ STDMETHODIMP_(void) HackerContext::DSSetShader(THIS_
 		 &G->mVisitedDomainShaders,
 		 G->mSelectedDomainShader,
 		 &mCurrentDomainShader,
-		 &mCurrentDomainShaderHandle);
+		 &mCurrentDomainShaderHandle,
+		 &mDomainShaderDeferredPending);
 }
 
 STDMETHODIMP_(void) HackerContext::DSSetSamplers(THIS_
@@ -2371,7 +2439,8 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 	std::set<UINT64> *visitedShaders,
 	UINT64 selectedShader,
 	UINT64 *currentShaderHash,
-	ID3D11Shader **currentShaderHandle)
+	ID3D11Shader **currentShaderHandle,
+	bool *deferredPending)
 {
 	ID3D11Shader *repl_shader = pShader;
 
@@ -2379,6 +2448,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 	// reliably check if a shader of a given type is bound and for certain
 	// types of old style filtering:
 	*currentShaderHandle = pShader;
+	*deferredPending = false;
 
 	if (pShader) {
 		// Store as current shader. Need to do this even while
@@ -2412,6 +2482,14 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 		// If the shader has been live reloaded from ShaderFixes, use the new one
 		// No longer conditional on G->hunting now that hunting may be soft enabled via key binding
 		ShaderReloadMap::iterator it = lookup_reloaded_shader(pShader);
+
+		// Only a shader that DeferredShaderReplacement() would actually
+		// analyse is worth its locked lookup before the next draw:
+		if (it != G->mReloadedShaders.end()) {
+			*deferredPending = it->second.deferred_replacement_candidate
+				&& !it->second.deferred_replacement_processed;
+		}
+
 		if (it != G->mReloadedShaders.end() && it->second.replacement != NULL) {
 			LogDebug("  shader replaced by: %p\n", it->second.replacement);
 
@@ -2457,7 +2535,8 @@ STDMETHODIMP_(void) HackerContext::CSSetShader(THIS_
 		 &G->mVisitedComputeShaders,
 		 G->mSelectedComputeShader,
 		 &mCurrentComputeShader,
-		 &mCurrentComputeShaderHandle);
+		 &mCurrentComputeShaderHandle,
+		 &mComputeShaderDeferredPending);
 }
 
 STDMETHODIMP_(void) HackerContext::CSSetSamplers(THIS_
@@ -3103,7 +3182,8 @@ STDMETHODIMP_(void) HackerContext::VSSetShader(THIS_
 		 &G->mVisitedVertexShaders,
 		 G->mSelectedVertexShader,
 		 &mCurrentVertexShader,
-		 &mCurrentVertexShaderHandle);
+		 &mCurrentVertexShaderHandle,
+		 &mVertexShaderDeferredPending);
 }
 
 STDMETHODIMP_(void) HackerContext::PSSetShaderResources(THIS_
@@ -3129,7 +3209,8 @@ STDMETHODIMP_(void) HackerContext::PSSetShader(THIS_
 		 &G->mVisitedPixelShaders,
 		 G->mSelectedPixelShader,
 		 &mCurrentPixelShader,
-		 &mCurrentPixelShaderHandle);
+		 &mCurrentPixelShaderHandle,
+		 &mPixelShaderDeferredPending);
 
 	if (pPixelShader) {
 		// Set custom depth texture.

@@ -146,6 +146,21 @@ private:
 	unsigned draw_number;
 	unsigned dispatch_number;
 
+	// Whether the shader the game bound to each stage may still be waiting
+	// for deferred ShaderRegex analysis. This is worked out from the lookup
+	// SetShader() does anyway, so that draw and dispatch calls only take the
+	// lock for the rare shader that still needs analysing instead of for
+	// every bound shader on every call. When G->deferred_shader_generation
+	// moves on all stages are rechecked, since shaders that are still bound
+	// may have become candidates again:
+	bool mVertexShaderDeferredPending;
+	bool mHullShaderDeferredPending;
+	bool mDomainShaderDeferredPending;
+	bool mGeometryShaderDeferredPending;
+	bool mPixelShaderDeferredPending;
+	bool mComputeShaderDeferredPending;
+	unsigned mDeferredShaderGeneration;
+
 	FlatHashMap<UINT, ID3D11Buffer*> mReadbackBuffers = FlatHashMap<UINT, ID3D11Buffer*>(64);
 
 	// These private methods are utility routines for HackerContext.
@@ -159,6 +174,7 @@ private:
 		HRESULT (__stdcall ID3D11Device::*CreateShader)(const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11Shader**)
 	>
 	void DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, wchar_t *shader_type);
+	void UpdateDeferredShaderGeneration();
 	void DeferredShaderReplacementBeforeDraw();
 	void DeferredShaderReplacementBeforeDispatch();
 	bool ExpandRegionCopy(ID3D11Resource *pDstResource, UINT DstX,
@@ -205,7 +221,8 @@ private:
 		std::set<UINT64> *visitedShaders,
 		UINT64 selectedShader,
 		UINT64 *currentShaderHash,
-		ID3D11Shader **currentShaderHandle);
+		ID3D11Shader **currentShaderHandle,
+		bool *deferredPending);
 	template <void (__stdcall ID3D11DeviceContext::*OrigSetShaderResources)(THIS_
 			UINT StartSlot,
 			UINT NumViews,

@@ -3588,6 +3588,36 @@ static void ParseTextureOverrideSections()
 			registered_command_lists.push_back(&to.post_command_list);
 		}
 	}
+
+	// Note whether any TextureOverride uses one of the options that the hot
+	// resource and copy paths would otherwise have to look up on every call.
+	// This has to happen after update_byte_width_overrides(), which can
+	// propagate a byte width to other sections sharing the same hash, and it
+	// has to cover fuzzy overrides as well since they participate in the same
+	// matching:
+	G->any_override_byte_width = false;
+	G->any_override_num_elements = false;
+	G->any_expand_region_copy = false;
+	G->any_deny_cpu_read = false;
+
+	auto note_resource_overrides = [](const TextureOverride &to) {
+		if (to.override_byte_width != -1)
+			G->any_override_byte_width = true;
+		if (to.override_num_elements != -1)
+			G->any_override_num_elements = true;
+		if (to.expand_region_copy)
+			G->any_expand_region_copy = true;
+		if (to.deny_cpu_read)
+			G->any_deny_cpu_read = true;
+	};
+
+	for (auto &tolkv : G->mTextureOverrideMap) {
+		for (TextureOverride &to : tolkv.second)
+			note_resource_overrides(to);
+	}
+	for (auto &tof : G->mFuzzyTextureOverrides)
+		note_resource_overrides(*tof->texture_override);
+
 	LeaveCriticalSection(&G->mCriticalSection);
 }
 
@@ -5151,6 +5181,10 @@ static void MarkAllShadersDeferredUnprocessed()
 		// any that are loaded from disk:
 		i->second.deferred_replacement_processed = false;
 	}
+
+	// Contexts only look for unprocessed shaders when they are bound, so
+	// make them recheck the shaders that are still bound from before:
+	G->deferred_shader_generation++;
 
 	// TODO: If ShaderRegex hash is unchanged leave these shaders in place
 	// and just update the ShaderOverrides & filter_index

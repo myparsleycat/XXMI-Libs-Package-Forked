@@ -437,6 +437,13 @@ static void RunCommandListComplete(HackerDevice *mHackerDevice,
 		ID3D11View *view,
 		bool post)
 {
+	// Empty command lists are common (the built-in Clear* lists and shader
+	// overrides that only use the old style filters are empty unless the
+	// user defines them) and _RunCommandList() would return immediately for
+	// them anyway, so bail out before constructing the state:
+	if (command_list->ResolveCommandList()->commands.empty())
+		return;
+
 	CommandListState state;
 	state.mHackerDevice = mHackerDevice;
 	state.mHackerContext = mHackerContext;
@@ -486,6 +493,11 @@ void RunViewCommandList(HackerDevice *mHackerDevice,
 		bool post)
 {
 	ID3D11Resource *res = NULL;
+
+	// Don't pay for the view->GetResource() round trip (and the release
+	// below) when there is nothing to run - see RunCommandListComplete():
+	if (command_list->ResolveCommandList()->commands.empty())
+		return;
 
 	if (view)
 		view->GetResource(&res);

@@ -129,6 +129,29 @@ VKInputButton::VKInputButton(const wchar_t *keyName) :
 		throw keyParseError;
 }
 
+// Every key binding of every mod is polled each frame, and most of them share
+// the same handful of keys and modifiers (each "no_ctrl no_alt no_shift" is
+// another three queries), so the same keys get asked about hundreds of times
+// per frame. GetAsyncKeyState() turns into a system call whenever any key
+// changed state since the thread last asked, which is all the time while
+// playing, so sample each key at most once per DispatchInputEvents() pass:
+static SHORT vkey_states[256];
+static unsigned vkey_state_pass[256];
+static unsigned dispatch_pass = 1;
+
+static SHORT GetPassKeyState(int vkey)
+{
+	if ((unsigned)vkey >= ARRAYSIZE(vkey_states))
+		return GetAsyncKeyState(vkey);
+
+	if (vkey_state_pass[vkey] != dispatch_pass) {
+		vkey_states[vkey] = GetAsyncKeyState(vkey);
+		vkey_state_pass[vkey] = dispatch_pass;
+	}
+
+	return vkey_states[vkey];
+}
+
 // The check for < 0 is a little odd.  The reason to use this form is because
 // the call can also set the low bit in different situations that can theoretically
 // result in non-zero, but top bit not set. This form ensures we only test the
@@ -136,7 +159,7 @@ VKInputButton::VKInputButton(const wchar_t *keyName) :
 
 bool VKInputButton::CheckState()
 {
-	return ((GetAsyncKeyState(vkey) < 0) ^ invert);
+	return ((GetPassKeyState(vkey) < 0) ^ invert);
 }
 
 
@@ -580,6 +603,10 @@ bool DispatchInputEvents(HackerDevice *device)
 
 	if (!CheckForegroundWindow())
 		return false;
+
+	// Start a new pass so that every key is sampled afresh, see
+	// GetPassKeyState():
+	dispatch_pass++;
 
 	for (j = 0; j < 4; j++) {
 		// Stagger polling controllers that were not connected last
