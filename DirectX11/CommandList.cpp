@@ -161,7 +161,18 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 
 	for (i = command_list->commands.begin(); i < command_list->commands.end() && !state->aborted; i++) {
 		profile_command_list_cmd_start(i->get(), &profiling_state);
-		(*i)->run(state);
+		if ((*i)->leaves_bindings_alone) {
+			(*i)->run(state);
+		} else {
+			// Forget on both sides of the command: before, since it
+			// may look up bindings it is about to change itself, and
+			// after, since it may have noted misses against bindings
+			// that it only had in place while it ran (as running a
+			// custom shader does):
+			state->mHackerContext->ForgetCheckTextureOverrideMisses();
+			(*i)->run(state);
+			state->mHackerContext->ForgetCheckTextureOverrideMisses();
+		}
 		profile_command_list_cmd_end(i->get(), state, &profiling_state);
 	}
 
@@ -1347,6 +1358,27 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 #pragma region Commands
 
+// Whether the target names a fixed slot of the pipeline, so that it resolves
+// to the same resource for as long as the bindings are left alone. Custom
+// resources, "this" and slots or pool indices given as expressions can change
+// what they refer to without any binding changing:
+static bool is_static_pipeline_slot(const ResourceCopyTarget &target)
+{
+	switch (target.type) {
+		case ResourceCopyTargetType::CONSTANT_BUFFER:
+		case ResourceCopyTargetType::SHADER_RESOURCE:
+		case ResourceCopyTargetType::VERTEX_BUFFER:
+		case ResourceCopyTargetType::INDEX_BUFFER:
+		case ResourceCopyTargetType::STREAM_OUTPUT:
+		case ResourceCopyTargetType::RENDER_TARGET:
+		case ResourceCopyTargetType::DEPTH_STENCIL_TARGET:
+		case ResourceCopyTargetType::UNORDERED_ACCESS_VIEW:
+			return !target.slot_expression;
+		default:
+			return false;
+	}
+}
+
 void CheckTextureOverrideCommand::run(CommandListState *state)
 {
 	TextureOverrideMatches matches;
@@ -1354,9 +1386,25 @@ void CheckTextureOverrideCommand::run(CommandListState *state)
 	bool saved_post;
 	unsigned i;
 
+	// This command usually sits in both the pre and post command lists of
+	// whatever runs it, which makes every draw call look up the same
+	// bindings twice, at several calls into DirectX each, only to find for
+	// nearly all of them that nothing matches either time. A lookup that
+	// matched nothing cannot match anything later in the same draw call
+	// unless something touched the bindings in between, so skip those:
+	bool memoise = is_static_pipeline_slot(target);
+
+	if (memoise && state->mHackerContext->CheckTextureOverrideMissed(this, state->call_info)) {
+		COMMAND_LIST_LOG(state, "%S: matched nothing earlier in this draw call\n", ini_line.c_str());
+		return;
+	}
+
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
 	target.FindTextureOverrides(state, NULL, &matches);
+
+	if (memoise && matches.empty())
+		state->mHackerContext->NoteCheckTextureOverrideMiss(this, state->call_info);
 
 	saved_this = state->this_target;
 	state->this_target = &target;
@@ -9370,6 +9418,9 @@ IfCommand::IfCommand(const wchar_t *section) :
 	has_nested_else_if(false),
 	section(section)
 {
+	// Evaluating the condition only reads state:
+	leaves_bindings_alone = true;
+
 	true_commands_pre = std::make_shared<CommandList>();
 	true_commands_post = std::make_shared<CommandList>();
 	false_commands_pre = std::make_shared<CommandList>();

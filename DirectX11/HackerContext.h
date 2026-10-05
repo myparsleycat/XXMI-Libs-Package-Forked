@@ -172,6 +172,20 @@ private:
 	} mShaderOverrideCache[1 << SHADER_OVERRIDE_CACHE_BITS];
 	struct ShaderOverride* LookupShaderOverride(UINT64 hash);
 
+	// The checktextureoverride commands that matched nothing so far during
+	// the draw call in progress, so that running the same commands again
+	// (typically from the post command lists, having run from the pre
+	// command lists already) can skip looking up bindings that cannot have
+	// changed. Only in use from the start of BeforeDraw() to the end of
+	// AfterDraw(), for command lists run with the DrawCallInfo of that draw
+	// call, and emptied whenever a command that might change the bindings
+	// runs. A draw call noting more misses than fit here just looks the
+	// remainder up again:
+	static const unsigned MAX_CHECK_TEXTURE_OVERRIDE_MISSES = 32;
+	const class CommandListCommand *mCheckTextureOverrideMisses[MAX_CHECK_TEXTURE_OVERRIDE_MISSES];
+	unsigned mCheckTextureOverrideMissCount;
+	const DrawCallInfo *mCheckTextureOverrideMissesDraw;
+
 	FlatHashMap<UINT, ID3D11Buffer*> mReadbackBuffers = FlatHashMap<UINT, ID3D11Buffer*>(64);
 
 	// These private methods are utility routines for HackerContext.
@@ -278,6 +292,26 @@ public:
 	unsigned GetDrawNumber() const { return draw_number; };
 	unsigned GetDispatchNumber() const { return dispatch_number; };
 	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
+
+	// public to allow CommandList access, see mCheckTextureOverrideMisses:
+	void NoteCheckTextureOverrideMiss(const class CommandListCommand *command, const DrawCallInfo *call_info)
+	{
+		if (!call_info || call_info != mCheckTextureOverrideMissesDraw)
+			return;
+		if (mCheckTextureOverrideMissCount < MAX_CHECK_TEXTURE_OVERRIDE_MISSES)
+			mCheckTextureOverrideMisses[mCheckTextureOverrideMissCount++] = command;
+	}
+	bool CheckTextureOverrideMissed(const class CommandListCommand *command, const DrawCallInfo *call_info) const
+	{
+		if (!call_info || call_info != mCheckTextureOverrideMissesDraw)
+			return false;
+		for (unsigned i = 0; i < mCheckTextureOverrideMissCount; i++) {
+			if (mCheckTextureOverrideMisses[i] == command)
+				return true;
+		}
+		return false;
+	}
+	void ForgetCheckTextureOverrideMisses() { mCheckTextureOverrideMissCount = 0; };
 
 	ID3D11Buffer* GetReadbackBuffer(UINT size);
 

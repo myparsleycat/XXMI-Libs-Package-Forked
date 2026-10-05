@@ -106,6 +106,13 @@ public:
 	unsigned post_executions;
 	unsigned profiling_generation = 0;
 
+	// Set by the few commands whose own run() cannot change what is bound
+	// to the pipeline (the commands of any command lists they call into
+	// are checked one by one). Running any other command forgets the
+	// checktextureoverride misses HackerContext remembers for the current
+	// draw call, see HackerContext::NoteCheckTextureOverrideMiss():
+	bool leaves_bindings_alone = false;
+
 	virtual ~CommandListCommand() {};
 
 	virtual void run(CommandListState*) = 0;
@@ -245,7 +252,9 @@ public:
 	RunExplicitCommandList() :
 		command_list_section(NULL),
 		run_pre_and_post_together(false)
-	{}
+	{
+		leaves_bindings_alone = true;
+	}
 
 	void run(CommandListState*) override;
 	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
@@ -260,7 +269,9 @@ public:
 
 	RunLinkedCommandList(CommandList *link) :
 		link(link)
-	{}
+	{
+		leaves_bindings_alone = true;
+	}
 
 	void run(CommandListState*) override;
 	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
@@ -1617,7 +1628,9 @@ public:
 	ParamOverride() :
 		param_idx(-1),
 		param_component(NULL)
-	{}
+	{
+		leaves_bindings_alone = true;
+	}
 
 	void run(CommandListState*) override;
 };
@@ -1628,7 +1641,9 @@ public:
 
 	VariableAssignment() :
 		var(NULL)
-	{}
+	{
+		leaves_bindings_alone = true;
+	}
 
 	void run(CommandListState*) override;
 };
@@ -1695,7 +1710,9 @@ public:
 
 	CheckTextureOverrideCommand() :
 		run_pre_and_post_together(false)
-	{}
+	{
+		leaves_bindings_alone = true;
+	}
 
 	void run(CommandListState*) override;
 	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
