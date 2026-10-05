@@ -166,15 +166,21 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 		profile_command_list_cmd_start(i->get(), &profiling_state);
 		if ((*i)->leaves_bindings_alone) {
 			(*i)->run(state);
+		} else if ((*i)->binds_known_slots) {
+			// Looks nothing up itself, so there is nothing to
+			// forget up front:
+			(*i)->run(state);
+			state->mHackerContext->ForgetCheckTextureOverrideResults((*i)->bound_type,
+					(*i)->bound_shader_type, (*i)->bound_first_slot, (*i)->bound_slot_count);
 		} else {
 			// Forget on both sides of the command: before, since it
 			// may look up bindings it is about to change itself, and
-			// after, since it may have noted misses against bindings
+			// after, since it may have noted results for bindings
 			// that it only had in place while it ran (as running a
 			// custom shader does):
-			state->mHackerContext->ForgetCheckTextureOverrideMisses();
+			state->mHackerContext->ForgetCheckTextureOverrideResults();
 			(*i)->run(state);
-			state->mHackerContext->ForgetCheckTextureOverrideMisses();
+			state->mHackerContext->ForgetCheckTextureOverrideResults();
 		}
 		profile_command_list_cmd_end(i->get(), state, &profiling_state);
 	}
@@ -824,6 +830,7 @@ void optimise_command_lists(HackerDevice *device)
 		merge_shader_resource_batches(command_list);
 		merge_check_texture_override_batches(command_list);
 		merge_constant_assignment_batches(command_list);
+		note_bound_slots(command_list);
 	}
 
 	Profiling::update_cto_warning(!ignore_cto_post);
@@ -1614,6 +1621,27 @@ static bool is_static_pipeline_slot(const ResourceCopyTarget &target)
 	}
 }
 
+bool CheckTextureOverrideCommand::RecallMatches(CommandListState *state, TextureOverrideMatches *matches)
+{
+	const CheckTextureOverrideResult *result;
+
+	result = state->mHackerContext->FindCheckTextureOverrideResult(this, state->call_info);
+	if (!result)
+		return false;
+
+	if (result->count)
+		COMMAND_LIST_LOG(state, "%S: same matches as earlier in this draw call\n", ini_line.c_str());
+	else
+		COMMAND_LIST_LOG(state, "%S: matched nothing earlier in this draw call\n", ini_line.c_str());
+
+	// Copied, as the command lists of the matches may bind to the slot and
+	// with that have the result forgotten while they are still running:
+	for (unsigned i = 0; i < result->count; i++)
+		matches->push_back(result->matches[i]);
+
+	return true;
+}
+
 void CheckTextureOverrideCommand::run(CommandListState *state)
 {
 	TextureOverrideMatches matches;
@@ -1621,24 +1649,25 @@ void CheckTextureOverrideCommand::run(CommandListState *state)
 	// This command usually sits in both the pre and post command lists of
 	// whatever runs it, which makes every draw call look up the same
 	// bindings twice, at several calls into DirectX each, only to find for
-	// nearly all of them that nothing matches either time. A lookup that
-	// matched nothing cannot match anything later in the same draw call
-	// unless something touched the bindings in between, so skip those:
+	// nearly all of them that nothing matches either time. What a lookup
+	// matched (the binding, the sections that could match it and the draw
+	// call all being the same) cannot differ later in the same draw call
+	// unless something touched the binding in between, so only look it up
+	// the first time:
 	bool memoise = is_static_pipeline_slot(target);
 
-	if (memoise && state->mHackerContext->CheckTextureOverrideMissed(this, state->call_info)) {
-		COMMAND_LIST_LOG(state, "%S: matched nothing earlier in this draw call\n", ini_line.c_str());
-		return;
+	if (!memoise || !RecallMatches(state, &matches)) {
+		COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+		target.FindTextureOverrides(state, NULL, &matches);
+
+		// Before running the matches, see RecallMatches():
+		if (memoise)
+			state->mHackerContext->NoteCheckTextureOverrideResult(this, state->call_info, matches);
 	}
 
-	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
-
-	target.FindTextureOverrides(state, NULL, &matches);
-
-	if (memoise && matches.empty())
-		state->mHackerContext->NoteCheckTextureOverrideMiss(this, state->call_info);
-
-	RunMatches(state, matches);
+	if (!matches.empty())
+		RunMatches(state, matches);
 }
 
 static void RunTextureOverrideCommandList(CommandList *command_list, CommandListState *state)
@@ -13602,8 +13631,13 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		// Same as CheckTextureOverrideCommand::run(), every merged line
 		// names a static pipeline slot. In a post command list this is
 		// usually how all of them end, without reading any bindings:
-		if (context->CheckTextureOverrideMissed(command, state->call_info)) {
-			COMMAND_LIST_LOG(state, "%S: matched nothing earlier in this draw call\n", command->ini_line.c_str());
+		if (command->RecallMatches(state, &matches)) {
+			if (matches.empty())
+				continue;
+
+			release();
+			matched = true;
+			command->RunMatches(state, matches);
 			continue;
 		}
 
@@ -13667,10 +13701,11 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 				resource->Release();
 		}
 
-		if (matches.empty()) {
-			context->NoteCheckTextureOverrideMiss(command, state->call_info);
+		// Before running the matches, see RecallMatches():
+		context->NoteCheckTextureOverrideResult(command, state->call_info, matches);
+
+		if (matches.empty())
 			continue;
-		}
 
 		// The command lists about to run may bind anything anywhere, so
 		// nothing read so far can be trusted for the lines that follow.
@@ -13765,7 +13800,7 @@ static void emit_check_texture_override_batch(const std::vector<std::shared_ptr<
 // checktextureoverride commands with a batch. Any other command ends the
 // run, since it may change what the slots hold. The order of commands is
 // preserved, and the merged commands themselves stay shared between the pre
-// and post command lists, which HackerContext::CheckTextureOverrideMissed()
+// and post command lists, which HackerContext::FindCheckTextureOverrideResult()
 // depends on to recognise them.
 void merge_check_texture_override_batches(CommandList *command_list)
 {
@@ -13800,6 +13835,77 @@ void merge_check_texture_override_batches(CommandList *command_list)
 }
 
 #pragma endregion CheckTextureOverrideBatches
+
+
+#pragma region BoundSlots
+
+// True if all the operation ever does to the pipeline is set its destination
+// slot. Null does nothing else at all, and a reference to a custom resource
+// only takes calls into the device to resolve (creating the resource and a
+// view of it at most). DirectX refusing the binding for a resource that is
+// bound as an output still only changes that one slot. Copies are left out:
+// they come in too many flavours to vouch for here.
+static bool binds_destination_only(const ResourceCopyOperation *op)
+{
+	if (op->dst.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE || op->dst.slot_expression)
+		return false;
+
+	switch (op->dst.type) {
+		case ResourceCopyTargetType::SHADER_RESOURCE:
+		case ResourceCopyTargetType::CONSTANT_BUFFER:
+		case ResourceCopyTargetType::VERTEX_BUFFER:
+		case ResourceCopyTargetType::INDEX_BUFFER:
+			break;
+		default:
+			return false;
+	}
+
+	if (op->src.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE)
+		return false;
+
+	if (op->src.type == ResourceCopyTargetType::EMPTY)
+		return true;
+
+	return op->src.type == ResourceCopyTargetType::CUSTOM_RESOURCE
+		&& !(op->options & ResourceCopyOptions::COPY_MASK)
+		&& !(op->options & ResourceCopyOptions::SET_VIEWPORT);
+}
+
+// Optimiser pass: marks the commands that only bind to slots known up front,
+// see CommandListCommand::binds_known_slots. Runs after the batches have been
+// merged, as a batch binds the slots of all its operations at once.
+void note_bound_slots(CommandList *command_list)
+{
+	for (auto &command : command_list->commands) {
+		if (ResourceCopyOperation *op = dynamic_cast<ResourceCopyOperation*>(command.get())) {
+			if (!binds_destination_only(op))
+				continue;
+
+			op->bound_type = op->dst.type;
+			op->bound_shader_type = op->dst.shader_type;
+			op->bound_first_slot = op->dst.slot;
+			op->bound_slot_count = 1;
+			op->binds_known_slots = true;
+		} else if (ShaderResourceBindBatch *batch = dynamic_cast<ShaderResourceBindBatch*>(command.get())) {
+			bool known = true;
+
+			for (auto &op : batch->operations)
+				known = known && binds_destination_only(op.get());
+			if (!known)
+				continue;
+
+			// Every slot of the range is written, including those
+			// that are only put back as they were:
+			batch->bound_type = ResourceCopyTargetType::SHADER_RESOURCE;
+			batch->bound_shader_type = batch->shader_type;
+			batch->bound_first_slot = batch->first_slot;
+			batch->bound_slot_count = batch->count;
+			batch->binds_known_slots = true;
+		}
+	}
+}
+
+#pragma endregion BoundSlots
 
 
 #pragma region ConstantAssignmentBatches

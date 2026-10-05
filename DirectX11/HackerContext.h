@@ -105,6 +105,16 @@ struct MappedResourceInfo {
 // Any HackerDevice will be the superset object ID3D11DeviceContext1 in all cases
 // except for Win7 missing the evil platform_update.
 
+// What a checktextureoverride command matched when it last ran, see
+// HackerContext::mCheckTextureOverrideResults:
+struct CheckTextureOverrideResult {
+	static const unsigned MAX_MATCHES = 4;
+
+	const CheckTextureOverrideCommand *command;
+	unsigned count;
+	TextureOverride *matches[MAX_MATCHES];
+};
+
 // Hierarchy:
 //  HackerContext <- ID3D11DeviceContext1 <- ID3D11DeviceContext <- ID3D11DeviceChild <- IUnknown
 
@@ -172,19 +182,21 @@ private:
 	} mShaderOverrideCache[1 << SHADER_OVERRIDE_CACHE_BITS];
 	struct ShaderOverride* LookupShaderOverride(UINT64 hash);
 
-	// The checktextureoverride commands that matched nothing so far during
-	// the draw call in progress, so that running the same commands again
-	// (typically from the post command lists, having run from the pre
-	// command lists already) can skip looking up bindings that cannot have
-	// changed. Only in use from the start of BeforeDraw() to the end of
-	// AfterDraw(), for command lists run with the DrawCallInfo of that draw
-	// call, and emptied whenever a command that might change the bindings
-	// runs. A draw call noting more misses than fit here just looks the
-	// remainder up again:
-	static const unsigned MAX_CHECK_TEXTURE_OVERRIDE_MISSES = 32;
-	const class CommandListCommand *mCheckTextureOverrideMisses[MAX_CHECK_TEXTURE_OVERRIDE_MISSES];
-	unsigned mCheckTextureOverrideMissCount;
-	const DrawCallInfo *mCheckTextureOverrideMissesDraw;
+	// What the checktextureoverride commands that ran so far during the
+	// draw call in progress matched (for most of them: nothing), so that
+	// running the same commands again (typically from the post command
+	// lists, having run from the pre command lists already) can skip
+	// looking up bindings that cannot have changed. Only in use from the
+	// start of BeforeDraw() to the end of AfterDraw(), for command lists
+	// run with the DrawCallInfo of that draw call. Running a command that
+	// might change the bindings forgets the results for the slots it may
+	// have bound to, which is all of them unless the command is known to
+	// keep to certain slots. Results that do not fit in here (too many of
+	// them, or too many matches in one) are just looked up again:
+	static const unsigned MAX_CHECK_TEXTURE_OVERRIDE_RESULTS = 32;
+	CheckTextureOverrideResult mCheckTextureOverrideResults[MAX_CHECK_TEXTURE_OVERRIDE_RESULTS];
+	unsigned mCheckTextureOverrideResultCount;
+	const DrawCallInfo *mCheckTextureOverrideResultsDraw;
 
 	FlatHashMap<UINT, ID3D11Buffer*> mReadbackBuffers = FlatHashMap<UINT, ID3D11Buffer*>(64);
 
@@ -293,25 +305,56 @@ public:
 	unsigned GetDispatchNumber() const { return dispatch_number; };
 	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
 
-	// public to allow CommandList access, see mCheckTextureOverrideMisses:
-	void NoteCheckTextureOverrideMiss(const class CommandListCommand *command, const DrawCallInfo *call_info)
+	// public to allow CommandList access, see mCheckTextureOverrideResults:
+	void NoteCheckTextureOverrideResult(const CheckTextureOverrideCommand *command, const DrawCallInfo *call_info, const TextureOverrideMatches &matches)
 	{
-		if (!call_info || call_info != mCheckTextureOverrideMissesDraw)
+		if (!call_info || call_info != mCheckTextureOverrideResultsDraw)
 			return;
-		if (mCheckTextureOverrideMissCount < MAX_CHECK_TEXTURE_OVERRIDE_MISSES)
-			mCheckTextureOverrideMisses[mCheckTextureOverrideMissCount++] = command;
+		if (mCheckTextureOverrideResultCount >= MAX_CHECK_TEXTURE_OVERRIDE_RESULTS
+		 || matches.size() > CheckTextureOverrideResult::MAX_MATCHES)
+			return;
+
+		CheckTextureOverrideResult &result = mCheckTextureOverrideResults[mCheckTextureOverrideResultCount++];
+		result.command = command;
+		result.count = (unsigned)matches.size();
+		for (unsigned i = 0; i < result.count; i++)
+			result.matches[i] = matches[i];
 	}
-	bool CheckTextureOverrideMissed(const class CommandListCommand *command, const DrawCallInfo *call_info) const
+	// NULL unless the command has run before during this draw call and
+	// nothing may have bound to its slot since. The result does not outlive
+	// the next command that runs, copy the matches before running theirs:
+	const CheckTextureOverrideResult* FindCheckTextureOverrideResult(const CheckTextureOverrideCommand *command, const DrawCallInfo *call_info) const
 	{
-		if (!call_info || call_info != mCheckTextureOverrideMissesDraw)
-			return false;
-		for (unsigned i = 0; i < mCheckTextureOverrideMissCount; i++) {
-			if (mCheckTextureOverrideMisses[i] == command)
-				return true;
+		if (!call_info || call_info != mCheckTextureOverrideResultsDraw)
+			return NULL;
+		for (unsigned i = 0; i < mCheckTextureOverrideResultCount; i++) {
+			if (mCheckTextureOverrideResults[i].command == command)
+				return &mCheckTextureOverrideResults[i];
 		}
-		return false;
+		return NULL;
 	}
-	void ForgetCheckTextureOverrideMisses() { mCheckTextureOverrideMissCount = 0; };
+	void ForgetCheckTextureOverrideResults() { mCheckTextureOverrideResultCount = 0; };
+	// As above, for a command known to have bound to these slots only, see
+	// CommandListCommand::binds_known_slots:
+	void ForgetCheckTextureOverrideResults(ResourceCopyTargetType type, wchar_t shader_type, unsigned first_slot, unsigned slot_count)
+	{
+		for (unsigned i = 0; i < mCheckTextureOverrideResultCount; ) {
+			const ResourceCopyTarget &target = mCheckTextureOverrideResults[i].command->target;
+			bool bound = target.type == type;
+
+			// There is only the one ib, and vb slots belong to no stage:
+			if (bound && type != ResourceCopyTargetType::INDEX_BUFFER) {
+				bound = target.slot >= first_slot && target.slot - first_slot < slot_count;
+				if (type != ResourceCopyTargetType::VERTEX_BUFFER)
+					bound = bound && target.shader_type == shader_type;
+			}
+
+			if (bound)
+				mCheckTextureOverrideResults[i] = mCheckTextureOverrideResults[--mCheckTextureOverrideResultCount];
+			else
+				i++;
+		}
+	}
 
 	ID3D11Buffer* GetReadbackBuffer(UINT size);
 

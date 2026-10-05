@@ -94,8 +94,8 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mComputeShaderDeferredPending = false;
 	mDeferredShaderGeneration = G->deferred_shader_generation;
 	memset(mShaderOverrideCache, 0, sizeof(mShaderOverrideCache));
-	mCheckTextureOverrideMissCount = 0;
-	mCheckTextureOverrideMissesDraw = NULL;
+	mCheckTextureOverrideResultCount = 0;
+	mCheckTextureOverrideResultsDraw = NULL;
 	mCurrentDepthTarget = NULL;
 	mCurrentPSUAVStartSlot = 0;
 	mCurrentPSNumUAVs = 0;
@@ -922,8 +922,8 @@ void HackerContext::BeforeDraw(DrawContext &data)
 {
 	draw_number++;
 
-	mCheckTextureOverrideMissCount = 0;
-	mCheckTextureOverrideMissesDraw = &data.call_info;
+	mCheckTextureOverrideResultCount = 0;
+	mCheckTextureOverrideResultsDraw = &data.call_info;
 
 	Profiling::State profiling_state;
 
@@ -1157,8 +1157,8 @@ void HackerContext::AfterDraw(DrawContext &data)
 	}
 
 	// The bindings are the game's to change again from here:
-	mCheckTextureOverrideMissCount = 0;
-	mCheckTextureOverrideMissesDraw = NULL;
+	mCheckTextureOverrideResultCount = 0;
+	mCheckTextureOverrideResultsDraw = NULL;
 
 	if (data.oldVertexShader) {
 		ID3D11VertexShader *ret;

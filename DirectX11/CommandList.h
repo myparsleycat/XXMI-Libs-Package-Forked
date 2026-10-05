@@ -108,6 +108,8 @@ public:
 	~CommandListState();
 };
 
+enum class ResourceCopyTargetType : uint32_t;
+
 class CommandListCommand {
 public:
 	wstring ini_line;
@@ -122,9 +124,19 @@ public:
 	// Set by the few commands whose own run() cannot change what is bound
 	// to the pipeline (the commands of any command lists they call into
 	// are checked one by one). Running any other command forgets the
-	// checktextureoverride misses HackerContext remembers for the current
-	// draw call, see HackerContext::NoteCheckTextureOverrideMiss():
+	// checktextureoverride results HackerContext remembers for the current
+	// draw call, see HackerContext::NoteCheckTextureOverrideResult():
 	bool leaves_bindings_alone = false;
+	// Set by the optimiser for a command that does bind, but provably only
+	// to the slots below and without doing anything else to the pipeline
+	// or to resource contents (a reference to a custom resource or null
+	// assigned to t, cb, vb or ib slots). Running it only forgets what is
+	// remembered for those slots, see note_bound_slots():
+	bool binds_known_slots = false;
+	ResourceCopyTargetType bound_type = (ResourceCopyTargetType)0;
+	wchar_t bound_shader_type = L'\0';
+	unsigned bound_first_slot = 0;
+	unsigned bound_slot_count = 0;
 
 	virtual ~CommandListCommand() {};
 
@@ -1786,6 +1798,9 @@ public:
 
 	// Runs the command lists of the TextureOverride sections that matched:
 	void RunMatches(CommandListState *state, TextureOverrideMatches &matches);
+	// Fills in what this command matched earlier in the draw call, if
+	// HackerContext still remembers. False if it has to be looked up:
+	bool RecallMatches(CommandListState *state, TextureOverrideMatches *matches);
 };
 
 // A run of adjacent "checktextureoverride = <slot>" lines for t, vb and ib
@@ -1825,6 +1840,7 @@ public:
 };
 
 void merge_check_texture_override_batches(CommandList *command_list);
+void note_bound_slots(CommandList *command_list);
 
 enum class DrawCommandType {
 	INVALID,
