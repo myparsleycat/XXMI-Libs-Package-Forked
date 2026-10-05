@@ -930,7 +930,7 @@ uint32_t CalcTexture3DDataHash(
 	return hash;
 }
 
-static bool supports_hash_tracking(ResourceHandleInfo *handle_info)
+static bool supports_hash_tracking(D3D11_RESOURCE_DIMENSION type)
 {
 	// We only support hash tracking and contamination detection for 2D and
 	// 3D textures currently. We could probably add 1D textures relatively
@@ -938,8 +938,13 @@ static bool supports_hash_tracking(ResourceHandleInfo *handle_info)
 	// are updated, so we're skipping them for now. If we do want to add
 	// support for them later, we should add a means to turn off the
 	// contamination detection on a per-resource type basis:
-	return (handle_info->type == D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
-		handle_info->type == D3D11_RESOURCE_DIMENSION_TEXTURE3D);
+	return (type == D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
+		type == D3D11_RESOURCE_DIMENSION_TEXTURE3D);
+}
+
+static bool supports_hash_tracking(ResourceHandleInfo *handle_info)
+{
+	return supports_hash_tracking(handle_info->type);
 }
 
 static bool GetResourceInfoFields(struct ResourceHashInfo *info, UINT subresource,
@@ -998,7 +1003,7 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 	// draw. Ask the resource for its type up front so those bail before
 	// taking the locks and searching the resource map for nothing:
 	dest->GetType(&dim);
-	if (dim != D3D11_RESOURCE_DIMENSION_TEXTURE2D && dim != D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+	if (!supports_hash_tracking(dim))
 		goto out_profile;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
@@ -1130,6 +1135,14 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
 
+	// As in MarkResourceHashContaminated(), the bulk of the calls here are
+	// for constant buffers the game updates on every draw, which have no
+	// hash to update. Bail for those before taking the locks and searching
+	// the resource map:
+	resource->GetType(&dim);
+	if (!supports_hash_tracking(dim))
+		goto out_profile;
+
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
 	info = GetResourceHandleInfo(resource);
@@ -1158,7 +1171,6 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 	old_data_hash = info->data_hash;
 	old_hash = info->hash;
 
-	resource->GetType(&dim);
 	switch (dim) {
 		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
 			tex2D = (ID3D11Texture2D*)resource;
@@ -1189,6 +1201,7 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 out_unlock:
 	LeaveCriticalSection(&G->mCriticalSection);
 
+out_profile:
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::hash_tracking_overhead);
 }
@@ -1202,8 +1215,17 @@ void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src)
 	uint32_t old_data_hash, old_hash;
 	Profiling::State profiling_state;
 
+	if (!dst || !src)
+		return;
+
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
+
+	// Buffer to buffer copies have no hash to propagate, see
+	// UpdateResourceHashFromCPU():
+	dst->GetType(&dim);
+	if (!supports_hash_tracking(dim))
+		goto out_profile;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
@@ -1239,7 +1261,6 @@ void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src)
 
 	dst_info->data_hash = src_info->data_hash;
 
-	dst->GetType(&dim);
 	switch (dim) {
 		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
 			desc2D = &dst_info->desc2D;
@@ -1264,15 +1285,23 @@ void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src)
 out_unlock:
 	LeaveCriticalSection(&G->mCriticalSection);
 
+out_profile:
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::hash_tracking_overhead);
 }
 
-bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource)
+bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource, D3D11_RESOURCE_DIMENSION dim)
 {
 	if (G->hunting && G->track_texture_updates != 2) { // Any hunting mode - want to catch hash contamination even while soft disabled
 		MarkResourceHashContaminated(pResource, Subresource, NULL, 0, 'M', 0, 0, 0, NULL);
 	}
+
+	// Only these have a hash to update once they are unmapped. Tracking
+	// the mapping of anything else would send every constant buffer the
+	// game fills through a temporary allocation and a copy of the whole
+	// buffer, for UpdateResourceHashFromCPU() to then ignore it:
+	if (!supports_hash_tracking(dim))
+		return false;
 
 	// TODO: If track_texture_updated is disabled, but we are in hunting
 	// with a reloadable config, we might consider tracking the data hash

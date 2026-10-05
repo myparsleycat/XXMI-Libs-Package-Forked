@@ -1451,6 +1451,8 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 	if (FAILED(map_hr) || !pResource || !pMappedResource || !pMappedResource->pData)
 		goto out_profile;
 
+	pResource->GetType(&dim);
+
 	switch (MapType) {
 		case D3D11_MAP_READ_WRITE:
 			read = true;
@@ -1472,7 +1474,7 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 			// all these IO mapped addresses, but not sure about
 			// performance or if there might be any unintended
 			// consequences like uninitialised data:
-			divert = track = MapTrackResourceHashUpdate(pResource, Subresource);
+			divert = track = MapTrackResourceHashUpdate(pResource, Subresource, dim);
 			break;
 
 		case D3D11_MAP_READ:
@@ -1480,8 +1482,6 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 			divert = deny = MapDenyCPURead(pResource, Subresource, MapType, MapFlags, pMappedResource);
 			break;
 	}
-
-	pResource->GetType(&dim);
 
 	// Divert CB or IB or VB buffer for use in region hashes system cache.
 	// Data will be copied during TrackAndDivertUnmap from allocated replacement.

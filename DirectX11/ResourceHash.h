@@ -645,7 +645,7 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 
 void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src);
 
-bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource);
+bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource, D3D11_RESOURCE_DIMENSION dim);
 
 int StrResourceDesc(char *buf, size_t size, const D3D11_BUFFER_DESC *desc);
 int StrResourceDesc(char *buf, size_t size, const D3D11_TEXTURE1D_DESC *desc);
