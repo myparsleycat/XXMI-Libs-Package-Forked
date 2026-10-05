@@ -600,6 +600,10 @@ struct Globals
 	// deferred analysis when it is bound, so this tells them to recheck the
 	// shaders that are still bound from before:
 	unsigned deferred_shader_generation;
+	// Bumped after every insertion into or clearing of mShaderOverrideMap,
+	// to invalidate the lookups each context caches for its draw calls
+	// (HackerContext::LookupShaderOverride):
+	unsigned shader_override_generation;
 
 	std::set<UINT64> mVisitedComputeShaders;
 	UINT64 mSelectedComputeShader;
@@ -704,6 +708,7 @@ struct Globals
 		mSelectedHullShaderPos(-1),
 		mPinkingShader(0),
 		deferred_shader_generation(0),
+		shader_override_generation(1), // 0 marks unused cache entries
 
 		hunting(HUNTING_MODE_DISABLED),
 		overlay_buffer_hash_lifetime(-1),

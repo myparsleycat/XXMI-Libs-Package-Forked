@@ -2592,6 +2592,7 @@ static void ParseShaderOverrideSections()
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
 	G->mShaderOverrideMap.clear();
+	G->shader_override_generation++;
 
 	lower = ini_sections.lower_bound(wstring(L"ShaderOverride"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderOverride"));
@@ -2608,6 +2609,7 @@ static void ParseShaderOverrideSections()
 
 		duplicate = !!G->mShaderOverrideMap.count(hash);
 		override = &G->mShaderOverrideMap[hash];
+		G->shader_override_generation++;
 		if (!duplicate)
 			override->first_ini_section = id;
 

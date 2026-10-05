@@ -161,6 +161,17 @@ private:
 	bool mComputeShaderDeferredPending;
 	unsigned mDeferredShaderGeneration;
 
+	// Direct mapped cache in front of G->mShaderOverrideMap for the lookups
+	// every draw call does for each of its bound shaders. Entries (misses
+	// included) are only valid while G->shader_override_generation matches:
+	static const unsigned SHADER_OVERRIDE_CACHE_BITS = 10;
+	struct ShaderOverrideCacheEntry {
+		UINT64 hash;
+		struct ShaderOverride *shader_override;
+		unsigned generation;
+	} mShaderOverrideCache[1 << SHADER_OVERRIDE_CACHE_BITS];
+	struct ShaderOverride* LookupShaderOverride(UINT64 hash);
+
 	FlatHashMap<UINT, ID3D11Buffer*> mReadbackBuffers = FlatHashMap<UINT, ID3D11Buffer*>(64);
 
 	// These private methods are utility routines for HackerContext.

@@ -1819,6 +1819,8 @@ static uint32_t LogRenderTarget(ID3D11Resource *target, char *log_prefix)
 	EnterCriticalSectionPretty(&G->mResourcesLock);
 	uint32_t hash = G->mResources[target].hash;
 	uint32_t orig_hash = G->mResources[target].orig_hash;
+	// The above may have just registered a blank entry for the target:
+	ForgetTextureOverrideMiss(target);
 	LeaveCriticalSection(&G->mResourcesLock);
 	struct ResourceHashInfo &info = G->mResourceInfo[orig_hash];
 	StrResourceDesc(buf, 256, info);

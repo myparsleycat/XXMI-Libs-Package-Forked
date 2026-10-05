@@ -884,5 +884,9 @@ void find_texture_overrides_for_resource_by_hash_from_fuzzy_matches(ID3D11Resour
 TextureOverrideCandidates* get_texture_override_candidates(ID3D11Resource* resource);
 void find_fuzzy_texture_overrides_for_resource(ID3D11Resource* resource, TextureOverrideMatches* matches, DrawCallInfo* call_info);
 void InvalidateTextureOverrideCandidates();
+// Must be called whenever a resource that may have been looked up before
+// could start matching a TextureOverride (handle info registered at its
+// address, hash changed), see texture_override_miss_cache.
+void ForgetTextureOverrideMiss(ID3D11Resource* resource);
 
 void ClearRegionHashesGlobalCache();

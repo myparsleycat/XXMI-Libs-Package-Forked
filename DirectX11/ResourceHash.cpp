@@ -1180,6 +1180,8 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 			break;
 	}
 
+	ForgetTextureOverrideMiss(resource);
+
 	LogDebug("Updated resource hash\n");
 	LogDebug("  old data: %08x new data: %08x\n", old_data_hash, info->data_hash);
 	LogDebug("  old hash: %08x new hash: %08x\n", old_hash, info->hash);
@@ -1252,6 +1254,8 @@ void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src)
 			dst_info->hash = CalcTexture3DDescHash(dst_info->data_hash, desc3D);
 			break;
 	}
+
+	ForgetTextureOverrideMiss(dst);
 
 	LogDebug("Propagated resource hash\n");
 	LogDebug("  old data: %08x new data: %08x\n", old_data_hash, dst_info->data_hash);
@@ -1779,6 +1783,38 @@ static void collect_fuzzy_texture_overrides_for_resource(ID3D11Resource *resourc
 	}
 }
 
+// Most resources checktextureoverride looks at match no TextureOverride at
+// all, yet finding that out costs two critical sections and a mResources
+// lookup, every draw call. This direct mapped table remembers resources that
+// are known to have no candidates so those lookups can bail out lock free.
+//
+// Only misses are cached, so a stale or evicted slot can at worst send a
+// lookup down the regular path. An entry must be forgotten whenever its
+// resource could start matching:
+// - A new resource is registered at the same address (the previous owner of
+//   the address is gone by then, and nothing can look up the new one until
+//   its creation call returns)
+// - The resource hash changes (track_texture_updates)
+// - The TextureOverride sections are reloaded
+// The latter two and adding entries are serialised by G->mCriticalSection.
+#define TEXTURE_OVERRIDE_MISS_CACHE_BITS 14
+static std::atomic<ID3D11Resource*> texture_override_miss_cache[1 << TEXTURE_OVERRIDE_MISS_CACHE_BITS];
+
+static inline std::atomic<ID3D11Resource*>* texture_override_miss_slot(ID3D11Resource *resource)
+{
+	// Fibonacci hashing, the low bits of a pointer are all alignment:
+	uint64_t slot = (uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull;
+	return &texture_override_miss_cache[slot >> (64 - TEXTURE_OVERRIDE_MISS_CACHE_BITS)];
+}
+
+void ForgetTextureOverrideMiss(ID3D11Resource *resource)
+{
+	std::atomic<ID3D11Resource*> *slot = texture_override_miss_slot(resource);
+
+	if (resource && slot->load(std::memory_order_relaxed) == resource)
+		slot->compare_exchange_strong(resource, nullptr);
+}
+
 void InvalidateTextureOverrideCandidates()
 {
 	EnterCriticalSectionPretty(&G->mResourcesLock);
@@ -1790,6 +1826,9 @@ void InvalidateTextureOverrideCandidates()
 	}
 
 	LeaveCriticalSection(&G->mResourcesLock);
+
+	for (auto &slot : texture_override_miss_cache)
+		slot.store(nullptr);
 }
 
 // Must be called with G->mCriticalSection held, and the returned candidates
@@ -1915,6 +1954,14 @@ void find_texture_overrides_for_resource(ID3D11Resource *resource, TextureOverri
 	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())
 		return;
 
+	// Already known to match nothing? See texture_override_miss_cache:
+	std::atomic<ID3D11Resource*> *miss_slot = texture_override_miss_slot(resource);
+	if (miss_slot->load(std::memory_order_relaxed) == resource) {
+		if (Profiling::mode == Profiling::Mode::SUMMARY)
+			Profiling::texture_override_candidates_lookup_overhead.count++;
+		return;
+	}
+
 	Profiling::State profiling_state;
 	size_t matches_before = 0;
 	if (Profiling::mode == Profiling::Mode::SUMMARY) {
@@ -1940,6 +1987,8 @@ void find_texture_overrides_for_resource(ID3D11Resource *resource, TextureOverri
 				matches->push_back(to);
 		}
 	}
+	if (!candidates || (!candidates->hash_matches && candidates->fuzzy_matches.empty()))
+		miss_slot->store(resource, std::memory_order_relaxed);
 	LeaveCriticalSection(&G->mCriticalSection);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY) {

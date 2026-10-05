@@ -93,6 +93,7 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mPixelShaderDeferredPending = false;
 	mComputeShaderDeferredPending = false;
 	mDeferredShaderGeneration = G->deferred_shader_generation;
+	memset(mShaderOverrideCache, 0, sizeof(mShaderOverrideCache));
 	mCurrentDepthTarget = NULL;
 	mCurrentPSUAVStartSlot = 0;
 	mCurrentPSNumUAVs = 0;
@@ -616,13 +617,6 @@ void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 		if (asm_text.empty())
 			goto out_drop;
 
-		asm_text = BinaryToAsmText(orig_info->byteCode->GetBufferPointer(),
-				orig_info->byteCode->GetBufferSize(),
-				G->patch_cb_offsets,
-				G->disassemble_undecipherable_custom_data);
-		if (asm_text.empty())
-			goto out_drop;
-
 		// Apply patches from ShaderRegex with Patterns (and Templates).
 		try {
 			patch_regex = apply_shader_regex_groups(&asm_text, shader_type, &orig_info->shaderModel, hash, &tagline);
@@ -723,6 +717,31 @@ void HackerContext::UpdateDeferredShaderGeneration()
 	mGeometryShaderDeferredPending = true;
 	mPixelShaderDeferredPending = true;
 	mComputeShaderDeferredPending = true;
+}
+
+ShaderOverride* HackerContext::LookupShaderOverride(UINT64 hash)
+{
+	ShaderOverrideCacheEntry *entry = &mShaderOverrideCache[
+		(hash * 0x9E3779B97F4A7C15ull) >> (64 - SHADER_OVERRIDE_CACHE_BITS)];
+	// Read before the lookup, so that an entry cached while another thread
+	// was inserting is stale once that thread bumps the generation:
+	unsigned generation = G->shader_override_generation;
+	ShaderOverrideMap::iterator i;
+
+	if (entry->hash == hash && entry->generation == generation) {
+		if (Profiling::mode == Profiling::Mode::SUMMARY) {
+			Profiling::shaderoverride_lookup_overhead.count++;
+			if (entry->shader_override)
+				Profiling::shaderoverride_lookup_overhead.hits++;
+		}
+		return entry->shader_override;
+	}
+
+	i = lookup_shaderoverride(hash);
+	entry->hash = hash;
+	entry->generation = generation;
+	entry->shader_override = (i != G->mShaderOverrideMap.end()) ? &i->second : NULL;
+	return entry->shader_override;
 }
 
 void HackerContext::DeferredShaderReplacementBeforeDraw()
@@ -1069,42 +1088,42 @@ void HackerContext::BeforeDraw(DrawContext &data)
 
 	// Override settings?
 	if (!G->mShaderOverrideMap.empty()) {
-		ShaderOverrideMap::iterator i;
+		ShaderOverride *shader_override;
 
-		i = lookup_shaderoverride(mCurrentVertexShader);
-		if (i != G->mShaderOverrideMap.end()) {
-			data.post_commands[0] = &i->second.post_command_list;
-			ProcessShaderOverride(&i->second, false, &data);
+		shader_override = LookupShaderOverride(mCurrentVertexShader);
+		if (shader_override) {
+			data.post_commands[0] = &shader_override->post_command_list;
+			ProcessShaderOverride(shader_override, false, &data);
 		}
 
 		if (mCurrentHullShader) {
-			i = lookup_shaderoverride(mCurrentHullShader);
-			if (i != G->mShaderOverrideMap.end()) {
-				data.post_commands[1] = &i->second.post_command_list;
-				ProcessShaderOverride(&i->second, false, &data);
+			shader_override = LookupShaderOverride(mCurrentHullShader);
+			if (shader_override) {
+				data.post_commands[1] = &shader_override->post_command_list;
+				ProcessShaderOverride(shader_override, false, &data);
 			}
 		}
 
 		if (mCurrentDomainShader) {
-			i = lookup_shaderoverride(mCurrentDomainShader);
-			if (i != G->mShaderOverrideMap.end()) {
-				data.post_commands[2] = &i->second.post_command_list;
-				ProcessShaderOverride(&i->second, false, &data);
+			shader_override = LookupShaderOverride(mCurrentDomainShader);
+			if (shader_override) {
+				data.post_commands[2] = &shader_override->post_command_list;
+				ProcessShaderOverride(shader_override, false, &data);
 			}
 		}
 
 		if (mCurrentGeometryShader) {
-			i = lookup_shaderoverride(mCurrentGeometryShader);
-			if (i != G->mShaderOverrideMap.end()) {
-				data.post_commands[3] = &i->second.post_command_list;
-				ProcessShaderOverride(&i->second, false, &data);
+			shader_override = LookupShaderOverride(mCurrentGeometryShader);
+			if (shader_override) {
+				data.post_commands[3] = &shader_override->post_command_list;
+				ProcessShaderOverride(shader_override, false, &data);
 			}
 		}
 
-		i = lookup_shaderoverride(mCurrentPixelShader);
-		if (i != G->mShaderOverrideMap.end()) {
-			data.post_commands[4] = &i->second.post_command_list;
-			ProcessShaderOverride(&i->second, true, &data);
+		shader_override = LookupShaderOverride(mCurrentPixelShader);
+		if (shader_override) {
+			data.post_commands[4] = &shader_override->post_command_list;
+			ProcessShaderOverride(shader_override, true, &data);
 		}
 
 		OverrideInputLayout();
@@ -1853,16 +1872,16 @@ bool HackerContext::BeforeDispatch(DispatchContext *context)
 
 	// Override settings?
 	if (!G->mShaderOverrideMap.empty()) {
-		ShaderOverrideMap::iterator i;
+		ShaderOverride *shader_override;
 
-		i = lookup_shaderoverride(mCurrentComputeShader);
-		if (i != G->mShaderOverrideMap.end()) {
-			context->post_commands = &i->second.post_command_list;
+		shader_override = LookupShaderOverride(mCurrentComputeShader);
+		if (shader_override) {
+			context->post_commands = &shader_override->post_command_list;
 			// XXX: Not using ProcessShaderOverride() as a
 			// lot of it's logic doesn't really apply to
 			// compute shaders. The main thing we care
 			// about is the command list, so just run that:
-			RunCommandList(mHackerDevice, this, &i->second.command_list, &context->call_info, false);
+			RunCommandList(mHackerDevice, this, &shader_override->command_list, &context->call_info, false);
 			return !context->call_info.skip;
 		}
 	}

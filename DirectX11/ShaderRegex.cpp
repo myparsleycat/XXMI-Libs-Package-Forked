@@ -377,6 +377,7 @@ void ShaderRegexGroup::link_command_lists_and_filter_index(UINT64 shader_hash)
 		return;
 
 	shader_override = &G->mShaderOverrideMap[shader_hash];
+	G->shader_override_generation++;
 
 	// Initialise the ShaderOverride's command lists if they aren't already:
 	if (shader_override->command_list.ini_section.empty()) {
