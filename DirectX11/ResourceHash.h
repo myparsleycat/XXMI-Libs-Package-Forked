@@ -6,6 +6,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <iterator>
 #include <memory>
 #include <atomic>
 
@@ -860,7 +861,57 @@ struct FuzzyMatchResourceDescLess {
 // order for consistent results.
 typedef std::set<std::shared_ptr<FuzzyMatchResourceDesc>, FuzzyMatchResourceDescLess> FuzzyTextureOverrides;
 
-typedef std::vector<TextureOverride*> TextureOverrideMatches;
+// The sections a lookup matched, in the order they are to be processed. A
+// lookup rarely matches more than one or two, and checktextureoverride does
+// several lookups per draw call, so the first few matches are kept in the
+// object itself rather than paying for a heap allocation per lookup that
+// matched. Only as much of std::vector as the callers use:
+class TextureOverrideMatches {
+public:
+	typedef TextureOverride** iterator;
+	typedef std::reverse_iterator<iterator> reverse_iterator;
+
+	TextureOverrideMatches() :
+		first(local),
+		count(0)
+	{}
+
+	// first may point into the object:
+	TextureOverrideMatches(const TextureOverrideMatches&) = delete;
+	TextureOverrideMatches& operator=(const TextureOverrideMatches&) = delete;
+
+	void push_back(TextureOverride *match)
+	{
+		if (first == local) {
+			if (count < LOCAL_MATCHES) {
+				local[count++] = match;
+				return;
+			}
+			spilled.assign(local, local + count);
+		}
+
+		spilled.push_back(match);
+		first = spilled.data();
+		count++;
+	}
+
+	bool empty() const { return !count; }
+	size_t size() const { return count; }
+	TextureOverride* operator[](size_t i) const { return first[i]; }
+
+	iterator begin() { return first; }
+	iterator end() { return first + count; }
+	reverse_iterator rbegin() { return reverse_iterator(end()); }
+	reverse_iterator rend() { return reverse_iterator(begin()); }
+
+private:
+	static const size_t LOCAL_MATCHES = 4;
+
+	TextureOverride *local[LOCAL_MATCHES];
+	std::vector<TextureOverride*> spilled;
+	TextureOverride **first;
+	size_t count;
+};
 
 struct TextureOverrideFuzzyMatch {
 	uint32_t hash;
