@@ -96,6 +96,9 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	memset(mShaderOverrideCache, 0, sizeof(mShaderOverrideCache));
 	mCheckTextureOverrideResultCount = 0;
 	mCheckTextureOverrideResultsDraw = NULL;
+	memset(mShaderResourceViewCache, 0, sizeof(mShaderResourceViewCache));
+	mShaderResourceViewCacheCount = 0;
+	mShaderResourceViewCacheFrame = 0;
 	mCurrentDepthTarget = NULL;
 	mCurrentPSUAVStartSlot = 0;
 	mCurrentPSNumUAVs = 0;
@@ -111,6 +114,11 @@ HackerContext::~HackerContext()
 		if (buffer)
 			buffer->Release();
 	});
+
+	for (ShaderResourceViewCacheEntry &entry : mShaderResourceViewCache) {
+		if (entry.view)
+			entry.view->Release();
+	}
 }
 
 // Save the corresponding HackerDevice, as we need to use it periodically to get
@@ -883,6 +891,84 @@ ID3D11Buffer* HackerContext::GetReadbackBuffer(UINT size)
 	return buffer;
 }
 
+HackerContext::ShaderResourceViewCacheEntry* HackerContext::ShaderResourceViewCacheBucket(ID3D11Resource *resource)
+{
+	// Fibonacci hashing, the low bits of a pointer are all alignment:
+	uint64_t bucket = ((uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull) >> (64 - SHADER_RESOURCE_VIEW_CACHE_BUCKET_BITS);
+
+	return &mShaderResourceViewCache[bucket * SHADER_RESOURCE_VIEW_CACHE_WAYS];
+}
+
+ID3D11View* HackerContext::RecallShaderResourceView(ID3D11Resource *resource, UINT stride, UINT offset,
+		DXGI_FORMAT format, UINT buf_size, ResourceCopyOptions options)
+{
+	ShaderResourceViewCacheEntry *bucket = ShaderResourceViewCacheBucket(resource);
+
+	for (unsigned i = 0; i < SHADER_RESOURCE_VIEW_CACHE_WAYS; i++) {
+		ShaderResourceViewCacheEntry *entry = &bucket[i];
+
+		// The view holds a reference to its resource, so the address
+		// cannot have passed to another resource in the meantime:
+		if (!entry->view || entry->resource != resource
+		 || entry->stride != stride || entry->offset != offset || entry->buf_size != buf_size
+		 || entry->format != format || entry->options != options)
+			continue;
+
+		entry->frame_no = G->frame_no;
+		entry->view->AddRef();
+		return entry->view;
+	}
+
+	return NULL;
+}
+
+void HackerContext::NoteShaderResourceView(ID3D11View *view, ID3D11Resource *resource, UINT stride, UINT offset,
+		DXGI_FORMAT format, UINT buf_size, ResourceCopyOptions options)
+{
+	ShaderResourceViewCacheEntry *bucket = ShaderResourceViewCacheBucket(resource);
+	ShaderResourceViewCacheEntry *entry = &bucket[0];
+	unsigned frame_no = G->frame_no;
+
+	// A free entry, or else the one that has gone unused the longest:
+	for (unsigned i = 0; i < SHADER_RESOURCE_VIEW_CACHE_WAYS && entry->view; i++) {
+		if (!bucket[i].view || frame_no - bucket[i].frame_no > frame_no - entry->frame_no)
+			entry = &bucket[i];
+	}
+
+	if (entry->view)
+		entry->view->Release();
+	else
+		mShaderResourceViewCacheCount++;
+
+	view->AddRef();
+	entry->view = view;
+	entry->resource = resource;
+	entry->stride = stride;
+	entry->offset = offset;
+	entry->buf_size = buf_size;
+	entry->format = format;
+	entry->options = options;
+	entry->frame_no = frame_no;
+}
+
+void HackerContext::ExpireShaderResourceViews()
+{
+	unsigned frame_no = G->frame_no;
+
+	mShaderResourceViewCacheFrame = frame_no;
+
+	for (ShaderResourceViewCacheEntry &entry : mShaderResourceViewCache) {
+		// Kept while used in this frame or the one before it:
+		if (!entry.view || frame_no - entry.frame_no < 2)
+			continue;
+
+		entry.view->Release();
+		entry.view = NULL;
+		entry.resource = NULL;
+		mShaderResourceViewCacheCount--;
+	}
+}
+
 void HackerContext::DeferInputLayoutOverride(HackerInputLayout* pInputLayout)
 {
 	LogDebug("HackerContext::DeferInputLayoutOverride(%s@%p) called pInputLayout=%p\n", type_name(this), this, pInputLayout);
@@ -924,6 +1010,9 @@ void HackerContext::BeforeDraw(DrawContext &data)
 
 	mCheckTextureOverrideResultCount = 0;
 	mCheckTextureOverrideResultsDraw = &data.call_info;
+
+	if (mShaderResourceViewCacheCount && mShaderResourceViewCacheFrame != G->frame_no)
+		ExpireShaderResourceViews();
 
 	Profiling::State profiling_state;
 
@@ -1863,6 +1952,9 @@ STDMETHODIMP_(void) HackerContext::SOSetTargets(THIS_
 bool HackerContext::BeforeDispatch(DispatchContext *context)
 {
 	dispatch_number++;
+
+	if (mShaderResourceViewCacheCount && mShaderResourceViewCacheFrame != G->frame_no)
+		ExpireShaderResourceViews();
 
 	if (G->hunting == HUNTING_MODE_ENABLED) {
 		if (G->DumpUsage)

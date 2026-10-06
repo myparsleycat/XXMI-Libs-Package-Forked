@@ -13344,8 +13344,28 @@ void ResourceCopyOperation::CopyResourceToResource(
 	}
 
 	if (!dst_view) {
-		dst_view = CreateCompatibleView(&dst, dst_resource, state,
-				stride, offset, format, buf_src_size, options);
+		// A resource referenced to a t slot may well have had a view
+		// created for it before, by this operation or another, see
+		// HackerContext::mShaderResourceViewCache:
+		bool recall_view = !(options & ResourceCopyOptions::COPY_MASK)
+			&& dst.type == ResourceCopyTargetType::SHADER_RESOURCE
+			&& !(options & ResourceCopyOptions::NO_VIEW_CACHE)
+			&& !src.forbid_view_cache;
+
+		if (recall_view) {
+			dst_view = state->mHackerContext->RecallShaderResourceView(dst_resource,
+					stride, offset, format, buf_src_size, options);
+		}
+
+		if (!dst_view) {
+			dst_view = CreateCompatibleView(&dst, dst_resource, state,
+					stride, offset, format, buf_src_size, options);
+
+			if (recall_view && dst_view) {
+				state->mHackerContext->NoteShaderResourceView(dst_view, dst_resource,
+						stride, offset, format, buf_src_size, options);
+			}
+		}
 		// Not checking for NULL return as view's are not applicable to
 		// all types. Legitimate failures are logged.
 		*pp_cached_view = dst_view;

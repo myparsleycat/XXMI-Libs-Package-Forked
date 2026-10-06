@@ -198,6 +198,31 @@ private:
 	unsigned mCheckTextureOverrideResultCount;
 	const DrawCallInfo *mCheckTextureOverrideResultsDraw;
 
+	// Views that command lists created to bind a resource by reference to a
+	// t slot, so that binding the same resource again need not create
+	// another. An operation remembers the view it used last by itself, but
+	// that is no help to one that binds a different resource every time it
+	// runs, such as those putting back the textures the game had bound
+	// after each modded draw call: every run would destroy the view of the
+	// previous one and create its own. A few entries per bucket, the bucket
+	// chosen by resource. Each view keeps its resource alive, so those that
+	// go unused for a whole frame are dropped:
+	static const unsigned SHADER_RESOURCE_VIEW_CACHE_BUCKET_BITS = 8;
+	static const unsigned SHADER_RESOURCE_VIEW_CACHE_WAYS = 4;
+	struct ShaderResourceViewCacheEntry {
+		ID3D11View *view;
+		ID3D11Resource *resource;
+		// What the view was created from besides the resource:
+		UINT stride, offset, buf_size;
+		DXGI_FORMAT format;
+		ResourceCopyOptions options;
+		unsigned frame_no;
+	} mShaderResourceViewCache[SHADER_RESOURCE_VIEW_CACHE_WAYS << SHADER_RESOURCE_VIEW_CACHE_BUCKET_BITS];
+	unsigned mShaderResourceViewCacheCount;
+	unsigned mShaderResourceViewCacheFrame;
+	ShaderResourceViewCacheEntry* ShaderResourceViewCacheBucket(ID3D11Resource *resource);
+	void ExpireShaderResourceViews();
+
 	FlatHashMap<UINT, ID3D11Buffer*> mReadbackBuffers = FlatHashMap<UINT, ID3D11Buffer*>(64);
 
 	// These private methods are utility routines for HackerContext.
@@ -355,6 +380,14 @@ public:
 				i++;
 		}
 	}
+
+	// public to allow CommandList access, see mShaderResourceViewCache. A
+	// view is only recalled for the exact parameters one was noted with, and
+	// is the caller's to release. NULL if there is none:
+	ID3D11View* RecallShaderResourceView(ID3D11Resource *resource, UINT stride, UINT offset,
+			DXGI_FORMAT format, UINT buf_size, ResourceCopyOptions options);
+	void NoteShaderResourceView(ID3D11View *view, ID3D11Resource *resource, UINT stride, UINT offset,
+			DXGI_FORMAT format, UINT buf_size, ResourceCopyOptions options);
 
 	ID3D11Buffer* GetReadbackBuffer(UINT size);
 
