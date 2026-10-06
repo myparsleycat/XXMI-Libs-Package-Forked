@@ -958,7 +958,13 @@ static bool ParseCheckTextureOverride(const wchar_t *section,
 	CheckTextureOverrideCommand *operation = new CheckTextureOverrideCommand();
 
 	// Parse value as consistent with texture filtering and resource copying
-	ret = operation->target.ParseTarget(val->c_str(), true, ini_namespace, pre_command_list->scope);
+	ret = operation->target.ParseTarget(val->c_str(), true, ini_namespace, pre_command_list->scope, true, true);
+	if (ret && operation->target.type == ResourceCopyTargetType::POOL && !operation->target.IsRange())
+	{
+		// A whole pool has no resource of its own to check, only its elements do:
+		LogOverlayW(LOG_WARNING, L"checktextureoverride needs a pool element or a pool range: %ls\n", val->c_str());
+		ret = false;
+	}
 	if (ret) {
 		// If the user indicated an explicit command list we will run the pre
 		// and post lists of the target list together.
@@ -1455,9 +1461,11 @@ static bool ParseFrameAnalysisDump(const wchar_t *section,
 	if (!operation->target.ParseTarget(target, true, ini_namespace, pre_command_list->scope, true, true))
 		goto bail;
 
-	if (operation->target.evaluation_mode == ResourceCopyTargetEvaluationMode::POOL_RANGE)
+	// A whole pool has no resource of its own to dump, only its elements do:
+	if (operation->target.type == ResourceCopyTargetType::POOL
+		&& operation->target.evaluation_mode != ResourceCopyTargetEvaluationMode::POOL_RANGE)
 	{
-		LogOverlayW(LOG_WARNING, L"dump does not support pool ranges: %ls\n", target);
+		LogOverlayW(LOG_WARNING, L"dump needs a pool element or a pool range: %ls\n", target);
 		goto bail;
 	}
 
@@ -1600,12 +1608,18 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 #pragma region Commands
 
+static std::string slot_log_name(const ResourceCopyTarget &target, unsigned slot);
+static CustomResource* pool_element(CustomResourcePool *pool, int pool_first, unsigned index, bool is_assignment);
+
 // Whether the target names a fixed slot of the pipeline, so that it resolves
 // to the same resource for as long as the bindings are left alone. Custom
-// resources, "this" and slots or pool indices given as expressions can change
-// what they refer to without any binding changing:
+// resources, "this", slot ranges and slots or pool indices given as
+// expressions can change what they refer to without any binding changing:
 static bool is_static_pipeline_slot(const ResourceCopyTarget &target)
 {
+	if (target.IsRange())
+		return false;
+
 	switch (target.type) {
 		case ResourceCopyTargetType::CONSTANT_BUFFER:
 		case ResourceCopyTargetType::SHADER_RESOURCE:
@@ -1644,6 +1658,11 @@ bool CheckTextureOverrideCommand::RecallMatches(CommandListState *state, Texture
 
 void CheckTextureOverrideCommand::run(CommandListState *state)
 {
+	if (target.IsRange()) {
+		RunRange(state);
+		return;
+	}
+
 	TextureOverrideMatches matches;
 
 	// This command usually sits in both the pre and post command lists of
@@ -1670,13 +1689,53 @@ void CheckTextureOverrideCommand::run(CommandListState *state)
 		RunMatches(state, matches);
 }
 
+void CheckTextureOverrideCommand::RunRange(CommandListState *state)
+{
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	// A range checks every slot or element in turn, as the equivalent single
+	// lines would. "this" refers to the one being checked:
+	int first = (int)target.slot;
+	unsigned count = 1;
+	if (!target.ResolveRange(state, &first, &count))
+		return;
+
+	for (unsigned s = 0; s < count; s++) {
+		TextureOverrideMatches matches;
+		// Each slot or element of a range is checked through a local target,
+		// rather than rewriting the command's own, which every context
+		// running it shares:
+		ResourceCopyTarget range_target;
+
+		if (target.evaluation_mode == ResourceCopyTargetEvaluationMode::POOL_RANGE) {
+			// Range bounds are element indices on every pool type, and
+			// checking an element does not count as updating it:
+			CustomResource *element = pool_element(target.custom_resource_pool, first, s, false);
+
+			range_target.type = ResourceCopyTargetType::CUSTOM_RESOURCE;
+			range_target.SetCustomResource(element);
+			COMMAND_LIST_LOG(state, "  checktextureoverride = %S\n", element ? element->name.c_str() : L"null");
+		} else {
+			range_target.type = target.type;
+			range_target.shader_type = target.shader_type;
+			range_target.slot = (unsigned)first + s;
+			COMMAND_LIST_LOG(state, "  checktextureoverride = %s\n", slot_log_name(range_target, range_target.slot).c_str());
+		}
+
+		range_target.FindTextureOverrides(state, NULL, &matches);
+
+		if (!matches.empty())
+			RunMatches(state, matches, &range_target);
+	}
+}
+
 static void RunTextureOverrideCommandList(CommandList *command_list, CommandListState *state)
 {
 	state->preload_scope = command_list;
 	_RunCommandList(command_list, state);
 }
 
-void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOverrideMatches &matches)
+void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOverrideMatches &matches, ResourceCopyTarget *checked)
 {
 	ResourceCopyTarget *saved_this = NULL;
 	CommandList *saved_scope;
@@ -1685,7 +1744,7 @@ void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOve
 
 	saved_this = state->this_target;
 	saved_scope = state->preload_scope;
-	state->this_target = &target;
+	state->this_target = checked ? checked : &target;
 	if (run_pre_and_post_together) {
 		saved_post = state->post;
 		state->post = false;
@@ -2501,22 +2560,40 @@ void FrameAnalysisDumpCommand::run(CommandListState *state)
 
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
-	// A slot range dumps every slot in turn:
-	int first = (int)target.slot;
+	// A range dumps every slot or pool element in turn:
+	int first = 0;
 	unsigned count = 1;
 	if (target.IsRange() && !target.ResolveRange(state, &first, &count))
 		return;
 
 	for (unsigned i = 0; i < count; i++) {
 		wstring name = target_name;
+		// Each element of a range is named by a local target, rather than
+		// rewriting the command's own, which every context running it shares:
+		ResourceCopyTarget element;
+		ResourceCopyTarget &source = target.IsRange() ? element : target;
+
 		if (target.IsRange()) {
-			target.slot = (unsigned)first + i;
-			name += L"-" + std::to_wstring(target.slot);
+			int index = first + (int)i;
+
+			name += L"-" + std::to_wstring(index);
+			if (target.evaluation_mode == ResourceCopyTargetEvaluationMode::POOL_RANGE) {
+				// GetResource(id, template_lookup, use_ring_index, is_assignment).
+				// Range bounds are element indices on every pool type, so
+				// bypass fifo / spatial key lookup, and dumping an element
+				// does not count as updating it:
+				element.type = ResourceCopyTargetType::CUSTOM_RESOURCE;
+				element.SetCustomResource(target.custom_resource_pool->GetResource((float)index, false, true, false));
+			} else {
+				element.type = target.type;
+				element.shader_type = target.shader_type;
+				element.slot = (unsigned)index;
+			}
 		}
 
-		resource = target.GetResource(state, &view, &stride, &offset, &format, NULL);
+		resource = source.GetResource(state, &view, &stride, &offset, &format, NULL);
 		if (!resource) {
-			COMMAND_LIST_LOG(state, "  No resource to dump (slot %u)\n", target.slot);
+			COMMAND_LIST_LOG(state, "  No resource to dump (%S)\n", name.c_str());
 			continue;
 		}
 
@@ -10907,7 +10984,16 @@ D3D11_BIND_FLAG ResourceCopyTarget::BindFlags(CommandListState *state, D3D11_RES
 		case ResourceCopyTargetType::CUSTOM_RESOURCE:
 		case ResourceCopyTargetType::POOL:
 		{
-			CustomResource* custom_resource = GetCustomResource(state);
+			// Look the pool's template up instead of resolving an element
+			// (passing no state): every element's flags come from the
+			// template, since PropagateFlags updates both and
+			// InitializeResource copies the template's metadata. This is
+			// called from GetResource() to substantiate the *source* of a
+			// copy, before unless_null has had a chance to cancel it, and
+			// resolving an element postpones its expiration and can lazily
+			// create its resource. A statically indexed element is still
+			// returned directly.
+			CustomResource* custom_resource = GetCustomResource(nullptr);
 			if (misc_flags)
 				*misc_flags = custom_resource->misc_flags;
 			return custom_resource->bind_flags;
@@ -11798,10 +11884,14 @@ static ID3D11Buffer *RecreateCompatibleBuffer(
 			dst_size = (new_desc.ByteWidth + 15) & ~0xf;
 			dst_size = min(dst_size, D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
 
-			// Constant buffers cannot be structured, so clear that flag:
+			// Constant buffers cannot be structured, so clear that flag
+			// and the stride that came with it. D3D11 ignores a stride
+			// without the flag, but GetResourceStride() (`->stride`) and
+			// FillInMissingInfo() both read it back out of the buffer
+			// description, and would report the source's element size for
+			// a buffer that is no longer made of elements:
 			new_desc.MiscFlags &= ~D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-			// XXX: Should we clear StructureByteStride? Seems to work ok
-			// without clearing that.
+			new_desc.StructureByteStride = 0;
 
 			// If the size of the new resource doesn't match the old or
 			// there is an offset we will have to perform a region copy
@@ -13055,6 +13145,63 @@ static ResourceCopyTargetType EquivTarget(ResourceCopyTargetType type)
 	return type;
 }
 
+// The source's own view, if it is a view of dst_resource of the kind the
+// destination takes. A custom resource holds a view of any kind; a pipeline
+// slot needs one of its own kind, which only a QueryInterface can confirm,
+// since the target type a view came from says nothing about what it is.
+//
+// Widening the target type comparison this replaces to also accept a custom
+// resource on either side would be shorter, but SetResource casts a view
+// straight to the destination's type: a shader resource view stored on a
+// resource later bound as cs-u0 would reach CSSetUnorderedAccessViews.
+//
+// SlotRangeCopyOperation::ViewForSlot applies the same rule to ranges and is
+// not reused here: it is a member of the range operation, covers only shader
+// resource and unordered access views, and returns a reference its caller
+// owns, where this borrows the source's.
+static ID3D11View* UsableRefView(ResourceCopyTarget *dst, CommandListState *state,
+		ID3D11View *view, ID3D11Resource *resource)
+{
+	ResourceCopyTargetType type = dst->type;
+	const IID *iid;
+	void *typed = NULL;
+
+	if (!view || !ViewMatchesResource(view, resource))
+		return NULL;
+
+	if (type == ResourceCopyTargetType::THIS_RESOURCE) {
+		if (!state->this_target)
+			return NULL;
+		type = state->this_target->type;
+	}
+
+	switch (EquivTarget(type)) {
+		case ResourceCopyTargetType::CUSTOM_RESOURCE:
+			return view;
+		case ResourceCopyTargetType::SHADER_RESOURCE:
+			iid = &__uuidof(ID3D11ShaderResourceView);
+			break;
+		case ResourceCopyTargetType::RENDER_TARGET:
+			iid = &__uuidof(ID3D11RenderTargetView);
+			break;
+		case ResourceCopyTargetType::DEPTH_STENCIL_TARGET:
+			iid = &__uuidof(ID3D11DepthStencilView);
+			break;
+		case ResourceCopyTargetType::UNORDERED_ACCESS_VIEW:
+			iid = &__uuidof(ID3D11UnorderedAccessView);
+			break;
+		default:
+			return NULL;
+	}
+
+	if (FAILED(view->QueryInterface(*iid, &typed)))
+		return NULL;
+	// The destination borrows the source's reference, as it did when this
+	// was a target type comparison. SetResource() AddRef()s what it stores:
+	((IUnknown*)typed)->Release();
+	return view;
+}
+
 void ResourceCopyOperation::CopyResourceToResource(
 	CommandListState* state, ID3D11Resource* src_resource, ID3D11View* src_view, UINT stride, UINT offset, DXGI_FORMAT format, UINT buf_src_size
 )
@@ -13177,9 +13324,8 @@ void ResourceCopyOperation::CopyResourceToResource(
 		if (G->cache_resource_data != DataCacheBindFlags::INVALID && dst_custom_resource)
 			dst_custom_resource->SetHandleInfo(src_resource, offset, buf_src_size);
 		dst_resource = src_resource;
-		if (src_view && (EquivTarget(src.type) == EquivTarget(dst.type))) {
-			dst_view = src_view;
-		} else if (*pp_cached_view) {
+		dst_view = UsableRefView(&dst, state, src_view, dst_resource);
+		if (!dst_view && *pp_cached_view) {
 			if (ViewMatchesResource(*pp_cached_view, dst_resource)) {
 				dst_view = *pp_cached_view;
 			} else {
@@ -13188,11 +13334,6 @@ void ResourceCopyOperation::CopyResourceToResource(
 				*pp_cached_view = NULL;
 			}
 		}
-		// TODO: If we are referencing to/from a custom resource we
-		// currently don't reference the view, but we could so long as
-		// the bind flags from the original source are compatible with
-		// the bind flags in the final destination. If we implement
-		// this, go read the note in CustomResource::Substantiate()
 	}
 
 	if (!dst_view) {

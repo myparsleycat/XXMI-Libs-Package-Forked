@@ -1796,8 +1796,11 @@ public:
 	void run(CommandListState*) override;
 	bool noop(bool post, bool ignore_cto_pre, bool ignore_cto_post) override;
 
-	// Runs the command lists of the TextureOverride sections that matched:
-	void RunMatches(CommandListState *state, TextureOverrideMatches &matches);
+	// Runs the command lists of the TextureOverride sections that matched.
+	// "this" refers to checked in them, or to the command's target if NULL:
+	void RunMatches(CommandListState *state, TextureOverrideMatches &matches, ResourceCopyTarget *checked = NULL);
+	// Checks every slot or pool element of a range target in turn:
+	void RunRange(CommandListState *state);
 	// Fills in what this command matched earlier in the draw call, if
 	// HackerContext still remembers. False if it has to be looked up:
 	bool RecallMatches(CommandListState *state, TextureOverrideMatches *matches);
