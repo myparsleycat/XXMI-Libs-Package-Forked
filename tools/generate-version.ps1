@@ -28,15 +28,17 @@ function Parse-VersionTag {
         [string]$Tag
     )
 
-    if ($Tag -notmatch '^v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$') {
-        throw "Invalid version tag '$Tag'. Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH.BUILD"
+    # A fork's build of an upstream release is tagged vMAJOR.MINOR.PATCH-LABEL.N
+    # (e.g. v1.2.2-nhd.1), where N takes the place of BUILD.
+    if ($Tag -notmatch '^v?(\d+)\.(\d+)\.(\d+)(?:\.(\d+)|-[A-Za-z][A-Za-z0-9]*\.(\d+))?$') {
+        throw "Invalid version tag '$Tag'. Expected vMAJOR.MINOR.PATCH, vMAJOR.MINOR.PATCH.BUILD or vMAJOR.MINOR.PATCH-LABEL.N"
     }
 
     return @{
         Major    = [int]$Matches[1]
         Minor    = [int]$Matches[2]
         Revision = [int]$Matches[3]
-        Build    = if ($Matches[4]) { [int]$Matches[4] } else { 0 }
+        Build    = if ($Matches[4]) { [int]$Matches[4] } elseif ($Matches[5]) { [int]$Matches[5] } else { 0 }
     }
 }
 
