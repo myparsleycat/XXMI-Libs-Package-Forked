@@ -168,6 +168,12 @@ public:
 	float fval;
 	VariableFlags flags;
 
+	// Alternative d3dx_user.ini key derived from the path of the ini file
+	// that declared the variable. Only set for persistent variables declared
+	// in a file that overrode its namespace, in which case "name" is keyed by
+	// that namespace and would be shared by every copy of the mod.
+	wstring persist_path_name;
+
 	CommandListVariable(wstring name, float fval, VariableFlags flags) :
 		name(name), fval(fval), flags(flags)
 	{}
@@ -182,6 +188,10 @@ public:
 typedef std::unordered_map<std::wstring, class CommandListVariable> CommandListVariables;
 extern CommandListVariables command_list_globals;
 extern std::vector<CommandListVariable*> persistent_variables;
+// Global variables indexed by their persist_path_name, so d3dx_user.ini
+// entries saved under either key can be resolved. Pool variables are resolved
+// through their pool instead (see custom_resource_pool_path_keys):
+extern std::unordered_map<std::wstring, CommandListVariable*> persistent_variable_path_keys;
 extern std::map<std::wstring, float> unknown_variables;
 
 // The scope object is used to declare local variables in a command list. The
@@ -733,6 +743,12 @@ class CustomResourcePool
 public:
 	wstring name;
 
+	// Pool name re-namespaced with the path of the declaring ini file. Only
+	// set for pools with persistent variables declared in a file that
+	// overrode its namespace, so each copy of the mod can keep its own
+	// saved values in d3dx_user.ini (see persistent_variable_key):
+	wstring persist_path_name;
+
 	PoolIndexType index_type = PoolIndexType::RING;
 	bool lazy_initialization = true;
 	bool element_type_switch_reset = true;
@@ -790,6 +806,9 @@ private:
 
 typedef std::unordered_map<std::wstring, CustomResourcePool> CustomResourcePools;
 extern CustomResourcePools customResourcePools;
+// Pools indexed by their persist_path_name, so d3dx_user.ini entries of pool
+// variables saved under the path key can be resolved:
+extern std::unordered_map<std::wstring, CustomResourcePool*> custom_resource_pool_path_keys;
 
 // Bind flags of a custom resource referenced into another custom resource or
 // pool depend on where that destination is referenced in turn, which may be

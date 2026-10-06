@@ -24,10 +24,12 @@
 
 CustomResources customResources;
 CustomResourcePools customResourcePools;
+std::unordered_map<std::wstring, CustomResourcePool*> custom_resource_pool_path_keys;
 CustomShaders customShaders;
 ExplicitCommandListSections explicitCommandListSections;
 CommandListVariables command_list_globals;
 std::vector<CommandListVariable*> persistent_variables;
+std::unordered_map<std::wstring, CommandListVariable*> persistent_variable_path_keys;
 std::map<std::wstring, float> unknown_variables;
 std::vector<CommandList*> registered_command_lists;
 std::unordered_set<CommandList*> command_lists_profiling;
@@ -6286,11 +6288,24 @@ bool parse_command_list_var_name(const wstring &name, const wstring *ini_namespa
 	if (var == command_list_globals.end())
 		var = command_list_globals.find(low_name);
 
-	if (var == command_list_globals.end())
-		return false;
+	if (var != command_list_globals.end()) {
+		*target = &var->second;
+		return true;
+	}
 
-	*target = &var->second;
-	return true;
+	// d3dx_user.ini may refer to persistent variables by the path of the
+	// declaring ini file instead of its namespace (see persistent_variable_key).
+	// Both keys are accepted regardless of the current setting so that
+	// switching it migrates the saved values either way.
+	if (*ini_namespace == G->user_config) {
+		auto path_var = persistent_variable_path_keys.find(low_name);
+		if (path_var != persistent_variable_path_keys.end()) {
+			*target = path_var->second;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 bool CommandListOperand::parse_float(const wstring* operand, const wstring* ini_namespace, CommandListScope* scope, size_t& out_length)
@@ -8458,6 +8473,8 @@ void CustomResourcePool::InitializeVariable(size_t pool_index)
 	if (!element.variable) {
 		wstring variable_id = L"$" + name + L"[" + std::to_wstring(pool_index) + L"]";
 		element.variable = RegisterGlobalVariable(variable_id, &variable_template->fval, variable_template->flags);
+		if (element.variable && !persist_path_name.empty())
+			element.variable->persist_path_name = L"$" + persist_path_name + L"[" + std::to_wstring(pool_index) + L"]";
 	}
 	else {
 		element.variable->fval = variable_template->fval;
@@ -9037,6 +9054,16 @@ IniParserResult ResourceCopyTarget::ParseTargetPool(const wchar_t*& target, size
 			con = customResourcePools.find(pool_id);
 		if (con != customResourcePools.end())
 			custom_resource_pool = &con->second;
+
+		// d3dx_user.ini may refer to pool variables by the path of the
+		// declaring ini file instead of its namespace (see
+		// persistent_variable_key). Both keys are accepted regardless of
+		// the current setting so that switching it migrates saved values:
+		if (custom_resource_pool == nullptr && *ini_namespace == G->user_config) {
+			auto path_con = custom_resource_pool_path_keys.find(pool_id);
+			if (path_con != custom_resource_pool_path_keys.end())
+				custom_resource_pool = path_con->second;
+		}
 	}
 
 	if (custom_resource_pool == nullptr)

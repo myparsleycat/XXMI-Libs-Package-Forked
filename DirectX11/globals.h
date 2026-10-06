@@ -417,6 +417,20 @@ static EnumName_t<const wchar_t*, InputDisableScope> InputDisableScopeNames[] = 
 	{NULL, InputDisableScope::INVALID} // End of list marker
 };
 
+// Which key persistent variables declared by ini files that override their
+// namespace are saved under in d3dx_user.ini:
+enum class PersistentVariableKey: int8_t {
+	INVALID   = -1,
+	NAMESPACE = 0, // $\<namespace>\<var>, shared by every copy of the mod
+	PATH      = 1, // $\<path of declaring ini>\<var>, unique per copy
+};
+static EnumName_t<const wchar_t*, PersistentVariableKey> PersistentVariableKeyNames[] = {
+	{L"namespace", PersistentVariableKey::NAMESPACE},
+	{L"path", PersistentVariableKey::PATH},
+
+	{NULL, PersistentVariableKey::INVALID} // End of list marker
+};
+
 struct Globals
 {
 	bool gInitialized;
@@ -429,6 +443,7 @@ struct Globals
 	bool dump_all_profiles;
 
 	bool clear_unknown_settings = true;
+	PersistentVariableKey persistent_variable_key = PersistentVariableKey::NAMESPACE;
 	uint32_t current_unknown_settings_hash = 0;
 	uint32_t last_unknown_settings_hash = 0;
 

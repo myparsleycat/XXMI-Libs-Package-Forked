@@ -24,11 +24,20 @@ struct IniLine {
 	// to resolve references within the namespace:
 	wstring ini_namespace;
 
-	IniLine(wstring &key, wstring &val, wstring &line, const wstring &ini_namespace) :
+	// Only set when the ini file overrode its namespace, so the path of the
+	// file this line came from can still be recovered (mirrors
+	// IniSection::ini_path for lines of global sections such as [Constants]).
+	// Points into a registry owned by the ini parser that lives as long as
+	// the parsed sections, so this costs a pointer rather than a string per
+	// line:
+	const wstring *ini_path;
+
+	IniLine(wstring &key, wstring &val, wstring &line, const wstring &ini_namespace, const wstring *ini_path) :
 		first(key),
 		second(val),
 		raw_line(line),
-		ini_namespace(ini_namespace)
+		ini_namespace(ini_namespace),
+		ini_path(ini_path)
 	{}
 };
 
@@ -82,3 +91,4 @@ bool get_section_namespace(const wchar_t *section, wstring *ret);
 wstring get_namespaced_var_name_lower(const wstring& low_name, const wstring* ini_namespace);
 
 CommandListVariable* RegisterGlobalVariable(wstring& name, float* fval, VariableFlags flags);
+const wstring& persistent_variable_save_name(const CommandListVariable* var);

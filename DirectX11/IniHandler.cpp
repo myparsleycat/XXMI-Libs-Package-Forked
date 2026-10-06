@@ -219,6 +219,11 @@ typedef std::map<wstring, IniSection, WStringInsensitiveLess> IniSections;
 IniSections ini_sections;
 std::unordered_set<wstring> recursive_includes;
 
+// Paths of ini files that overrode their namespace, referenced by
+// IniLine::ini_path. Node based so the pointers survive insertions, and
+// cleared together with ini_sections:
+static std::unordered_set<wstring> overridden_ini_paths;
+
 // Returns an iterator to the first element in a set that does not begin with
 // prefix in a case insensitive way. Combined with set::lower_bound, this can
 // be used to iterate over all elements in the sections set that begin with a
@@ -362,6 +367,19 @@ static bool _get_namespaced_section_path(IniSections *custom_ini_sections, const
 static bool get_namespaced_section_path(const wchar_t *section, wstring *ret)
 {
 	return _get_namespaced_section_path(&ini_sections, section, ret);
+}
+
+// Returns the section name re-namespaced with the path of the ini file that
+// declared it, lower cased. Only succeeds for sections of files that overrode
+// their namespace, since the result would otherwise equal the section name.
+static bool get_section_path_keyed_name_lower(const wchar_t *section, wstring *ret)
+{
+	IniSections::iterator entry = ini_sections.find(section);
+	if (entry == ini_sections.end() || entry->second.ini_path.empty())
+		return false;
+
+	wstring bare_section = wstring(SectionPrefix(section)) + (section + get_section_namespace_endpos(section));
+	return get_namespaced_section_name_lower(&bare_section, &entry->second.ini_path, ret);
 }
 
 static void ParseIniSectionLine(wstring *wline, wstring *section,
@@ -510,7 +528,8 @@ static bool ParseIniPreamble(wstring *wline, wstring *ini_namespace)
 
 static void ParseIniKeyValLine(wstring *wline, wstring *section,
 		int warn_duplicates, bool warn_lines_without_equals,
-		IniSection *section_entry, const wstring *ini_namespace)
+		IniSection *section_entry, const wstring *ini_namespace,
+		const wstring *ini_path)
 {
 	size_t first, last, delim;
 	wstring key, val;
@@ -561,7 +580,7 @@ static void ParseIniKeyValLine(wstring *wline, wstring *section,
 		}
 	}
 
-	section_entry->kv_vec.emplace_back(key, val, *wline, *ini_namespace);
+	section_entry->kv_vec.emplace_back(key, val, *wline, *ini_namespace, ini_path);
 }
 
 static void ParseIniStream(wistream *stream, const wstring *_ini_namespace)
@@ -578,6 +597,8 @@ static void ParseIniStream(wistream *stream, const wstring *_ini_namespace)
 	bool warn_lines_without_equals = true;
 	wstring ini_namespace;
 	bool preamble = true;
+	// Set once the preamble ends if the file overrode its namespace:
+	const wstring *line_ini_path = NULL;
 
 	// Simplify code further on by translating NULL to "" here:
 	if (_ini_namespace)
@@ -611,7 +632,13 @@ static void ParseIniStream(wistream *stream, const wstring *_ini_namespace)
 
 		// Section?
 		if (wline[0] == L'[') {
-			preamble = false;
+			if (preamble) {
+				preamble = false;
+				// The namespace can only be renamed in the
+				// preamble, so the path override is final now:
+				if (ini_path != ini_namespace)
+					line_ini_path = &*overridden_ini_paths.insert(ini_path).first;
+			}
 			ParseIniSectionLine(&wline, &section, &warn_duplicates,
 					    &warn_lines_without_equals,
 					    &section_entry, &ini_namespace,
@@ -627,7 +654,7 @@ static void ParseIniStream(wistream *stream, const wstring *_ini_namespace)
 
 		ParseIniKeyValLine(&wline, &section, warn_duplicates,
 				   warn_lines_without_equals, section_entry,
-				   &ini_namespace);
+				   &ini_namespace, line_ini_path);
 	}
 }
 
@@ -670,6 +697,7 @@ static void ParseNamespacedIniFile(const wchar_t *ini, const wstring *ini_namesp
 static void ParseIniFile(const wchar_t *ini)
 {
 	ini_sections.clear();
+	overridden_ini_paths.clear();
 
 	return ParseNamespacedIniFile(ini, NULL);
 }
@@ -2171,6 +2199,12 @@ static CustomResourcePool* ParseResourcePoolSection(const wchar_t* section_name)
 		persist_variables ? VariableFlags::PERSIST : VariableFlags::NONE
 	);
 
+	// Persistent pool variables of a file that overrode its namespace get
+	// a second d3dx_user.ini key derived from the file path, like globals
+	// declared in [Constants] (see persistent_variable_key):
+	if (persist_variables && get_section_path_keyed_name_lower(section_name, &pool->persist_path_name))
+		custom_resource_pool_path_keys[pool->persist_path_name] = pool;
+
 	pool->Initialize(pool_size);
 
 	return pool;
@@ -2181,6 +2215,7 @@ static void ParseResourceSections()
 	// Edges point at entries of the maps cleared below:
 	ClearDeferredBindFlags();
 	customResourcePools.clear();
+	custom_resource_pool_path_keys.clear();
 	customResources.clear();
 
 	IniSections::iterator lower = ini_sections.lower_bound(wstring(L"Pool"));
@@ -2402,6 +2437,7 @@ static void ParseConstantsSection()
 
 	command_list_globals.clear();
 	persistent_variables.clear();
+	persistent_variable_path_keys.clear();
 	GetIniSection(&section, L"Constants");
 
 	// Process Globals while Compacting the Vector in-place.
@@ -2458,6 +2494,13 @@ static void ParseConstantsSection()
 			continue;
 		}
 
+		// Persistent variables declared by a file that overrode its
+		// namespace get a second d3dx_user.ini key derived from the
+		// file path, so copies of the mod can keep separate values:
+		wstring path_name;
+		if ((flags & VariableFlags::PERSIST) && entry.ini_path)
+			path_name = get_namespaced_var_name_lower(name, entry.ini_path);
+
 		if (!ini_namespace->empty())
 			name = get_namespaced_var_name_lower(name, ini_namespace);
 
@@ -2470,9 +2513,15 @@ static void ParseConstantsSection()
 				continue;
 		}
 
-		if (!RegisterGlobalVariable(name, &fval, flags)) {
+		CommandListVariable* var = RegisterGlobalVariable(name, &fval, flags);
+		if (!var) {
 			IniWarningW(L"Redeclaration of %ls\n - [Constants] @ [%ls]\n", name.c_str(), ini_namespace->c_str());
 			continue;
+		}
+
+		if (!path_name.empty()) {
+			var->persist_path_name = path_name;
+			persistent_variable_path_keys[path_name] = var;
 		}
 
 		// Global Entries are Intentionally not Copied into the Compacted
@@ -4658,6 +4707,9 @@ void LoadConfigFile()
 	// Controls whether saved values of persistent variables should be cleared when source mods are no longer detected (disabled or removed).
 	G->clear_unknown_settings = GetIniBool(L"System", L"clear_unknown_settings", true, NULL);
 
+	// Controls whether persistent variables of mods that override their namespace are saved under the namespace or the ini file path.
+	G->persistent_variable_key = GetIniEnumClass(L"System", L"persistent_variable_key", PersistentVariableKey::NAMESPACE, NULL, PersistentVariableKeyNames);
+
 	// Allows to configure fallback screen resolution to be used as return for `window_width` and `window_height`
 	G->gFallbackScreenWidth = GetIniInt(L"System", L"screen_width", 1920, NULL);
 	if (G->gFallbackScreenWidth < 640 || G->gFallbackScreenWidth > 15360) {
@@ -5025,6 +5077,15 @@ static void ShowUnknownSettingsNotification()
 		LogWarningW(L"Unrecognised persistent variable: %ls = %f\n", entry.first.c_str(), entry.second);
 }
 
+// Key a persistent variable is written under in d3dx_user.ini, as selected by
+// the persistent_variable_key setting. Loading accepts both keys regardless.
+const wstring& persistent_variable_save_name(const CommandListVariable* var)
+{
+	if (G->persistent_variable_key == PersistentVariableKey::PATH && !var->persist_path_name.empty())
+		return var->persist_path_name;
+	return var->name;
+}
+
 // Save the currently known persistent variables to d3dx_user.ini.
 // Unknown variables are handled separately by HandleUnknownPersistentSettings():
 // they are discovered by LoadConfigFile() after this function runs and may be
@@ -5063,7 +5124,7 @@ bool SavePersistentSettings(bool force)
 	      "[Constants]\n", f);
 
 	for (auto global : persistent_variables)
-		fprintf_s(f, "%ls = %.9g\n", global->name.c_str(), global->fval);
+		fprintf_s(f, "%ls = %.9g\n", persistent_variable_save_name(global).c_str(), global->fval);
 
 	G->user_config_dirty = false;
 
