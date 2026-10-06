@@ -38,9 +38,16 @@ std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
 // Adds consistent "3DMigoto" prefix to frame analysis log with appropriate
 // level of indentation for the current recursion level. Using a
 // macro instead of a function for this to concatenate static strings:
+//
+// FrameAnalysisLog() is a virtual varargs call that writes nothing unless a
+// frame is being analysed or debug logging is on. A command list that runs for
+// every draw call gets here dozens of times per draw, so check for that up
+// front. All that skips is closing the log file of an analysis that has
+// ended, which the next call the game makes on the context does anyway:
 #define COMMAND_LIST_LOG(state, fmt, ...) \
 	do { \
-		(state)->mHackerContext->FrameAnalysisLog("3DMigoto%*s " fmt, state->recursion + state->extra_indent, "", __VA_ARGS__); \
+		if (G->analyse_frame || gLogVerbosity >= LogVerbosity::DEBUG) \
+			(state)->mHackerContext->FrameAnalysisLog("3DMigoto%*s " fmt, state->recursion + state->extra_indent, "", __VA_ARGS__); \
 	} while (0)
 
 
