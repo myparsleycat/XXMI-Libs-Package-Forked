@@ -2109,11 +2109,6 @@ static const DescType* process_texture_override(uint32_t hash,
 	const DescType* ret = origDesc;
 	unsigned i;
 
-	// The game is about to use whatever it is creating here, and with it
-	// the custom resources of the TextureOverride sections for this hash.
-	// Their files can be read while the game is still busy getting there:
-	RequestTextureOverridePreload(hash);
-
 	find_texture_overrides(hash, origDesc, &matches, NULL);
 
 	if (origDesc && !matches.empty()) {

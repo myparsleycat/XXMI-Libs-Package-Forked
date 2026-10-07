@@ -510,9 +510,6 @@ struct Globals
 
 	ShaderHashType shader_hash_type;
 	bool track_region_hashes;
-	// Load the files of custom resources on worker threads ahead of their
-	// first use, see CustomResource::Preload():
-	bool async_resource_loading = true;
 	DataCacheBindFlags cache_resource_data = (DataCacheBindFlags)0;
 	bool track_implicit_index_buffers;
 	// Set while parsing TextureOverride sections when any of them asks for
@@ -868,15 +865,9 @@ struct TLS
 
 	bool com_initialized;
 
-	// Set on threads that work ahead of the game on things it may never
-	// get to use, see CustomResource::PreloadThread(). What LogOverlay()
-	// is given on these still goes to the log, but not on the screen:
-	bool suppress_overlay_notices;
-
 	TLS() :
 		hooking_quirk_protection(false),
-		com_initialized(false),
-		suppress_overlay_notices(false)
+		com_initialized(false)
 	{}
 };
 

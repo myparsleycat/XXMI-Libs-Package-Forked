@@ -6,11 +6,8 @@
 
 #include <DDSTextureLoader.h>
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
-#include <deque>
 #include <sstream>
-#include <thread>
 #include "HackerDevice.h"
 #include "HackerContext.h"
 #include "Override.h"
@@ -458,231 +455,6 @@ static void CommandListFlushState(CommandListState* state)
 	}
 }
 
-#pragma region CustomResourcePreload
-
-// A custom resource backed by a file is only loaded the first time a command
-// list uses it, which stalls the draw call that happens to be first for as
-// long as reading (and decoding) the file takes. The functions below work out
-// which resources a command list is about to use and hand them to
-// CustomResource::Preload(), so that the files are read on worker threads
-// instead.
-//
-// All of this is only ever a prediction. A resource that was not preloaded, or
-// was preloaded for other bind flags than its first use turns out to pass, is
-// loaded by CustomResource::Substantiate() the way it always was.
-
-// Holds an SRW lock exclusively for a scope. The allocations made under the
-// locks below may throw, and must not leave them held when they do:
-struct SRWExclusiveGuard {
-	SRWLOCK *lock;
-
-	explicit SRWExclusiveGuard(SRWLOCK *lock) :
-		lock(lock)
-	{
-		AcquireSRWLockExclusive(lock);
-	}
-
-	~SRWExclusiveGuard()
-	{
-		ReleaseSRWLockExclusive(lock);
-	}
-
-	SRWExclusiveGuard(const SRWExclusiveGuard&) = delete;
-	SRWExclusiveGuard& operator=(const SRWExclusiveGuard&) = delete;
-};
-
-// The bind flags Substantiate() is passed if this operation is the first to
-// use its source, as ResourceCopyTarget::GetResource() works them out. False
-// if they depend on state that is not known ahead of time:
-static bool PredictSubstantiateFlags(ResourceCopyOperation *op,
-		D3D11_BIND_FLAG *bind_flags, D3D11_RESOURCE_MISC_FLAG *misc_flags)
-{
-	CustomResource *dst_resource;
-
-	*bind_flags = (D3D11_BIND_FLAG)0;
-	*misc_flags = (D3D11_RESOURCE_MISC_FLAG)0;
-
-	// Only a reference passes its destination on to GetResource():
-	if (!(op->options & ResourceCopyOptions::REFERENCE))
-		return true;
-
-	switch (op->dst.type) {
-		case ResourceCopyTargetType::CONSTANT_BUFFER:
-		case ResourceCopyTargetType::SHADER_RESOURCE:
-		case ResourceCopyTargetType::VERTEX_BUFFER:
-		case ResourceCopyTargetType::INDEX_BUFFER:
-		case ResourceCopyTargetType::STREAM_OUTPUT:
-		case ResourceCopyTargetType::RENDER_TARGET:
-		case ResourceCopyTargetType::DEPTH_STENCIL_TARGET:
-		case ResourceCopyTargetType::UNORDERED_ACCESS_VIEW:
-			*bind_flags = op->dst.BindFlags(NULL);
-			return true;
-		case ResourceCopyTargetType::CUSTOM_RESOURCE:
-			dst_resource = op->dst.StaticCustomResource();
-			if (!dst_resource)
-				return false;
-			*bind_flags = dst_resource->bind_flags;
-			*misc_flags = dst_resource->misc_flags;
-			return true;
-	}
-
-	return false;
-}
-
-static void PreloadOperationSource(ResourceCopyOperation *op, HackerDevice *mHackerDevice, CustomResource *skip)
-{
-	D3D11_RESOURCE_MISC_FLAG misc_flags;
-	D3D11_BIND_FLAG bind_flags;
-	CustomResource *custom_resource;
-
-	if (op->src.type != ResourceCopyTargetType::CUSTOM_RESOURCE)
-		return;
-
-	custom_resource = op->src.StaticCustomResource();
-	if (!custom_resource || custom_resource == skip)
-		return;
-
-	if (!PredictSubstantiateFlags(op, &bind_flags, &misc_flags))
-		return;
-
-	custom_resource->Preload(mHackerDevice, bind_flags, misc_flags);
-}
-
-// Preloads the custom resources the command list would use if it ran now.
-// "skip" is a resource the caller is about to load itself.
-static void PreloadCommandList(CommandList *command_list, bool post, HackerDevice *mHackerDevice,
-		CustomResource *skip, std::vector<CommandList*> *visited)
-{
-	command_list = command_list->ResolveCommandList();
-
-	// Command lists may run each other in a circle:
-	if (std::find(visited->begin(), visited->end(), command_list) != visited->end())
-		return;
-	visited->push_back(command_list);
-
-	for (std::shared_ptr<CommandListCommand> &command : command_list->commands) {
-		if (ResourceCopyOperation *copy = dynamic_cast<ResourceCopyOperation*>(command.get())) {
-			PreloadOperationSource(copy, mHackerDevice, skip);
-		} else if (ShaderResourceBatch *batch = dynamic_cast<ShaderResourceBatch*>(command.get())) {
-			for (std::shared_ptr<ResourceCopyOperation> &op : batch->operations)
-				PreloadOperationSource(op.get(), mHackerDevice, skip);
-		} else if (SlotRangeCopyOperation *range = dynamic_cast<SlotRangeCopyOperation*>(command.get())) {
-			D3D11_BIND_FLAG bind_flags;
-			CustomResource *source = range->StaticSource(&bind_flags);
-
-			if (source && source != skip)
-				source->Preload(mHackerDevice, bind_flags, (D3D11_RESOURCE_MISC_FLAG)0);
-		} else if (IfCommand *if_command = dynamic_cast<IfCommand*>(command.get())) {
-			float val;
-
-			// Mods keep every variant of a model in the branches of
-			// an if, and loading them all would cost far more VRAM
-			// than the one that is shown. Only follow the branch the
-			// condition selects right now, and neither if it depends
-			// on more than variables:
-			if (!if_command->expression.static_evaluate(&val, NULL, true))
-				continue;
-
-			if (val) {
-				PreloadCommandList(post ? if_command->true_commands_post.get() : if_command->true_commands_pre.get(),
-						post, mHackerDevice, skip, visited);
-			} else {
-				PreloadCommandList(post ? if_command->false_commands_post.get() : if_command->false_commands_pre.get(),
-						post, mHackerDevice, skip, visited);
-			}
-		} else if (RunExplicitCommandList *run = dynamic_cast<RunExplicitCommandList*>(command.get())) {
-			if (run->run_pre_and_post_together || !post)
-				PreloadCommandList(&run->command_list_section->command_list, false, mHackerDevice, skip, visited);
-			if (run->run_pre_and_post_together || post)
-				PreloadCommandList(&run->command_list_section->post_command_list, true, mHackerDevice, skip, visited);
-		} else if (RunLinkedCommandList *linked = dynamic_cast<RunLinkedCommandList*>(command.get())) {
-			// Runs as part of the list it is linked into:
-			PreloadCommandList(linked->link, post, mHackerDevice, skip, visited);
-		} else if (RunCustomShaderCommand *shader = dynamic_cast<RunCustomShaderCommand*>(command.get())) {
-			PreloadCommandList(&shader->custom_shader->command_list, false, mHackerDevice, skip, visited);
-			PreloadCommandList(&shader->custom_shader->post_command_list, true, mHackerDevice, skip, visited);
-		}
-	}
-}
-
-// A command list is about to load the file of "first_use" on this thread.
-// The files the rest of the command list needs can load in the meantime:
-static void PreloadCommandListSiblings(CommandListState *state, CustomResource *first_use)
-{
-	std::vector<CommandList*> visited;
-
-	if (!G->async_resource_loading || !state->preload_scope || first_use->filename.empty())
-		return;
-
-	// The first use of the next resource of the scope would only find
-	// everything this queues queued already:
-	if (state->preloaded_scope == state->preload_scope && state->preloaded_post == state->post)
-		return;
-	state->preloaded_scope = state->preload_scope;
-	state->preloaded_post = state->post;
-
-	PreloadCommandList(state->preload_scope, state->post, state->mHackerDevice, first_use, &visited);
-}
-
-// Hashes of the resources the game has created since command lists last ran
-// that have TextureOverride sections. The game creates resources on whatever
-// thread it likes, while custom resources belong to the thread running command
-// lists, so the hashes are only noted here and looked up over there:
-static SRWLOCK preload_requests_lock = SRWLOCK_INIT;
-static std::vector<uint32_t> preload_requests;
-static std::atomic<bool> preload_requests_pending{false};
-
-void RequestTextureOverridePreload(uint32_t hash)
-{
-	if (!G->async_resource_loading)
-		return;
-
-	if (lookup_textureoverride(hash) == G->mTextureOverrideMap.end())
-		return;
-
-	SRWExclusiveGuard guard(&preload_requests_lock);
-	// Nothing is lost by dropping requests, and command lists may not be
-	// running at all to pick them up:
-	if (preload_requests.size() < 4096) {
-		preload_requests.push_back(hash);
-		preload_requests_pending.store(true, std::memory_order_relaxed);
-	}
-}
-
-static void PreloadRequestedTextureOverrides(CommandListState *state)
-{
-	std::vector<CommandList*> visited;
-	std::vector<uint32_t> requests;
-	TextureOverrideMap::iterator i;
-
-	// Command lists running on a deferred context share the custom
-	// resources with the immediate context as it is, no need to add to it:
-	if (state->mOrigContext1->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
-		return;
-
-	AcquireSRWLockExclusive(&preload_requests_lock);
-	requests.swap(preload_requests);
-	preload_requests_pending.store(false, std::memory_order_relaxed);
-	ReleaseSRWLockExclusive(&preload_requests_lock);
-
-	for (uint32_t hash : requests) {
-		i = lookup_textureoverride(hash);
-		if (i == G->mTextureOverrideMap.end())
-			continue;
-
-		// All of them, whichever draw calls they are restricted to: an
-		// index buffer typically has one section for each part of a
-		// model, and the game will be drawing every part.
-		for (TextureOverride &texture_override : i->second) {
-			PreloadCommandList(&texture_override.command_list, false, state->mHackerDevice, NULL, &visited);
-			PreloadCommandList(&texture_override.post_command_list, true, state->mHackerDevice, NULL, &visited);
-		}
-	}
-}
-
-#pragma endregion CustomResourcePreload
-
-
 static void RunCommandListComplete(HackerDevice *mHackerDevice,
 		HackerContext *mHackerContext,
 		CommandList *command_list,
@@ -708,10 +480,6 @@ static void RunCommandListComplete(HackerDevice *mHackerDevice,
 	state.resource = resource;
 	state.view = view;
 	state.post = post;
-	state.preload_scope = command_list;
-
-	if (preload_requests_pending.load(std::memory_order_relaxed))
-		PreloadRequestedTextureOverrides(&state);
 
 	if (!post && !state.input_layout_overrides.empty())
 		UpdateInputLayout(command_list->ini_section.c_str(), &state);
@@ -1738,41 +1506,32 @@ void CheckTextureOverrideCommand::RunRange(CommandListState *state)
 	}
 }
 
-static void RunTextureOverrideCommandList(CommandList *command_list, CommandListState *state)
-{
-	state->preload_scope = command_list;
-	_RunCommandList(command_list, state);
-}
-
 void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOverrideMatches &matches, ResourceCopyTarget *checked)
 {
 	ResourceCopyTarget *saved_this = NULL;
-	CommandList *saved_scope;
 	bool saved_post;
 	unsigned i;
 
 	saved_this = state->this_target;
-	saved_scope = state->preload_scope;
 	state->this_target = checked ? checked : &target;
 	if (run_pre_and_post_together) {
 		saved_post = state->post;
 		state->post = false;
 		for (i = 0; i < matches.size(); i++)
-			RunTextureOverrideCommandList(&matches[i]->command_list, state);
+			_RunCommandList(&matches[i]->command_list, state);
 		state->post = true;
 		for (i = 0; i < matches.size(); i++)
-			RunTextureOverrideCommandList(&matches[i]->post_command_list, state);
+			_RunCommandList(&matches[i]->post_command_list, state);
 		state->post = saved_post;
 	} else {
 		for (i = 0; i < matches.size(); i++) {
 			if (state->post)
-				RunTextureOverrideCommandList(&matches[i]->post_command_list, state);
+				_RunCommandList(&matches[i]->post_command_list, state);
 			else
-				RunTextureOverrideCommandList(&matches[i]->command_list, state);
+				_RunCommandList(&matches[i]->command_list, state);
 		}
 	}
 	state->this_target = saved_this;
-	state->preload_scope = saved_scope;
 }
 
 bool CheckTextureOverrideCommand::noop(bool post, bool ignore_cto_pre, bool ignore_cto_post)
@@ -6783,376 +6542,6 @@ ResourceHandleInfo* CustomResource::GetHandleInfo()
 	return handle_info.get();
 }
 
-// The file of a custom resource being loaded on a worker thread ahead of the
-// first use of the resource, see CustomResource::Preload():
-struct CustomResourceLoad {
-	enum class State {
-		QUEUED,
-		RUNNING,
-		DONE,
-		// Substantiate() got to the resource before a worker thread
-		// got to the load, and is loading the file itself:
-		ABANDONED,
-	};
-
-	// Stands in for the custom resource on the worker thread, which this
-	// way runs the very code Substantiate() does without touching anything
-	// the thread running the command lists may be using:
-	CustomResource loaded;
-	// Keeps the device alive for the worker thread. Held through our
-	// wrapper rather than on the device itself, so that if this turns out
-	// to be the last reference HackerDevice::Release() still gets to clean
-	// up after itself:
-	HackerDevice *hacker_device;
-	ID3D11Device *device;
-
-	// What the stand-in started out with. The file is loaded the same way
-	// as long as these match the resource when it is first used:
-	D3D11_BIND_FLAG bind_flags;
-	D3D11_RESOURCE_MISC_FLAG misc_flags;
-	DXGI_FORMAT format;
-	UINT stride;
-	UINT buf_size;
-
-	State state = State::QUEUED; // Protected by preload_lock
-	// Nothing was loaded. Substantiate() loads the file again, to fail
-	// the same way (and as visibly) as it would have without us:
-	bool failed = false;
-
-	CustomResourceLoad(HackerDevice *hacker_device) :
-		hacker_device(hacker_device),
-		device(hacker_device->GetPassThroughOrigDevice1())
-	{
-		hacker_device->AddRef();
-	}
-
-	~CustomResourceLoad()
-	{
-		// Ahead of the device, for the reason given above:
-		if (loaded.resource) {
-			loaded.resource->Release();
-			loaded.resource = NULL;
-		}
-		hacker_device->Release();
-	}
-};
-
-// Protects the queue, the state of every load and CustomResource::preload of
-// every custom resource. The latter because command lists running on deferred
-// contexts may preload and substantiate the same resource at the same time.
-static SRWLOCK preload_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE preload_queued = CONDITION_VARIABLE_INIT;
-static CONDITION_VARIABLE preload_done = CONDITION_VARIABLE_INIT;
-static std::deque<std::shared_ptr<CustomResourceLoad>> *preload_queue;
-static bool preload_threads_tried;
-static unsigned preload_threads;
-
-// Files on a disk that has to seek (a hard disk) are read one at a time, since
-// reading several at once mostly has the head travelling between them. For the
-// same reason no worker thread starts on such a file while a thread running
-// command lists is loading a file itself, which is a draw call waiting. Disks
-// that don't seek are left to read as many files at once as there are worker
-// threads. All of this is protected by preload_lock:
-static CONDITION_VARIABLE preload_seek_free = CONDITION_VARIABLE_INIT;
-static std::unordered_map<std::wstring, bool> *preload_volume_seeks;
-static bool preload_seeking;
-static unsigned preload_foreground_loads;
-
-// Held by a thread running command lists for as long as it is loading a file:
-struct PreloadForegroundLoad {
-	PreloadForegroundLoad()
-	{
-		SRWExclusiveGuard guard(&preload_lock);
-		preload_foreground_loads++;
-	}
-
-	~PreloadForegroundLoad()
-	{
-		{
-			SRWExclusiveGuard guard(&preload_lock);
-			preload_foreground_loads--;
-		}
-		WakeAllConditionVariable(&preload_seek_free);
-	}
-};
-
-// Whether the file is on a disk that has to seek to read it. Asks the volume
-// the file turns out to be on rather than going by its path, which may lead
-// anywhere through symbolic links. False if there is no telling.
-static bool FileIncursSeekPenalty(const wstring &filename)
-{
-	STORAGE_PROPERTY_QUERY query = {StorageDeviceSeekPenaltyProperty, PropertyStandardQuery};
-	DEVICE_SEEK_PENALTY_DESCRIPTOR penalty = {0};
-	const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-	wchar_t path[1024], *end;
-	bool seeks = false;
-	DWORD len;
-	HANDLE f;
-
-	f = CreateFile(filename.c_str(), 0, share, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (f == INVALID_HANDLE_VALUE)
-		return false;
-	// "\\?\Volume{...}\path\to\file", of which we want the volume:
-	len = GetFinalPathNameByHandle(f, path, ARRAYSIZE(path), FILE_NAME_OPENED | VOLUME_NAME_GUID);
-	CloseHandle(f);
-	if (!len || len >= ARRAYSIZE(path))
-		return false;
-	end = wcschr(path, L'}');
-	if (!end)
-		return false;
-	end[1] = L'\0';
-
-	{
-		SRWExclusiveGuard guard(&preload_lock);
-		auto known = preload_volume_seeks->find(path);
-		if (known != preload_volume_seeks->end())
-			return known->second;
-	}
-
-	// Without a trailing backslash this opens the volume itself, which
-	// takes no access rights to ask about:
-	f = CreateFile(path, 0, share, NULL, OPEN_EXISTING, 0, NULL);
-	if (f != INVALID_HANDLE_VALUE) {
-		if (DeviceIoControl(f, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
-				&penalty, sizeof(penalty), &len, NULL))
-			seeks = !!penalty.IncursSeekPenalty;
-		CloseHandle(f);
-	}
-
-	LogInfo("Custom resource files on %S are preloaded %s\n", path,
-			seeks ? "one at a time, as the disk has to seek" : "in parallel");
-
-	SRWExclusiveGuard guard(&preload_lock);
-	(*preload_volume_seeks)[path] = seeks;
-	return seeks;
-}
-
-// Starts the worker threads along with the queue the first time anything is
-// preloaded. Neither is ever torn down: the threads cannot be joined from
-// DllMain, and they do nothing but wait once the queue is empty. Called with
-// preload_lock held, returns false if there is no thread to load anything.
-bool CustomResource::StartPreloadThreads()
-{
-	HMODULE module = NULL;
-	unsigned threads;
-
-	if (preload_threads_tried)
-		return preload_threads > 0;
-	preload_threads_tried = true;
-
-	// The threads keep running our code for as long as the process lives,
-	// so from here on the DLL must stay loaded even if whatever loaded it
-	// frees it:
-	if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-			(LPCWSTR)&preload_lock, &module)) {
-		LogInfo("Unable to pin the DLL, custom resources will not be preloaded: %d\n", GetLastError());
-		return false;
-	}
-
-	preload_queue = new std::deque<std::shared_ptr<CustomResourceLoad>>();
-	preload_volume_seeks = new std::unordered_map<std::wstring, bool>();
-
-	threads = std::thread::hardware_concurrency() / 2;
-	threads = max(1u, min(threads, 4u));
-	try {
-		while (preload_threads < threads) {
-			std::thread(PreloadThread).detach();
-			preload_threads++;
-		}
-	} catch (...) {
-		// Make do with the threads that did start, if any
-	}
-
-	return preload_threads > 0;
-}
-
-void CustomResource::PreloadThread()
-{
-	std::shared_ptr<CustomResourceLoad> load;
-	bool run, seeks;
-
-	// Whatever goes wrong here goes wrong for a resource that may never be
-	// used, which is nothing to put on the screen. It still goes to the
-	// log, and Substantiate() reports it if the resource does get used:
-	get_tls()->suppress_overlay_notices = true;
-
-	while (true) {
-		AcquireSRWLockExclusive(&preload_lock);
-		while (preload_queue->empty())
-			SleepConditionVariableSRW(&preload_queued, &preload_lock, INFINITE, 0);
-		load = std::move(preload_queue->front());
-		preload_queue->pop_front();
-		// Not worth loading if ours is the only reference left, which
-		// means the custom resource is gone (config reload) or reset:
-		run = (load->state == CustomResourceLoad::State::QUEUED && load.use_count() > 1);
-		ReleaseSRWLockExclusive(&preload_lock);
-
-		seeks = run && FileIncursSeekPenalty(load->loaded.filename);
-
-		if (run) {
-			AcquireSRWLockExclusive(&preload_lock);
-			// Waiting for our turn at a disk that seeks. The load
-			// is still queued as far as Substantiate() is concerned,
-			// which takes it over if it gets to the resource first:
-			while (seeks && (preload_seeking || preload_foreground_loads)
-			    && load->state == CustomResourceLoad::State::QUEUED && load.use_count() > 1)
-				SleepConditionVariableSRW(&preload_seek_free, &preload_lock, INFINITE, 0);
-			run = (load->state == CustomResourceLoad::State::QUEUED && load.use_count() > 1);
-			if (run) {
-				load->state = CustomResourceLoad::State::RUNNING;
-				preload_seeking = preload_seeking || seeks;
-			}
-			ReleaseSRWLockExclusive(&preload_lock);
-		}
-
-		if (run) {
-			// Not taking the resource creation mode lock, as this
-			// build never changes the creation mode it protects,
-			// and the game's own resource creation would otherwise
-			// queue up behind every file being read and decoded.
-			try {
-				load->loaded.LoadFromFile(load->device);
-			} catch (...) {
-				load->failed = true;
-			}
-			if (!load->loaded.resource)
-				load->failed = true;
-
-			AcquireSRWLockExclusive(&preload_lock);
-			load->state = CustomResourceLoad::State::DONE;
-			if (seeks)
-				preload_seeking = false;
-			ReleaseSRWLockExclusive(&preload_lock);
-			WakeAllConditionVariable(&preload_done);
-			if (seeks)
-				WakeAllConditionVariable(&preload_seek_free);
-		}
-
-		// May be the last reference if the custom resource is gone or
-		// has loaded the file itself. Released outside of the lock:
-		load.reset();
-	}
-}
-
-// Starts loading the file of the custom resource on a worker thread, for
-// Substantiate() to pick up later. The bind flags are those that Substantiate()
-// is expected to be called with.
-void CustomResource::Preload(HackerDevice *mHackerDevice,
-		D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags)
-{
-	std::shared_ptr<CustomResourceLoad> load;
-
-	// Nothing to do unless Substantiate() would go on to load a file:
-	if (substantiated || resource || view || filename.empty())
-		return;
-
-	// The worker threads call into the device while the game is using it:
-	if (mHackerDevice->GetPassThroughOrigDevice1()->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)
-		return;
-
-	SRWExclusiveGuard guard(&preload_lock);
-
-	// Substantiate() sets the flag before it takes the preload under the
-	// lock, so checking it again here means that a preload is never left
-	// behind on a resource that another thread has just substantiated:
-	if (preload || substantiated || !StartPreloadThreads())
-		return;
-
-	load = std::make_shared<CustomResourceLoad>(mHackerDevice);
-
-	load->loaded.CopyMetadataFrom(*this);
-	// Not used when loading from a file, and not the stand-in's to free:
-	load->loaded.initial_data = NULL;
-	load->loaded.initial_data_size = 0;
-	load->loaded.name = name;
-
-	// Everything else of the resource loading the file reads or updates:
-	load->bind_flags = (D3D11_BIND_FLAG)(this->bind_flags | bind_flags);
-	load->misc_flags = (D3D11_RESOURCE_MISC_FLAG)(this->misc_flags | misc_flags);
-	load->format = format;
-	load->stride = stride;
-	load->buf_size = buf_size;
-	load->loaded.bind_flags = load->bind_flags;
-	load->loaded.misc_flags = load->misc_flags;
-	load->loaded.format = load->format;
-	load->loaded.stride = load->stride;
-	load->loaded.buf_size = load->buf_size;
-
-	// In this order, so that queueing it failing leaves no preload behind
-	// that no worker thread will ever get to:
-	preload_queue->push_back(load);
-	preload = std::move(load);
-
-	WakeConditionVariable(&preload_queued);
-}
-
-// Forgets about the preload, if there is one. A load that is already running
-// carries on, and is thrown away when it completes.
-void CustomResource::DropPreload()
-{
-	std::shared_ptr<CustomResourceLoad> load;
-
-	AcquireSRWLockExclusive(&preload_lock);
-	load.swap(preload);
-	ReleaseSRWLockExclusive(&preload_lock);
-
-	// Released here, outside of the lock
-}
-
-// Takes over what Preload() has loaded, waiting for a load that is still
-// running. Returns false if the file is still to be loaded: there was no
-// preload, no worker thread had started on it yet, it failed to load, or it
-// was not loaded the way it would be loaded now.
-bool CustomResource::AdoptPreload(ID3D11Device *mOrigDevice1)
-{
-	std::shared_ptr<CustomResourceLoad> load;
-	bool done = false;
-
-	AcquireSRWLockExclusive(&preload_lock);
-	load.swap(preload);
-	if (load) {
-		if (load->state == CustomResourceLoad::State::QUEUED) {
-			// Still waiting behind other files. This thread would
-			// only sit idle until its turn came, and may as well
-			// load it:
-			load->state = CustomResourceLoad::State::ABANDONED;
-		}
-		while (load->state == CustomResourceLoad::State::RUNNING)
-			SleepConditionVariableSRW(&preload_done, &preload_lock, INFINITE, 0);
-		done = (load->state == CustomResourceLoad::State::DONE);
-	}
-	ReleaseSRWLockExclusive(&preload_lock);
-
-	if (!done || load->failed)
-		return false;
-
-	if (load->device != mOrigDevice1
-	 || load->bind_flags != bind_flags
-	 || load->misc_flags != misc_flags
-	 || load->format != format
-	 || load->stride != stride
-	 || load->buf_size != buf_size) {
-		LogInfo("Preloaded custom resource [%S] is out of date, loading it again\n", name.c_str());
-		return false;
-	}
-
-	// The stand-in started out as we are now, so it has ended up as we
-	// would have:
-	bind_flags = load->loaded.bind_flags;
-	misc_flags = load->loaded.misc_flags;
-	format = load->loaded.format;
-	stride = load->loaded.stride;
-	buf_size = load->loaded.buf_size;
-	resource = load->loaded.resource;
-	load->loaded.resource = NULL;
-	device = load->loaded.device;
-	is_null = load->loaded.is_null;
-
-	LogInfo("Custom resource [%S] was loaded ahead of its first use\n", name.c_str());
-
-	return true;
-}
-
 void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 		D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags)
 {
@@ -7168,10 +6557,8 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 
 	// If this custom resource has already been set through other means we
 	// won't overwrite it:
-	if (resource || view) {
-		DropPreload();
+	if (resource || view)
 		return;
-	}
 
 	Profiling::resources_created++;
 
@@ -7185,12 +6572,6 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 	this->bind_flags = (D3D11_BIND_FLAG)(this->bind_flags | bind_flags);
 	this->misc_flags = (D3D11_RESOURCE_MISC_FLAG)(this->misc_flags | misc_flags);
 
-	// The file may already have been loaded on a worker thread, or be in
-	// the middle of it. Checked before taking the resource creation mode
-	// lock so that we don't sit on it while waiting for the worker:
-	if (AdoptPreload(mOrigDevice1))
-		return;
-
 	// If the resource section has enough information to create a resource
 	// we do so the first time it is loaded from. The reason we do it this
 	// late is to make sure we know which device is actually being used to
@@ -7201,8 +6582,6 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 	LockResourceCreationMode();
 
 	if (!filename.empty()) {
-		// Worker threads hold off reading from disks that seek:
-		PreloadForegroundLoad foreground;
 		LoadFromFile(mOrigDevice1);
 	} else {
 		switch (override_type) {
@@ -7644,7 +7023,6 @@ void CustomResource::ResetRuntimeState()
 
 	is_null = false;
 	substantiated = false;
-	DropPreload();
 
 	copies_this_frame = 0;
 	frame_no = 0;
@@ -10610,12 +9988,6 @@ ID3D11Resource *ResourceCopyTarget::GetResource(
 
 			if (dst)
 				bind_flags = dst->BindFlags(state, &misc_flags);
-
-			// The first use of a resource may be about to load a
-			// file right here, in which case the files the rest
-			// of the command list needs get a head start:
-			if (!custom_resource->substantiated)
-				PreloadCommandListSiblings(state, custom_resource);
 
 			custom_resource->Substantiate(mOrigDevice1, bind_flags, misc_flags);
 
@@ -14541,25 +13913,6 @@ bool SlotRangeCopyOperation::UsesSlotOps() const
 		| (int)ResourceCopyOptions::UNLESS_NULL
 		| (int)ResourceCopyOptions::NO_VIEW_CACHE;
 	return ((int)options & ~plain_ref) && src.type != ResourceCopyTargetType::EMPTY;
-}
-
-// The custom resource a bind of the range reads if that is known ahead of
-// running it (NULL for a pool, or anything but a bind), along with the bind
-// flags its first use passes to CustomResource::Substantiate():
-CustomResource* SlotRangeCopyOperation::StaticSource(D3D11_BIND_FLAG *bind_flags)
-{
-	if (dst.evaluation_mode != ResourceCopyTargetEvaluationMode::SLOT_RANGE
-	 || src.type != ResourceCopyTargetType::CUSTOM_RESOURCE)
-		return NULL;
-
-	// BindSlotRef() always passes the slots on to GetResource(), while a
-	// slot operation only does so for a reference:
-	if (!UsesSlotOps() || (options & ResourceCopyOptions::REFERENCE))
-		*bind_flags = dst.BindFlags(NULL);
-	else
-		*bind_flags = (D3D11_BIND_FLAG)0;
-
-	return src.StaticCustomResource();
 }
 
 // Frame analysis log line per slot. Guarded so the name formatting isn't
