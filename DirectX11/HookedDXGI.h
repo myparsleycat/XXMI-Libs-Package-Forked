@@ -69,6 +69,23 @@ extern "C" LPVOID lpvtbl_CreateSwapChainForCoreWindow(IDXGIFactory2* pFactory2);
 
 extern "C" LPVOID lpvtbl_CreateSwapChainForComposition(IDXGIFactory2* pFactory2);
 
+extern "C" LPVOID* lpvtbl_slot_CreateSwapChain(IDXGIFactory* pFactory);
+
+extern "C" LPVOID* lpvtbl_slot_CreateSwapChainForHwnd(IDXGIFactory2* pFactory2);
+
+extern "C" LPVOID* lpvtbl_slot_CreateSwapChainForCoreWindow(IDXGIFactory2* pFactory2);
+
+extern "C" LPVOID* lpvtbl_slot_CreateSwapChainForComposition(IDXGIFactory2* pFactory2);
+
+// Called after device creation, when a driver present layer may have been
+// loaded and detoured the factory methods we hooked:
+
+void maybe_install_outer_swap_chain_hooks();
+
+// Called from RemoveHooks on DLL unload:
+
+void remove_outer_swap_chain_hooks();
+
 extern "C" LPVOID lpvtbl_Present(IDXGISwapChain* pSwapChain);
 
 extern "C" LPVOID lpvtbl_Present1(IDXGISwapChain1* pSwapChain1);

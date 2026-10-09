@@ -350,7 +350,7 @@ STDMETHODIMP HackerSwapChain::QueryInterface(THIS_
 	// with a vtable entry that does not match what they expected. Somehow they decide
 	// they are on Win10, and know these APIs ought to exist.  Does not crash on Win7.
 	//
-	// Returning an E_NOINTERFACE here seems to work, but this does call into question our 
+	// Returning an E_NOINTERFACE here seems to work, but this does call into question our
 	// entire wrapping strategy.  If the object we've wrapped is a superclass of the
 	// object they desire, the vtable is not going to match.
 

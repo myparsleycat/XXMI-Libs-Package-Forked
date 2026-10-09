@@ -162,6 +162,7 @@ static HRESULT HookD3D11(HINSTANCE our_dll)
 // ----------------------------------------------------------------------------
 static void RemoveHooks()
 {
+	remove_outer_swap_chain_hooks();
 	cHookMgr.UnhookAll();
 }
 

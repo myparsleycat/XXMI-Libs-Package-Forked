@@ -896,6 +896,7 @@ HRESULT WINAPI D3D11CreateDevice(
 	ShowDebugInfo(retDevice);
 #endif
 
+	maybe_install_outer_swap_chain_hooks();
 	wrap_d3d11_device_and_context(ppDevice, ppImmediateContext);
 
 	LogInfo("->D3D11CreateDevice result = %x\n", ret);
@@ -1024,6 +1025,7 @@ HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
 	ShowDebugInfo(retDevice);
 #endif
 
+	maybe_install_outer_swap_chain_hooks();
 	HackerDevice *deviceWrap = wrap_d3d11_device_and_context(ppDevice, ppImmediateContext);
 	wrap_swap_chain(deviceWrap, ppSwapChain, pSwapChainDesc, &origSwapChainDesc);
 

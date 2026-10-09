@@ -68,6 +68,41 @@ LPVOID lpvtbl_CreateSwapChainForCoreWindow(IDXGIFactory2* pFactory2)
 	return pFactory2->lpVtbl->CreateSwapChainForCoreWindow;
 }
 
+// Addresses of the vtable slots themselves, for hooking by replacing the slot
+// rather than patching the method's code.
+
+LPVOID* lpvtbl_slot_CreateSwapChain(IDXGIFactory* pFactory)
+{
+	if (!pFactory)
+		return NULL;
+
+	return (LPVOID*)&pFactory->lpVtbl->CreateSwapChain;
+}
+
+LPVOID* lpvtbl_slot_CreateSwapChainForHwnd(IDXGIFactory2* pFactory2)
+{
+	if (!pFactory2)
+		return NULL;
+
+	return (LPVOID*)&pFactory2->lpVtbl->CreateSwapChainForHwnd;
+}
+
+LPVOID* lpvtbl_slot_CreateSwapChainForCoreWindow(IDXGIFactory2* pFactory2)
+{
+	if (!pFactory2)
+		return NULL;
+
+	return (LPVOID*)&pFactory2->lpVtbl->CreateSwapChainForCoreWindow;
+}
+
+LPVOID* lpvtbl_slot_CreateSwapChainForComposition(IDXGIFactory2* pFactory2)
+{
+	if (!pFactory2)
+		return NULL;
+
+	return (LPVOID*)&pFactory2->lpVtbl->CreateSwapChainForComposition;
+}
+
 LPVOID lpvtbl_Present(IDXGISwapChain* pSwapChain)
 {
 	if (!pSwapChain)

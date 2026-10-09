@@ -169,17 +169,17 @@ static HackerDevice* sort_out_swap_chain_device_mess(IUnknown **device)
 		analyse_iunknown(*device);
 
 		if (check_interface_supported(*device, IID_ID3D11Device)) {
-			// If we do end up in another situation where we are
-			// seeing a device for the first time (like
-			// CreateDeviceAndSwapChain calling back into us), we
-			// could consider creating our HackerDevice here. But
-			// for now we aren't expecting this to happen, so treat
-			// it as fatal if it does.
-			//
-			// D3D11On12CreateDevice() could possibly lead us here,
-			// depending on how that works.
-			LogInfo("BUG: Unwrapped ID3D11Device!\n");
-			DoubleBeepExit();
+			// A D3D11 device we never wrapped. This happens when a
+			// driver layer living in the same process creates its own
+			// helper device while our hooking_quirk_protection is set
+			// (NVIDIA Smooth Motion's NvPresent64.dll does this from
+			// inside the game's D3D11CreateDevice call) and later
+			// creates a swap chain on it through the factory we hooked.
+			// That swap chain is not the game's, so leave it alone
+			// rather than treating it as fatal.
+			LogInfo("WARNING: Unwrapped ID3D11Device, not touching this swap chain\n");
+			fflush(LogFile);
+			return NULL;
 		}
 
 		LogInfo("FATAL: Unsupported DirectX Version!\n");
@@ -541,7 +541,11 @@ HRESULT(__stdcall *fnOrigCreateSwapChainForHwnd)(
 	/* [annotation][out] */
 	_Out_  IDXGISwapChain1 **ppSwapChain) = nullptr;
 
-HRESULT __stdcall Hooked_CreateSwapChainForHwnd(
+typedef HRESULT(__stdcall *CreateSwapChainForHwnd_t)(IDXGIFactory2*, IUnknown*, HWND,
+	const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+static CreateSwapChainForHwnd_t fnVtblOrigCreateSwapChainForHwnd = nullptr;
+
+static HRESULT create_swap_chain_for_hwnd(CreateSwapChainForHwnd_t orig,
 	IDXGIFactory2 * This,
 	/* [annotation][in] */
 	_In_  IUnknown *pDevice,
@@ -559,7 +563,7 @@ HRESULT __stdcall Hooked_CreateSwapChainForHwnd(
 	if (get_tls()->hooking_quirk_protection) {
 		LogInfo("Hooking Quirk: Unexpected call back into IDXGIFactory2::CreateSwapChainForHwnd, passing through\n");
 		// No known cases
-		return fnOrigCreateSwapChainForHwnd(This, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+		return orig(This, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
 	}
 
 	HackerDevice *hackerDevice = NULL;
@@ -572,10 +576,17 @@ HRESULT __stdcall Hooked_CreateSwapChainForHwnd(
 	LogInfo("  Description1 = %p\n", pDesc);
 	LogInfo("  FullScreenDescription = %p\n", pFullscreenDesc);
 
+	hackerDevice = sort_out_swap_chain_device_mess(&pDevice);
+	if (!hackerDevice) {
+		LogInfo("  Device is not ours, passing IDXGIFactory2::CreateSwapChainForHwnd through untouched\n");
+		get_tls()->hooking_quirk_protection = true;
+		HRESULT hr = orig(This, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+		get_tls()->hooking_quirk_protection = false;
+		return hr;
+	}
+
 	// Save window handle so we can translate mouse coordinates to the window:
 	G->hWnd = hWnd;
-
-	hackerDevice = sort_out_swap_chain_device_mess(&pDevice);
 
 	// The game may pass in NULL for pFullscreenDesc, but we may still want
 	// to override it. To keep things simpler we always use our own full
@@ -588,7 +599,7 @@ HRESULT __stdcall Hooked_CreateSwapChainForHwnd(
 	override_factory2_swap_chain(&pDesc, &descCopy, &fullscreenCopy);
 
 	get_tls()->hooking_quirk_protection = true;
-	HRESULT hr = fnOrigCreateSwapChainForHwnd(This, pDevice, hWnd, pDesc, &fullscreenCopy, pRestrictToOutput, ppSwapChain);
+	HRESULT hr = orig(This, pDevice, hWnd, pDesc, &fullscreenCopy, pRestrictToOutput, ppSwapChain);
 	get_tls()->hooking_quirk_protection = false;
 	if (FAILED(hr))
 	{
@@ -603,6 +614,20 @@ out_release:
 	if (hackerDevice)
 		hackerDevice->Release();
 	return hr;
+}
+
+HRESULT __stdcall Hooked_CreateSwapChainForHwnd(IDXGIFactory2 *This, IUnknown *pDevice, HWND hWnd,
+	const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
+	IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	return create_swap_chain_for_hwnd(fnOrigCreateSwapChainForHwnd, This, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
+}
+
+static HRESULT __stdcall Vtbl_CreateSwapChainForHwnd(IDXGIFactory2 *This, IUnknown *pDevice, HWND hWnd,
+	const DXGI_SWAP_CHAIN_DESC1 *pDesc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
+	IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	return create_swap_chain_for_hwnd(fnVtblOrigCreateSwapChainForHwnd, This, pDevice, hWnd, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain);
 }
 
 // This is used for Windows Store apps:
@@ -620,7 +645,11 @@ HRESULT(__stdcall *fnOrigCreateSwapChainForCoreWindow)(
 	/* [annotation][out] */
 	_COM_Outptr_  IDXGISwapChain1 **ppSwapChain) = nullptr;
 
-HRESULT __stdcall Hooked_CreateSwapChainForCoreWindow(
+typedef HRESULT(__stdcall *CreateSwapChainForCoreWindow_t)(IDXGIFactory2*, IUnknown*, IUnknown*,
+	const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+static CreateSwapChainForCoreWindow_t fnVtblOrigCreateSwapChainForCoreWindow = nullptr;
+
+static HRESULT create_swap_chain_for_core_window(CreateSwapChainForCoreWindow_t orig,
 	IDXGIFactory2 * This,
 	/* [annotation][in] */
 	_In_  IUnknown *pDevice,
@@ -636,7 +665,7 @@ HRESULT __stdcall Hooked_CreateSwapChainForCoreWindow(
 	if (get_tls()->hooking_quirk_protection) {
 		LogInfo("Hooking Quirk: Unexpected call back into IDXGIFactory2::CreateSwapChainForCoreWindow, passing through\n");
 		// No known cases
-		return fnOrigCreateSwapChainForCoreWindow(This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
+		return orig(This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
 	}
 
 	HackerDevice *hackerDevice = NULL;
@@ -650,11 +679,18 @@ HRESULT __stdcall Hooked_CreateSwapChainForCoreWindow(
 	// FIXME: Need the hWnd for mouse support
 
 	hackerDevice = sort_out_swap_chain_device_mess(&pDevice);
+	if (!hackerDevice) {
+		LogInfo("  Device is not ours, passing IDXGIFactory2::CreateSwapChainForCoreWindow through untouched\n");
+		get_tls()->hooking_quirk_protection = true;
+		HRESULT hr = orig(This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
+		get_tls()->hooking_quirk_protection = false;
+		return hr;
+	}
 
 	override_factory2_swap_chain(&pDesc, &descCopy, NULL);
 
 	get_tls()->hooking_quirk_protection = true;
-	HRESULT hr = fnOrigCreateSwapChainForCoreWindow(This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
+	HRESULT hr = orig(This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
 	get_tls()->hooking_quirk_protection = false;
 	if (FAILED(hr))
 	{
@@ -669,6 +705,18 @@ out_release:
 	if (hackerDevice)
 		hackerDevice->Release();
 	return hr;
+}
+
+HRESULT __stdcall Hooked_CreateSwapChainForCoreWindow(IDXGIFactory2 *This, IUnknown *pDevice, IUnknown *pWindow,
+	const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	return create_swap_chain_for_core_window(fnOrigCreateSwapChainForCoreWindow, This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
+}
+
+static HRESULT __stdcall Vtbl_CreateSwapChainForCoreWindow(IDXGIFactory2 *This, IUnknown *pDevice, IUnknown *pWindow,
+	const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	return create_swap_chain_for_core_window(fnVtblOrigCreateSwapChainForCoreWindow, This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
 }
 
 // Not sure we actually care about anything using DirectComposition, but for
@@ -686,7 +734,11 @@ HRESULT(__stdcall *fnOrigCreateSwapChainForComposition)(
 	/* [annotation][out] */
 	_COM_Outptr_  IDXGISwapChain1 **ppSwapChain) = nullptr;
 
-HRESULT __stdcall Hooked_CreateSwapChainForComposition(
+typedef HRESULT(__stdcall *CreateSwapChainForComposition_t)(IDXGIFactory2*, IUnknown*,
+	const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+static CreateSwapChainForComposition_t fnVtblOrigCreateSwapChainForComposition = nullptr;
+
+static HRESULT create_swap_chain_for_composition(CreateSwapChainForComposition_t orig,
 	IDXGIFactory2 * This,
 	/* [annotation][in] */
 	_In_  IUnknown *pDevice,
@@ -700,7 +752,7 @@ HRESULT __stdcall Hooked_CreateSwapChainForComposition(
 	if (get_tls()->hooking_quirk_protection) {
 		LogInfo("Hooking Quirk: Unexpected call back into IDXGIFactory2::CreateSwapChainForComposition, passing through\n");
 		// No known cases
-		return fnOrigCreateSwapChainForComposition(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
+		return orig(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
 	}
 
 	HackerDevice *hackerDevice = NULL;
@@ -714,11 +766,18 @@ HRESULT __stdcall Hooked_CreateSwapChainForComposition(
 	// FIXME: Need the hWnd for mouse support
 
 	hackerDevice = sort_out_swap_chain_device_mess(&pDevice);
+	if (!hackerDevice) {
+		LogInfo("  Device is not ours, passing IDXGIFactory2::CreateSwapChainForComposition through untouched\n");
+		get_tls()->hooking_quirk_protection = true;
+		HRESULT hr = orig(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
+		get_tls()->hooking_quirk_protection = false;
+		return hr;
+	}
 
 	override_factory2_swap_chain(&pDesc, &descCopy, NULL);
 
 	get_tls()->hooking_quirk_protection = true;
-	HRESULT hr = fnOrigCreateSwapChainForComposition(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
+	HRESULT hr = orig(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
 	get_tls()->hooking_quirk_protection = false;
 	if (FAILED(hr))
 	{
@@ -733,6 +792,18 @@ out_release:
 	if (hackerDevice)
 		hackerDevice->Release();
 	return hr;
+}
+
+HRESULT __stdcall Hooked_CreateSwapChainForComposition(IDXGIFactory2 *This, IUnknown *pDevice,
+	const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	return create_swap_chain_for_composition(fnOrigCreateSwapChainForComposition, This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
+}
+
+static HRESULT __stdcall Vtbl_CreateSwapChainForComposition(IDXGIFactory2 *This, IUnknown *pDevice,
+	const DXGI_SWAP_CHAIN_DESC1 *pDesc, IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain)
+{
+	return create_swap_chain_for_composition(fnVtblOrigCreateSwapChainForComposition, This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
 }
 
 // -----------------------------------------------------------------------------
@@ -822,7 +893,10 @@ static HRESULT(__stdcall *fnOrigCreateSwapChain)(
 // that input into an ID3D11Device1 using QueryInterface.  Leaving the original
 // code commented out at the bottom of the file, for reference.
 
-HRESULT __stdcall Hooked_CreateSwapChain(
+typedef HRESULT(__stdcall *CreateSwapChain_t)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+static CreateSwapChain_t fnVtblOrigCreateSwapChain = nullptr;
+
+static HRESULT create_swap_chain(CreateSwapChain_t orig,
 	IDXGIFactory * This,
 	/* [annotation][in] */
 	_In_  IUnknown *pDevice,
@@ -838,7 +912,7 @@ HRESULT __stdcall Hooked_CreateSwapChain(
 		//             ppSwapChain is not NULL), triggering this if we
 		//             call the former and have hooked the later.
 		//             Note that the Steam overlay depends on this.
-		return fnOrigCreateSwapChain(This, pDevice, pDesc, ppSwapChain);
+		return orig(This, pDevice, pDesc, ppSwapChain);
 	}
 
 	LogInfo("\n*** Hooked IDXGIFactory::CreateSwapChain(%p) called\n", This);
@@ -850,11 +924,18 @@ HRESULT __stdcall Hooked_CreateSwapChain(
 	DXGI_SWAP_CHAIN_DESC origSwapChainDesc;
 
 	hackerDevice = sort_out_swap_chain_device_mess(&pDevice);
+	if (!hackerDevice) {
+		LogInfo("  Device is not ours, passing IDXGIFactory::CreateSwapChain through untouched\n");
+		get_tls()->hooking_quirk_protection = true;
+		HRESULT hr = orig(This, pDevice, pDesc, ppSwapChain);
+		get_tls()->hooking_quirk_protection = false;
+		return hr;
+	}
 
 	override_swap_chain(pDesc, &origSwapChainDesc);
 
 	get_tls()->hooking_quirk_protection = true;
-	HRESULT hr = fnOrigCreateSwapChain(This, pDevice, pDesc, ppSwapChain);
+	HRESULT hr = orig(This, pDevice, pDesc, ppSwapChain);
 	get_tls()->hooking_quirk_protection = false;
 	if (FAILED(hr))
 	{
@@ -876,6 +957,18 @@ out_release:
 }
 
 
+HRESULT __stdcall Hooked_CreateSwapChain(IDXGIFactory *This, IUnknown *pDevice,
+	DXGI_SWAP_CHAIN_DESC *pDesc, IDXGISwapChain **ppSwapChain)
+{
+	return create_swap_chain(fnOrigCreateSwapChain, This, pDevice, pDesc, ppSwapChain);
+}
+
+static HRESULT __stdcall Vtbl_CreateSwapChain(IDXGIFactory *This, IUnknown *pDevice,
+	DXGI_SWAP_CHAIN_DESC *pDesc, IDXGISwapChain **ppSwapChain)
+{
+	return create_swap_chain(fnVtblOrigCreateSwapChain, This, pDevice, pDesc, ppSwapChain);
+}
+
 // -----------------------------------------------------------------------------
 // This hook should work in all variants, including the CreateSwapChain1
 // and CreateSwapChainForHwnd
@@ -896,6 +989,130 @@ static void HookCreateSwapChain(void* factory)
 		LogInfo("  *** Failed install IDXGIFactory->CreateSwapChain hook.\n");
 }
 
+
+// -----------------------------------------------------------------------------
+// Driver present layers such as NVIDIA Smooth Motion (NvPresent64.dll) are
+// loaded by the user mode driver while the game creates its first D3D11
+// device, which is after our Deviare code hooks on the factory's
+// CreateSwapChain methods went in. They then detour the same functions, which
+// puts them in front of us: the game's call reaches the driver layer first,
+// the layer creates a device and swap chain of its own, calls through to our
+// hook for the game's real swap chain, and hands the game a wrapper of its
+// own. The game presents on that wrapper, HackerSwapChain::Present never runs
+// and nothing per-frame (command lists, overlay, input) happens.
+//
+// To get back in front we additionally hook the factory's vtable slots once
+// such a layer is loaded. The slot is dispatched before any code patch on the
+// method itself, so the game reaches us first, we call whatever the slot held
+// (the driver layer), and the layer's own call into the method is passed
+// straight through by our inner code hook thanks to hooking_quirk_protection.
+
+struct VtblHook {
+	const char *name;
+	LPVOID *slot;
+	LPVOID hook;
+	LPVOID orig;
+};
+static VtblHook vtbl_hooks[4];
+static unsigned num_vtbl_hooks = 0;
+static LONG vtbl_hooks_installed = 0;
+
+static void hook_vtable_slot(const char *name, LPVOID *slot, LPVOID hook, LPVOID *orig)
+{
+	HMODULE module = NULL;
+	wchar_t path[MAX_PATH] = L"?";
+	DWORD old_protect = 0;
+
+	if (!slot || !*slot) {
+		LogInfo("  *** %s: no vtable slot\n", name);
+		return;
+	}
+
+	if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)*slot, &module))
+		GetModuleFileNameW(module, path, MAX_PATH);
+	LogInfo("  %s slot %p -> %p in %S, first byte %02x\n", name, slot, *slot, path, *(unsigned char*)*slot);
+
+	if (*slot == hook) {
+		LogInfo("  %s already hooked\n", name);
+		return;
+	}
+
+	if (!VirtualProtect(slot, sizeof(LPVOID), PAGE_READWRITE, &old_protect)) {
+		LogInfo("  *** VirtualProtect failed for %s: %u\n", name, GetLastError());
+		return;
+	}
+	*orig = *slot;
+	*slot = hook;
+	VirtualProtect(slot, sizeof(LPVOID), old_protect, &old_protect);
+	LogInfo("  Installed vtable hook for %s\n", name);
+
+	if (num_vtbl_hooks < ARRAYSIZE(vtbl_hooks))
+		vtbl_hooks[num_vtbl_hooks++] = { name, slot, hook, *orig };
+}
+
+void remove_outer_swap_chain_hooks()
+{
+	DWORD old_protect = 0;
+
+	for (unsigned i = 0; i < num_vtbl_hooks; i++) {
+		VtblHook *h = &vtbl_hooks[i];
+
+		// Only restore a slot we still own. If someone hooked on top of
+		// us they will call into our (soon unmapped) function regardless,
+		// but overwriting their pointer would break them for certain.
+		if (*h->slot != h->hook) {
+			LogInfo("  %s slot now owned by %p, leaving it alone\n", h->name, *h->slot);
+			continue;
+		}
+		if (!VirtualProtect(h->slot, sizeof(LPVOID), PAGE_READWRITE, &old_protect))
+			continue;
+		*h->slot = h->orig;
+		VirtualProtect(h->slot, sizeof(LPVOID), old_protect, &old_protect);
+		LogInfo("  Restored vtable slot for %s\n", h->name);
+	}
+	num_vtbl_hooks = 0;
+}
+
+void maybe_install_outer_swap_chain_hooks()
+{
+	IDXGIFactory1 *factory1 = NULL;
+	IDXGIFactory2 *factory2 = NULL;
+
+	if (!GetModuleHandleW(L"NvPresent64.dll"))
+		return;
+
+	// Nothing to get in front of until our own code hooks are in place.
+	if (!fnOrigCreateSwapChain)
+		return;
+
+	if (InterlockedCompareExchange(&vtbl_hooks_installed, 1, 0) != 0)
+		return;
+
+	LogInfo("*** NvPresent64.dll is loaded, hooking IDXGIFactory vtable slots to stay in front of it\n");
+
+	// Every factory shares the class vtable, so a throwaway one is enough to
+	// find the slots. Use the trampoline so we don't run our own factory hook.
+	if (FAILED(fnOrigCreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory1)) || !factory1) {
+		LogInfo("  *** CreateDXGIFactory1 failed, cannot hook the vtable, will retry on the next device\n");
+		InterlockedExchange(&vtbl_hooks_installed, 0);
+		return;
+	}
+
+	hook_vtable_slot("IDXGIFactory::CreateSwapChain", lpvtbl_slot_CreateSwapChain(factory1),
+		Vtbl_CreateSwapChain, (LPVOID*)&fnVtblOrigCreateSwapChain);
+
+	if (SUCCEEDED(factory1->QueryInterface(IID_PPV_ARGS(&factory2)))) {
+		hook_vtable_slot("IDXGIFactory2::CreateSwapChainForHwnd", lpvtbl_slot_CreateSwapChainForHwnd(factory2),
+			Vtbl_CreateSwapChainForHwnd, (LPVOID*)&fnVtblOrigCreateSwapChainForHwnd);
+		hook_vtable_slot("IDXGIFactory2::CreateSwapChainForCoreWindow", lpvtbl_slot_CreateSwapChainForCoreWindow(factory2),
+			Vtbl_CreateSwapChainForCoreWindow, (LPVOID*)&fnVtblOrigCreateSwapChainForCoreWindow);
+		hook_vtable_slot("IDXGIFactory2::CreateSwapChainForComposition", lpvtbl_slot_CreateSwapChainForComposition(factory2),
+			Vtbl_CreateSwapChainForComposition, (LPVOID*)&fnVtblOrigCreateSwapChainForComposition);
+		factory2->Release();
+	}
+
+	factory1->Release();
+}
 
 // -----------------------------------------------------------------------------
 // Actual function called by the game for every CreateDXGIFactory they make.
