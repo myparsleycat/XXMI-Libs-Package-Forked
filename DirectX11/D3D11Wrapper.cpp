@@ -381,6 +381,7 @@ void InitD311()
 
 	InitializeCriticalSectionPretty(&G->mCriticalSection);
 	InitializeCriticalSectionPretty(&G->mResourcesLock);
+	InitializeCriticalSectionPretty(&G->mResourceInfoLock);
 	InitializeCriticalSectionPretty(&resource_creation_mode_lock);
 	InitializeCriticalSectionPretty(&G->mShaderBindingsLock);
 

@@ -1327,11 +1327,15 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 	// state analysis we always need to keep a copy of the original bytecode for later analysis. For now the shader
 	// regex engine counts as deferred, though that may change with optimisations in the future.
 	if (G->hunting || !shader_regex_groups.empty()) {
+		// The copy is made before taking the lock the render thread
+		// holds for every draw call:
+		ID3DBlob* blob;
+		hr = D3DCreateBlob(BytecodeLength, &blob);
+		if (SUCCEEDED(hr))
+			memcpy(blob->GetBufferPointer(), pShaderBytecode, blob->GetBufferSize());
+
 		EnterCriticalSectionPretty(&G->mCriticalSection);
-			ID3DBlob* blob;
-			hr = D3DCreateBlob(BytecodeLength, &blob);
 			if (SUCCEEDED(hr)) {
-				memcpy(blob->GetBufferPointer(), pShaderBytecode, blob->GetBufferSize());
 				RegisterForReload(*ppShader, hash, shaderType, "bin", pClassLinkage, blob, {0}, L"", true);
 
 				// Also add the original shader to the original shaders
@@ -2099,6 +2103,23 @@ static void override_resource_desc(D3D11_TEXTURE3D_DESC *desc, TextureOverride *
 	override_resource_desc_common_2d_3d(desc, textureOverride);
 }
 
+// Records the description of a resource hash for hunting and frame analysis.
+// Only for a hash not seen before: another resource with the same hash has the
+// same description, and the existing entries are annotated by the render
+// thread under mCriticalSection, which the threads the game creates resources
+// on must not queue up behind:
+template <typename DescType>
+static void RememberResourceInfo(uint32_t hash, const DescType *desc, bool data_in_hash)
+{
+	EnterCriticalSectionPretty(&G->mResourceInfoLock);
+	if (G->mResourceInfo.find(hash) == G->mResourceInfo.end()) {
+		ResourceHashInfo &info = G->mResourceInfo[hash];
+		info = *desc;
+		info.initial_data_used_in_hash = data_in_hash;
+	}
+	LeaveCriticalSection(&G->mResourceInfoLock);
+}
+
 template <typename DescType>
 static const DescType* process_texture_override(uint32_t hash,
 		const DescType *origDesc,
@@ -2169,16 +2190,13 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
-	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateBuffer(pNewDesc, pInitialData, ppBuffer);
-	UnlockResourceCreationMode();
 
 	if (hr == S_OK && ppBuffer && *ppBuffer)
 	{
 		EnterCriticalSectionPretty(&G->mResourcesLock);
 			ResourceHandleInfo *handle_info = &G->mResources[*ppBuffer];
 			ForgetTextureOverrideMiss(*ppBuffer);
-			new ResourceReleaseTracker(*ppBuffer);
 			handle_info->type = D3D11_RESOURCE_DIMENSION_BUFFER;
 			handle_info->hash = hash;
 			handle_info->orig_hash = hash;
@@ -2190,16 +2208,9 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 			//	memcpy(&handle_info->descBuf, pDesc, sizeof(D3D11_BUFFER_DESC));
 
 		LeaveCriticalSection(&G->mResourcesLock);
-		// For stat collection and hash contamination tracking. Checked
-		// before taking the lock so that creating resources does not
-		// queue up behind the render thread when there is nothing to
-		// record:
-		if (G->hunting && pDesc) {
-			EnterCriticalSectionPretty(&G->mCriticalSection);
-				G->mResourceInfo[hash] = *pDesc;
-				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			LeaveCriticalSection(&G->mCriticalSection);
-		}
+		new ResourceReleaseTracker(*ppBuffer);
+		if (G->hunting && pDesc)
+			RememberResourceInfo(hash, pDesc, !!data_hash);
 	}
 	return hr;
 }
@@ -2228,16 +2239,13 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
-	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateTexture1D(pNewDesc, pInitialData, ppTexture1D);
-	UnlockResourceCreationMode();
 
 	if (hr == S_OK && ppTexture1D && *ppTexture1D)
 	{
 		EnterCriticalSectionPretty(&G->mResourcesLock);
 			ResourceHandleInfo *handle_info = &G->mResources[*ppTexture1D];
 			ForgetTextureOverrideMiss(*ppTexture1D);
-			new ResourceReleaseTracker(*ppTexture1D);
 			handle_info->type = D3D11_RESOURCE_DIMENSION_TEXTURE1D;
 			handle_info->hash = hash;
 			handle_info->orig_hash = hash;
@@ -2247,13 +2255,10 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 			// if (pDesc)
 			// 	memcpy(&handle_info->desc1D, pDesc, sizeof(D3D11_TEXTURE1D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);
+		new ResourceReleaseTracker(*ppTexture1D);
 		// For stat collection and hash contamination tracking:
-		if (G->hunting && pDesc) {
-			EnterCriticalSectionPretty(&G->mCriticalSection);
-				G->mResourceInfo[hash] = *pDesc;
-				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			LeaveCriticalSection(&G->mCriticalSection);
-		}
+		if (G->hunting && pDesc)
+			RememberResourceInfo(hash, pDesc, !!data_hash);
 	}
 	return hr;
 }
@@ -2341,9 +2346,7 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
 	// Actual creation:
-	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateTexture2D(pNewDesc, pInitialData, ppTexture2D);
-	UnlockResourceCreationMode();
 
 	if (ppTexture2D) LogDebug("  returns result = %x, handle = %p\n", hr, *ppTexture2D);
 
@@ -2353,7 +2356,6 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 		EnterCriticalSectionPretty(&G->mResourcesLock);
 			ResourceHandleInfo *handle_info = &G->mResources[*ppTexture2D];
 			ForgetTextureOverrideMiss(*ppTexture2D);
-			new ResourceReleaseTracker(*ppTexture2D);
 			handle_info->type = D3D11_RESOURCE_DIMENSION_TEXTURE2D;
 			handle_info->hash = hash;
 			handle_info->orig_hash = hash;
@@ -2361,12 +2363,9 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 			if (pDesc)
 				memcpy(&handle_info->desc2D, pDesc, sizeof(D3D11_TEXTURE2D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);
-		if (G->hunting && pDesc) {
-			EnterCriticalSectionPretty(&G->mCriticalSection);
-				G->mResourceInfo[hash] = *pDesc;
-				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			LeaveCriticalSection(&G->mCriticalSection);
-		}
+		new ResourceReleaseTracker(*ppTexture2D);
+		if (G->hunting && pDesc)
+			RememberResourceInfo(hash, pDesc, !!data_hash);
 	}
 
 	return hr;
@@ -2413,9 +2412,7 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
-	LockResourceCreationMode();
 	HRESULT hr = mOrigDevice1->CreateTexture3D(pNewDesc, pInitialData, ppTexture3D);
-	UnlockResourceCreationMode();
 
 	// Register texture.
 	if (hr == S_OK && ppTexture3D)
@@ -2423,7 +2420,6 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 		EnterCriticalSectionPretty(&G->mResourcesLock);
 			ResourceHandleInfo *handle_info = &G->mResources[*ppTexture3D];
 			ForgetTextureOverrideMiss(*ppTexture3D);
-			new ResourceReleaseTracker(*ppTexture3D);
 			handle_info->type = D3D11_RESOURCE_DIMENSION_TEXTURE3D;
 			handle_info->hash = hash;
 			handle_info->orig_hash = hash;
@@ -2431,12 +2427,9 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 			if (pDesc)
 				memcpy(&handle_info->desc3D, pDesc, sizeof(D3D11_TEXTURE3D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);
-		if (G->hunting && pDesc) {
-			EnterCriticalSectionPretty(&G->mCriticalSection);
-				G->mResourceInfo[hash] = *pDesc;
-				G->mResourceInfo[hash].initial_data_used_in_hash = !!data_hash;
-			LeaveCriticalSection(&G->mCriticalSection);
-		}
+		new ResourceReleaseTracker(*ppTexture3D);
+		if (G->hunting && pDesc)
+			RememberResourceInfo(hash, pDesc, !!data_hash);
 	}
 
 	LogInfo("  returns result = %x\n", hr);

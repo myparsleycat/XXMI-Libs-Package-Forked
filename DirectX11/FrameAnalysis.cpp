@@ -236,7 +236,10 @@ void FrameAnalysisContext::FrameAnalysisLogResourceHashInline(ID3D11Resource *re
 		if (orig_hash != hash)
 			fprintf(frame_analysis_log, " orig_hash=%08x", orig_hash);
 
-		info = &G->mResourceInfo.at(orig_hash);
+		{
+			CriticalSectionGuard(&G->mResourceInfoLock);
+			info = &G->mResourceInfo.at(orig_hash);
+		}
 		if (info->hash_contaminated) {
 			fprintf(frame_analysis_log, " hash_contamination=");
 			if (!info->map_contamination.empty())
@@ -1995,7 +1998,10 @@ HRESULT FrameAnalysisContext::FrameAnalysisFilename(wchar_t *filename, size_t si
 
 	if (hash) {
 		try {
-			info = &G->mResourceInfo.at(orig_hash);
+			{
+				CriticalSectionGuard(&G->mResourceInfoLock);
+				info = &G->mResourceInfo.at(orig_hash);
+			}
 			if (info->hash_contaminated) {
 				StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"=!");
 				if (!info->map_contamination.empty())
@@ -2077,7 +2083,10 @@ HRESULT FrameAnalysisContext::FrameAnalysisFilenameResource(wchar_t *filename, s
 
 	if (hash) {
 		try {
-			info = &G->mResourceInfo.at(orig_hash);
+			{
+				CriticalSectionGuard(&G->mResourceInfoLock);
+				info = &G->mResourceInfo.at(orig_hash);
+			}
 			if (info->hash_contaminated) {
 				StringCchPrintfExW(pos, rem, &pos, &rem, NULL, L"=!");
 				if (!info->map_contamination.empty())

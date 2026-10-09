@@ -676,6 +676,15 @@ struct Globals
 	CRITICAL_SECTION mResourcesLock;
 	ResourceMap mResources;
 
+	// Guards insertion into and lookup in mResourceInfo, so that the
+	// threads the game creates resources on do not queue up behind the
+	// render thread's mCriticalSection for it. Entries are never removed
+	// and never written again once inserted from resource creation; the
+	// hash contamination fields are changed under mCriticalSection as
+	// before. Take after mCriticalSection when both are needed, and do
+	// not call into DirectX while holding it:
+	CRITICAL_SECTION mResourceInfoLock;
+
 	std::unordered_map<ID3D11Asynchronous*, AsyncQueryType> mQueryTypes;
 
 	// These five items work with the *original* resource hash:
@@ -815,6 +824,13 @@ struct Globals
 		gFrameTime(0)
 	{
 		int i;
+
+		// Sized for a large game up front so that the maps the render
+		// thread looks up on every draw call do not rehash under their
+		// locks while the game is streaming resources in:
+		mResources.reserve(1 << 17);
+		mShaders.reserve(1 << 14);
+		mReloadedShaders.reserve(1 << 14);
 
 		SHADER_PATH[0] = 0;
 		SHADER_CACHE_PATH[0] = 0;

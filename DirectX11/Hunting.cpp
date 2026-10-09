@@ -47,6 +47,7 @@ static void DumpUsageResourceInfo(HANDLE f, std::set<uint32_t> *hashes, char *ta
 
 	for (orig_hash = hashes->begin(); orig_hash != hashes->end(); orig_hash++) {
 		try {
+			CriticalSectionGuard(&G->mResourceInfoLock);
 			info = &G->mResourceInfo.at(*orig_hash);
 		} catch (std::out_of_range) {
 			continue;
@@ -170,6 +171,7 @@ static void DumpUsageRegister(HANDLE f, char *tag, int id, const ResourceSnapsho
 	}
 
 	try {
+		CriticalSectionGuard(&G->mResourceInfoLock);
 		if (G->mResourceInfo.at(info.orig_hash).hash_contaminated) {
 			sprintf(buf, " hash_contaminated=true");
 			WriteFile(f, buf, castStrLen(buf), &written, 0);
@@ -1822,7 +1824,9 @@ static uint32_t LogRenderTarget(ID3D11Resource *target, char *log_prefix)
 	// The above may have just registered a blank entry for the target:
 	ForgetTextureOverrideMiss(target);
 	LeaveCriticalSection(&G->mResourcesLock);
+	EnterCriticalSectionPretty(&G->mResourceInfoLock);
 	struct ResourceHashInfo &info = G->mResourceInfo[orig_hash];
+	LeaveCriticalSection(&G->mResourceInfoLock);
 	StrResourceDesc(buf, 256, info);
 	LogInfo("%srender target handle = %p, hash = %08lx, orig_hash = %08lx, %s\n",
 		log_prefix, target, hash, orig_hash, buf);

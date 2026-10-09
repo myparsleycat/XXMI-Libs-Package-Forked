@@ -1022,11 +1022,15 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::hash_tracking_overhead.hits++;
 
-	// Faster than catching an out_of_range exception from .at():
+	// Faster than catching an out_of_range exception from .at(). The
+	// iterator is only valid under the lock, since resource creation may
+	// rehash the map; the entry itself stays put, so its address is kept:
+	EnterCriticalSectionPretty(&G->mResourceInfoLock);
 	info_i = G->mResourceInfo.find(dstHash);
-	if (info_i == G->mResourceInfo.end())
+	dstInfo = info_i != G->mResourceInfo.end() ? &info_i->second : NULL;
+	LeaveCriticalSection(&G->mResourceInfoLock);
+	if (!dstInfo)
 		goto out_unlock;
-	dstInfo = &info_i->second;
 
 	GetResourceInfoFields(dstInfo, DstSubresource,
 			&dstWidth, &dstHeight, &dstDepth,
@@ -1042,10 +1046,11 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 		srcHash = GetOrigResourceHash(src);
 		G->mCopiedResourceInfo.insert(srcHash);
 
-		// Faster than catching an out_of_range exception from .at():
+		EnterCriticalSectionPretty(&G->mResourceInfoLock);
 		info_i = G->mResourceInfo.find(srcHash);
-		if (info_i != G->mResourceInfo.end()) {
-			srcInfo = &info_i->second;
+		srcInfo = info_i != G->mResourceInfo.end() ? &info_i->second : NULL;
+		LeaveCriticalSection(&G->mResourceInfoLock);
+		if (srcInfo) {
 			GetResourceInfoFields(srcInfo, srcSubresource,
 					&srcWidth, &srcHeight, &srcDepth,
 					&srcIdx, &srcMip, &srcArraySize);
