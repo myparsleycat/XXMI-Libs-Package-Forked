@@ -541,23 +541,16 @@ void HackerContext::ProcessShaderOverride(ShaderOverride *shaderOverride, bool i
 // over automatically replaced shaders.
 template <class ID3D11Shader,
 	void (__stdcall ID3D11DeviceContext::*GetShaderVS2013BUGWORKAROUND)(ID3D11Shader**, ID3D11ClassInstance**, UINT*),
-	void (__stdcall ID3D11DeviceContext::*SetShaderVS2013BUGWORKAROUND)(ID3D11Shader*, ID3D11ClassInstance*const*, UINT),
-	HRESULT (__stdcall ID3D11Device::*CreateShader)(const void*, SIZE_T, ID3D11ClassLinkage*, ID3D11Shader**)
+	void (__stdcall ID3D11DeviceContext::*SetShaderVS2013BUGWORKAROUND)(ID3D11Shader*, ID3D11ClassInstance*const*, UINT)
 >
 void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, wchar_t *shader_type)
 {
-	ID3D11Shader *orig_shader = NULL, *patched_shader = NULL;
+	ID3D11Shader *bound_shader = NULL, *replacement = NULL;
 	ID3D11ClassInstance *class_instances[256];
 	ShaderReloadMap::iterator orig_info_i;
 	OriginalShaderInfo *orig_info = NULL;
 	UINT num_instances = 0;
-	string asm_text;
-	bool patch_regex = false;
-	HRESULT hr;
 	unsigned i;
-	wstring tagline(L"//");
-	vector<byte> patched_bytecode;
-	vector<char> asm_vector;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
@@ -567,123 +560,25 @@ void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 		goto out_drop;
 	orig_info = &orig_info_i->second;
 
-	if (!orig_info->deferred_replacement_candidate || orig_info->deferred_replacement_processed)
+	if (!orig_info->deferred_replacement_candidate)
 		goto out_drop;
 
-	// Remember that we have analysed this one so we don't check it again
-	// (until config reload) regardless of whether we patch it or not:
-	orig_info->deferred_replacement_processed = true;
-
-	switch (load_shader_regex_cache(hash, shader_type, &patched_bytecode, &tagline)) {
-	case ShaderRegexCache::NO_MATCH:
-		LogInfo("%S %016I64x has cached ShaderRegex miss\n", shader_type, hash);
-		goto out_drop;
-	case ShaderRegexCache::MATCH:
-		LogInfo("Loaded %S %016I64x command list from ShaderRegex cache\n", shader_type, hash);
-		goto out_drop;
-	case ShaderRegexCache::PATCH:
-		LogInfo("Loaded %S %016I64x bytecode from ShaderRegex cache\n", shader_type, hash);
-		break;
-	case ShaderRegexCache::NO_CACHE:
-		LogInfo("Performing deferred shader analysis on %S %016I64x...\n", shader_type, hash);
-
-		// Detect shader model
-		auto it = G->mShaderModelCache.find(hash);
-		if (it != G->mShaderModelCache.end()) {
-			orig_info->shaderModel = it->second.shaderModel;
-			LogInfo("%S %016I64x shader model %s is loaded from cache.\n", shader_type, hash, orig_info->shaderModel.c_str());
-		}
-		else {
-			if (orig_info->shaderModel == "bin") {
-				// Get shader model from bytecode.
-				if (!get_shader_model_from_bytecode(orig_info->byteCode->GetBufferPointer(), orig_info->byteCode->GetBufferSize(), &orig_info->shaderModel)) {
-					LogInfo("%S %016I64x shader model detection from bytecode failed.\n", shader_type, hash);
-					goto out_drop;
-				}
-				// Store shader model in cache.
-				G->mShaderModelCache.emplace(hash, ShaderModelCacheEntry{ orig_info->shaderModel });
-				LogInfo("%S %016I64x shader model %s detected from bytecode.\n", shader_type, hash, orig_info->shaderModel.c_str());
-			}
-		}
-
-		bool decompilation_required = false;
-
-		// Process ShaderRegex sections that don't require bytecode decompilation.
-		link_shader_regex_groups_without_patterns(shader_type, &orig_info->shaderModel, hash, &decompilation_required);
-
-		// Skip disassemble entirely if there are no matching ShaderRegex with Patterns found.
-		if (!decompilation_required) {
-			LogInfo("%S %016I64x disassembly skipped: no matching ShaderRegex with Patterns found for %s.\n", shader_type, hash, orig_info->shaderModel.c_str());
-			goto out_drop;
-		}
-
-		// Disassemble shader bytecode.
-		asm_text = BinaryToAsmText(
-			orig_info->byteCode->GetBufferPointer(),
-			orig_info->byteCode->GetBufferSize(),
-			G->patch_cb_offsets,
-			G->disassemble_undecipherable_custom_data);
-
-		if (asm_text.empty())
-			goto out_drop;
-
-		// Apply patches from ShaderRegex with Patterns (and Templates).
-		try {
-			patch_regex = apply_shader_regex_groups(&asm_text, shader_type, &orig_info->shaderModel, hash, &tagline);
-		} catch (...) {
-			LogInfo("    *** Exception while patching shader\n");
-			goto out_drop;
-		}
-
-		if (!patch_regex) {
-			LogInfo("Patch did not apply\n");
-			goto out_drop;
-		}
-
-		// No longer logging this since we can output to ShaderFixes
-		// via hunting if marking_actions = regex, or it could be
-		// disassembled from the regex cache with cmd_Decompiler
-		// LogInfo("Patched Shader:\n%s\n", asm_text.c_str());
-
-		asm_vector.assign(asm_text.begin(), asm_text.end());
-
-		try {
-			vector<AssemblerParseError> parse_errors;
-			hr = AssembleFluganWithSignatureParsing(&asm_vector, &patched_bytecode, &parse_errors);
-			if (FAILED(hr)) {
-				LogInfo("    *** Assembling patched shader failed\n");
-				goto out_drop;
-			}
-			// Parse errors are currently being treated as non-fatal on
-			// creation time replacement and ShaderRegex for backwards
-			// compatibility (live shader reload is fatal).
-			for (auto &parse_error : parse_errors)
-				LogOverlayW(LOG_NOTICE, L"%016I64x-%ls %ls: %S\n",
-						hash, shader_type, tagline.c_str(), parse_error.what());
-		} catch (const exception &e) {
-			LogOverlayW(LOG_WARNING, L"Error assembling ShaderRegex patched %016I64x-%ls\n%ls\n%S\n",
-					hash, shader_type, tagline.c_str(), e.what());
-			goto out_drop;
-		}
-
-		save_shader_regex_cache_bin(hash, shader_type, &patched_bytecode);
+	if (!orig_info->deferred_replacement_processed) {
+		// Remember that we have analysed this one so we don't check it
+		// again (until config reload) regardless of whether we patch it
+		// or not:
+		orig_info->deferred_replacement_processed = true;
+		apply_shader_regex_to_shader(mOrigDevice1, orig_info);
 	}
 
-	hr = (mOrigDevice1->*CreateShader)(patched_bytecode.data(), patched_bytecode.size(),
-			orig_info->linkage, &patched_shader);
-	CleanupShaderMaps(patched_shader);
-	if (FAILED(hr)) {
-		LogInfo("    *** Creating replacement shader failed\n");
-		goto out_drop;
+	// A config reload may have put a new replacement in place without
+	// the game binding the shader again since, so make sure the one
+	// bound is the current one. Held across the unlock below so that a
+	// reload on another thread cannot release it under us:
+	if (orig_info->replacement && orig_info->replacement_from_regex) {
+		replacement = (ID3D11Shader*)orig_info->replacement;
+		replacement->AddRef();
 	}
-
-	// Update replacement map so we don't have to repeat this process.
-	// Not updating the bytecode in the replaced shader map - we do that
-	// elsewhere, but I think that is a bug. Need to untangle that first.
-	if (orig_info->replacement)
-		orig_info->replacement->Release();
-	orig_info->replacement = patched_shader;
-	orig_info->infoText = tagline;
 
 	// Now that we've finished updating our data structures we can drop the
 	// critical section before calling into DirectX to bind the replacement
@@ -691,20 +586,25 @@ void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 	// release tracker, but that now uses a different lock.
 	LeaveCriticalSection(&G->mCriticalSection);
 
+	if (!replacement)
+		return;
+
 	// And bind the replaced shader in time for this draw call:
 	// VSBUGWORKAROUND: VS2013 toolchain has a bug that mistakes a member
 	// pointer called "SetShader" for the SetShader we have in
 	// HackerContext, even though the member pointer we were passed very
 	// clearly points to a member function of ID3D11DeviceContext. VS2015
 	// toolchain does not suffer from this bug.
-	(mOrigContext1->*GetShaderVS2013BUGWORKAROUND)(&orig_shader, class_instances, &num_instances);
-	(mOrigContext1->*SetShaderVS2013BUGWORKAROUND)(patched_shader, class_instances, num_instances);
-	if (orig_shader)
-		orig_shader->Release();
+	(mOrigContext1->*GetShaderVS2013BUGWORKAROUND)(&bound_shader, class_instances, &num_instances);
+	if (bound_shader != replacement)
+		(mOrigContext1->*SetShaderVS2013BUGWORKAROUND)(replacement, class_instances, num_instances);
+	if (bound_shader)
+		bound_shader->Release();
 	for (i = 0; i < num_instances; i++) {
 		if (class_instances[i])
 			class_instances[i]->Release();
 	}
+	replacement->Release();
 	return;
 
 out_drop:
@@ -773,40 +673,35 @@ void HackerContext::DeferredShaderReplacementBeforeDraw()
 	if (mCurrentVertexShaderHandle && mVertexShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11VertexShader,
 			&ID3D11DeviceContext::VSGetShader,
-			&ID3D11DeviceContext::VSSetShader,
-			&ID3D11Device::CreateVertexShader>
+			&ID3D11DeviceContext::VSSetShader>
 			(mCurrentVertexShaderHandle, mCurrentVertexShader, L"vs");
 		mVertexShaderDeferredPending = false;
 	}
 	if (mCurrentHullShaderHandle && mHullShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11HullShader,
 			&ID3D11DeviceContext::HSGetShader,
-			&ID3D11DeviceContext::HSSetShader,
-			&ID3D11Device::CreateHullShader>
+			&ID3D11DeviceContext::HSSetShader>
 			(mCurrentHullShaderHandle, mCurrentHullShader, L"hs");
 		mHullShaderDeferredPending = false;
 	}
 	if (mCurrentDomainShaderHandle && mDomainShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11DomainShader,
 			&ID3D11DeviceContext::DSGetShader,
-			&ID3D11DeviceContext::DSSetShader,
-			&ID3D11Device::CreateDomainShader>
+			&ID3D11DeviceContext::DSSetShader>
 			(mCurrentDomainShaderHandle, mCurrentDomainShader, L"ds");
 		mDomainShaderDeferredPending = false;
 	}
 	if (mCurrentGeometryShaderHandle && mGeometryShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11GeometryShader,
 			&ID3D11DeviceContext::GSGetShader,
-			&ID3D11DeviceContext::GSSetShader,
-			&ID3D11Device::CreateGeometryShader>
+			&ID3D11DeviceContext::GSSetShader>
 			(mCurrentGeometryShaderHandle, mCurrentGeometryShader, L"gs");
 		mGeometryShaderDeferredPending = false;
 	}
 	if (mCurrentPixelShaderHandle && mPixelShaderDeferredPending) {
 		DeferredShaderReplacement<ID3D11PixelShader,
 			&ID3D11DeviceContext::PSGetShader,
-			&ID3D11DeviceContext::PSSetShader,
-			&ID3D11Device::CreatePixelShader>
+			&ID3D11DeviceContext::PSSetShader>
 			(mCurrentPixelShaderHandle, mCurrentPixelShader, L"ps");
 		mPixelShaderDeferredPending = false;
 	}
@@ -827,8 +722,7 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
 
 	DeferredShaderReplacement<ID3D11ComputeShader,
 		&ID3D11DeviceContext::CSGetShader,
-		&ID3D11DeviceContext::CSSetShader,
-		&ID3D11Device::CreateComputeShader>
+		&ID3D11DeviceContext::CSSetShader>
 		(mCurrentComputeShaderHandle, mCurrentComputeShader, L"cs");
 	mComputeShaderDeferredPending = false;
 }

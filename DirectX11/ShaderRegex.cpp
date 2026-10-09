@@ -2,13 +2,30 @@
 #include "CommandList.h"
 #include "globals.h" // For ShaderOverride FIXME: This should be in a separate header
 #include "log.h"
+#include "Overlay.h"
 
 #include <algorithm>
 #include <iterator>
+#include <unordered_map>
 
 ShaderRegexGroups shader_regex_groups;
 std::vector<ShaderRegexGroup*> shader_regex_group_index;
 uint32_t shader_regex_hash;
+
+// The outcome of ShaderRegex analysis for one shader hash, kept in memory so
+// that a config reload which leaves the ShaderRegex sections alone, or a
+// shader the game creates again, is served without reading the cache files
+// or disassembling the shader again. Only valid while regex_hash matches
+// shader_regex_hash. Accessed with G->mCriticalSection held.
+struct ShaderRegexResult {
+	uint32_t regex_hash = 0;
+	std::wstring shader_type;
+	bool patched = false;
+	std::vector<uint32_t> match_ids;
+	std::vector<byte> patched_bytecode;
+	std::wstring tagline;
+};
+static std::unordered_map<UINT64, ShaderRegexResult> shader_regex_results;
 
 static void log_pcre2_error_nonl(int err, char *fmt, ...)
 {
@@ -475,7 +492,7 @@ struct ShaderRegexCacheHeader {
 	uint32_t num_matches;
 };
 
-ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode, std::wstring *tagline)
+static ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type, ShaderRegexResult *result)
 {
 	ShaderRegexCache ret = ShaderRegexCache::NO_CACHE;
 	HANDLE meta_f = INVALID_HANDLE_VALUE;
@@ -488,6 +505,11 @@ ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type
 	byte *buf = NULL;
 	size_t suffix;
 	uint32_t i;
+
+	*result = ShaderRegexResult();
+	result->regex_hash = shader_regex_hash;
+	result->shader_type = shader_type;
+	result->tagline = L"//";
 
 	suffix = swprintf_s(path, MAX_PATH, L"%ls\\%016llx-%ls_regex.", G->SHADER_CACHE_PATH, hash, shader_type);
 	wcscpy_s(path+suffix, MAX_PATH-suffix, L"dat");
@@ -514,6 +536,8 @@ ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type
 	if (size != sizeof(ShaderRegexCacheHeader) + header->num_matches * sizeof(uint32_t))
 		goto out;
 
+	result->patched = !!header->patched;
+
 	// num_matches may be 0, which means the ShaderRegex didn't match the
 	// shader, but we cache it anyway to skip processing the shader again.
 	// We don't really need any special handling for this case, since
@@ -532,11 +556,12 @@ ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type
 		if (match_ids[i] >= shader_regex_group_index.size())
 			goto out;
 		group = shader_regex_group_index[match_ids[i]];
+		result->match_ids.push_back(match_ids[i]);
 
 		LogInfo("ShaderRegexCache: %S %016I64x matches [%S]\n", shader_type, hash, group->ini_section.c_str());
 
-		if (header->patched && tagline)
-			tagline->append(std::wstring(L"[") + group->ini_section + std::wstring(L"]"));
+		if (header->patched)
+			result->tagline.append(std::wstring(L"[") + group->ini_section + std::wstring(L"]"));
 
 		group->link_command_lists_and_filter_index(hash);
 	}
@@ -547,8 +572,8 @@ ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type
 		if (bin_f == INVALID_HANDLE_VALUE)
 			goto out;
 		size = GetFileSize(bin_f, 0);
-		bytecode->resize(size);
-		if (!size || !ReadFile(bin_f, bytecode->data(), size, &size2, NULL) || size != size2)
+		result->patched_bytecode.resize(size);
+		if (!size || !ReadFile(bin_f, result->patched_bytecode.data(), size, &size2, NULL) || size != size2)
 			goto out;
 		ret = ShaderRegexCache::PATCH;
 	} else
@@ -719,7 +744,7 @@ bool get_shader_model_from_bytecode(const void* data, size_t size, std::string* 
 }
 
 // Process groups that do not have patches to apply. Those can be handled without disassembly.
-void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required)
+static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required, std::vector<uint32_t> *match_ids_out)
 {
 	ShaderRegexGroups::iterator i;
 	vector<uint32_t> match_ids;
@@ -758,10 +783,12 @@ void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::
 		// won't be any. This only saves the metadata - the caller will use
 		// save_shader_regex_cache_bin to save the assembled binary.
 		save_shader_regex_cache_meta(hash, shader_type, &match_ids, false, nullptr, nullptr);
+		if (match_ids_out)
+			*match_ids_out = match_ids;
 	}
 }
 
-bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline)
+bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out)
 {
 	ShaderRegexGroups::iterator i;
 	ShaderRegexGroup *group;
@@ -804,6 +831,230 @@ bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type
 	// won't be any. This only saves the metadata - the caller will use
 	// save_shader_regex_cache_bin to save the assembled binary.
 	save_shader_regex_cache_meta(hash, shader_type, &match_ids, patched, asm_text, tagline);
+	if (match_ids_out)
+		*match_ids_out = match_ids;
 
 	return patched;
+}
+
+static ShaderRegexResult* store_shader_regex_result(UINT64 hash, ShaderRegexResult *result)
+{
+	ShaderRegexResult *stored = &shader_regex_results[hash];
+	*stored = std::move(*result);
+	return stored;
+}
+
+// The analysis that used to live in HackerContext::DeferredShaderReplacement():
+// disassemble, run the ShaderRegex groups over the assembly, reassemble when
+// anything was patched. Returns NULL when it failed, in which case nothing is
+// remembered and the shader will be analysed again after the next config
+// reload:
+static ShaderRegexResult* analyse_shader_regex(UINT64 hash, const wchar_t *shader_type, OriginalShaderInfo *orig_info, ShaderRegexResult *result)
+{
+	bool decompilation_required = false;
+	bool patch_regex = false;
+	string asm_text;
+	vector<char> asm_vector;
+	HRESULT hr;
+
+	LogInfo("Performing deferred shader analysis on %S %016I64x...\n", shader_type, hash);
+
+	// Detect shader model
+	auto it = G->mShaderModelCache.find(hash);
+	if (it != G->mShaderModelCache.end()) {
+		orig_info->shaderModel = it->second.shaderModel;
+		LogInfo("%S %016I64x shader model %s is loaded from cache.\n", shader_type, hash, orig_info->shaderModel.c_str());
+	}
+	else {
+		if (orig_info->shaderModel == "bin") {
+			// Get shader model from bytecode.
+			if (!get_shader_model_from_bytecode(orig_info->byteCode->GetBufferPointer(), orig_info->byteCode->GetBufferSize(), &orig_info->shaderModel)) {
+				LogInfo("%S %016I64x shader model detection from bytecode failed.\n", shader_type, hash);
+				return NULL;
+			}
+			// Store shader model in cache.
+			G->mShaderModelCache.emplace(hash, ShaderModelCacheEntry{ orig_info->shaderModel });
+			LogInfo("%S %016I64x shader model %s detected from bytecode.\n", shader_type, hash, orig_info->shaderModel.c_str());
+		}
+	}
+
+	// Process ShaderRegex sections that don't require bytecode decompilation.
+	link_shader_regex_groups_without_patterns(shader_type, &orig_info->shaderModel, hash, &decompilation_required, &result->match_ids);
+
+	// Skip disassemble entirely if there are no matching ShaderRegex with Patterns found.
+	if (!decompilation_required) {
+		LogInfo("%S %016I64x disassembly skipped: no matching ShaderRegex with Patterns found for %s.\n", shader_type, hash, orig_info->shaderModel.c_str());
+		return store_shader_regex_result(hash, result);
+	}
+
+	// Disassemble shader bytecode.
+	asm_text = BinaryToAsmText(
+		orig_info->byteCode->GetBufferPointer(),
+		orig_info->byteCode->GetBufferSize(),
+		G->patch_cb_offsets,
+		G->disassemble_undecipherable_custom_data);
+
+	if (asm_text.empty())
+		return NULL;
+
+	// Apply patches from ShaderRegex with Patterns (and Templates).
+	try {
+		patch_regex = apply_shader_regex_groups(&asm_text, shader_type, &orig_info->shaderModel, hash, &result->tagline, &result->match_ids);
+	} catch (...) {
+		LogInfo("    *** Exception while patching shader\n");
+		return NULL;
+	}
+
+	if (!patch_regex) {
+		LogInfo("Patch did not apply\n");
+		return store_shader_regex_result(hash, result);
+	}
+
+	// No longer logging this since we can output to ShaderFixes
+	// via hunting if marking_actions = regex, or it could be
+	// disassembled from the regex cache with cmd_Decompiler
+	// LogInfo("Patched Shader:\n%s\n", asm_text.c_str());
+
+	asm_vector.assign(asm_text.begin(), asm_text.end());
+
+	try {
+		vector<AssemblerParseError> parse_errors;
+		hr = AssembleFluganWithSignatureParsing(&asm_vector, &result->patched_bytecode, &parse_errors);
+		if (FAILED(hr)) {
+			LogInfo("    *** Assembling patched shader failed\n");
+			return NULL;
+		}
+		// Parse errors are currently being treated as non-fatal on
+		// creation time replacement and ShaderRegex for backwards
+		// compatibility (live shader reload is fatal).
+		for (auto &parse_error : parse_errors)
+			LogOverlayW(LOG_NOTICE, L"%016I64x-%ls %ls: %S\n",
+					hash, shader_type, result->tagline.c_str(), parse_error.what());
+	} catch (const exception &e) {
+		LogOverlayW(LOG_WARNING, L"Error assembling ShaderRegex patched %016I64x-%ls\n%ls\n%S\n",
+				hash, shader_type, result->tagline.c_str(), e.what());
+		return NULL;
+	}
+
+	save_shader_regex_cache_bin(hash, shader_type, &result->patched_bytecode);
+	result->patched = true;
+
+	return store_shader_regex_result(hash, result);
+}
+
+// The outcome for a shader: from memory, else from the cache files, else by
+// analysis. Whichever way, the command lists of the matched groups are linked
+// to the shader's ShaderOverride, which a config reload clears:
+static ShaderRegexResult* resolve_shader_regex(UINT64 hash, const wchar_t *shader_type, OriginalShaderInfo *orig_info)
+{
+	ShaderRegexResult result;
+	uint32_t i;
+
+	auto stored = shader_regex_results.find(hash);
+	if (stored != shader_regex_results.end()) {
+		ShaderRegexResult *r = &stored->second;
+		bool valid = r->regex_hash == shader_regex_hash && r->shader_type == shader_type;
+
+		for (i = 0; valid && i < r->match_ids.size(); i++)
+			valid = r->match_ids[i] < shader_regex_group_index.size();
+
+		if (valid) {
+			for (i = 0; i < r->match_ids.size(); i++)
+				shader_regex_group_index[r->match_ids[i]]->link_command_lists_and_filter_index(hash);
+			return r;
+		}
+
+		shader_regex_results.erase(stored);
+	}
+
+	switch (load_shader_regex_cache(hash, shader_type, &result)) {
+	case ShaderRegexCache::NO_MATCH:
+		LogInfo("%S %016I64x has cached ShaderRegex miss\n", shader_type, hash);
+		return store_shader_regex_result(hash, &result);
+	case ShaderRegexCache::MATCH:
+		LogInfo("Loaded %S %016I64x command list from ShaderRegex cache\n", shader_type, hash);
+		return store_shader_regex_result(hash, &result);
+	case ShaderRegexCache::PATCH:
+		LogInfo("Loaded %S %016I64x bytecode from ShaderRegex cache\n", shader_type, hash);
+		return store_shader_regex_result(hash, &result);
+	case ShaderRegexCache::NO_CACHE:
+		break;
+	}
+
+	// A partial cache read may have linked some groups and filled some of
+	// the result already. Start the analysis from a clean result:
+	result = ShaderRegexResult();
+	result.regex_hash = shader_regex_hash;
+	result.shader_type = shader_type;
+	result.tagline = L"//";
+
+	return analyse_shader_regex(hash, shader_type, orig_info, &result);
+}
+
+static bool create_shader_regex_replacement(ID3D11Device *device, OriginalShaderInfo *orig_info, ShaderRegexResult *result)
+{
+	const void *bytecode = result->patched_bytecode.data();
+	SIZE_T size = result->patched_bytecode.size();
+	ID3D11ClassLinkage *linkage = orig_info->linkage;
+	ID3D11DeviceChild *replacement = NULL;
+	const wstring &type = orig_info->shaderType;
+	HRESULT hr;
+
+	if (type == L"vs")
+		hr = device->CreateVertexShader(bytecode, size, linkage, (ID3D11VertexShader**)&replacement);
+	else if (type == L"ps")
+		hr = device->CreatePixelShader(bytecode, size, linkage, (ID3D11PixelShader**)&replacement);
+	else if (type == L"cs")
+		hr = device->CreateComputeShader(bytecode, size, linkage, (ID3D11ComputeShader**)&replacement);
+	else if (type == L"gs")
+		hr = device->CreateGeometryShader(bytecode, size, linkage, (ID3D11GeometryShader**)&replacement);
+	else if (type == L"hs")
+		hr = device->CreateHullShader(bytecode, size, linkage, (ID3D11HullShader**)&replacement);
+	else if (type == L"ds")
+		hr = device->CreateDomainShader(bytecode, size, linkage, (ID3D11DomainShader**)&replacement);
+	else
+		hr = E_INVALIDARG;
+
+	CleanupShaderMaps(replacement);
+	if (FAILED(hr) || !replacement) {
+		LogInfo("    *** Creating replacement shader failed\n");
+		return false;
+	}
+
+	// Update replacement map so we don't have to repeat this process.
+	// Not updating the bytecode in the replaced shader map - we do that
+	// elsewhere, but I think that is a bug. Need to untangle that first.
+	if (orig_info->replacement)
+		orig_info->replacement->Release();
+	orig_info->replacement = replacement;
+	orig_info->replacement_from_regex = true;
+	orig_info->replacement_regex_hash = result->regex_hash;
+	orig_info->infoText = result->tagline;
+
+	return true;
+}
+
+bool apply_shader_regex_to_shader(ID3D11Device *device, OriginalShaderInfo *orig_info)
+{
+	ShaderRegexResult *result;
+
+	result = resolve_shader_regex(orig_info->hash, orig_info->shaderType.c_str(), orig_info);
+	if (!result || !result->patched)
+		return false;
+
+	if (orig_info->replacement && orig_info->replacement_from_regex
+	 && orig_info->replacement_regex_hash == result->regex_hash)
+		return true;
+
+	return create_shader_regex_replacement(device, orig_info, result);
+}
+
+void drop_stale_shader_regex_results()
+{
+	for (auto i = shader_regex_results.begin(); i != shader_regex_results.end();) {
+		if (i->second.regex_hash != shader_regex_hash)
+			i = shader_regex_results.erase(i);
+		else
+			i++;
+	}
 }

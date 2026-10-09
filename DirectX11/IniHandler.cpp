@@ -5386,6 +5386,8 @@ static void MarkAllShadersDeferredUnprocessed()
 {
 	ShaderReloadMap::iterator i;
 
+	drop_stale_shader_regex_results();
+
 	for (i = G->mReloadedShaders.begin(); i != G->mReloadedShaders.end(); i++) {
 		// Whenever we reload the config we clear the processed flag on
 		// all auto patched shaders to ensure that they will be
@@ -5400,9 +5402,6 @@ static void MarkAllShadersDeferredUnprocessed()
 	// Contexts only look for unprocessed shaders when they are bound, so
 	// make them recheck the shaders that are still bound from before:
 	G->deferred_shader_generation++;
-
-	// TODO: If ShaderRegex hash is unchanged leave these shaders in place
-	// and just update the ShaderOverrides & filter_index
 }
 
 void ReloadConfig(HackerDevice *device)

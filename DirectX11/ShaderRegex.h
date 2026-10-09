@@ -57,11 +57,23 @@ struct ShaderBindings
 	std::array<ShaderResource, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> resources{};
 };
 
-void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required);
-bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline);
-ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode, std::wstring *tagline);
+struct OriginalShaderInfo;
+
+bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out = NULL);
 void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode);
 bool unlink_shader_regex_command_lists_and_filter_index(UINT64 shader_hash);
+
+// Works out and applies the ShaderRegex outcome for one shader registered in
+// G->mReloadedShaders: links the command lists of the matched groups to its
+// ShaderOverride and, when it is patched, creates the replacement shader on
+// device unless the one it already has was patched under the current
+// ShaderRegex sections. Returns true when a ShaderRegex replacement is in
+// place afterwards. Call with G->mCriticalSection held.
+bool apply_shader_regex_to_shader(ID3D11Device *device, OriginalShaderInfo *orig_info);
+
+// Config reload: forgets the results of the previous ShaderRegex sections.
+// Call with G->mCriticalSection held.
+void drop_stale_shader_regex_results();
 
 typedef std::set<std::string> ShaderRegexTemps;
 typedef std::set<std::string> ShaderRegexModels;

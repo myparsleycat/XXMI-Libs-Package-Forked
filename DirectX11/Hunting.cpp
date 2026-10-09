@@ -810,6 +810,7 @@ static bool ReloadShader(wchar_t *shaderPath, wchar_t *fileName, HackerDevice *d
 			if (G->mReloadedShaders[oldShader].replacement != NULL)
 				G->mReloadedShaders[oldShader].replacement->Release();
 			G->mReloadedShaders[oldShader].replacement = replacement;
+			G->mReloadedShaders[oldShader].replacement_from_regex = false;
 
 			// We do *not* replace the byteCode in the ReloadedShaders map,
 			// since that is used in future CopyToFixes and ShaderRegex which
@@ -1119,6 +1120,7 @@ static void RevertMissingShaders()
 
 		replacement->AddRef();
 		i->second.replacement = replacement;
+		i->second.replacement_from_regex = false;
 		i->second.timeStamp = { 0 };
 		i->second.infoText.clear();
 

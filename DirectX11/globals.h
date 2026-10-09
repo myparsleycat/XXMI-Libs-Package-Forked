@@ -125,6 +125,11 @@ struct OriginalShaderInfo
 	bool found;
 	bool deferred_replacement_candidate;
 	bool deferred_replacement_processed;
+	// Set when replacement was patched by ShaderRegex, with the
+	// shader_regex_hash of the sections it was patched under, so that a
+	// config reload that leaves those sections alone can keep it:
+	bool replacement_from_regex = false;
+	uint32_t replacement_regex_hash = 0;
 	std::wstring infoText;
 };
 
