@@ -523,3 +523,8 @@ public:
 };
 
 HackerDevice* lookup_hacker_device(IUnknown *unknown);
+
+// Takes the list of files in ShaderFixes that shader creation consults
+// instead of probing the disk. Called whenever the config is loaded, the
+// fixes are reloaded or hunting is toggled:
+void SnapshotShaderFixes();

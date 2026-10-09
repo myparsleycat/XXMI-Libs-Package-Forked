@@ -1162,6 +1162,10 @@ static void ReloadFixes(HackerDevice *device, void *private_data)
 		for (ShaderReloadMap::iterator iter = G->mReloadedShaders.begin(); iter != G->mReloadedShaders.end(); iter++)
 			iter->second.found = false;
 
+		// Files added since the last config load must also be found by
+		// shaders created from now on:
+		SnapshotShaderFixes();
+
 		// Strict file name format, to allow renaming out of the way. 
 		// "00aa7fa12bbf66b3-ps_replace.txt" or "00aa7fa12bbf66b3-vs.txt"
 		// Will still blow up if the first characters are not hex.
@@ -1949,6 +1953,10 @@ static void ToggleHunting(HackerDevice *device, void *private_data)
 	else
 		G->hunting = HUNTING_MODE_ENABLED;
 	LogInfo("> Hunting toggled to %d\n", G->hunting);
+
+	// Hunting adds files to ShaderFixes, so the snapshot taken while it
+	// was off is stale once it is turned off again:
+	SnapshotShaderFixes();
 }
 
 void ParseHuntingSection()

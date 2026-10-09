@@ -5016,6 +5016,8 @@ void LoadConfigFile()
 	if (G->hide_cursor || G->SCREEN_UPSCALING)
 		InstallMouseHooks(G->hide_cursor);
 
+	SnapshotShaderFixes();
+
 	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
 
 	emit_ini_warning_tone();

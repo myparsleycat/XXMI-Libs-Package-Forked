@@ -18,6 +18,9 @@
 
 #include <D3Dcompiler.h>
 #include <codecvt>
+#include <algorithm>
+#include <memory>
+#include <unordered_set>
 
 #include "log.h"
 #include "util.h"
@@ -1162,6 +1165,76 @@ static bool DecompileAndPossiblyPatchShader(__in UINT64 hash,
 // the string read from the first line of the HLSL file.  This the logical place for
 // it because the file is already open and read into memory.
 
+// The names of the files in ShaderFixes, lower cased, as of the last config
+// load, reload of the fixes or hunting toggle. While it is set, a shader that
+// has none of the four replacement files skips the four failed file opens
+// that would otherwise run on whichever thread the game creates it on. It is
+// not taken while hunting is enabled, which adds files to ShaderFixes at
+// runtime (soft disabled hunting cannot), nor while exporting or auto
+// patching shaders, which consult further files there:
+static std::shared_ptr<const std::unordered_set<std::wstring>> shader_fixes_snapshot;
+
+void SnapshotShaderFixes()
+{
+	std::shared_ptr<std::unordered_set<std::wstring>> names;
+	std::shared_ptr<const std::unordered_set<std::wstring>> none;
+	WIN32_FIND_DATA find_data;
+	wchar_t pattern[MAX_PATH];
+	HANDLE find;
+
+	if (G->hunting == HUNTING_MODE_ENABLED || !G->SHADER_PATH[0] || G->EXPORT_HLSL
+	 || G->decompiler_settings.fixSvPosition || G->decompiler_settings.recompileVs) {
+		std::atomic_store(&shader_fixes_snapshot, none);
+		return;
+	}
+
+	names = std::make_shared<std::unordered_set<std::wstring>>();
+	swprintf_s(pattern, MAX_PATH, L"%ls\\*", G->SHADER_PATH);
+	find = FindFirstFileEx(pattern, FindExInfoBasic, &find_data, FindExSearchNameMatch, NULL, 0);
+	if (find != INVALID_HANDLE_VALUE) {
+		do {
+			std::wstring name(find_data.cFileName);
+			std::transform(name.begin(), name.end(), name.begin(), towlower);
+			names->insert(name);
+		} while (FindNextFile(find, &find_data));
+	}
+	DWORD err = GetLastError();
+	if (find != INVALID_HANDLE_VALUE)
+		FindClose(find);
+
+	// A missing folder has no files, but any other failure to list it
+	// must not be remembered as "no files", so shader creation falls back
+	// to probing the files until the next snapshot:
+	if (err != ERROR_NO_MORE_FILES && err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+		LogInfo("  ShaderFixes snapshot failed: error %u\n", err);
+		std::atomic_store(&shader_fixes_snapshot, none);
+		return;
+	}
+	LogInfo("  ShaderFixes snapshot: %Iu files\n", names->size());
+
+	std::atomic_store(&shader_fixes_snapshot, std::shared_ptr<const std::unordered_set<std::wstring>>(names));
+}
+
+// Whether any of the files _ReplaceShaderFromShaderFixes() would look for
+// exists, according to the snapshot. True when there is no snapshot:
+static bool shader_fixes_may_have(UINT64 hash, const wchar_t *shader_type)
+{
+	static const wchar_t *suffixes[] = { L"_replace.bin", L".bin", L"_replace.txt", L".txt" };
+	std::shared_ptr<const std::unordered_set<std::wstring>> names = std::atomic_load(&shader_fixes_snapshot);
+	wchar_t name[MAX_PATH];
+
+	if (!names || G->hunting == HUNTING_MODE_ENABLED)
+		return true;
+
+	for (const wchar_t *suffix : suffixes) {
+		swprintf_s(name, MAX_PATH, L"%016llx-%ls%ls", hash, shader_type, suffix);
+		if (names->count(name))
+			return true;
+	}
+
+	return false;
+}
+
 char* HackerDevice::_ReplaceShaderFromShaderFixes(UINT64 hash, const wchar_t *shaderType, const void *pShaderBytecode,
 	SIZE_T BytecodeLength, SIZE_T &pCodeSize, string &foundShaderModel, FILETIME &timeStamp,
 	wstring &headerLine, const char *overrideShaderModel)
@@ -1182,6 +1255,8 @@ char* HackerDevice::_ReplaceShaderFromShaderFixes(UINT64 hash, const wchar_t *sh
 	if (G->EXPORT_SHADERS)
 		CreateAsmTextFile(G->SHADER_CACHE_PATH, hash, shaderType, pShaderBytecode, BytecodeLength, G->patch_cb_offsets);
 
+	if (!shader_fixes_may_have(hash, shaderType))
+		return NULL;
 
 	// Read the binary compiled shaders, as previously cached shaders.  This is how
 	// fixes normally ship, so that we just load previously compiled/assembled shaders.
