@@ -257,11 +257,8 @@ void HackerSwapChain::RunFrameActions()
 	// This way resources will be loaded properly before modded object appear on screen and cause crash
 	if (G->gConfigInitialized) {
 		// Autosave persistent variables every gSettingsAutoSaveInterval seconds
-		if (G->gTime - G->gSettingsSaveTime > G->gSettingsAutoSaveInterval) {
-			if (SavePersistentSettings())
-				SaveUnknownPersistentSettings();
-			//LogOverlay(LOG_INFO, "Saved Persistent Variables\n");
-		}
+		if (G->gTime - G->gSettingsSaveTime > G->gSettingsAutoSaveInterval)
+			SavePersistentSettingsInBackground();
 	}
 	else {
 		if (G->gTime > G->gConfigInitializationDelay) {

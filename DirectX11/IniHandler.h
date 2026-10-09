@@ -7,6 +7,8 @@ void ReloadConfig(HackerDevice *device);
 void RegisterUnknownSetting(const wchar_t* name, float value);
 bool SavePersistentSettings(bool force = false);
 bool SaveUnknownPersistentSettings();
+void SavePersistentSettingsInBackground();
+void CleanUpPersistentSettingsSaves();
 
 struct IniLine {
 	// Same syntax as std::pair, whitespace stripped around each:

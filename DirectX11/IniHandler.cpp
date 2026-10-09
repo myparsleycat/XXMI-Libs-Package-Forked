@@ -17,6 +17,8 @@
 #include "ShaderRegex.h"
 #include "cursor.h"
 #include <chrono>
+#include <mutex>
+#include <atomic>
 
 #include "vector"
 #include <locale>
@@ -5084,6 +5086,127 @@ const wstring& persistent_variable_save_name(const CommandListVariable* var)
 	return var->name;
 }
 
+// d3dx_user.ini is written by the periodic autosave on a short lived thread,
+// so that creating the file (security attributes, antivirus) does not land
+// in a frame, and synchronously around config reloads. Every writer takes a
+// ticket on the thread that decided the file's content and, under the lock,
+// writes only while no later ticket has been written, so a background save
+// that started earlier can never overwrite a newer synchronous one. The lock
+// is held for the whole write, so a synchronous writer also waits for a
+// background write in progress, and a config reload that follows reads a
+// complete file. A ticket counts as written only once its file is complete:
+// a failed write leaves the earlier ticket in place, so that the next
+// synchronous save does not skip it, and sets the retry flag for the
+// autosave. The file is written to a temporary and renamed over the old one,
+// so that a process exit in the middle of a save leaves the previous
+// settings intact:
+static std::mutex user_config_write_lock;
+static std::atomic<unsigned> user_config_tickets{0};
+static unsigned user_config_written_ticket = 0; // Guarded by user_config_write_lock
+static std::atomic<bool> user_config_save_failed{false};
+
+static std::wstring UserConfigTempPath()
+{
+	return G->user_config + L".tmp";
+}
+
+static void FormatPersistentSetting(std::string *text, const wstring &name, float value)
+{
+	char fval[64];
+	int len;
+
+	len = WideCharToMultiByte(CP_UTF8, 0, name.c_str(), (int)name.size(), NULL, 0, NULL, NULL);
+	if (len > 0) {
+		size_t start = text->size();
+		text->resize(start + len);
+		WideCharToMultiByte(CP_UTF8, 0, name.c_str(), (int)name.size(), &(*text)[start], len, NULL, NULL);
+	}
+
+	_snprintf_s(fval, sizeof(fval), _TRUNCATE, " = %.9g\n", value);
+	*text += fval;
+}
+
+static std::string FormatPersistentSettings()
+{
+	std::string text =
+		"; AUTOMATICALLY GENERATED FILE - DO NOT EDIT\n"
+		";\n"
+		"; 3DMigoto will overwrite this file whenever any persistent settings are\n"
+		"; altered by hot key or command list. Tag global variables with the \"persist\"\n"
+		"; keyword to save them in this file. Use the post keyword in the [Constants]\n"
+		"; command list if you need to do any intialisation after this file is loaded.\n"
+		";\n"
+		"[Constants]\n";
+
+	for (auto global : persistent_variables)
+		FormatPersistentSetting(&text, persistent_variable_save_name(global), global->fval);
+
+	return text;
+}
+
+static std::string FormatUnknownPersistentSettings()
+{
+	std::string text;
+
+	for (auto& entry : unknown_variables)
+		FormatPersistentSetting(&text, entry.first, entry.second);
+
+	return text;
+}
+
+static bool WriteTextFile(const wchar_t *path, const std::string &text, const wchar_t *mode)
+{
+	FILE* f;
+	bool ok;
+
+	wfopen_ensuring_access(&f, path, mode);
+	if (!f)
+		return false;
+
+	ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+	return fclose(f) == 0 && ok;
+}
+
+// Caller holds user_config_write_lock:
+static bool ReplaceUserConfigLocked(const std::string &text)
+{
+	std::wstring tmp = UserConfigTempPath();
+
+	if (WriteTextFile(tmp.c_str(), text, L"w")
+	 && MoveFileEx(tmp.c_str(), G->user_config.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		return true;
+
+	LogWarning("Unable to save settings in %S\n", G->user_config.c_str());
+	DeleteFile(tmp.c_str());
+	return false;
+}
+
+// Caller holds user_config_write_lock:
+static bool AppendUserConfigLocked(const std::string &text)
+{
+	if (WriteTextFile(G->user_config.c_str(), text, L"a"))
+		return true;
+
+	LogWarning("Unable to save unknown settings in %S\n", G->user_config.c_str());
+	return false;
+}
+
+static void WriteUserConfigWithTicket(const std::string &text, unsigned ticket)
+{
+	std::lock_guard<std::mutex> guard(user_config_write_lock);
+
+	if ((int)(ticket - user_config_written_ticket) <= 0) {
+		LogInfo("Skipping superseded save of user settings\n");
+		return;
+	}
+
+	LogInfo("Saving user settings to %S\n", G->user_config.c_str());
+	if (ReplaceUserConfigLocked(text))
+		user_config_written_ticket = ticket;
+	else
+		user_config_save_failed = true;
+}
+
 // Save the currently known persistent variables to d3dx_user.ini.
 // Unknown variables are handled separately by HandleUnknownPersistentSettings():
 // they are discovered by LoadConfigFile() after this function runs and may be
@@ -5092,44 +5215,23 @@ bool SavePersistentSettings(bool force)
 {
 	G->gSettingsSaveTime = G->gTime;
 
-	if (!G->user_config_dirty && !force)
+	std::lock_guard<std::mutex> guard(user_config_write_lock);
+
+	// Also written while the latest background save has not landed yet or
+	// has failed, so that a config reload that follows reads the current
+	// values:
+	if (!force && !G->user_config_dirty && user_config_written_ticket == user_config_tickets)
 		return false;
 
-	setlocale(LC_CTYPE, "en_US.UTF-8");
-
-	// TODO: Ability to update existing file rather than overwriting:
-	//wfopen_ensuring_access(&f, G->user_config.c_str(), L"r+");
-	//if (!f)
-
-	FILE* f;
-	wfopen_ensuring_access(&f, G->user_config.c_str(), L"w");
-	if (!f)
-	{
-		LogWarning("Unable to save settings in %S\n", G->user_config.c_str());
-		setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
-		return false;
-	}
+	unsigned ticket = ++user_config_tickets;
 
 	LogInfo("Saving user settings to %S\n", G->user_config.c_str());
+	if (!ReplaceUserConfigLocked(FormatPersistentSettings()))
+		return false;
 
-	fputs("; AUTOMATICALLY GENERATED FILE - DO NOT EDIT\n"
-	      ";\n"
-	      "; 3DMigoto will overwrite this file whenever any persistent settings are\n"
-	      "; altered by hot key or command list. Tag global variables with the \"persist\"\n"
-	      "; keyword to save them in this file. Use the post keyword in the [Constants]\n"
-	      "; command list if you need to do any intialisation after this file is loaded.\n"
-	      ";\n"
-	      "[Constants]\n", f);
-
-	for (auto global : persistent_variables)
-		fprintf_s(f, "%ls = %.9g\n", persistent_variable_save_name(global).c_str(), global->fval);
-
+	user_config_written_ticket = ticket;
+	user_config_save_failed = false;
 	G->user_config_dirty = false;
-
-	fclose(f);
-
-	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
-
 	return true;
 }
 
@@ -5142,27 +5244,70 @@ bool SaveUnknownPersistentSettings()
 	if (unknown_variables.empty())
 		return false;
 
-	setlocale(LC_CTYPE, "en_US.UTF-8");
-
-	FILE* f;
-	wfopen_ensuring_access(&f, G->user_config.c_str(), L"a");
-	if (!f)
-	{
-		LogWarning("Unable to save unknown settings in %S\n", G->user_config.c_str());
-		setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
-		return false;
-	}
+	std::lock_guard<std::mutex> guard(user_config_write_lock);
 
 	LogInfo("Saving unknown user settings to %S\n", G->user_config.c_str());
+	return AppendUserConfigLocked(FormatUnknownPersistentSettings());
+}
 
-	for (auto& entry : unknown_variables)
-		fprintf_s(f, "%ls = %.9g\n", entry.first.c_str(), entry.second);
+struct UserConfigSave {
+	std::string text;
+	unsigned ticket;
+	HMODULE module;
+};
 
-	fclose(f);
+static DWORD WINAPI UserConfigSaveThread(void *param)
+{
+	UserConfigSave *save = (UserConfigSave*)param;
+	HMODULE module = save->module;
 
-	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
+	WriteUserConfigWithTicket(save->text, save->ticket);
+	delete save;
 
-	return true;
+	// Releases the reference that kept this DLL mapped while the thread
+	// was running its code, without returning into it:
+	FreeLibraryAndExitThread(module, 0);
+}
+
+// The periodic autosave: the file is formatted on the calling thread, where
+// the variables are consistent, and written on a thread of its own:
+void SavePersistentSettingsInBackground()
+{
+	G->gSettingsSaveTime = G->gTime;
+
+	bool retry = user_config_save_failed.exchange(false);
+	if (!G->user_config_dirty && !retry)
+		return;
+
+	UserConfigSave *save = new UserConfigSave{ FormatPersistentSettings() + FormatUnknownPersistentSettings(), ++user_config_tickets, NULL };
+	G->user_config_dirty = false;
+
+	// The thread owns a reference to this DLL, taken before it starts, so
+	// that a dynamic unload cannot unmap the code it runs:
+	HANDLE thread = NULL;
+	if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&UserConfigSaveThread, &save->module))
+		thread = CreateThread(NULL, 0, UserConfigSaveThread, save, 0, NULL);
+	if (thread) {
+		CloseHandle(thread);
+		return;
+	}
+
+	if (save->module)
+		FreeLibrary(save->module);
+	WriteUserConfigWithTicket(save->text, save->ticket);
+	delete save;
+}
+
+// Called when the DLL is unloaded. No save thread can be running on a dynamic
+// unload, since each holds a reference to the DLL. On process exit they have
+// been terminated already, possibly in the middle of a write: d3dx_user.ini
+// itself is intact, since it is only ever replaced by a complete file, and
+// the temporary file such a save left behind is removed where possible (the
+// next save overwrites it otherwise):
+void CleanUpPersistentSettingsSaves()
+{
+	if (!G->user_config.empty())
+		DeleteFile(UserConfigTempPath().c_str());
 }
 
 // Handle unknown persistent variables discovered by LoadConfigFile().
@@ -5224,6 +5369,11 @@ static void WipeUserConfig()
 	unknown_variables.clear();
 	G->current_unknown_settings_hash = 0;
 	G->last_unknown_settings_hash = 0;
+
+	// Under the lock so that a background save still in flight can
+	// neither interleave with the delete nor recreate the file after it:
+	std::lock_guard<std::mutex> guard(user_config_write_lock);
+	user_config_written_ticket = ++user_config_tickets;
 
 	DeleteFile(G->user_config.c_str());
 
