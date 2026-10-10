@@ -130,7 +130,65 @@ void InstallSetWindowPosHook()
 
 // -----------------------------------------------------------------------------
 
-// In the Elite Dangerous case, they Release the HackerContext objects before creating the 
+#ifdef NTDDI_WIN10
+#include <d3d12.h>
+#include <d3d11on12.h>
+
+// The only D3D12 swap chain we ever wrap is the one of the D3D11On12 device
+// made for the "DirectX 12 is not supported" overlay warning.
+static bool is_d3d11on12_device(HackerDevice *device)
+{
+	ID3D11On12Device *d3d11on12_dev = NULL;
+
+	if (FAILED(device->GetPossiblyHookedOrigDevice1()->QueryInterface(IID_ID3D11On12Device, (void**)&d3d11on12_dev)))
+		return false;
+	d3d11on12_dev->Release();
+	return true;
+}
+
+static bool is_d3d12_iid(REFIID riid)
+{
+	return riid == IID_ID3D12Object
+		|| riid == IID_ID3D12DeviceChild
+		|| riid == IID_ID3D12Pageable
+		|| riid == IID_ID3D12Resource
+		|| riid == IID_ID3D12Device
+		|| riid == IID_ID3D12Device1
+		|| riid == IID_ID3D12Device2
+		|| riid == IID_ID3D12Device3
+		|| riid == IID_ID3D12CommandQueue;
+}
+#else
+static bool is_d3d11on12_device(HackerDevice *device)
+{
+	return false;
+}
+
+static bool is_d3d12_iid(REFIID riid)
+{
+	return false;
+}
+#endif
+
+// A D3D11 swap chain answers E_NOINTERFACE when asked for a D3D12 back buffer
+// or device, and overlays that hooked our Present (they find it through the
+// dummy swap chain they create, which we wrap as well) rely on that to tell
+// the two APIs apart. A driver present layer underneath us such as NVIDIA
+// Smooth Motion's NvPresent64.dll presents through D3D12 and answers those
+// requests with its own objects, which sends the overlay down its D3D12 path
+// on a D3D11 game and crashes it (seen with the Epic Online Services overlay).
+bool HackerSwapChain::RefuseD3D12Interface(REFIID riid, void **ppvObject)
+{
+	if (mIsD3D12SwapChain || !is_d3d12_iid(riid))
+		return false;
+
+	LogInfo("  D3D11 swap chain asked for %s, returning E_NOINTERFACE\n", NameFromIID(riid).c_str());
+	if (ppvObject)
+		*ppvObject = NULL;
+	return true;
+}
+
+// In the Elite Dangerous case, they Release the HackerContext objects before creating the
 // swap chain.  That causes problems, because we are not expecting anyone to get here without
 // having a valid context.  They later call GetImmediateContext, which will generate a wrapped
 // context.  So, since we need the context for our Overlay, let's do that a litte early in
@@ -142,6 +200,7 @@ HackerSwapChain::HackerSwapChain(IDXGISwapChain1 *pSwapChain, HackerDevice *pDev
 
 	mHackerDevice = pDevice;
 	mHackerContext = pContext;
+	mIsD3D12SwapChain = is_d3d11on12_device(pDevice);
 
 	// Bump the refcounts on the device and context to make sure they can't
 	// be released as long as the swap chain is alive and we may be
@@ -525,6 +584,9 @@ STDMETHODIMP HackerSwapChain::GetDevice(
 {
 	LogDebug("HackerSwapChain::GetDevice(%s@%p) called with IID: %s\n", type_name(this), this, NameFromIID(riid).c_str());
 
+	if (RefuseD3D12Interface(riid, ppDevice))
+		return E_NOINTERFACE;
+
 	HRESULT hr = mOrigSwapChain1->GetDevice(riid, ppDevice);
 	LogDebug("  returns result = %x, handle = %p\n", hr, *ppDevice);
 	return hr;
@@ -614,6 +676,9 @@ STDMETHODIMP HackerSwapChain::GetBuffer(THIS_
 	_Out_  void **ppSurface)
 {
 	LogDebug("HackerSwapChain::GetBuffer(%s@%p) called with IID: %s\n", type_name(this), this, NameFromIID(riid).c_str());
+
+	if (RefuseD3D12Interface(riid, ppSurface))
+		return E_NOINTERFACE;
 
 	HRESULT hr = mOrigSwapChain1->GetBuffer(Buffer, riid, ppSurface);
 	LogDebug("  returns %x\n", hr);
@@ -1085,6 +1150,9 @@ STDMETHODIMP HackerUpscalingSwapChain::GetBuffer(THIS_
 	_Out_  void **ppSurface)
 {
 	LogDebug("HackerUpscalingSwapChain::GetBuffer(%s@%p) called with IID: %s\n", type_name(this), this, NameFromIID(riid).c_str());
+
+	if (RefuseD3D12Interface(riid, ppSurface))
+		return E_NOINTERFACE;
 
 	HRESULT hr = S_OK;
 

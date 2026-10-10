@@ -27,6 +27,9 @@ protected:
 	IDXGISwapChain1 *mOrigSwapChain1;
 	HackerDevice *mHackerDevice;
 	HackerContext *mHackerContext;
+	bool mIsD3D12SwapChain;
+
+	bool RefuseD3D12Interface(REFIID riid, void **ppvObject);
 
 public:
 	HackerSwapChain(IDXGISwapChain1 *pSwapChain, HackerDevice *pDevice, HackerContext *pContext);
