@@ -5,6 +5,7 @@
 #include <d3dx9shader.h>
 #endif
 
+#include <mutex>
 #include <stdexcept>
 
 using namespace std;
@@ -17,7 +18,10 @@ using namespace std;
 // for sscanf_s convinience. Explanation in DecompileHLSL.cpp
 #define UCOUNTOF(...) (unsigned)_countof(__VA_ARGS__)
 
+// The only state shared between calls into the assembler and disassembler,
+// which may come from several threads at once:
 static unordered_map<string, vector<DWORD>> codeBin;
+static mutex codeBinLock;
 
 static DWORD strToDWORD(string s)
 {
@@ -186,6 +190,7 @@ void writeLUT()
 	if (!f)
 		return;
 
+	lock_guard<mutex> lock(codeBinLock);
 	for (unordered_map<string, vector<DWORD>>::iterator it = codeBin.begin(); it != codeBin.end(); ++it) {
 		fputs(it->first.c_str(), f);
 		fputs(":->", f);
@@ -2499,6 +2504,7 @@ static string assembleAndCompare(string s, vector<DWORD> v)
 				s2.append(s);
 				// codeBin[s2] = v;
 			} else {
+				lock_guard<mutex> lock(codeBinLock);
 				s2 = s;
 				s2.append(" orig");
 				codeBin[s2] = v;
@@ -2509,6 +2515,7 @@ static string assembleAndCompare(string s, vector<DWORD> v)
 		}
 	} else {
 		if (s != "undecipherable custom data") {
+			lock_guard<mutex> lock(codeBinLock);
 			s2 = "!missing ";
 			s2.append(s);
 			codeBin[s2] = v;

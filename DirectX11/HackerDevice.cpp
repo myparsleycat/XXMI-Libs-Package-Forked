@@ -1412,6 +1412,7 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 		EnterCriticalSectionPretty(&G->mCriticalSection);
 			if (SUCCEEDED(hr)) {
 				RegisterForReload(*ppShader, hash, shaderType, "bin", pClassLinkage, blob, {0}, L"", true);
+				prewarm_shader_regex(mOrigDevice1, hash, shaderType, blob, pClassLinkage);
 
 				// Also add the original shader to the original shaders
 				// map so that if it is later replaced marking_mode =

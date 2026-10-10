@@ -543,13 +543,14 @@ template <class ID3D11Shader,
 	void (__stdcall ID3D11DeviceContext::*GetShaderVS2013BUGWORKAROUND)(ID3D11Shader**, ID3D11ClassInstance**, UINT*),
 	void (__stdcall ID3D11DeviceContext::*SetShaderVS2013BUGWORKAROUND)(ID3D11Shader*, ID3D11ClassInstance*const*, UINT)
 >
-void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, wchar_t *shader_type)
+bool HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, wchar_t *shader_type)
 {
 	ID3D11Shader *bound_shader = NULL, *replacement = NULL;
 	ID3D11ClassInstance *class_instances[256];
 	ShaderReloadMap::iterator orig_info_i;
 	OriginalShaderInfo *orig_info = NULL;
 	UINT num_instances = 0;
+	bool pending = false;
 	unsigned i;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
@@ -566,9 +567,11 @@ void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 	if (!orig_info->deferred_replacement_processed) {
 		// Remember that we have analysed this one so we don't check it
 		// again (until config reload) regardless of whether we patch it
-		// or not:
-		orig_info->deferred_replacement_processed = true;
-		apply_shader_regex_to_shader(mOrigDevice1, orig_info);
+		// or not. The exception is a shader the background ShaderRegex
+		// threads are still working on, which is drawn as it is for now
+		// and checked again on the next draw:
+		apply_shader_regex_to_shader(mOrigDevice1, orig_info, &pending);
+		orig_info->deferred_replacement_processed = !pending;
 	}
 
 	// A config reload may have put a new replacement in place without
@@ -587,7 +590,7 @@ void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 	LeaveCriticalSection(&G->mCriticalSection);
 
 	if (!replacement)
-		return;
+		return pending;
 
 	// And bind the replaced shader in time for this draw call:
 	// VSBUGWORKAROUND: VS2013 toolchain has a bug that mistakes a member
@@ -605,10 +608,11 @@ void HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 			class_instances[i]->Release();
 	}
 	replacement->Release();
-	return;
+	return pending;
 
 out_drop:
 	LeaveCriticalSection(&G->mCriticalSection);
+	return false;
 }
 
 void HackerContext::UpdateDeferredShaderGeneration()
@@ -669,41 +673,37 @@ void HackerContext::DeferredShaderReplacementBeforeDraw()
 	// Each bound shader only needs to go through this once: whatever the
 	// outcome, DeferredShaderReplacement() marks it processed (or it was
 	// never a candidate), so further calls for it would just take the lock
-	// to find that out again.
+	// to find that out again. Unless it reports that the outcome is still
+	// being worked out in the background.
 	if (mCurrentVertexShaderHandle && mVertexShaderDeferredPending) {
-		DeferredShaderReplacement<ID3D11VertexShader,
+		mVertexShaderDeferredPending = DeferredShaderReplacement<ID3D11VertexShader,
 			&ID3D11DeviceContext::VSGetShader,
 			&ID3D11DeviceContext::VSSetShader>
 			(mCurrentVertexShaderHandle, mCurrentVertexShader, L"vs");
-		mVertexShaderDeferredPending = false;
 	}
 	if (mCurrentHullShaderHandle && mHullShaderDeferredPending) {
-		DeferredShaderReplacement<ID3D11HullShader,
+		mHullShaderDeferredPending = DeferredShaderReplacement<ID3D11HullShader,
 			&ID3D11DeviceContext::HSGetShader,
 			&ID3D11DeviceContext::HSSetShader>
 			(mCurrentHullShaderHandle, mCurrentHullShader, L"hs");
-		mHullShaderDeferredPending = false;
 	}
 	if (mCurrentDomainShaderHandle && mDomainShaderDeferredPending) {
-		DeferredShaderReplacement<ID3D11DomainShader,
+		mDomainShaderDeferredPending = DeferredShaderReplacement<ID3D11DomainShader,
 			&ID3D11DeviceContext::DSGetShader,
 			&ID3D11DeviceContext::DSSetShader>
 			(mCurrentDomainShaderHandle, mCurrentDomainShader, L"ds");
-		mDomainShaderDeferredPending = false;
 	}
 	if (mCurrentGeometryShaderHandle && mGeometryShaderDeferredPending) {
-		DeferredShaderReplacement<ID3D11GeometryShader,
+		mGeometryShaderDeferredPending = DeferredShaderReplacement<ID3D11GeometryShader,
 			&ID3D11DeviceContext::GSGetShader,
 			&ID3D11DeviceContext::GSSetShader>
 			(mCurrentGeometryShaderHandle, mCurrentGeometryShader, L"gs");
-		mGeometryShaderDeferredPending = false;
 	}
 	if (mCurrentPixelShaderHandle && mPixelShaderDeferredPending) {
-		DeferredShaderReplacement<ID3D11PixelShader,
+		mPixelShaderDeferredPending = DeferredShaderReplacement<ID3D11PixelShader,
 			&ID3D11DeviceContext::PSGetShader,
 			&ID3D11DeviceContext::PSSetShader>
 			(mCurrentPixelShaderHandle, mCurrentPixelShader, L"ps");
-		mPixelShaderDeferredPending = false;
 	}
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
@@ -720,11 +720,10 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
 	if (!mCurrentComputeShaderHandle || !mComputeShaderDeferredPending)
 		return;
 
-	DeferredShaderReplacement<ID3D11ComputeShader,
+	mComputeShaderDeferredPending = DeferredShaderReplacement<ID3D11ComputeShader,
 		&ID3D11DeviceContext::CSGetShader,
 		&ID3D11DeviceContext::CSSetShader>
 		(mCurrentComputeShaderHandle, mCurrentComputeShader, L"cs");
-	mComputeShaderDeferredPending = false;
 }
 
 static UINT NextPow2(UINT v)

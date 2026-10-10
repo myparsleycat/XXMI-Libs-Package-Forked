@@ -59,7 +59,7 @@ struct ShaderBindings
 
 struct OriginalShaderInfo;
 
-bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out = NULL);
+bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out = NULL, bool link = true);
 void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode);
 bool unlink_shader_regex_command_lists_and_filter_index(UINT64 shader_hash);
 
@@ -68,8 +68,26 @@ bool unlink_shader_regex_command_lists_and_filter_index(UINT64 shader_hash);
 // ShaderOverride and, when it is patched, creates the replacement shader on
 // device unless the one it already has was patched under the current
 // ShaderRegex sections. Returns true when a ShaderRegex replacement is in
-// place afterwards. Call with G->mCriticalSection held.
-bool apply_shader_regex_to_shader(ID3D11Device *device, OriginalShaderInfo *orig_info);
+// place afterwards. With shader_regex_background enabled the outcome may not
+// be known yet, or the replacement not created yet: pending is set then and
+// the caller has to call again later. Call with G->mCriticalSection held.
+bool apply_shader_regex_to_shader(ID3D11Device *device, OriginalShaderInfo *orig_info, bool *pending);
+
+// [Rendering] shader_regex_background, see the comment in ShaderRegex.cpp:
+void set_shader_regex_background(int mode);
+
+// Starts on a shader's ShaderRegex outcome in the background as soon as the
+// game has created it, ahead of the first draw that needs it:
+void prewarm_shader_regex(ID3D11Device *device, UINT64 hash, const wchar_t *shader_type,
+		ID3DBlob *bytecode, ID3D11ClassLinkage *linkage);
+
+// Keeps the background threads out of the ShaderRegex sections and the
+// settings their analysis reads while a config reload replaces them:
+class ShaderRegexConfigUpdate {
+public:
+	ShaderRegexConfigUpdate();
+	~ShaderRegexConfigUpdate();
+};
 
 // Config reload: forgets the results of the previous ShaderRegex sections.
 // Call with G->mCriticalSection held.

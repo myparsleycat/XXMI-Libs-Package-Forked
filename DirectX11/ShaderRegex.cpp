@@ -5,7 +5,10 @@
 #include "Overlay.h"
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <iterator>
+#include <mutex>
 #include <unordered_map>
 
 ShaderRegexGroups shader_regex_groups;
@@ -16,7 +19,8 @@ uint32_t shader_regex_hash;
 // that a config reload which leaves the ShaderRegex sections alone, or a
 // shader the game creates again, is served without reading the cache files
 // or disassembling the shader again. Only valid while regex_hash matches
-// shader_regex_hash. Accessed with G->mCriticalSection held.
+// shader_regex_hash. Accessed with G->mCriticalSection held. A result taken
+// from a background job has no patched_bytecode, see restore_patched_bytecode().
 struct ShaderRegexResult {
 	uint32_t regex_hash = 0;
 	std::wstring shader_type;
@@ -26,6 +30,8 @@ struct ShaderRegexResult {
 	std::wstring tagline;
 };
 static std::unordered_map<UINT64, ShaderRegexResult> shader_regex_results;
+
+static std::mutex shader_regex_analysis_lock;
 
 static void log_pcre2_error_nonl(int err, char *fmt, ...)
 {
@@ -492,7 +498,7 @@ struct ShaderRegexCacheHeader {
 	uint32_t num_matches;
 };
 
-static ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type, ShaderRegexResult *result)
+static ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shader_type, ShaderRegexResult *result, bool link)
 {
 	ShaderRegexCache ret = ShaderRegexCache::NO_CACHE;
 	HANDLE meta_f = INVALID_HANDLE_VALUE;
@@ -563,7 +569,8 @@ static ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shad
 		if (header->patched)
 			result->tagline.append(std::wstring(L"[") + group->ini_section + std::wstring(L"]"));
 
-		group->link_command_lists_and_filter_index(hash);
+		if (link)
+			group->link_command_lists_and_filter_index(hash);
 	}
 
 	if (header->patched) {
@@ -744,7 +751,7 @@ bool get_shader_model_from_bytecode(const void* data, size_t size, std::string* 
 }
 
 // Process groups that do not have patches to apply. Those can be handled without disassembly.
-static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required, std::vector<uint32_t> *match_ids_out)
+static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type, std::string* shader_model, UINT64 hash, bool* decompilation_required, std::vector<uint32_t> *match_ids_out, bool link)
 {
 	ShaderRegexGroups::iterator i;
 	vector<uint32_t> match_ids;
@@ -776,7 +783,8 @@ static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type
 	if (decompilation_required && !*decompilation_required) {
 		// Enable CommandList sections execution for this group.
 		for (ShaderRegexGroup* group : match_groups) {
-			group->link_command_lists_and_filter_index(hash);
+			if (link)
+				group->link_command_lists_and_filter_index(hash);
 		}
 		// We save the cache metadata even if we didn't match anything. That
 		// way we can skip checking for a match next time when we know there
@@ -788,7 +796,7 @@ static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type
 	}
 }
 
-bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out)
+bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out, bool link)
 {
 	ShaderRegexGroups::iterator i;
 	ShaderRegexGroup *group;
@@ -823,7 +831,8 @@ bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type
 		match_ids.push_back(j);
 
 		// Enable CommandList sections execution for this group.
-		group->link_command_lists_and_filter_index(hash);
+		if (link)
+			group->link_command_lists_and_filter_index(hash);
 	}
 
 	// We save the cache metadata even if we didn't match anything. That
@@ -846,10 +855,11 @@ static ShaderRegexResult* store_shader_regex_result(UINT64 hash, ShaderRegexResu
 
 // The analysis that used to live in HackerContext::DeferredShaderReplacement():
 // disassemble, run the ShaderRegex groups over the assembly, reassemble when
-// anything was patched. Returns NULL when it failed, in which case nothing is
-// remembered and the shader will be analysed again after the next config
-// reload:
-static ShaderRegexResult* analyse_shader_regex(UINT64 hash, const wchar_t *shader_type, OriginalShaderInfo *orig_info, ShaderRegexResult *result)
+// anything was patched. Only reads the ShaderRegex sections, and with link
+// false leaves the command lists alone, so that the background threads can
+// run it. Returns false when it failed:
+static bool analyse_shader_regex_bytecode(UINT64 hash, const wchar_t *shader_type, const void *bytecode, size_t bytecode_size,
+		std::string *shader_model, bool link, ShaderRegexResult *result)
 {
 	bool decompilation_required = false;
 	bool patch_regex = false;
@@ -857,6 +867,79 @@ static ShaderRegexResult* analyse_shader_regex(UINT64 hash, const wchar_t *shade
 	vector<char> asm_vector;
 	HRESULT hr;
 
+	// One at a time, so that the background threads leave a core to the
+	// game. A render thread that could not use them for a shader may be in
+	// here as well:
+	std::lock_guard<std::mutex> guard(shader_regex_analysis_lock);
+
+	// Process ShaderRegex sections that don't require bytecode decompilation.
+	link_shader_regex_groups_without_patterns(shader_type, shader_model, hash, &decompilation_required, &result->match_ids, link);
+
+	// Skip disassemble entirely if there are no matching ShaderRegex with Patterns found.
+	if (!decompilation_required) {
+		LogInfo("%S %016I64x disassembly skipped: no matching ShaderRegex with Patterns found for %s.\n", shader_type, hash, shader_model->c_str());
+		return true;
+	}
+
+	// Disassemble shader bytecode.
+	asm_text = BinaryToAsmText(
+		bytecode,
+		bytecode_size,
+		G->patch_cb_offsets,
+		G->disassemble_undecipherable_custom_data);
+
+	if (asm_text.empty())
+		return false;
+
+	// Apply patches from ShaderRegex with Patterns (and Templates).
+	try {
+		patch_regex = apply_shader_regex_groups(&asm_text, shader_type, shader_model, hash, &result->tagline, &result->match_ids, link);
+	} catch (...) {
+		LogInfo("    *** Exception while patching shader\n");
+		return false;
+	}
+
+	if (!patch_regex) {
+		LogInfo("Patch did not apply\n");
+		return true;
+	}
+
+	// No longer logging this since we can output to ShaderFixes
+	// via hunting if marking_actions = regex, or it could be
+	// disassembled from the regex cache with cmd_Decompiler
+	// LogInfo("Patched Shader:\n%s\n", asm_text.c_str());
+
+	asm_vector.assign(asm_text.begin(), asm_text.end());
+
+	try {
+		vector<AssemblerParseError> parse_errors;
+		hr = AssembleFluganWithSignatureParsing(&asm_vector, &result->patched_bytecode, &parse_errors);
+		if (FAILED(hr)) {
+			LogInfo("    *** Assembling patched shader failed\n");
+			return false;
+		}
+		// Parse errors are currently being treated as non-fatal on
+		// creation time replacement and ShaderRegex for backwards
+		// compatibility (live shader reload is fatal).
+		for (auto &parse_error : parse_errors)
+			LogOverlayW(LOG_NOTICE, L"%016I64x-%ls %ls: %S\n",
+					hash, shader_type, result->tagline.c_str(), parse_error.what());
+	} catch (const exception &e) {
+		LogOverlayW(LOG_WARNING, L"Error assembling ShaderRegex patched %016I64x-%ls\n%ls\n%S\n",
+				hash, shader_type, result->tagline.c_str(), e.what());
+		return false;
+	}
+
+	save_shader_regex_cache_bin(hash, shader_type, &result->patched_bytecode);
+	result->patched = true;
+
+	return true;
+}
+
+// Returns NULL when the analysis failed, in which case nothing is remembered
+// and the shader will be analysed again after the next config reload:
+static ShaderRegexResult* analyse_shader_regex(UINT64 hash, const wchar_t *shader_type, OriginalShaderInfo *orig_info, bool link, ShaderRegexResult *result)
+{
 	LogInfo("Performing deferred shader analysis on %S %016I64x...\n", shader_type, hash);
 
 	// Detect shader model
@@ -878,107 +961,558 @@ static ShaderRegexResult* analyse_shader_regex(UINT64 hash, const wchar_t *shade
 		}
 	}
 
-	// Process ShaderRegex sections that don't require bytecode decompilation.
-	link_shader_regex_groups_without_patterns(shader_type, &orig_info->shaderModel, hash, &decompilation_required, &result->match_ids);
-
-	// Skip disassemble entirely if there are no matching ShaderRegex with Patterns found.
-	if (!decompilation_required) {
-		LogInfo("%S %016I64x disassembly skipped: no matching ShaderRegex with Patterns found for %s.\n", shader_type, hash, orig_info->shaderModel.c_str());
-		return store_shader_regex_result(hash, result);
-	}
-
-	// Disassemble shader bytecode.
-	asm_text = BinaryToAsmText(
-		orig_info->byteCode->GetBufferPointer(),
-		orig_info->byteCode->GetBufferSize(),
-		G->patch_cb_offsets,
-		G->disassemble_undecipherable_custom_data);
-
-	if (asm_text.empty())
+	if (!analyse_shader_regex_bytecode(hash, shader_type, orig_info->byteCode->GetBufferPointer(),
+			orig_info->byteCode->GetBufferSize(), &orig_info->shaderModel, link, result))
 		return NULL;
-
-	// Apply patches from ShaderRegex with Patterns (and Templates).
-	try {
-		patch_regex = apply_shader_regex_groups(&asm_text, shader_type, &orig_info->shaderModel, hash, &result->tagline, &result->match_ids);
-	} catch (...) {
-		LogInfo("    *** Exception while patching shader\n");
-		return NULL;
-	}
-
-	if (!patch_regex) {
-		LogInfo("Patch did not apply\n");
-		return store_shader_regex_result(hash, result);
-	}
-
-	// No longer logging this since we can output to ShaderFixes
-	// via hunting if marking_actions = regex, or it could be
-	// disassembled from the regex cache with cmd_Decompiler
-	// LogInfo("Patched Shader:\n%s\n", asm_text.c_str());
-
-	asm_vector.assign(asm_text.begin(), asm_text.end());
-
-	try {
-		vector<AssemblerParseError> parse_errors;
-		hr = AssembleFluganWithSignatureParsing(&asm_vector, &result->patched_bytecode, &parse_errors);
-		if (FAILED(hr)) {
-			LogInfo("    *** Assembling patched shader failed\n");
-			return NULL;
-		}
-		// Parse errors are currently being treated as non-fatal on
-		// creation time replacement and ShaderRegex for backwards
-		// compatibility (live shader reload is fatal).
-		for (auto &parse_error : parse_errors)
-			LogOverlayW(LOG_NOTICE, L"%016I64x-%ls %ls: %S\n",
-					hash, shader_type, result->tagline.c_str(), parse_error.what());
-	} catch (const exception &e) {
-		LogOverlayW(LOG_WARNING, L"Error assembling ShaderRegex patched %016I64x-%ls\n%ls\n%S\n",
-				hash, shader_type, result->tagline.c_str(), e.what());
-		return NULL;
-	}
-
-	save_shader_regex_cache_bin(hash, shader_type, &result->patched_bytecode);
-	result->patched = true;
 
 	return store_shader_regex_result(hash, result);
 }
 
-// The outcome for a shader: from memory, else from the cache files, else by
-// analysis. Whichever way, the command lists of the matched groups are linked
-// to the shader's ShaderOverride, which a config reload clears:
-static ShaderRegexResult* resolve_shader_regex(UINT64 hash, const wchar_t *shader_type, OriginalShaderInfo *orig_info)
+// ShaderRegex in the background
+//
+// Working out a shader's ShaderRegex outcome for the first time means
+// disassembling, matching and reassembling it, and a patched shader then has
+// to be compiled by the driver, which together stalls the first draw that uses
+// it for 100ms or more. With shader_regex_background enabled those two steps
+// run on our own threads instead, starting when the game creates the shader.
+// A draw that comes before they are done either uses the shader as the game
+// made it and checks again on the next draw, or waits, depending on the mode.
+//
+// The threads never take G->mCriticalSection, so the render thread may wait
+// for them while holding it. They read the ShaderRegex sections under
+// shader_regex_config_lock, which a config reload holds exclusively, and leave
+// linking the command lists of the matched groups to the render thread.
+
+// 0: off, 1: draw unpatched until ready, 2: wait at the draw
+static int shader_regex_background_mode;
+
+static SRWLOCK shader_regex_config_lock = SRWLOCK_INIT;
+
+ShaderRegexConfigUpdate::ShaderRegexConfigUpdate()
 {
+	AcquireSRWLockExclusive(&shader_regex_config_lock);
+}
+
+ShaderRegexConfigUpdate::~ShaderRegexConfigUpdate()
+{
+	ReleaseSRWLockExclusive(&shader_regex_config_lock);
+}
+
+void set_shader_regex_background(int mode)
+{
+	shader_regex_background_mode = mode;
+}
+
+enum class ShaderRegexJobState {
+	QUEUED,
+	RUNNING,
+	DONE,
+	FAILED,
+};
+
+enum class ShaderRegexJobStatus {
+	NONE,
+	PENDING,
+	READY,
+	FAILED,
+};
+
+// One per shader hash. Stays around once done to hand its shader object to
+// every shader of that hash, until the ShaderRegex sections change:
+struct ShaderRegexJob {
+	uint64_t id = 0;
+	ShaderRegexJobState state = ShaderRegexJobState::QUEUED;
+	bool urgent = false;
+	std::wstring shader_type;
+	ID3D11Device *device = NULL;
+	// The game's bytecode, for the analysis:
+	ID3DBlob *bytecode = NULL;
+	// Set when the render thread already found there are no cache files:
+	bool cache_checked = false;
+	// Either passed in by the render thread, leaving only the patched
+	// shader to create, or worked out by the job. The command lists of its
+	// groups have not been linked. The patched bytecode is dropped once the
+	// shader has been created from it:
+	bool have_result = false;
+	ShaderRegexResult result;
+	ID3D11DeviceChild *shader = NULL;
+};
+
+struct ShaderRegexJobs {
+	std::mutex lock;
+	std::condition_variable wake;
+	std::condition_variable done;
+	std::unordered_map<UINT64, ShaderRegexJob> jobs;
+	std::deque<UINT64> urgent;
+	std::deque<UINT64> normal;
+	uint64_t next_id = 1;
+	bool threads_started = false;
+	unsigned threads = 0;
+};
+
+static ShaderRegexJobs& shader_regex_jobs()
+{
+	// Never freed: the threads may still be running when the statics of
+	// the DLL are destroyed at exit.
+	static ShaderRegexJobs *jobs = new ShaderRegexJobs();
+	return *jobs;
+}
+
+static ShaderRegexResult copy_shader_regex_result_without_bytecode(const ShaderRegexResult &result)
+{
+	ShaderRegexResult copy;
+
+	copy.regex_hash = result.regex_hash;
+	copy.shader_type = result.shader_type;
+	copy.patched = result.patched;
+	copy.match_ids = result.match_ids;
+	copy.tagline = result.tagline;
+	return copy;
+}
+
+static ID3D11DeviceChild* create_patched_shader(ID3D11Device *device, const wstring &type,
+		ID3D11ClassLinkage *linkage, const std::vector<byte> &patched_bytecode)
+{
+	const void *bytecode = patched_bytecode.data();
+	SIZE_T size = patched_bytecode.size();
+	ID3D11DeviceChild *shader = NULL;
+	HRESULT hr;
+
+	if (type == L"vs")
+		hr = device->CreateVertexShader(bytecode, size, linkage, (ID3D11VertexShader**)&shader);
+	else if (type == L"ps")
+		hr = device->CreatePixelShader(bytecode, size, linkage, (ID3D11PixelShader**)&shader);
+	else if (type == L"cs")
+		hr = device->CreateComputeShader(bytecode, size, linkage, (ID3D11ComputeShader**)&shader);
+	else if (type == L"gs")
+		hr = device->CreateGeometryShader(bytecode, size, linkage, (ID3D11GeometryShader**)&shader);
+	else if (type == L"hs")
+		hr = device->CreateHullShader(bytecode, size, linkage, (ID3D11HullShader**)&shader);
+	else if (type == L"ds")
+		hr = device->CreateDomainShader(bytecode, size, linkage, (ID3D11DomainShader**)&shader);
+	else
+		hr = E_INVALIDARG;
+
+	if (FAILED(hr) && shader) {
+		shader->Release();
+		shader = NULL;
+	}
+
+	return shader;
+}
+
+// The outcome from the cache files, else by analysis, without linking any
+// command lists. Call with shader_regex_config_lock or G->mCriticalSection held:
+static bool prepare_shader_regex_result(UINT64 hash, const wchar_t *shader_type, ID3DBlob *bytecode,
+		bool cache_checked, ShaderRegexResult *result)
+{
+	std::string shader_model;
+
+	if (!cache_checked && load_shader_regex_cache(hash, shader_type, result, false) != ShaderRegexCache::NO_CACHE)
+		return true;
+
+	*result = ShaderRegexResult();
+	result->regex_hash = shader_regex_hash;
+	result->shader_type = shader_type;
+	result->tagline = L"//";
+
+	if (!bytecode || !get_shader_model_from_bytecode(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), &shader_model))
+		return false;
+
+	return analyse_shader_regex_bytecode(hash, shader_type, bytecode->GetBufferPointer(),
+			bytecode->GetBufferSize(), &shader_model, false, result);
+}
+
+static void release_shader_regex_job(ShaderRegexJob *job)
+{
+	if (job->bytecode)
+		job->bytecode->Release();
+	if (job->shader)
+		job->shader->Release();
+	if (job->device)
+		job->device->Release();
+	job->bytecode = NULL;
+	job->shader = NULL;
+	job->device = NULL;
+}
+
+static ShaderRegexJob* next_shader_regex_job(ShaderRegexJobs &j, UINT64 *hash)
+{
+	for (std::deque<UINT64> *queue : {&j.urgent, &j.normal}) {
+		while (!queue->empty()) {
+			*hash = queue->front();
+			queue->pop_front();
+			// A job may be queued in both, or have been taken back
+			// by the render thread:
+			auto i = j.jobs.find(*hash);
+			if (i != j.jobs.end() && i->second.state == ShaderRegexJobState::QUEUED)
+				return &i->second;
+		}
+	}
+
+	return NULL;
+}
+
+static DWORD WINAPI shader_regex_thread(void *param)
+{
+	ShaderRegexJobs &j = shader_regex_jobs();
+
+	// Whatever a draw is not waiting on should not take CPU time from the game:
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
+	for (;;) {
+		ID3D11DeviceChild *shader = NULL;
+		ID3DBlob *bytecode = NULL, *job_bytecode = NULL;
+		ID3D11Device *device = NULL;
+		ShaderRegexResult result;
+		std::wstring shader_type;
+		bool cache_checked, have_result;
+		UINT64 hash = 0;
+		uint64_t id;
+
+		{
+			std::unique_lock<std::mutex> lock(j.lock);
+			ShaderRegexJob *job;
+
+			while (!(job = next_shader_regex_job(j, &hash)))
+				j.wake.wait(lock);
+
+			job->state = ShaderRegexJobState::RUNNING;
+			id = job->id;
+			shader_type = job->shader_type;
+			cache_checked = job->cache_checked;
+			have_result = job->have_result;
+			result = std::move(job->result);
+			bytecode = job->bytecode;
+			if (bytecode)
+				bytecode->AddRef();
+			device = job->device;
+			device->AddRef();
+		}
+
+		if (!have_result) {
+			AcquireSRWLockShared(&shader_regex_config_lock);
+			have_result = prepare_shader_regex_result(hash, shader_type.c_str(), bytecode, cache_checked, &result);
+			ReleaseSRWLockShared(&shader_regex_config_lock);
+		}
+
+		if (have_result && result.patched) {
+			shader = create_patched_shader(device, shader_type, NULL, result.patched_bytecode);
+			if (!shader)
+				LogInfo("    *** Creating replacement shader for %S %016I64x failed\n", shader_type.c_str(), hash);
+			std::vector<byte>().swap(result.patched_bytecode);
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(j.lock);
+
+			auto i = j.jobs.find(hash);
+			if (i != j.jobs.end() && i->second.id == id) {
+				ShaderRegexJob *job = &i->second;
+
+				job->result = std::move(result);
+				job->have_result = have_result;
+				job->shader = shader;
+				shader = NULL;
+				job_bytecode = job->bytecode;
+				job->bytecode = NULL;
+				job->state = have_result ? ShaderRegexJobState::DONE : ShaderRegexJobState::FAILED;
+			}
+		}
+		j.done.notify_all();
+
+		if (shader)
+			shader->Release();
+		if (job_bytecode)
+			job_bytecode->Release();
+		if (bytecode)
+			bytecode->Release();
+		device->Release();
+	}
+
+	return 0;
+}
+
+// Call with the lock of the jobs held, and no job for this hash present.
+// result is consumed if passed.
+static bool queue_shader_regex_job(ShaderRegexJobs &j, UINT64 hash, const wchar_t *shader_type, ID3D11Device *device,
+		ID3DBlob *bytecode, bool cache_checked, ShaderRegexResult *result, bool urgent)
+{
+	if (!j.threads_started) {
+		j.threads_started = true;
+		// Two, so that a slow driver compile does not hold up everything
+		// else. The analysis itself is serialised.
+		for (int i = 0; i < 2; i++) {
+			HANDLE thread = CreateThread(NULL, 0, shader_regex_thread, NULL, 0, NULL);
+			if (thread) {
+				CloseHandle(thread);
+				j.threads++;
+			}
+		}
+		if (!j.threads)
+			LogInfo("  *** Unable to start the ShaderRegex background threads\n");
+	}
+	if (!j.threads)
+		return false;
+
+	ShaderRegexJob *job = &j.jobs[hash];
+	job->id = j.next_id++;
+	job->urgent = urgent;
+	job->shader_type = shader_type;
+	job->device = device;
+	job->device->AddRef();
+	job->bytecode = bytecode;
+	if (job->bytecode)
+		job->bytecode->AddRef();
+	job->cache_checked = cache_checked;
+	if (result) {
+		job->have_result = true;
+		job->result = std::move(*result);
+	}
+
+	(urgent ? j.urgent : j.normal).push_back(hash);
+	j.wake.notify_one();
+	return true;
+}
+
+// A draw needs this one, so it goes ahead of the shaders that were queued
+// when the game created them. Returns true if the caller should come back for
+// it later, false if it has waited for the job to finish.
+static bool await_shader_regex_job(ShaderRegexJobs &j, std::unique_lock<std::mutex> &lock, UINT64 hash)
+{
+	auto i = j.jobs.find(hash);
+
+	if (i != j.jobs.end() && i->second.state == ShaderRegexJobState::QUEUED && !i->second.urgent) {
+		i->second.urgent = true;
+		j.urgent.push_back(hash);
+		j.wake.notify_one();
+	}
+
+	if (shader_regex_background_mode != 2)
+		return true;
+
+	j.done.wait(lock, [&] {
+		auto i = j.jobs.find(hash);
+		return i == j.jobs.end()
+			|| i->second.state == ShaderRegexJobState::DONE
+			|| i->second.state == ShaderRegexJobState::FAILED;
+	});
+	return false;
+}
+
+// Class linkage belongs to the one shader object it was passed with, hooked
+// devices would see the shaders we create as the game's, and a device created
+// single threaded must not be called from our threads at all:
+static bool shader_regex_background_allowed(ID3D11Device *device, ID3D11ClassLinkage *linkage)
+{
+	return shader_regex_background_mode && !linkage
+		&& !(G->enable_hooks & EnableHooks::DEVICE)
+		&& !(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED);
+}
+
+void prewarm_shader_regex(ID3D11Device *device, UINT64 hash, const wchar_t *shader_type,
+		ID3DBlob *bytecode, ID3D11ClassLinkage *linkage)
+{
+	if (shader_regex_groups.empty() || !bytecode || !shader_regex_background_allowed(device, linkage))
+		return;
+
+	ShaderRegexJobs &j = shader_regex_jobs();
+	std::lock_guard<std::mutex> lock(j.lock);
+
+	if (j.jobs.count(hash))
+		return;
+
+	queue_shader_regex_job(j, hash, shader_type, device, bytecode, false, NULL, false);
+}
+
+// Hands over what a job worked out for a shader the render thread has no
+// result for yet, without the command lists linked:
+static ShaderRegexJobStatus take_shader_regex_job_result(UINT64 hash, const wchar_t *shader_type, ShaderRegexResult *result)
+{
+	ShaderRegexJobs &j = shader_regex_jobs();
+	std::unique_lock<std::mutex> lock(j.lock);
+	uint32_t n;
+
+	for (;;) {
+		auto i = j.jobs.find(hash);
+		if (i == j.jobs.end())
+			return ShaderRegexJobStatus::NONE;
+		ShaderRegexJob *job = &i->second;
+
+		switch (job->state) {
+		case ShaderRegexJobState::QUEUED:
+			if (!job->cache_checked) {
+				// Not started, and for most shaders the cache
+				// files answer in less time than a frame of
+				// drawing them unpatched would be noticed for:
+				release_shader_regex_job(job);
+				j.jobs.erase(i);
+				return ShaderRegexJobStatus::NONE;
+			}
+			// Fall through
+		case ShaderRegexJobState::RUNNING:
+			if (await_shader_regex_job(j, lock, hash))
+				return ShaderRegexJobStatus::PENDING;
+			continue;
+		case ShaderRegexJobState::DONE: {
+			bool valid = job->have_result
+				&& job->result.regex_hash == shader_regex_hash
+				&& job->result.shader_type == shader_type;
+
+			for (n = 0; valid && n < job->result.match_ids.size(); n++)
+				valid = job->result.match_ids[n] < shader_regex_group_index.size();
+
+			if (!valid) {
+				release_shader_regex_job(job);
+				j.jobs.erase(i);
+				return ShaderRegexJobStatus::NONE;
+			}
+
+			*result = copy_shader_regex_result_without_bytecode(job->result);
+			return ShaderRegexJobStatus::READY;
+		}
+		case ShaderRegexJobState::FAILED:
+			if (job->result.regex_hash == shader_regex_hash)
+				return ShaderRegexJobStatus::FAILED;
+			release_shader_regex_job(job);
+			j.jobs.erase(i);
+			return ShaderRegexJobStatus::NONE;
+		}
+	}
+}
+
+// Hands over the patched shader of a job, queueing one to create it from
+// result if there is none. NONE means the caller has to create it itself:
+static ShaderRegexJobStatus take_shader_regex_job_shader(ID3D11Device *device, UINT64 hash, ShaderRegexResult *result,
+		ID3D11DeviceChild **shader)
+{
+	ShaderRegexJobs &j = shader_regex_jobs();
+	std::unique_lock<std::mutex> lock(j.lock);
+
+	for (;;) {
+		auto i = j.jobs.find(hash);
+		if (i == j.jobs.end()) {
+			if (result->patched_bytecode.empty())
+				return ShaderRegexJobStatus::NONE;
+
+			// The job gets the only copy:
+			ShaderRegexResult job_result = copy_shader_regex_result_without_bytecode(*result);
+			job_result.patched_bytecode = std::move(result->patched_bytecode);
+			if (!queue_shader_regex_job(j, hash, result->shader_type.c_str(), device, NULL, true, &job_result, true)) {
+				result->patched_bytecode = std::move(job_result.patched_bytecode);
+				return ShaderRegexJobStatus::NONE;
+			}
+
+			if (await_shader_regex_job(j, lock, hash))
+				return ShaderRegexJobStatus::PENDING;
+			continue;
+		}
+		ShaderRegexJob *job = &i->second;
+
+		switch (job->state) {
+		case ShaderRegexJobState::QUEUED:
+		case ShaderRegexJobState::RUNNING:
+			if (await_shader_regex_job(j, lock, hash))
+				return ShaderRegexJobStatus::PENDING;
+			continue;
+		case ShaderRegexJobState::DONE:
+			if (job->device != device)
+				return ShaderRegexJobStatus::NONE;
+			if (!job->have_result || !job->result.patched || job->result.regex_hash != result->regex_hash) {
+				release_shader_regex_job(job);
+				j.jobs.erase(i);
+				continue;
+			}
+			// The driver refused it, which it would do again:
+			if (!job->shader)
+				return ShaderRegexJobStatus::FAILED;
+			*shader = job->shader;
+			(*shader)->AddRef();
+			return ShaderRegexJobStatus::READY;
+		case ShaderRegexJobState::FAILED:
+			release_shader_regex_job(job);
+			j.jobs.erase(i);
+			continue;
+		}
+	}
+}
+
+static void link_shader_regex_result(UINT64 hash, ShaderRegexResult *result)
+{
+	for (uint32_t id : result->match_ids)
+		shader_regex_group_index[id]->link_command_lists_and_filter_index(hash);
+}
+
+// The outcome for a shader: from memory, else from a background job, else from
+// the cache files, else by analysis. Without background the command lists of
+// the matched groups are linked to the shader's ShaderOverride on the way,
+// which a config reload clears. With it that is left to the caller, and NULL
+// with pending set means the analysis is still running in the background:
+static ShaderRegexResult* resolve_shader_regex(ID3D11Device *device, OriginalShaderInfo *orig_info, bool background, bool *pending)
+{
+	const wchar_t *shader_type = orig_info->shaderType.c_str();
+	UINT64 hash = orig_info->hash;
 	ShaderRegexResult result;
 	uint32_t i;
 
-	auto stored = shader_regex_results.find(hash);
-	if (stored != shader_regex_results.end()) {
-		ShaderRegexResult *r = &stored->second;
-		bool valid = r->regex_hash == shader_regex_hash && r->shader_type == shader_type;
+	for (;;) {
+		auto stored = shader_regex_results.find(hash);
+		if (stored != shader_regex_results.end()) {
+			ShaderRegexResult *r = &stored->second;
+			bool valid = r->regex_hash == shader_regex_hash && r->shader_type == shader_type;
 
-		for (i = 0; valid && i < r->match_ids.size(); i++)
-			valid = r->match_ids[i] < shader_regex_group_index.size();
+			for (i = 0; valid && i < r->match_ids.size(); i++)
+				valid = r->match_ids[i] < shader_regex_group_index.size();
 
-		if (valid) {
-			for (i = 0; i < r->match_ids.size(); i++)
-				shader_regex_group_index[r->match_ids[i]]->link_command_lists_and_filter_index(hash);
-			return r;
+			if (valid) {
+				if (!background)
+					link_shader_regex_result(hash, r);
+				return r;
+			}
+
+			shader_regex_results.erase(stored);
 		}
 
-		shader_regex_results.erase(stored);
-	}
+		if (background) {
+			switch (take_shader_regex_job_result(hash, shader_type, &result)) {
+			case ShaderRegexJobStatus::PENDING:
+				*pending = true;
+				return NULL;
+			case ShaderRegexJobStatus::READY:
+				LogInfo("%S %016I64x ShaderRegex outcome taken from the background\n", shader_type, hash);
+				return store_shader_regex_result(hash, &result);
+			case ShaderRegexJobStatus::FAILED:
+				return NULL;
+			case ShaderRegexJobStatus::NONE:
+				break;
+			}
+		}
 
-	switch (load_shader_regex_cache(hash, shader_type, &result)) {
-	case ShaderRegexCache::NO_MATCH:
-		LogInfo("%S %016I64x has cached ShaderRegex miss\n", shader_type, hash);
-		return store_shader_regex_result(hash, &result);
-	case ShaderRegexCache::MATCH:
-		LogInfo("Loaded %S %016I64x command list from ShaderRegex cache\n", shader_type, hash);
-		return store_shader_regex_result(hash, &result);
-	case ShaderRegexCache::PATCH:
-		LogInfo("Loaded %S %016I64x bytecode from ShaderRegex cache\n", shader_type, hash);
-		return store_shader_regex_result(hash, &result);
-	case ShaderRegexCache::NO_CACHE:
-		break;
+		switch (load_shader_regex_cache(hash, shader_type, &result, !background)) {
+		case ShaderRegexCache::NO_MATCH:
+			LogInfo("%S %016I64x has cached ShaderRegex miss\n", shader_type, hash);
+			return store_shader_regex_result(hash, &result);
+		case ShaderRegexCache::MATCH:
+			LogInfo("Loaded %S %016I64x command list from ShaderRegex cache\n", shader_type, hash);
+			return store_shader_regex_result(hash, &result);
+		case ShaderRegexCache::PATCH:
+			LogInfo("Loaded %S %016I64x bytecode from ShaderRegex cache\n", shader_type, hash);
+			return store_shader_regex_result(hash, &result);
+		case ShaderRegexCache::NO_CACHE:
+			break;
+		}
+
+		if (!background)
+			break;
+
+		{
+			ShaderRegexJobs &j = shader_regex_jobs();
+			std::unique_lock<std::mutex> lock(j.lock);
+
+			if (!j.jobs.count(hash) && !queue_shader_regex_job(j, hash, shader_type, device, orig_info->byteCode, true, NULL, true))
+				break;
+		}
+		// Comes back as pending, or as its outcome after waiting for it:
 	}
 
 	// A partial cache read may have linked some groups and filled some of
@@ -988,35 +1522,49 @@ static ShaderRegexResult* resolve_shader_regex(UINT64 hash, const wchar_t *shade
 	result.shader_type = shader_type;
 	result.tagline = L"//";
 
-	return analyse_shader_regex(hash, shader_type, orig_info, &result);
+	return analyse_shader_regex(hash, shader_type, orig_info, !background, &result);
 }
 
-static bool create_shader_regex_replacement(ID3D11Device *device, OriginalShaderInfo *orig_info, ShaderRegexResult *result)
+// Results taken from a background job come without the patched bytecode:
+static bool restore_patched_bytecode(OriginalShaderInfo *orig_info, ShaderRegexResult *result)
 {
-	const void *bytecode = result->patched_bytecode.data();
-	SIZE_T size = result->patched_bytecode.size();
-	ID3D11ClassLinkage *linkage = orig_info->linkage;
-	ID3D11DeviceChild *replacement = NULL;
-	const wstring &type = orig_info->shaderType;
-	HRESULT hr;
+	ShaderRegexResult restored;
 
-	if (type == L"vs")
-		hr = device->CreateVertexShader(bytecode, size, linkage, (ID3D11VertexShader**)&replacement);
-	else if (type == L"ps")
-		hr = device->CreatePixelShader(bytecode, size, linkage, (ID3D11PixelShader**)&replacement);
-	else if (type == L"cs")
-		hr = device->CreateComputeShader(bytecode, size, linkage, (ID3D11ComputeShader**)&replacement);
-	else if (type == L"gs")
-		hr = device->CreateGeometryShader(bytecode, size, linkage, (ID3D11GeometryShader**)&replacement);
-	else if (type == L"hs")
-		hr = device->CreateHullShader(bytecode, size, linkage, (ID3D11HullShader**)&replacement);
-	else if (type == L"ds")
-		hr = device->CreateDomainShader(bytecode, size, linkage, (ID3D11DomainShader**)&replacement);
-	else
-		hr = E_INVALIDARG;
+	if (!prepare_shader_regex_result(orig_info->hash, orig_info->shaderType.c_str(), orig_info->byteCode, false, &restored))
+		return false;
+	if (!restored.patched || restored.patched_bytecode.empty())
+		return false;
+
+	result->patched_bytecode = std::move(restored.patched_bytecode);
+	return true;
+}
+
+static bool create_shader_regex_replacement(ID3D11Device *device, OriginalShaderInfo *orig_info, ShaderRegexResult *result,
+		bool background, bool *pending)
+{
+	ID3D11DeviceChild *replacement = NULL;
+
+	if (background) {
+		switch (take_shader_regex_job_shader(device, orig_info->hash, result, &replacement)) {
+		case ShaderRegexJobStatus::PENDING:
+			*pending = true;
+			return false;
+		case ShaderRegexJobStatus::FAILED:
+			return false;
+		case ShaderRegexJobStatus::READY:
+		case ShaderRegexJobStatus::NONE:
+			break;
+		}
+	}
+
+	if (!replacement) {
+		if (result->patched_bytecode.empty() && !restore_patched_bytecode(orig_info, result))
+			return false;
+		replacement = create_patched_shader(device, orig_info->shaderType, orig_info->linkage, result->patched_bytecode);
+	}
 
 	CleanupShaderMaps(replacement);
-	if (FAILED(hr) || !replacement) {
+	if (!replacement) {
 		LogInfo("    *** Creating replacement shader failed\n");
 		return false;
 	}
@@ -1034,19 +1582,31 @@ static bool create_shader_regex_replacement(ID3D11Device *device, OriginalShader
 	return true;
 }
 
-bool apply_shader_regex_to_shader(ID3D11Device *device, OriginalShaderInfo *orig_info)
+bool apply_shader_regex_to_shader(ID3D11Device *device, OriginalShaderInfo *orig_info, bool *pending)
 {
+	bool background = shader_regex_background_allowed(device, orig_info->linkage);
 	ShaderRegexResult *result;
+	bool replaced = false;
 
-	result = resolve_shader_regex(orig_info->hash, orig_info->shaderType.c_str(), orig_info);
-	if (!result || !result->patched)
+	*pending = false;
+
+	result = resolve_shader_regex(device, orig_info, background, pending);
+	if (!result)
 		return false;
 
-	if (orig_info->replacement && orig_info->replacement_from_regex
-	 && orig_info->replacement_regex_hash == result->regex_hash)
-		return true;
+	if (result->patched) {
+		replaced = orig_info->replacement && orig_info->replacement_from_regex
+			&& orig_info->replacement_regex_hash == result->regex_hash;
+		if (!replaced)
+			replaced = create_shader_regex_replacement(device, orig_info, result, background, pending);
+	}
 
-	return create_shader_regex_replacement(device, orig_info, result);
+	// The command lists were written for the patched shader, so they wait
+	// for it, and stay out if the driver refused it:
+	if (background && !*pending && (!result->patched || replaced))
+		link_shader_regex_result(orig_info->hash, result);
+
+	return replaced;
 }
 
 void drop_stale_shader_regex_results()
@@ -1055,6 +1615,24 @@ void drop_stale_shader_regex_results()
 		if (i->second.regex_hash != shader_regex_hash)
 			i = shader_regex_results.erase(i);
 		else
+			i++;
+	}
+
+	ShaderRegexJobs &j = shader_regex_jobs();
+	std::lock_guard<std::mutex> lock(j.lock);
+
+	for (auto i = j.jobs.begin(); i != j.jobs.end();) {
+		ShaderRegexJob *job = &i->second;
+		// Running jobs are found stale when their outcome is taken.
+		// Queued ones without a result work with the new sections:
+		bool stale = job->state != ShaderRegexJobState::RUNNING
+			&& (job->have_result || job->state == ShaderRegexJobState::FAILED)
+			&& job->result.regex_hash != shader_regex_hash;
+
+		if (stale) {
+			release_shader_regex_job(job);
+			i = j.jobs.erase(i);
+		} else
 			i++;
 	}
 }
