@@ -5,6 +5,7 @@
 #include "CommandList.h"
 
 #include <DDSTextureLoader.h>
+#include "ResourceLoading.h"
 #include <algorithm>
 #include <cstdio>
 #include <sstream>
@@ -743,6 +744,14 @@ static bool ParseCheckTextureOverride(const wchar_t *section,
 		ret = false;
 	}
 	if (ret) {
+		// A matched [TextureOverride] may assign to "this", which is the
+		// checked custom resource:
+		if (operation->target.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
+			CustomResource* checked = operation->target.GetCustomResource(nullptr);
+			if (checked)
+				checked->written_by_command_list = true;
+		}
+
 		// If the user indicated an explicit command list we will run the pre
 		// and post lists of the target list together.
 		if (explicit_command_list)
@@ -877,6 +886,11 @@ static bool ParseClearView(const wchar_t *section,
 
 	if (operation->target.type == ResourceCopyTargetType::INVALID)
 		goto bail;
+	if (operation->target.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
+		CustomResource* cleared = operation->target.GetCustomResource(nullptr);
+		if (cleared)
+			cleared->written_by_command_list = true;
+	}
 
 	// Use the first value specified as the depth value when clearing a
 	// DSV, and the second as the stencil value, unless we are only
@@ -6417,6 +6431,7 @@ CustomResource::CustomResource() :
 	view(NULL),
 	is_null(true),
 	substantiated(false),
+	written_by_command_list(false),
 	bind_flags((D3D11_BIND_FLAG)0),
 	misc_flags((D3D11_RESOURCE_MISC_FLAG)0),
 	stride(0),
@@ -6588,7 +6603,7 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 			case CustomResourceType::BUFFER:
 			case CustomResourceType::STRUCTURED_BUFFER:
 			case CustomResourceType::RAW_BUFFER:
-				SubstantiateBuffer(mOrigDevice1, NULL, 0);
+				SubstantiateBuffer(mOrigDevice1, NULL, 0, nullptr);
 				break;
 			case CustomResourceType::TEXTURE1D:
 				SubstantiateTexture1D(mOrigDevice1);
@@ -6606,83 +6621,69 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 	UnlockResourceCreationMode();
 }
 
-void CustomResource::LoadBufferFromFile(ID3D11Device *mOrigDevice1)
+bool CustomResource::ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags)
 {
-	DWORD size, read_size;
-	void *buf = NULL;
-	HANDLE f;
+	// Pool elements are reassigned by their pool, and a resource some
+	// command list or the GPU writes into must stay private to its section:
+	if (!G->share_duplicate_resources || written_by_command_list || pool || pool_index != -2)
+		return false;
 
-	f = CreateFile(filename.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (f == INVALID_HANDLE_VALUE) {
-		LogOverlayW(LOG_WARNING, L"Failed to load custom buffer resource %ls: %d\n", filename.c_str(), GetLastError());
-		return;
-	}
-
-	size = GetFileSize(f, 0);
-	buf = malloc(size); // malloc to allow realloc to resize it if the user overrode the size
-	if (!buf) {
-		LogOverlayW(LOG_DIRE, L"Out of memory loading %ls\n", filename.c_str());
-		goto out_close;
-	}
-
-	if (!ReadFile(f, buf, size, &read_size, 0) || size != read_size) {
-		LogOverlayW(LOG_WARNING, L"Error reading custom buffer from file %ls\n", filename.c_str());
-		goto out_delete;
-	}
-
-	SubstantiateBuffer(mOrigDevice1, &buf, size);
-
-	buf_size = (UINT)size;
-
-	// TODO: Research for possible usefulness of RAM caching of loaded files.
-	//if(G->track_region_hashes)
-	//	InitializeHandleInfo(buf, buf_size);
-
-out_delete:
-	//if (!G->track_region_hashes)
-	free(buf);
-out_close:
-	CloseHandle(f);
+	return !(effective_bind_flags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL
+				| D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT));
 }
 
-bool CustomResource::HasPNGsRGBChunk(wstring filename)
+void CustomResource::LoadBufferFromFile(ID3D11Device *mOrigDevice1)
 {
-	FILE *f = _wfopen(filename.c_str(), L"rb");
-	if (f != nullptr) {
-		unsigned char signature[8];
-		fread(signature, 1, 8, f);
-		if (memcmp(signature, "\x89PNG\r\n\x1a\n", 8) == 0) { // File is png
-			unsigned char chunk_size[4], chunk_type[4];
-			uint32_t chunk_size_int;
-			while (true) {
-				if (!fread(chunk_size, 1, 4, f)) break; // Read chunk size or break from loop on read failure
-				chunk_size_int = ((uint32_t)chunk_size[0] << 24) |
-								 ((uint32_t)chunk_size[1] << 16) |
-								 ((uint32_t)chunk_size[2] << 8)  |
-								 chunk_size[3];
-				if (!fread(chunk_type, 1, 4, f)) break; // Read chunk type or break from loop on read failure
-				if (memcmp(chunk_type, "sRGB", 4) == 0) { // sRGB found
-					fclose(f);
-					return true;
-				} else if (memcmp(chunk_type, "IDAT", 4) == 0) { // IDAT found
-					break;
-				}
-				fseek(f, chunk_size_int + 4, SEEK_CUR);
-			}
-		}
-		fclose(f);
+	MappedFile file(filename.c_str());
+
+	if (!file.valid()) {
+		LogOverlayW(LOG_WARNING, L"Failed to load custom buffer resource %ls: %d\n", filename.c_str(), file.error);
+		return;
+	}
+	if (file.size > UINT_MAX) {
+		LogOverlayW(LOG_WARNING, L"Custom buffer resource %ls is too large\n", filename.c_str());
+		return;
+	}
+	RecordResourceFileUse(filename);
+	file.prefetch();
+
+	SubstantiateBuffer(mOrigDevice1, file.data, (DWORD)file.size, &file);
+
+	buf_size = (UINT)file.size;
+}
+
+bool CustomResource::HasPNGsRGBChunk(const uint8_t *data, size_t size)
+{
+	size_t pos = 8;
+
+	if (size < pos || memcmp(data, "\x89PNG\r\n\x1a\n", 8))
+		return false;
+
+	// Each chunk is a big endian length, a type, the data and a CRC. The
+	// sRGB chunk must precede the first IDAT chunk:
+	while (pos + 8 <= size) {
+		uint32_t chunk_size = ((uint32_t)data[pos] << 24) |
+				      ((uint32_t)data[pos + 1] << 16) |
+				      ((uint32_t)data[pos + 2] << 8) |
+				      data[pos + 3];
+		const uint8_t *chunk_type = data + pos + 4;
+		if (!memcmp(chunk_type, "sRGB", 4))
+			return true;
+		if (!memcmp(chunk_type, "IDAT", 4))
+			return false;
+		pos += 8 + (size_t)chunk_size + 4;
 	}
 	return false;
 }
 
-DirectX::WIC_LOADER_FLAGS CustomResource::GetWICFlags(wstring filename)
+DirectX::WIC_LOADER_FLAGS CustomResource::GetWICFlags(const uint8_t *data, size_t size)
 {
 	switch (override_color_space) {
 		case CustomColorSpace::LINEAR:
 		case CustomColorSpace::SRGB:
 			return (DirectX::WIC_LOADER_FLAGS) override_color_space;
 		default:
-			if (G->gForceDetectColorSpace && HasPNGsRGBChunk(filename))
+			if (G->gForceDetectColorSpace && HasPNGsRGBChunk(data, size))
 				return DirectX::WIC_LOADER_FLAGS::WIC_LOADER_FORCE_SRGB;
 	}
 	return DirectX::WIC_LOADER_FLAGS::WIC_LOADER_DEFAULT;
@@ -6690,7 +6691,10 @@ DirectX::WIC_LOADER_FLAGS CustomResource::GetWICFlags(wstring filename)
 
 void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 {
-	wstring ext;
+	SharedResourceKey share_key;
+	DirectX::WIC_LOADER_FLAGS wic_flags = DirectX::WIC_LOADER_DEFAULT;
+	bool dds, share, force_srgb;
+	size_t dot;
 	HRESULT hr;
 
 	switch (override_type) {
@@ -6723,45 +6727,81 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 	// could do something smart here, like only using it if the
 	// bind_flags indicate it will be used as a shader resource.
 
-	// Needs to be called at some point before CreateXXXTextureFromFile:
+	// Needs to be called at some point before CreateXXXTextureFromMemory:
 	EnsureCOM();
 
-	ext = filename.substr(filename.rfind(L"."));
-	if (!_wcsicmp(ext.c_str(), L".dds")) {
+	MappedFile file(filename.c_str());
+	if (!file.valid()) {
+		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: %d\n", filename.c_str(), file.error);
+		return;
+	}
+	RecordResourceFileUse(filename);
+	// Asks for the whole file to be read at once, instead of a page fault per 4K
+	// while the runtime copies the initial data out of the mapping:
+	file.prefetch();
+
+	dot = filename.rfind(L'.');
+	dds = dot != wstring::npos && !_wcsicmp(filename.c_str() + dot, L".dds");
+	force_srgb = override_color_space == CustomColorSpace::SRGB;
+	if (!dds)
+		wic_flags = GetWICFlags(file.data, file.size);
+
+	share = ShareableFromFile(bind_flags);
+	if (share) {
+		share_key.device = mOrigDevice1;
+		share_key.loader = dds ? SharedResourceLoader::DDS : SharedResourceLoader::WIC;
+		share_key.bind_flags = bind_flags;
+		share_key.misc_flags = misc_flags;
+		share_key.load_flags = dds ? force_srgb : wic_flags;
+		resource = FindSharedFileResource(share_key, file.data, file.size);
+		if (resource) {
+			LogInfoW(L"Sharing the texture already loaded from identical %s\n", filename.c_str());
+			Profiling::resources_shared++;
+			device = mOrigDevice1;
+			is_null = false;
+			return;
+		}
+	}
+
+	if (dds) {
 		LogInfoW(L"Loading custom resource %s as DDS, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
-		hr = DirectX::CreateDDSTextureFromFileEx(mOrigDevice1,
-				filename.c_str(), 0,
+		hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
+				file.data, file.size, 0,
 				D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
-				override_color_space == CustomColorSpace::SRGB, &resource, NULL, NULL);
+				force_srgb, &resource, NULL, NULL);
 	} else {
 		LogInfoW(L"Loading custom resource %s as WIC, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
-		hr = DirectX::CreateWICTextureFromFileEx(mOrigDevice1,
-				filename.c_str(), 0,
+		hr = DirectX::CreateWICTextureFromMemoryEx(mOrigDevice1,
+				file.data, file.size, 0,
 				D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
-				GetWICFlags(filename), &resource, NULL);
+				wic_flags, &resource, NULL);
 	}
 	if (SUCCEEDED(hr)) {
 		device = mOrigDevice1;
 		is_null = false;
+		if (share)
+			ShareFileResource(share_key, filename, resource);
 		// TODO:
 		// format = ...
 	} else
 		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: 0x%x\n", filename.c_str(), hr);
 }
 
-void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf, DWORD size)
+void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, const void *data, DWORD size, const MappedFile *share_file)
 {
-	D3D11_SUBRESOURCE_DATA data = {0}, *pInitialData = NULL;
+	D3D11_SUBRESOURCE_DATA init_data = {0}, *pInitialData = NULL;
+	SharedResourceKey share_key;
+	void *enlarged = NULL;
 	ID3D11Buffer *buffer;
 	D3D11_BUFFER_DESC desc;
 	HRESULT hr;
 
-	if (!buf) {
+	if (!data) {
 		// If no file is passed in, we use the optional initial data to
 		// initialise the buffer. We do this even if no initial data
 		// has been specified, so that the buffer will be initialised
 		// with zeroes for safety.
-		buf = &initial_data;
+		data = initial_data;
 		size = (DWORD)initial_data_size;
 	}
 
@@ -6784,22 +6824,46 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf, 
 
 	OverrideBufferDesc(&desc);
 
+	// Sharing is decided on the flags the buffer is created with, since an
+	// ini bind_flags override can make it writable through a UAV even
+	// when every direct use is a shader resource:
+	if (share_file && !ShareableFromFile((D3D11_BIND_FLAG)desc.BindFlags))
+		share_file = nullptr;
+
+	if (share_file) {
+		share_key.device = mOrigDevice1;
+		share_key.loader = SharedResourceLoader::BUFFER;
+		share_key.bind_flags = desc.BindFlags;
+		share_key.misc_flags = desc.MiscFlags;
+		share_key.byte_width = desc.ByteWidth;
+		share_key.structure_stride = desc.StructureByteStride;
+		resource = FindSharedFileResource(share_key, share_file->data, share_file->size);
+		if (resource) {
+			LogInfo("Sharing the buffer already loaded from identical %S [%S]\n", filename.c_str(), name.c_str());
+			Profiling::resources_shared++;
+			device = mOrigDevice1;
+			is_null = false;
+			OverrideOutOfBandInfo(&format, &stride);
+			return;
+		}
+	}
+
 	if (desc.ByteWidth > 0) {
-		// Fill in size from the file/initial data, allowing for an
-		// override to make it larger or smaller, which may involve
-		// reallocating the buffer from the caller.
+		// An override may make the buffer larger than the data; the
+		// remainder is zero filled:
 		if (desc.ByteWidth > size) {
-			void *new_buf = realloc(*buf, desc.ByteWidth);
-			if (!new_buf) {
+			enlarged = calloc(desc.ByteWidth, 1);
+			if (!enlarged) {
 				LogInfo("Out of memory enlarging buffer: [%S]\n", name.c_str());
 				return;
 			}
-			memset((char*)new_buf + size, 0, desc.ByteWidth - size);
-			*buf = new_buf;
+			if (size)
+				memcpy(enlarged, data, size);
+			data = enlarged;
 		}
 
-		data.pSysMem = *buf;
-		pInitialData = &data;
+		init_data.pSysMem = data;
+		pInitialData = &init_data;
 	}
 
 	hr = mOrigDevice1->CreateBuffer(&desc, pInitialData, &buffer);
@@ -6811,11 +6875,15 @@ void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, void **buf, 
 		device = mOrigDevice1;
 		is_null = false;
 		OverrideOutOfBandInfo(&format, &stride);
+		if (share_file)
+			ShareFileResource(share_key, filename, resource);
 	} else {
 		LogOverlayW(LOG_NOTICE, L"Failed to substantiate custom %ls [%ls]: 0x%x\n",
 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), hr);
 		LogResourceDesc(&desc);
 	}
+
+	free(enlarged);
 }
 
 void CustomResource::SubstantiateTexture1D(ID3D11Device *mOrigDevice1)
@@ -7384,6 +7452,8 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
 	// when there has not been.
 	if (device == mOrigDevice1)
 		return;
+
+	ReleaseSharedFileResources(device);
 
 	// Attempt to transfer resource to new device by staging to the CPU and
 	// back. Rather slow, but ensures the contents are up to date.
@@ -9031,6 +9101,12 @@ static CommandListCommand* parse_resource_copy_operation(
 		// resolved by PropagateDeferredBindFlags() once parsing is complete.
 		if (dst.type == ResourceCopyTargetType::CUSTOM_RESOURCE || dst.type == ResourceCopyTargetType::POOL)
 			DeferBindFlagsPropagation(src_custom_resource, dst.GetCustomResource(nullptr));
+	}
+
+	if (dst.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
+		CustomResource* dst_custom_resource = dst.GetCustomResource(nullptr);
+		if (dst_custom_resource)
+			dst_custom_resource->written_by_command_list = true;
 	}
 
 	ResourceCopyOperation* operation = new ResourceCopyOperation();

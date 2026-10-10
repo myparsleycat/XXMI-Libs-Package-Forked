@@ -777,17 +777,6 @@ static void free_globbing_vector(vector<pcre2_code*> &patterns) {
 		pcre2_code_free(regex);
 }
 
-static string to_utf8(const wstring& wstr) {
-	if (wstr.empty())
-		return string();
-	int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
-	if (len == 0)
-		return string();
-	string utf8_str(len, 0);
-	WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &utf8_str[0], len, NULL, NULL);
-	return utf8_str;
-}
-
 static bool matches_globbing_vector(wchar_t *filename, vector<pcre2_code*> &patterns) {
 	string afilename;
 	pcre2_match_data *md;
@@ -2219,6 +2208,7 @@ static void ParseResourceSections()
 	customResourcePools.clear();
 	custom_resource_pool_path_keys.clear();
 	customResources.clear();
+	ReleaseSharedFileResources();
 
 	IniSections::iterator lower = ini_sections.lower_bound(wstring(L"Pool"));
 	IniSections::iterator upper = prefix_upper_bound(ini_sections, wstring(L"Pool"));
@@ -4794,6 +4784,8 @@ void LoadConfigFile()
 	}
 
 	G->CACHE_SHADERS = GetIniBool(L"Rendering", L"cache_shaders", false, NULL);
+	G->share_duplicate_resources = GetIniBool(L"Rendering", L"share_duplicate_resources", true, NULL);
+	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", false, NULL);
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
 
@@ -5017,6 +5009,7 @@ void LoadConfigFile()
 		InstallMouseHooks(G->hide_cursor);
 
 	SnapshotShaderFixes();
+	StartResourceFilePrefetch();
 
 	setlocale(LC_CTYPE, G->gDefaultLocale.c_str());
 

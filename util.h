@@ -21,6 +21,16 @@
 
 #include "D3D_Shaders\stdafx.h"
 
+static std::string to_utf8(const std::wstring &wstr)
+{
+	if (wstr.empty())
+		return std::string();
+	int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+	std::string utf8(len, 0);
+	WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &utf8[0], len, NULL, NULL);
+	return utf8;
+}
+
 #if MIGOTO_DX == 11
 #include "DirectX11\HookedDevice.h"
 #include "DirectX11\HookedContext.h"

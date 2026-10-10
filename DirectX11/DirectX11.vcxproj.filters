@@ -16,6 +16,7 @@
     <ClCompile Include="..\crc32c-hw-1.0.5\src\crc32c.cpp" />
     <ClCompile Include="CommandList.cpp" />
     <ClCompile Include="ResourceHash.cpp" />
+    <ClCompile Include="ResourceLoading.cpp" />
     <ClCompile Include="HookedContext.cpp" />
     <ClCompile Include="HookedDevice.cpp" />
     <ClCompile Include="..\D3D_Shaders\SignatureParser.cpp" />
@@ -54,6 +55,7 @@
     <ClInclude Include="..\crc32c-hw-1.0.5\include\crc32c.h" />
     <ClInclude Include="CommandList.h" />
     <ClInclude Include="ResourceHash.h" />
+    <ClInclude Include="ResourceLoading.h" />
     <ClInclude Include="HookedContext.h" />
     <ClInclude Include="HookedDevice.h" />
     <ClInclude Include="..\shader.h" />

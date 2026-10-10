@@ -127,6 +127,7 @@ static bool InitializeDLL()
 
 void DestroyDLL()
 {
+	StopResourceFilePrefetch();
 	CleanUpPersistentSettingsSaves();
 }
 

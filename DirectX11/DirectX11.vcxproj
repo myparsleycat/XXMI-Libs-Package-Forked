@@ -67,6 +67,7 @@
     <ClCompile Include="Override.cpp" />
     <ClCompile Include="profiling.cpp" />
     <ClCompile Include="ResourceHash.cpp" />
+    <ClCompile Include="ResourceLoading.cpp" />
     <ClCompile Include="ShaderRegex.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -102,6 +103,7 @@
     <ClInclude Include="Override.h" />
     <ClInclude Include="profiling.h" />
     <ClInclude Include="ResourceHash.h" />
+    <ClInclude Include="ResourceLoading.h" />
     <ClInclude Include="ShaderRegex.h" />
     <ClInclude Include="..\vkeys.h" />
   </ItemGroup>

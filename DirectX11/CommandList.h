@@ -27,6 +27,7 @@ class HackerDevice;
 class HackerContext;
 enum class FrameAnalysisOptions;
 class ResourceCopyTarget;
+class MappedFile;
 
 struct InputLayoutElementOverride {
 	struct Match {
@@ -609,6 +610,10 @@ public:
 
 	wstring filename;
 	bool substantiated;
+	// Set while parsing for every resource some command list assigns,
+	// copies or clears into. Such a resource may not share a GPU resource
+	// loaded from a file with another section, see ShareableFromFile():
+	bool written_by_command_list;
 
 	// Used to override description when copying or synthesise resources
 	// from scratch:
@@ -651,11 +656,16 @@ public:
 	void expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOrigContext1);
 
 private:
-	bool HasPNGsRGBChunk(wstring filename);
-	DirectX::WIC_LOADER_FLAGS GetWICFlags(wstring filename);
+	bool HasPNGsRGBChunk(const uint8_t *data, size_t size);
+	DirectX::WIC_LOADER_FLAGS GetWICFlags(const uint8_t *data, size_t size);
+	// bind_flags are the ones the resource is actually created with, which
+	// for buffers are only known once OverrideBufferDesc() has run:
+	bool ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags);
 	void LoadFromFile(ID3D11Device *mOrigDevice);
 	void LoadBufferFromFile(ID3D11Device *mOrigDevice);
-	void SubstantiateBuffer(ID3D11Device *mOrigDevice, void **buf, DWORD size);
+	// share_file is the mapped file the data came from when its GPU
+	// resource may be shared with other sections loading identical data:
+	void SubstantiateBuffer(ID3D11Device *mOrigDevice, const void *data, DWORD size, const MappedFile *share_file);
 	void SubstantiateTexture1D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture2D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture3D(ID3D11Device *mOrigDevice);
