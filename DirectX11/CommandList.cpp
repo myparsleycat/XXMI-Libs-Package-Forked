@@ -3294,7 +3294,10 @@ static bool is_shim_device(ID3D11Device *device)
 	return dx12_shim && device == static_cast<ID3D11Device*>(dx12_shim->shim_device);
 }
 
-static void find_sampler_slots(CommandList *command_list, UINT16 slots[6])
+// An if command sits in both the pre and the post list of its parent, and an
+// else if nests one level deeper, so without the visited set each level would
+// double the walk: a menu with 30 options hung the game while loading.
+static void find_sampler_slots(CommandList *command_list, UINT16 slots[6], std::unordered_set<IfCommand*> *visited)
 {
 	SamplerBindCommand *bind;
 	IfCommand *if_command;
@@ -3306,19 +3309,23 @@ static void find_sampler_slots(CommandList *command_list, UINT16 slots[6])
 		if ((bind = dynamic_cast<SamplerBindCommand*>(command.get()))) {
 			slots[sampler_stage(bind->shader_type)] |= 1 << bind->slot;
 		} else if ((if_command = dynamic_cast<IfCommand*>(command.get()))) {
-			find_sampler_slots(if_command->true_commands_pre.get(), slots);
-			find_sampler_slots(if_command->true_commands_post.get(), slots);
-			find_sampler_slots(if_command->false_commands_pre.get(), slots);
-			find_sampler_slots(if_command->false_commands_post.get(), slots);
+			if (!visited->insert(if_command).second)
+				continue;
+			find_sampler_slots(if_command->true_commands_pre.get(), slots, visited);
+			find_sampler_slots(if_command->true_commands_post.get(), slots, visited);
+			find_sampler_slots(if_command->false_commands_pre.get(), slots, visited);
+			find_sampler_slots(if_command->false_commands_post.get(), slots, visited);
 		}
 	}
 }
 
 void CustomShader::find_sampler_slots()
 {
+	std::unordered_set<IfCommand*> visited;
+
 	memset(sampler_slots, 0, sizeof(sampler_slots));
-	::find_sampler_slots(&command_list, sampler_slots);
-	::find_sampler_slots(&post_command_list, sampler_slots);
+	::find_sampler_slots(&command_list, sampler_slots, &visited);
+	::find_sampler_slots(&post_command_list, sampler_slots, &visited);
 }
 
 // Which sampler slots running the custom shader has to save and restore, false
