@@ -320,15 +320,17 @@ bool Dx12NoteTopMipUpload(ID3D12Resource *resource)
 	if (i != shard->resources.end()) {
 		Dx12ResourceInfo &info = i->second;
 
-		if (info.top_uploaded && frame - info.top_upload_frame < DX12_HOT_FRAMES) {
-			if (info.top_upload_hot < DX12_HOT_LIMIT)
+		if (info.top_uploaded && frame == info.top_upload_frame) {
+			// Counted already
+		} else if (info.top_uploaded && frame - info.top_upload_frame < DX12_HOT_FRAMES) {
+			if (info.top_upload_hot < DX12_HOT_TEXTURE_LIMIT)
 				info.top_upload_hot++;
 		} else {
 			info.top_upload_hot = 0;
 		}
 		info.top_uploaded = true;
 		info.top_upload_frame = frame;
-		hash_it = info.top_upload_hot < DX12_HOT_LIMIT;
+		hash_it = info.top_upload_hot < DX12_HOT_TEXTURE_LIMIT;
 	}
 	ReleaseSRWLockExclusive(&shard->lock);
 

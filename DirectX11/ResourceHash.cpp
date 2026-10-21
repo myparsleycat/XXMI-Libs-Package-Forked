@@ -1122,8 +1122,68 @@ out_profile:
 		Profiling::end(&profiling_state, &Profiling::hash_tracking_overhead);
 }
 
+// A texture whose subresource 0 is written again within this many frames, this
+// many times in a row, is one the game streams into, such as a video it plays,
+// and keeps the hash of its description alone. Hashing each write would cost a
+// copy and a CRC of the whole texture every frame, under the lock the render
+// thread takes for every draw, for a hash no mod can know in advance. The same
+// rule as DX12_HOT_FRAMES and DX12_HOT_TEXTURE_LIMIT on D3D12.
+static const unsigned hot_update_frames = 30;
+static const unsigned hot_update_limit = 16;
+
+// Called with G->mCriticalSection held. False once the texture is taken for
+// one the game streams into.
+static bool note_top_update(ID3D11Resource *resource, ResourceHandleInfo *info)
+{
+	unsigned frame = G->frame_no;
+	bool became_hot = false;
+	uint32_t old_hash;
+
+	// Writes within one frame count once, so that a texture filled in
+	// several pieces while it is set up, possibly before anything was
+	// presented, keeps the hash of what it ends up with:
+	if (!info->top_updated || frame != info->top_update_frame) {
+		if (info->top_updated && frame - info->top_update_frame < hot_update_frames) {
+			if (info->top_update_hot < hot_update_limit)
+				became_hot = ++info->top_update_hot == hot_update_limit;
+		} else {
+			info->top_update_hot = 0;
+		}
+		info->top_updated = true;
+		info->top_update_frame = frame;
+	}
+
+	if (info->top_update_hot < hot_update_limit)
+		return true;
+
+	// Also on a later write within the frame: a copy from another texture
+	// may have propagated a data hash to this one since
+	if (!info->data_hash)
+		return false;
+
+	old_hash = info->hash;
+	info->data_hash = 0;
+	switch (info->type) {
+		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+			info->hash = CalcTexture2DDescHash(0, &info->desc2D);
+			break;
+		case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+			info->hash = CalcTexture3DDescHash(0, &info->desc3D);
+			break;
+	}
+	ForgetTextureOverrideMiss(resource);
+
+	if (became_hot)
+		LogInfo("Texture %p is written every frame, no longer hashing its data: hash %08x -> %08x\n",
+				resource, old_hash, info->hash);
+	else
+		LogDebug("Texture %p written every frame, dropped data hash: hash %08x -> %08x\n",
+				resource, old_hash, info->hash);
+	return false;
+}
+
 void UpdateResourceHashFromCPU(ID3D11Resource *resource,
-	const void *data, UINT rowPitch, UINT depthPitch)
+	const void *data, UINT rowPitch, UINT depthPitch, bool note_update)
 {
 	D3D11_RESOURCE_DIMENSION dim;
 	D3D11_SUBRESOURCE_DATA initialData;
@@ -1156,6 +1216,9 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 		goto out_unlock;
 
 	if (!supports_hash_tracking(info))
+		goto out_unlock;
+
+	if (note_update && !note_top_update(resource, info))
 		goto out_unlock;
 
 	// Ever noticed that D3D11_SUBRESOURCE_DATA is binary identical to
@@ -1314,7 +1377,18 @@ bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource, D3D
 	// updates regardless (just not the full resource hash) so the option
 	// can be turned on live and work. But there's a few pieces we would
 	// need for that to work so for now let's not over-complicate things.
-	return G->track_texture_updates == 1 && Subresource == 0;
+	if (G->track_texture_updates != 1 || Subresource != 0)
+		return false;
+
+	// A texture the game streams into is then mapped as it would be
+	// without us, rather than through a copy of all of it:
+	bool track = true;
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	ResourceHandleInfo *info = GetResourceHandleInfo(pResource);
+	if (info && supports_hash_tracking(info))
+		track = note_top_update(pResource, info);
+	LeaveCriticalSection(&G->mCriticalSection);
+	return track;
 }
 
 // -----------------------------------------------------------------------------------------------

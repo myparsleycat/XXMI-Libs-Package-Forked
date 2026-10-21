@@ -1643,7 +1643,7 @@ void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresou
 				map_info->orig_pData && map_info->size <= DIVERT_REUSE_MAX);
 
 	if (G->track_texture_updates == 1 && Subresource == 0 && map_info->mapped_writable)
-		UpdateResourceHashFromCPU(pResource, map_info->map.pData, map_info->map.RowPitch, map_info->map.DepthPitch);
+		UpdateResourceHashFromCPU(pResource, map_info->map.pData, map_info->map.RowPitch, map_info->map.DepthPitch, false);
 
 	if (map_info->orig_pData) {
 		// TODO: Measure performance vs. not diverting:
@@ -2268,7 +2268,7 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
 	// and the hashes might be less predictable. Possibly something to
 	// enable as an option in the future if there is a proven need.
 	if (G->track_texture_updates == 1 && DstSubresource == 0 && pDstBox == NULL)
-		UpdateResourceHashFromCPU(pDstResource, pSrcData, SrcRowPitch, SrcDepthPitch);
+		UpdateResourceHashFromCPU(pDstResource, pSrcData, SrcRowPitch, SrcDepthPitch, true);
 }
 
 STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_

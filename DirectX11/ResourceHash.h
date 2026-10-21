@@ -419,6 +419,11 @@ struct ResourceHandleInfo
 	uint32_t orig_hash = 0;	// Original hash at the time of creation
 	uint32_t data_hash = 0;	// Just the data hash for track_texture_updates
 
+	// Writes of subresource 0 for track_texture_updates, see note_top_update()
+	bool top_updated = false;
+	unsigned top_update_frame = 0;
+	unsigned top_update_hot = 0;
+
 	// Cleared on config reload, rebuilt on next lookup. The hash list is
 	// also rebuilt when track_texture_updates changes the hash:
 	bool texture_override_candidates_valid = false;
@@ -657,8 +662,10 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 		ID3D11Resource *src, UINT srcSubresource, char type,
 		UINT DstX, UINT DstY, UINT DstZ, const D3D11_BOX *SrcBox);
 
+// note_update is false where MapTrackResourceHashUpdate() already counted
+// the write
 void UpdateResourceHashFromCPU(ID3D11Resource *resource,
-	const void *data, UINT rowPitch, UINT depthPitch);
+	const void *data, UINT rowPitch, UINT depthPitch, bool note_update);
 
 void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src);
 

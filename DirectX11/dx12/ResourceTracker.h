@@ -75,7 +75,7 @@ void Dx12ApplyTransition(ID3D12Resource *resource, UINT subresource, LONG state)
 void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32_t data_hash);
 void Dx12MarkCubeTexture(ID3D12Resource *resource);
 // For a copy that writes a texture's whole top mip: false while the game keeps
-// writing it, by the DX12_HOT_FRAMES and DX12_HOT_LIMIT rule of buffers
+// writing it, by the DX12_HOT_FRAMES and DX12_HOT_TEXTURE_LIMIT rule
 bool Dx12NoteTopMipUpload(ID3D12Resource *resource);
 // For remembering what Dx12GetResourceInfo said of a texture without asking
 // again: a number that has changed if the resource at the address, the hash of

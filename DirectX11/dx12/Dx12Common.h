@@ -134,10 +134,14 @@ extern volatile UINT dx12_raytracing_frame;
 // Presents so far, for telling how long ago something happened
 extern volatile UINT dx12_frame;
 
-// A buffer range or a texture's top mip written again within this many frames,
-// this many times in a row, is taken for dynamic and no longer hashed
+// A buffer range written again within this many frames, this many times in a
+// row, is taken for dynamic and no longer hashed
 const UINT DX12_HOT_FRAMES = 30;
 const UINT DX12_HOT_LIMIT = 4;
+// The same for a texture's top mip, counting writes within one frame once. A
+// game may fill a texture over a few frames while it loads, then keep it, and
+// a mod can only match the hash of what it ends up with.
+const UINT DX12_HOT_TEXTURE_LIMIT = 16;
 
 void Dx12FramePresented();
 
