@@ -137,6 +137,20 @@ static void texture_uploaded(ID3D12Resource *texture, UINT subresource, UINT x, 
 		return;
 	}
 
+	// Hashing a texture the game writes every frame, such as one it plays
+	// a video into, reads all of it back out of the write combined upload
+	// heap each time, which on some machines takes longer than the frame.
+	// The hash of whichever write came last would be of no use to a mod,
+	// where the description alone is the same from one run to the next.
+	if (!Dx12NoteTopMipUpload(texture)) {
+		InterlockedIncrement64(&dx12_texture_stats.dynamic);
+		if (info.has_data_hash) {
+			Dx12SetTextureDataHash(texture, false, 0);
+			Dx12DumpTexture(texture, "dynamic");
+		}
+		return;
+	}
+
 	DirectX::LoaderHelpers::GetSurfaceInfo(width, height, info.desc.Format, NULL, &row_bytes, &rows);
 	if (!row_bytes || !rows) {
 		InterlockedIncrement64(&dx12_texture_stats.unknown_format);

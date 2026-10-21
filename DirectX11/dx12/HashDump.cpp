@@ -403,8 +403,8 @@ void Dx12HashReport(bool info)
 		pipeline_count, signature_count, shader_count, dxbc_shaders, dxil_shaders, unreflected_shaders,
 		count_in_ini(shader_hashes, G->mShaderOverrideMap), G->mShaderOverrideMap.size());
 
-	REPORT("  Texture uploads: %lld hashed (%.1f MB). Not hashed: %lld lower mips or array slices, %lld partial, %lld updates, %lld not 2D, %lld unknown format, %lld untracked texture, %lld source not mappable, %lld out of bounds. Copies: %lld propagated a hash, %lld not of a whole top mip\n",
-		t->hashed, t->hashed_bytes / 1048576.0, t->other_subresource, t->partial, t->update_ignored, t->not_2d,
+	REPORT("  Texture uploads: %lld hashed (%.1f MB). Not hashed: %lld lower mips or array slices, %lld partial, %lld updates, %lld dynamic, %lld not 2D, %lld unknown format, %lld untracked texture, %lld source not mappable, %lld out of bounds. Copies: %lld propagated a hash, %lld not of a whole top mip\n",
+		t->hashed, t->hashed_bytes / 1048576.0, t->other_subresource, t->partial, t->update_ignored, t->dynamic, t->not_2d,
 		t->unknown_format, t->untracked, t->not_mappable, t->out_of_bounds, t->copy_propagated, t->copy_partial);
 
 	REPORT("  Buffer uploads: %lld hashed (%.1f MB). Not hashed: %lld dynamic, %lld source not mappable, %lld untracked, %lld out of bounds\n",

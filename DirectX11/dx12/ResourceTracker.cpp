@@ -309,6 +309,32 @@ void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32
 	ReleaseSRWLockExclusive(&shard->lock);
 }
 
+bool Dx12NoteTopMipUpload(ID3D12Resource *resource)
+{
+	ResourceShard *shard = shard_of(resource);
+	UINT frame = dx12_frame;
+	bool hash_it = true;
+
+	AcquireSRWLockExclusive(&shard->lock);
+	auto i = shard->resources.find(resource);
+	if (i != shard->resources.end()) {
+		Dx12ResourceInfo &info = i->second;
+
+		if (info.top_uploaded && frame - info.top_upload_frame < DX12_HOT_FRAMES) {
+			if (info.top_upload_hot < DX12_HOT_LIMIT)
+				info.top_upload_hot++;
+		} else {
+			info.top_upload_hot = 0;
+		}
+		info.top_uploaded = true;
+		info.top_upload_frame = frame;
+		hash_it = info.top_upload_hot < DX12_HOT_LIMIT;
+	}
+	ReleaseSRWLockExclusive(&shard->lock);
+
+	return hash_it;
+}
+
 void Dx12MarkCubeTexture(ID3D12Resource *resource)
 {
 	ResourceShard *shard = shard_of(resource);

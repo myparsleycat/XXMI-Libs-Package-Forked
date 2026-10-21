@@ -12,10 +12,6 @@
 Dx12BufferStats dx12_buffer_stats;
 
 const UINT64 MAX_HASHED_BYTES = 256 << 20;
-// A range written again within this many frames, this many times in a row,
-// is a dynamic buffer
-const UINT HOT_FRAMES = 30;
-const UINT HOT_LIMIT = 4;
 
 struct BufferRange {
 	UINT64 bytes;
@@ -142,8 +138,8 @@ static bool note_write(ID3D12Resource *resource, UINT64 offset, UINT64 bytes, bo
 	}
 
 	BufferRange &range = map[offset];
-	if (range.bytes == bytes && frame - range.frame < HOT_FRAMES) {
-		if (range.hot < HOT_LIMIT)
+	if (range.bytes == bytes && frame - range.frame < DX12_HOT_FRAMES) {
+		if (range.hot < DX12_HOT_LIMIT)
 			range.hot++;
 	} else {
 		range.hot = 0;
@@ -152,7 +148,7 @@ static bool note_write(ID3D12Resource *resource, UINT64 offset, UINT64 bytes, bo
 	range.frame = frame;
 	range.valid = false;
 	range.unmapped = unmapped;
-	hash_it = range.hot < HOT_LIMIT;
+	hash_it = range.hot < DX12_HOT_LIMIT;
 
 	// Whatever was erased overlaps the write, and so shares a counter
 	// with it
@@ -265,9 +261,9 @@ void Dx12DescribeBufferRange(ID3D12Resource *resource, UINT64 offset, char *text
 				_snprintf_s(text, size, _TRUNCATE, "hashed %08x, %llu bytes copied at frame %u", r.data_hash, r.bytes, r.frame);
 			else if (r.unmapped)
 				_snprintf_s(text, size, _TRUNCATE, "%llu bytes copied at frame %u from memory that is not mappable", r.bytes, r.frame);
-			else if (r.hot >= HOT_LIMIT)
+			else if (r.hot >= DX12_HOT_LIMIT)
 				_snprintf_s(text, size, _TRUNCATE, "%llu bytes copied at frame %u, %u times in a row within %u frames: taken for dynamic",
-					r.bytes, r.frame, r.hot + 1, HOT_FRAMES);
+					r.bytes, r.frame, r.hot + 1, DX12_HOT_FRAMES);
 			else
 				_snprintf_s(text, size, _TRUNCATE, "%llu bytes copied at frame %u, not hashed yet", r.bytes, r.frame);
 		} else if (next != i->second.end()) {

@@ -134,6 +134,11 @@ extern volatile UINT dx12_raytracing_frame;
 // Presents so far, for telling how long ago something happened
 extern volatile UINT dx12_frame;
 
+// A buffer range or a texture's top mip written again within this many frames,
+// this many times in a row, is taken for dynamic and no longer hashed
+const UINT DX12_HOT_FRAMES = 30;
+const UINT DX12_HOT_LIMIT = 4;
+
 void Dx12FramePresented();
 
 // crc32c_hw for memory that may be an upload heap. Those are write combined,

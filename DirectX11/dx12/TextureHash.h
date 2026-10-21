@@ -46,6 +46,7 @@ struct Dx12TextureStats {
 	volatile LONG64 other_subresource;
 	volatile LONG64 partial;
 	volatile LONG64 update_ignored;
+	volatile LONG64 dynamic;
 	volatile LONG64 not_2d;
 	volatile LONG64 unknown_format;
 	volatile LONG64 untracked;

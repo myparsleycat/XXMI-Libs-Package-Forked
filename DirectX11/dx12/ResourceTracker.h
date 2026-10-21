@@ -37,6 +37,10 @@ struct Dx12ResourceInfo {
 	uint32_t data_hash;
 	// D3D12 does not tell a cube map from a 2D array until a view is made
 	bool cube;
+	// Textures: see Dx12NoteTopMipUpload
+	bool top_uploaded;
+	UINT top_upload_frame;
+	UINT top_upload_hot;
 
 	// Tells the resource from one created at its address after it was
 	// destroyed. Never 0.
@@ -70,6 +74,9 @@ void Dx12ApplyTransition(ID3D12Resource *resource, UINT subresource, LONG state)
 
 void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32_t data_hash);
 void Dx12MarkCubeTexture(ID3D12Resource *resource);
+// For a copy that writes a texture's whole top mip: false while the game keeps
+// writing it, by the DX12_HOT_FRAMES and DX12_HOT_LIMIT rule of buffers
+bool Dx12NoteTopMipUpload(ID3D12Resource *resource);
 // For remembering what Dx12GetResourceInfo said of a texture without asking
 // again: a number that has changed if the resource at the address, the hash of
 // its data or whether it is a cube map has since, and may have changed without
