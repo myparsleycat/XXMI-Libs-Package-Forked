@@ -882,6 +882,7 @@ static bool pipeline_wanted(Pipeline *pipeline)
 
 struct Buffer {
 	VkDeviceSize size;
+	VkBufferUsageFlags usage;
 	VkDeviceMemory memory;
 	VkDeviceSize memory_offset;
 };
@@ -891,10 +892,29 @@ struct Mapping {
 	VkDeviceSize offset, size;
 };
 
+struct Allocation {
+	VkDevice device;
+	uint32_t type;
+	VkDeviceSize size;
+	// By the game, which is how what it holds can have been written by the
+	// CPU
+	bool mapped;
+};
+
+// A buffer with no other usage than these is not written by the GPU, so what
+// it holds is what the CPU wrote
+const VkBufferUsageFlags GPU_READ_ONLY_USAGE = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
+	| VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+	| VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+
 // Held while mapped memory is read, which keeps it from being unmapped
 static SRWLOCK memory_lock = SRWLOCK_INIT;
 static std::unordered_map<VkBuffer, Buffer> buffers;
 static std::unordered_map<VkDeviceMemory, Mapping> mappings;
+static std::unordered_map<VkDeviceMemory, Allocation> allocations;
+
+// See VkModsMapLock. Taken before memory_lock.
+static SRWLOCK map_locks[64];
 
 // A game with its meshes in a few large buffers writes those through memory
 // it keeps mapped, and nothing tells when it does: the place of a mesh that
@@ -935,6 +955,7 @@ void VkModsBufferCreated(VkBuffer buffer, const VkBufferCreateInfo *info)
 	Buffer created = {};
 
 	created.size = info->size;
+	created.usage = info->usage;
 
 	AcquireSRWLockExclusive(&memory_lock);
 	buffers[buffer] = created;
@@ -972,6 +993,9 @@ void VkModsMemoryMapped(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize
 
 	AcquireSRWLockExclusive(&memory_lock);
 	mappings[memory] = mapping;
+	auto allocation = allocations.find(memory);
+	if (data && allocation != allocations.end())
+		allocation->second.mapped = true;
 	ReleaseSRWLockExclusive(&memory_lock);
 }
 
@@ -980,6 +1004,26 @@ void VkModsMemoryUnmapped(VkDeviceMemory memory)
 	AcquireSRWLockExclusive(&memory_lock);
 	mappings.erase(memory);
 	ReleaseSRWLockExclusive(&memory_lock);
+}
+
+void VkModsMemoryAllocated(VkDevice device, VkDeviceMemory memory, const VkMemoryAllocateInfo *info)
+{
+	AcquireSRWLockExclusive(&memory_lock);
+	allocations[memory] = { device, info->memoryTypeIndex, info->allocationSize, false };
+	ReleaseSRWLockExclusive(&memory_lock);
+}
+
+void VkModsMemoryFreed(VkDeviceMemory memory)
+{
+	AcquireSRWLockExclusive(&memory_lock);
+	mappings.erase(memory);
+	allocations.erase(memory);
+	ReleaseSRWLockExclusive(&memory_lock);
+}
+
+SRWLOCK* VkModsMapLock(VkDeviceMemory memory)
+{
+	return &map_locks[((UINT64)(uintptr_t)memory * 0x9e3779b97f4a7c15ull) >> 58];
 }
 
 // With the lock of dx12/Bridge.h held, before anything is looked up in
@@ -3862,6 +3906,9 @@ static std::unordered_map<VkImageView, VkImage> game_views;
 // of dx12/Bridge.h held.
 static std::vector<IUnknown*> retired_images;
 static volatile LONG images_hashed, images_not_mapped;
+// Of the uploads hashed through a mapping of ours, see hash_unmapped
+static volatile LONG images_mapped_here, images_map_refused;
+static volatile LONG64 mapped_here_bytes, mapped_here_ticks, mapped_here_longest;
 // Odd while game_images or game_views is being changed, and one more each
 // time after, see shown_textures:
 static volatile LONG image_epoch;
@@ -3952,13 +3999,80 @@ static void release_retired_images()
 		object->Release();
 }
 
+// With vk_dump_hashes, for the report: once for each image, level and outcome
+static bool upload_note_wanted(VkImage image, uint32_t level, int outcome)
+{
+	static SRWLOCK lock = SRWLOCK_INIT;
+	static std::unordered_set<UINT64> noted;
+	bool wanted;
+
+	AcquireSRWLockExclusive(&lock);
+	wanted = noted.size() < 4000 && noted.insert(((UINT64)(uintptr_t)image * 131 + level) * 131 + outcome).second;
+	ReleaseSRWLockExclusive(&lock);
+	return wanted;
+}
+
+// The game may unmap the memory it filled the buffer through before it records
+// the copy. Mapped here for as long as it is read, with the lock the hooks take
+// around the game's map, unmap and free of it held throughout. Only for a
+// buffer the GPU does not write (GPU_READ_ONLY_USAGE) in memory the game has
+// mapped before: what it holds is what the CPU wrote, which the CPU reads
+// without anything to wait for.
+static bool hash_unmapped(VkDeviceMemory memory, VkDeviceSize start, VkDeviceSize bytes, uint32_t *data_hash, const char **why)
+{
+	SRWLOCK *lock = VkModsMapLock(memory);
+	UINT64 started, took, longest;
+	void *data = NULL;
+	bool ok = false;
+
+	AcquireSRWLockExclusive(lock);
+	AcquireSRWLockShared(&memory_lock);
+	auto allocation = allocations.find(memory);
+	if (allocation == allocations.end())
+		*why = "the memory of the buffer is not mapped, and its allocation was not seen";
+	else if (mappings.count(memory))
+		*why = "the game has the memory of the buffer mapped again, or failed to unmap it";
+	else if (!allocation->second.mapped)
+		*why = "the memory of the buffer is not mapped, and never was by the game: the CPU did not fill it";
+	else if (allocation->second.device != mods_device || allocation->second.type >= memory_properties.memoryTypeCount
+	    || !(memory_properties.memoryTypes[allocation->second.type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+		*why = "the memory of the buffer is not mapped, and cannot be mapped here";
+	else if (start + bytes > allocation->second.size)
+		*why = "the level would run past the end of the memory";
+	else
+		ok = true;
+	ReleaseSRWLockShared(&memory_lock);
+
+	if (ok) {
+		started = ticks();
+		ok = api.MapMemory(mods_device, memory, start, bytes, 0, &data) == VK_SUCCESS;
+		if (ok && data)
+			*data_hash = Dx12Crc32cWriteCombined(0, (const BYTE*)data, (size_t)bytes);
+		if (ok)
+			api.UnmapMemory(mods_device, memory);
+		ok = ok && data;
+		if (!ok)
+			*why = "the memory of the buffer is not mapped, and mapping it here failed";
+		took = ticks() - started;
+		InterlockedAdd64(&mapped_here_ticks, took);
+		InterlockedAdd64(&mapped_here_bytes, bytes);
+		for (longest = mapped_here_longest; took > longest; longest = mapped_here_longest)
+			InterlockedCompareExchange64(&mapped_here_longest, took, longest);
+	}
+	ReleaseSRWLockExclusive(lock);
+
+	InterlockedIncrement(ok ? &images_mapped_here : &images_map_refused);
+	return ok;
+}
+
 void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const VkBufferImageCopy *regions)
 {
 	const VkBufferImageCopy *top = NULL;
 	D3D11_TEXTURE2D_DESC desc = {};
 	VkDeviceSize start, bytes, level_bytes;
 	uint32_t data_hash, level, r;
-	bool known = false;
+	bool known = false, diag = G->vk_dump_hashes;
+	const char *why = NULL;
 	GameImage image;
 
 	for (r = 0; r < count; r++) {
@@ -3968,13 +4082,34 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 		if (!top || regions[r].imageSubresource.mipLevel < top->imageSubresource.mipLevel)
 			top = &regions[r];
 	}
-	if (!top)
+	if (!top) {
+		if (!diag || !count)
+			return;
+		AcquireSRWLockShared(&image_lock);
+		auto found = game_images.find(dst);
+		if (found != game_images.end()) {
+			image = found->second;
+			known = true;
+		}
+		ReleaseSRWLockShared(&image_lock);
+		if (known && upload_note_wanted(dst, regions[0].imageSubresource.mipLevel, 0)) {
+			VkDumpNote("Mods: upload to image %p (%d/%ux%u, %u mips) not hashed: none of its %u regions starts a level; "
+				"the first: level %u layer %u at %d,%d %ux%u, buffer offset %llu row length %u image height %u\n",
+				dst, image.format->dxgi, image.width, image.height, image.mips, count,
+				regions[0].imageSubresource.mipLevel, regions[0].imageSubresource.baseArrayLayer,
+				regions[0].imageOffset.x, regions[0].imageOffset.y, regions[0].imageExtent.width, regions[0].imageExtent.height,
+				(unsigned long long)regions[0].bufferOffset, regions[0].bufferRowLength, regions[0].bufferImageHeight);
+		}
 		return;
+	}
 	level = top->imageSubresource.mipLevel;
 
+	// With vk_dump_hashes a level that would not change the hash is hashed
+	// too, to tell what it would have been
 	AcquireSRWLockShared(&image_lock);
 	auto found = game_images.find(dst);
-	if (found != game_images.end() && level < found->second.mips && (!found->second.hashed || level < found->second.level)) {
+	if (found != game_images.end() && level < found->second.mips
+	    && (!found->second.hashed || level < found->second.level || diag)) {
 		image = found->second;
 		known = true;
 	}
@@ -3999,6 +4134,16 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 		: (VkDeviceSize)desc.Width * desc.Height * image.format->texel_bytes;
 	bytes = min((VkDeviceSize)desc.Width * desc.Height * desc.ArraySize, level_bytes);
 
+	bool update = !image.hashed || level < image.level;
+	// Only images the size of the textures of characters, and only once
+	// for what would not change a hash
+	diag = diag && max(image.width, image.height) >= 512;
+	if (!update && (!diag || !upload_note_wanted(dst, level, 3)))
+		return;
+
+	VkDeviceMemory unmapped = VK_NULL_HANDLE;
+	bool mapped_here = false;
+
 	AcquireSRWLockShared(&memory_lock);
 	auto from = buffers.find(src);
 	auto mapping = from != buffers.end() ? mappings.find(from->second.memory) : mappings.end();
@@ -4008,26 +4153,71 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 		known = start >= mapping->second.offset
 			&& (mapping->second.size == VK_WHOLE_SIZE || start + bytes <= mapping->second.offset + mapping->second.size);
 	}
-	if (known)
+	if (known) {
 		data_hash = Dx12Crc32cWriteCombined(0, mapping->second.data + (start - mapping->second.offset), (size_t)bytes);
+	} else if (from != buffers.end() && from->second.memory && (mapping == mappings.end() || !mapping->second.data)
+	    && top->bufferOffset + bytes <= from->second.size && !(from->second.usage & ~GPU_READ_ONLY_USAGE)) {
+		unmapped = from->second.memory;
+		start = from->second.memory_offset + top->bufferOffset;
+	} else {
+		// Of one the GPU may write, what it holds before the commands
+		// recorded so far have run is not what the copy reads
+		why = from == buffers.end() ? "the buffer was not seen created"
+			: !from->second.memory ? "no memory was seen bound to the buffer"
+			: top->bufferOffset + bytes > from->second.size ? "the level would run past the end of the buffer"
+			: mapping == mappings.end() || !mapping->second.data
+				? "the memory of the buffer is not mapped, and the GPU may write the buffer"
+			: "the level is outside the mapped range of the memory";
+	}
 	ReleaseSRWLockShared(&memory_lock);
+	if (unmapped)
+		known = mapped_here = hash_unmapped(unmapped, start, bytes, &data_hash, &why);
 	if (!known) {
-		InterlockedIncrement(&images_not_mapped);
+		if (update)
+			InterlockedIncrement(&images_not_mapped);
+		if (diag && upload_note_wanted(dst, level, 1)) {
+			VkDumpNote("Mods: upload to image %p (%d/%ux%u, %u mips) not hashed: level %u (%ux%u, %llu bytes from region "
+				"%ux%u at buffer offset %llu of %u regions): %s\n", dst, desc.Format, image.width, image.height, image.mips,
+				level, desc.Width, desc.Height, (unsigned long long)bytes, top->imageExtent.width, top->imageExtent.height,
+				(unsigned long long)top->bufferOffset, count, why);
+		}
 		return;
 	}
 
+	uint32_t hash = CalcTexture2DDescHash(data_hash, &desc);
+	uint32_t kept_hash = 0, kept_level = 0;
+	bool had = false;
+	char before[64];
+
 	AcquireSRWLockExclusive(&image_lock);
 	found = game_images.find(dst);
-	if (found != game_images.end() && (!found->second.hashed || level < found->second.level)) {
-		images_changing();
-		found->second.level = level;
-		found->second.hashed = true;
-		found->second.data_hash = data_hash;
-		found->second.hash = CalcTexture2DDescHash(data_hash, &desc);
-		images_changed();
-		InterlockedIncrement(&images_hashed);
+	if (found != game_images.end()) {
+		had = found->second.hashed;
+		kept_hash = found->second.hash;
+		kept_level = found->second.level;
+		update = !found->second.hashed || level < found->second.level;
+		if (update) {
+			images_changing();
+			found->second.level = level;
+			found->second.hashed = true;
+			found->second.data_hash = data_hash;
+			found->second.hash = hash;
+			images_changed();
+			InterlockedIncrement(&images_hashed);
+		}
 	}
 	ReleaseSRWLockExclusive(&image_lock);
+
+	if (diag && (!update || upload_note_wanted(dst, level, 2))) {
+		if (had)
+			_snprintf_s(before, _TRUNCATE, "%s %08x of level %u", update ? "was" : "it keeps", kept_hash, kept_level);
+		else
+			_snprintf_s(before, _TRUNCATE, "its first hash");
+		VkDumpNote("Mods: image %p (%d/%ux%u, %u mips): level %u (%ux%u, region %ux%u of %u%s) %s %08x (data %08x); %s\n",
+			dst, desc.Format, image.width, image.height, image.mips, level, desc.Width, desc.Height,
+			top->imageExtent.width, top->imageExtent.height, count, mapped_here ? ", memory mapped here" : "",
+			update ? "hashes to" : "would hash to", hash, data_hash, before);
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -5976,12 +6166,43 @@ static void describe_game_view(const SpirvBinding *slot, char *text, size_t size
 	AcquireSRWLockShared(&image_lock);
 	auto image_view = game_views.find(bound);
 	auto found = image_view != game_views.end() ? game_images.find(image_view->second) : game_images.end();
-	if (found != game_images.end()) {
-		_snprintf_s(text, size, _TRUNCATE, "s%ub%u %d/%u/%08x", slot->set, slot->binding,
-			found->second.format ? found->second.format->dxgi : 0, found->second.width,
-			found->second.hashed ? found->second.hash : 0);
+	// An image without a hash by its handle, which the notes of its uploads
+	// name, and a hash not of the top level by the level it is of
+	if (found != game_images.end() && !found->second.hashed) {
+		_snprintf_s(text, size, _TRUNCATE, "s%ub%u %d/%u/none@%p", slot->set, slot->binding,
+			found->second.format ? found->second.format->dxgi : 0, found->second.width, found->first);
+	} else if (found != game_images.end()) {
+		_snprintf_s(text, size, _TRUNCATE, found->second.level ? "s%ub%u %d/%u/%08x:L%u" : "s%ub%u %d/%u/%08x",
+			slot->set, slot->binding, found->second.format ? found->second.format->dxgi : 0, found->second.width,
+			found->second.hash, found->second.level);
 	}
 	ReleaseSRWLockShared(&image_lock);
+}
+
+// For the report: what the game has at the textures of a pixel shader where a
+// mod sets one, again each time that has changed
+static void note_game_views(const ShaderLayout *shader)
+{
+	static std::unordered_set<UINT64> listed;
+	const CmdState *game = &scope->state;
+	char there[96], all[900] = "";
+	UINT64 key = game->pipeline->shaders[DX12_STAGE_PS];
+	UINT v;
+
+	if (listed.size() >= 1000)
+		return;
+	for (v = 0; v < shader->views.size(); v++) {
+		if (shader->views[v].kind != SPIRV_TEXTURE)
+			continue;
+		describe_game_view(&shader->views[v], there, sizeof(there));
+		if (!strchr(there, '/'))
+			continue;
+		_snprintf_s(all + strlen(all), sizeof(all) - strlen(all), _TRUNCATE, " t%u:%s", v, there);
+	}
+	for (const char *c = all; *c; c++)
+		key = (key ^ (BYTE)*c) * 0x100000001b3ull;
+	if (listed.insert(key).second)
+		VkDumpNote("Mods: textures of %016llx where a mod sets one (frame %u):%s\n", game->pipeline->shaders[DX12_STAGE_PS], mods_frame, all);
 }
 
 static bool patch_texture_register(int stage, UINT i);
@@ -6065,6 +6286,12 @@ static bool collect_replaced(const ShimState *mod, Replaced *replaced, UINT *cou
 				return false;
 			}
 			replaced[(*count)++].slot = &shader->cbs[slot];
+		}
+
+		if (G->vk_dump_hashes && stage == DX12_STAGE_PS && shader) {
+			for (word = 0; word < ARRAYSIZE(state->srv_mask) && !state->srv_mask[word]; word++);
+			if (word < ARRAYSIZE(state->srv_mask))
+				note_game_views(shader);
 		}
 
 		for (word = 0; shader && word < ARRAYSIZE(state->srv_mask); word++) {
@@ -7486,9 +7713,12 @@ static void report()
 	}
 	VkDumpNote("  Textures of mods for the pixel shaders of the game: set %u times, %u images made (%llu KB copied), %u could not be; "
 		"%Iu held in %Iu blocks of memory; draws of mods with shaders of their own: %u; textures of the game shown by their hashes "
-		"%u times, %d hashed, %d filled from memory that is not mapped\n",
+		"%u times, %d hashed, %d whose upload could not be read; since the start %d uploads read by mapping their "
+		"memory here (%lld MB, %.1f ms in all, the longest %.2f ms), %d that could not be\n",
 		stats.textures_set, stats.textures_made, stats.textures_bytes >> 10, stats.textures_failed, mod_textures.size(),
-		image_blocks.size(), stats.apart_draws, stats.textures_shown, (int)images_hashed, (int)images_not_mapped);
+		image_blocks.size(), stats.apart_draws, stats.textures_shown, (int)images_hashed, (int)images_not_mapped,
+		(int)images_mapped_here, (long long)(mapped_here_bytes >> 20), mapped_here_ticks * 1000.0 / frequency.QuadPart,
+		mapped_here_longest * 1000.0 / frequency.QuadPart, (int)images_map_refused);
 	VkDeviceSize buffer_bytes = 0, buffer_taken = 0, image_bytes = 0, image_taken = 0, transient_bytes = 0;
 	for (const MirrorBlock *block : mirror_blocks) {
 		buffer_bytes += block->size;

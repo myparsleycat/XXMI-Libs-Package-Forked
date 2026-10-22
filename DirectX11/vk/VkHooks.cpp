@@ -31,8 +31,11 @@
 	X(DestroyBuffer) \
 	X(BindBufferMemory) \
 	X(BindBufferMemory2) \
+	X(AllocateMemory) \
 	X(MapMemory) \
 	X(UnmapMemory) \
+	X(MapMemory2KHR) \
+	X(UnmapMemory2KHR) \
 	X(FreeMemory) \
 	X(BeginCommandBuffer) 	X(CmdExecuteCommands) \
 	X(FlushMappedMemoryRanges) \
@@ -309,9 +312,37 @@ static VkResult VKAPI_CALL Hooked_vkBindBufferMemory2(VkDevice device, uint32_t 
 	return result;
 }
 
+static VkResult VKAPI_CALL Hooked_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info,
+		const VkAllocationCallbacks *allocator, VkDeviceMemory *memory)
+{
+	VkResult result = next_AllocateMemory(device)(device, info, allocator, memory);
+
+	if (result == VK_SUCCESS && vk_mods_active && info && memory && *memory)
+		VkModsMemoryAllocated(device, *memory, info);
+	return result;
+}
+
+// What the draw path reads through a mapping of its own must not have the
+// game map, unmap or free the same memory meanwhile
+static SRWLOCK* lock_memory(VkDeviceMemory memory)
+{
+	SRWLOCK *lock = memory && vk_mods_active ? VkModsMapLock(memory) : NULL;
+
+	if (lock)
+		AcquireSRWLockExclusive(lock);
+	return lock;
+}
+
+static void unlock_memory(SRWLOCK *lock)
+{
+	if (lock)
+		ReleaseSRWLockExclusive(lock);
+}
+
 static VkResult VKAPI_CALL Hooked_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
 		VkDeviceSize size, VkMemoryMapFlags flags, void **data)
 {
+	SRWLOCK *lock = lock_memory(memory);
 	VkResult result = next_MapMemory(device)(device, memory, offset, size, flags, data);
 
 	if (result == VK_SUCCESS && data && *data) {
@@ -320,28 +351,67 @@ static VkResult VKAPI_CALL Hooked_vkMapMemory(VkDevice device, VkDeviceMemory me
 		if (vk_mods_active)
 			VkModsMemoryMapped(memory, offset, size, *data);
 	}
+	unlock_memory(lock);
 	return result;
-}
-
-static void memory_unmapped(VkDeviceMemory memory)
-{
-	if (vk_dump_active)
-		VkDumpMemoryUnmapped(memory);
-	if (vk_mods_active)
-		VkModsMemoryUnmapped(memory);
 }
 
 static void VKAPI_CALL Hooked_vkUnmapMemory(VkDevice device, VkDeviceMemory memory)
 {
-	memory_unmapped(memory);
+	SRWLOCK *lock = lock_memory(memory);
+
+	if (vk_dump_active)
+		VkDumpMemoryUnmapped(memory);
+	if (vk_mods_active)
+		VkModsMemoryUnmapped(memory);
 	next_UnmapMemory(device)(device, memory);
+	unlock_memory(lock);
+}
+
+// Also what Vulkan 1.4 has as vkMapMemory2 and vkUnmapMemory2, see
+// Hooked_vkGetDeviceProcAddr
+static VkResult VKAPI_CALL Hooked_vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *info, void **data)
+{
+	SRWLOCK *lock = lock_memory(info ? info->memory : VK_NULL_HANDLE);
+	VkResult result = next_MapMemory2KHR(device)(device, info, data);
+
+	if (result == VK_SUCCESS && info && data && *data) {
+		if (vk_dump_active)
+			VkDumpMemoryMapped(info->memory, info->offset, info->size, *data);
+		if (vk_mods_active)
+			VkModsMemoryMapped(info->memory, info->offset, info->size, *data);
+	}
+	unlock_memory(lock);
+	return result;
+}
+
+static VkResult VKAPI_CALL Hooked_vkUnmapMemory2KHR(VkDevice device, const VkMemoryUnmapInfoKHR *info)
+{
+	SRWLOCK *lock = lock_memory(info ? info->memory : VK_NULL_HANDLE);
+	VkResult result;
+
+	if (info && vk_dump_active)
+		VkDumpMemoryUnmapped(info->memory);
+	if (info && vk_mods_active)
+		VkModsMemoryUnmapped(info->memory);
+	result = next_UnmapMemory2KHR(device)(device, info);
+	// Still mapped, where is not known: nothing reads it, and it is not
+	// mapped again here
+	if (result != VK_SUCCESS && info && vk_mods_active)
+		VkModsMemoryMapped(info->memory, 0, VK_WHOLE_SIZE, NULL);
+	unlock_memory(lock);
+	return result;
 }
 
 static void VKAPI_CALL Hooked_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *allocator)
 {
-	if (memory)
-		memory_unmapped(memory);
+	SRWLOCK *lock = lock_memory(memory);
+
+	if (memory && vk_dump_active)
+		VkDumpMemoryUnmapped(memory);
+	if (memory && vk_mods_active)
+		VkModsMemoryFreed(memory);
 	next_FreeMemory(device)(device, memory, allocator);
+	unlock_memory(lock);
 }
 
 static VkResult VKAPI_CALL Hooked_vkBeginCommandBuffer(VkCommandBuffer cmd, const VkCommandBufferBeginInfo *info)
@@ -775,6 +845,9 @@ static ExportHook device_export_hooks[] = {
 #define X(name) { "vk" #name, (void**)&exports.name, (void*)Hooked_vk##name },
 	VK_DEVICE_FUNCS(X)
 #undef X
+	// The Vulkan 1.4 names, which a loader that new exports
+	{ "vkMapMemory2", (void**)&exports.MapMemory2KHR, (void*)Hooked_vkMapMemory2KHR },
+	{ "vkUnmapMemory2", (void**)&exports.UnmapMemory2KHR, (void*)Hooked_vkUnmapMemory2KHR },
 };
 static bool device_exports_wanted;
 
@@ -990,6 +1063,17 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		next.name = exports.name;
 	VK_DEVICE_FUNCS(X)
 #undef X
+	// A Vulkan 1.4 device may have them by these names only
+	if (!next.MapMemory2KHR) {
+		next.MapMemory2KHR = (PFN_vkMapMemory2KHR)get(device, "vkMapMemory2");
+		if (exports.MapMemory2KHR && (void*)next.MapMemory2KHR == NktHookLibHelpers::GetProcedureAddress(vulkan, "vkMapMemory2"))
+			next.MapMemory2KHR = exports.MapMemory2KHR;
+	}
+	if (!next.UnmapMemory2KHR) {
+		next.UnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)get(device, "vkUnmapMemory2");
+		if (exports.UnmapMemory2KHR && (void*)next.UnmapMemory2KHR == NktHookLibHelpers::GetProcedureAddress(vulkan, "vkUnmapMemory2"))
+			next.UnmapMemory2KHR = exports.UnmapMemory2KHR;
+	}
 
 	AcquireSRWLockExclusive(&dispatch_lock);
 
@@ -1016,11 +1100,12 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		api.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)
 			NktHookLibHelpers::GetProcedureAddress(vulkan, "vkGetPhysicalDeviceMemoryProperties");
 		api.GetBufferMemoryRequirements = (PFN_vkGetBufferMemoryRequirements)get(device, "vkGetBufferMemoryRequirements");
-		api.AllocateMemory = (PFN_vkAllocateMemory)get(device, "vkAllocateMemory");
+		api.AllocateMemory = next.AllocateMemory;
 		api.CreateBuffer = next.CreateBuffer;
 		api.DestroyBuffer = next.DestroyBuffer;
 		api.BindBufferMemory = next.BindBufferMemory;
 		api.MapMemory = next.MapMemory;
+		api.UnmapMemory = next.UnmapMemory;
 		api.FreeMemory = next.FreeMemory;
 		api.CreateGraphicsPipelines = next.CreateGraphicsPipelines;
 		api.DestroyPipeline = next.DestroyPipeline;
@@ -1479,6 +1564,11 @@ static PFN_vkVoidFunction VKAPI_CALL Hooked_vkGetDeviceProcAddr(VkDevice device,
 		return (PFN_vkVoidFunction)Hooked_vkUpdateDescriptorSetWithTemplate;
 	if (!strcmp(name, "vkQueueSubmit2KHR") && dispatch->next.QueueSubmit2)
 		return (PFN_vkVoidFunction)Hooked_vkQueueSubmit2;
+	// And the name it has in Vulkan 1.4
+	if (!strcmp(name, "vkMapMemory2") && dispatch->next.MapMemory2KHR && real)
+		return (PFN_vkVoidFunction)Hooked_vkMapMemory2KHR;
+	if (!strcmp(name, "vkUnmapMemory2") && dispatch->next.UnmapMemory2KHR && real)
+		return (PFN_vkVoidFunction)Hooked_vkUnmapMemory2KHR;
 
 	return real;
 }

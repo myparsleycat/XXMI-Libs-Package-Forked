@@ -82,6 +82,7 @@ struct VkModsApi {
 	PFN_vkAllocateMemory AllocateMemory;
 	PFN_vkFreeMemory FreeMemory;
 	PFN_vkMapMemory MapMemory;
+	PFN_vkUnmapMemory UnmapMemory;
 	PFN_vkCreateBuffer CreateBuffer;
 	PFN_vkDestroyBuffer DestroyBuffer;
 	PFN_vkBindBufferMemory BindBufferMemory;
@@ -163,8 +164,13 @@ void VkModsRetirePipelineObject(VkObjectType type, uint64_t handle);
 void VkModsBufferCreated(VkBuffer buffer, const VkBufferCreateInfo *info);
 void VkModsBufferBound(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset);
 void VkModsForgetBuffer(VkBuffer buffer);
+void VkModsMemoryAllocated(VkDevice device, VkDeviceMemory memory, const VkMemoryAllocateInfo *info);
 void VkModsMemoryMapped(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, void *data);
 void VkModsMemoryUnmapped(VkDeviceMemory memory);
+void VkModsMemoryFreed(VkDeviceMemory memory);
+// Held exclusively by the hooks around the game's map, unmap and free of the
+// memory, and here while it is mapped to read what the game let go of
+SRWLOCK* VkModsMapLock(VkDeviceMemory memory);
 
 void VkModsBeginCommands(VkCommandBuffer cmd);
 void VkModsExecuteCommands(VkCommandBuffer cmd, uint32_t count, const VkCommandBuffer *cmds);
