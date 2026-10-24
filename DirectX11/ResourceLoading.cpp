@@ -253,6 +253,16 @@ static PrefetchVirtualMemory_t GetPrefetchVirtualMemory()
 	return fn;
 }
 
+typedef BOOL (WINAPI *SetThreadInformation_t)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+
+// Windows 8+ as well
+static SetThreadInformation_t GetSetThreadInformation()
+{
+	static SetThreadInformation_t fn = (SetThreadInformation_t)
+		GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+	return fn;
+}
+
 // Read-only view of a whole file, only there so that prefetch() can ask the
 // OS to read the file into its file cache at the thread's low I/O priority
 // without copying it anywhere. That is a hint: the OS may read only part of
@@ -627,8 +637,15 @@ static DWORD WINAPI PrefetchThread(LPVOID param)
 	ResourceFileLog *log = (ResourceFileLog*)param;
 
 	// Background mode lowers the CPU, I/O and memory priority of this
-	// thread so that it yields to the game's own loading:
+	// thread so that it yields to the game's own loading. The memory
+	// priority goes back up: pages read at the lowest one are the first
+	// the system takes back when the game allocates, so they were gone
+	// again by the time a mod was first drawn.
 	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+	if (SetThreadInformation_t set_info = GetSetThreadInformation()) {
+		MEMORY_PRIORITY_INFORMATION normal = { MEMORY_PRIORITY_NORMAL };
+		set_info(GetCurrentThread(), ThreadMemoryPriority, &normal, sizeof(normal));
+	}
 	PrefetchFiles(*log);
 	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
 	delete log;
