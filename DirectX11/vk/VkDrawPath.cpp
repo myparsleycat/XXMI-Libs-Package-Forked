@@ -2436,8 +2436,16 @@ struct Transfer {
 };
 
 const UINT64 READBACK_BYTES = 1 << 20;
+// Making one took 10-20 ms for 16-64 MB textures. They are kept for the next
+// characters loaded in the same burst, like the upload buffers of
+// dx12/Bridge.cpp, and are this much apart in size above it.
+const UINT64 READBACK_STEP = 16 << 20;
+const UINT64 READBACK_KEPT = 256 << 20;
+const ULONGLONG READBACK_IDLE_MS = 15000;
 
 static std::vector<Readback> readbacks;
+static ULONGLONG readbacks_used;
+static bool readback_not_zeroed_refused;
 static std::vector<Transfer> transfers;
 // Read without the lock by the threads handing command buffers to a queue
 static volatile bool transfers_pending;
@@ -2450,6 +2458,7 @@ static Readback* readback_space(UINT64 bytes, UINT64 *offset)
 	D3D12_RESOURCE_DESC desc = {};
 	Readback *found = NULL;
 	Readback created = {};
+	HRESULT hr = E_FAIL;
 
 	for (Readback &readback : readbacks) {
 		*offset = ShimAlign(readback.used, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
@@ -2459,15 +2468,29 @@ static Readback* readback_space(UINT64 bytes, UINT64 *offset)
 		}
 	}
 	if (!found) {
+		desc.Width = READBACK_BYTES;
+		while (desc.Width < bytes && desc.Width < READBACK_STEP)
+			desc.Width *= 2;
+		if (desc.Width < bytes)
+			desc.Width = ShimAlign(bytes, READBACK_STEP);
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_MEMORY, L"readback bytes", desc.Width);
+
 		heap.Type = D3D12_HEAP_TYPE_READBACK;
 		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc.Width = max(bytes, READBACK_BYTES);
 		desc.Height = 1;
 		desc.DepthOrArraySize = 1;
 		desc.MipLevels = 1;
 		desc.SampleDesc.Count = 1;
 		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		if (FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+		// Only what a copy wrote is read. Windows before 10 2004 refuses
+		// the flag.
+		if (!readback_not_zeroed_refused) {
+			hr = dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc,
+				D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&created.resource));
+			if (FAILED(hr))
+				readback_not_zeroed_refused = true;
+		}
+		if (FAILED(hr) && FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
 				D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&created.resource))))
 			return NULL;
 		if (FAILED(created.resource->Map(0, NULL, (void**)&created.data))) {
@@ -2481,6 +2504,7 @@ static Readback* readback_space(UINT64 bytes, UINT64 *offset)
 	}
 
 	found->used = *offset + bytes;
+	readbacks_used = GetTickCount64();
 	return found;
 }
 
@@ -2503,11 +2527,32 @@ static bool transfer_from_gpu(ShimResource *resource, UINT64 offset, UINT64 byte
 	return true;
 }
 
-static void release_readbacks()
+// With no copy to them pending
+static void release_idle_readbacks()
 {
-	for (Readback &readback : readbacks)
-		readback.resource->Release();
-	readbacks.clear();
+	UINT64 total = 0;
+	size_t i, biggest;
+
+	if (readbacks.empty())
+		return;
+	if (GetTickCount64() - readbacks_used >= READBACK_IDLE_MS) {
+		for (Readback &readback : readbacks)
+			readback.resource->Release();
+		readbacks.clear();
+		return;
+	}
+	for (const Readback &readback : readbacks)
+		total += readback.size;
+	while (total > READBACK_KEPT) {
+		biggest = 0;
+		for (i = 1; i < readbacks.size(); i++) {
+			if (readbacks[i].size > readbacks[biggest].size)
+				biggest = i;
+		}
+		total -= readbacks[biggest].size;
+		readbacks[biggest].resource->Release();
+		readbacks.erase(readbacks.begin() + biggest);
+	}
 }
 
 // Bringing what a shader of a mod wrote past the CPU is two copies of all of
@@ -7834,8 +7879,7 @@ void VkModsPresent(VkQueue queue)
 
 	// Whatever was recorded with them has been handed to a queue by now
 	finish_transfers(queue, NULL);
-	if (!(vk_frame & 255))
-		release_readbacks();
+	release_idle_readbacks();
 	frame_over();
 	refresh_wanted();
 	// The configuration as it was read when the DLL was loaded
