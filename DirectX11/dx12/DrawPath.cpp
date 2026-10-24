@@ -3,6 +3,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <deque>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -437,8 +438,11 @@ struct VertexReach {
 	uint32_t vb_upload, ib_upload;
 	UINT frame;
 
-	// Pending: the index buffer followed by vb_bytes of the vertex buffer
+	// Pending: the index buffer followed by vb_bytes of the vertex buffer,
+	// in readback or at readback_offset of the ring
 	ID3D12Resource *readback;
+	UINT64 readback_offset;
+	bool in_ring;
 	UINT64 vb_bytes;
 	UINT64 fence;
 
@@ -449,7 +453,11 @@ static std::map<ReachKey, VertexReach> reaches;
 // Counts the times entries of reaches or published were erased, after which
 // what publish_buffer remembers about them is not to be looked at
 static UINT buffer_cache_generation = 1;
-static std::vector<ReachKey> pending_reaches;
+struct PendingReach {
+	ReachKey key;
+	bool in_ring;
+};
+static std::vector<PendingReach> pending_reaches;
 static UINT reach_frame;
 static UINT64 reach_frame_bytes;
 
@@ -476,6 +484,91 @@ static std::vector<ID3D12Resource*> spare_readbacks;
 const UINT64 REACH_READBACK_STEP = 1 << 16;
 const UINT64 REACH_SPARE_BYTES = 4 << 20;
 const size_t REACH_SPARES = 4;
+
+// One readback buffer, mapped for good, that the copies take turns in.
+// Making and releasing a buffer for each copy held the draw up for 10-40 ms at
+// a time while the game was loading, with the lock held. Reaches are done with
+// in the order they were started (the fence only goes up, and update_reaches
+// only ever drops pending ones from the front), so the space is handed out as
+// a ring and given back oldest first. A copy that does not fit has a buffer of
+// its own as before.
+static ID3D12Resource *reach_ring;
+static BYTE *reach_ring_data;
+static bool reach_ring_failed;
+static UINT64 reach_ring_head;
+// Where each copy in the ring that is pending starts, oldest first
+static std::deque<UINT64> reach_ring_starts;
+const UINT64 REACH_RING_BYTES = 8 << 20;
+const UINT64 REACH_RING_ALIGNMENT = 256;
+
+static bool create_reach_ring()
+{
+	D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_READBACK };
+	D3D12_RESOURCE_DESC desc = {};
+	D3D12_RANGE range = { 0, (SIZE_T)REACH_RING_BYTES };
+
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = REACH_RING_BYTES;
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	if (FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&reach_ring))))
+		return false;
+	if (FAILED(reach_ring->Map(0, &range, (void**)&reach_ring_data)) || !reach_ring_data) {
+		reach_ring->Release();
+		reach_ring = NULL;
+		reach_ring_data = NULL;
+		return false;
+	}
+	return true;
+}
+
+static bool reach_ring_alloc(UINT64 bytes, UINT64 *offset)
+{
+	UINT64 start = reach_ring_head, tail;
+
+	if (!reach_ring && !reach_ring_failed && !create_reach_ring()) {
+		reach_ring_failed = true;
+		Dx12LogInfo("*** Failed to create the readback buffer for index reaches, each gets one of its own\n");
+	}
+	if (!reach_ring)
+		return false;
+
+	bytes = (bytes + REACH_RING_ALIGNMENT - 1) & ~(REACH_RING_ALIGNMENT - 1);
+	if (bytes > REACH_RING_BYTES)
+		return false;
+
+	if (reach_ring_starts.empty()) {
+		start = 0;
+	} else {
+		tail = reach_ring_starts.front();
+		// With copies pending, the head on the tail is a full ring
+		if (start > tail) {
+			if (start + bytes > REACH_RING_BYTES) {
+				if (bytes > tail)
+					return false;
+				start = 0;
+			}
+		} else if (start == tail || start + bytes > tail) {
+			return false;
+		}
+	}
+
+	reach_ring_head = start + bytes;
+	reach_ring_starts.push_back(start);
+	*offset = start;
+	return true;
+}
+
+// For the oldest copy in the ring, once what it read is gone through
+static void reach_ring_free()
+{
+	if (!reach_ring_starts.empty())
+		reach_ring_starts.pop_front();
+}
 
 // The barriers that let a list of ours copy from a buffer of the game and
 // leave it as the game expects it. False if it is in no state to be read, or
@@ -508,6 +601,7 @@ static bool start_reach(const ReachKey *key, VertexReach *reach, UINT64 vb_bytes
 	D3D12_RESOURCE_BARRIER barriers[2];
 	D3D12_RESOURCE_DESC desc = {};
 	ID3D12GraphicsCommandList *list;
+	ID3D12Resource *destination;
 	bool needed[2] = {};
 	Profiling::Spike::Scope spike(Profiling::Spike::DX12_REACH, L"start, bytes", vb_bytes);
 	UINT count = 0, i;
@@ -523,30 +617,37 @@ static bool start_reach(const ReachKey *key, VertexReach *reach, UINT64 vb_bytes
 			count++;
 	}
 
-	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-	// In steps, for one that finish_reach kept to do for another mesh
-	desc.Width = (key->ib_bytes + vb_bytes + REACH_READBACK_STEP - 1) & ~(REACH_READBACK_STEP - 1);
-	desc.Height = 1;
-	desc.DepthOrArraySize = 1;
-	desc.MipLevels = 1;
-	desc.SampleDesc.Count = 1;
-	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-	for (i = 0; i < spare_readbacks.size(); i++) {
-		if (spare_readbacks[i]->GetDesc().Width < desc.Width)
-			continue;
-		reach->readback = spare_readbacks[i];
-		spare_readbacks.erase(spare_readbacks.begin() + i);
-		break;
+	reach->in_ring = reach_ring_alloc(key->ib_bytes + vb_bytes, &reach->readback_offset);
+	if (reach->in_ring) {
+		destination = reach_ring;
+	} else {
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		// In steps, for one that finish_reach kept to do for another mesh
+		desc.Width = (key->ib_bytes + vb_bytes + REACH_READBACK_STEP - 1) & ~(REACH_READBACK_STEP - 1);
+		desc.Height = 1;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.SampleDesc.Count = 1;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		for (i = 0; i < spare_readbacks.size(); i++) {
+			if (spare_readbacks[i]->GetDesc().Width < desc.Width)
+				continue;
+			reach->readback = spare_readbacks[i];
+			spare_readbacks.erase(spare_readbacks.begin() + i);
+			break;
+		}
+		if (!reach->readback && FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+				D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&reach->readback))))
+			return false;
+		destination = reach->readback;
+		reach->readback_offset = 0;
 	}
-	if (!reach->readback && FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-			D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&reach->readback))))
-		return false;
 
 	list = Dx12ShimList();
 	if (count)
 		list->ResourceBarrier(count, barriers);
-	list->CopyBufferRegion(reach->readback, 0, key->ib, key->ib_offset, key->ib_bytes);
-	list->CopyBufferRegion(reach->readback, key->ib_bytes, key->vb, key->vb_offset, vb_bytes);
+	list->CopyBufferRegion(destination, reach->readback_offset, key->ib, key->ib_offset, key->ib_bytes);
+	list->CopyBufferRegion(destination, reach->readback_offset + key->ib_bytes, key->vb, key->vb_offset, vb_bytes);
 	for (i = 0; i < count; i++)
 		std::swap(barriers[i].Transition.StateBefore, barriers[i].Transition.StateAfter);
 	if (count)
@@ -649,7 +750,7 @@ static const Dx12BufferHash* vertex_reach(ID3D12Resource *vb, UINT64 vb_offset, 
 	reach->frame = dx12_frame;
 	if (start_reach(&key, reach, vb_bytes)) {
 		reach->state = REACH_PENDING;
-		pending_reaches.push_back(key);
+		pending_reaches.push_back({ key, reach->in_ring });
 	} else {
 		reach->state = REACH_FAILED;
 		stats.reaches_failed++;
@@ -776,7 +877,11 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 
 	reach->state = REACH_FAILED;
 	stats.reaches_failed++;
-	if (SUCCEEDED(reach->readback->Map(0, &range, (void**)&data)) && data) {
+	if (reach->in_ring)
+		data = reach_ring_data + reach->readback_offset;
+	else if (FAILED(reach->readback->Map(0, &range, (void**)&data)))
+		data = NULL;
+	if (data) {
 		collect_section_ends();
 
 		for (i = 0; i + key->index_bytes <= key->ib_bytes; i += key->index_bytes) {
@@ -833,9 +938,13 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 			if (!matched.bytes && key->ib_bytes + reach->vb_bytes >= 65536)
 				dump_reach(key, data, key->ib_bytes + reach->vb_bytes);
 		}
-		reach->readback->Unmap(0, &nothing);
+		if (!reach->in_ring)
+			reach->readback->Unmap(0, &nothing);
 	}
 
+	// update_reaches gives the space in the ring back
+	if (reach->in_ring)
+		return;
 	if (spare_readbacks.size() < REACH_SPARES && reach->readback->GetDesc().Width <= REACH_SPARE_BYTES)
 		spare_readbacks.push_back(reach->readback);
 	else
@@ -846,17 +955,18 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 static void update_reaches()
 {
 	UINT64 finished = 0, bytes;
-	size_t i;
+	size_t done;
 	bool kept;
 
-	for (i = 0; i < pending_reaches.size();) {
-		auto found = reaches.find(pending_reaches[i]);
+	for (done = 0; done < pending_reaches.size(); done++) {
+		auto found = reaches.find(pending_reaches[done].key);
 
 		if (found != reaches.end()) {
-			if (!Dx12ShimFenceReached(found->second.fence)) {
-				i++;
-				continue;
-			}
+			// Strictly in order: the fence can move on while this goes
+			// through the list, and finishing a later one first would
+			// give the ring space of this one back before it is read
+			if (!Dx12ShimFenceReached(found->second.fence))
+				break;
 			// The rest waits for the next frame. Until then their
 			// buffers go by the hash of all of them, as before.
 			bytes = found->first.ib_bytes + found->second.vb_bytes;
@@ -865,8 +975,10 @@ static void update_reaches()
 			finished += bytes;
 			finish_reach(&found->first, &found->second);
 		}
-		pending_reaches.erase(pending_reaches.begin() + i);
+		if (pending_reaches[done].in_ring)
+			reach_ring_free();
 	}
+	pending_reaches.erase(pending_reaches.begin(), pending_reaches.begin() + done);
 
 	if (dx12_frame & 255)
 		return;
