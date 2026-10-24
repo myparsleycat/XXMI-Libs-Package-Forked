@@ -551,6 +551,9 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"D3D12: deciding without the lock whether a draw or dispatch concerns the mods",
 	L"D3D12: noting what the game writes to a descriptor",
 	L"D3D12: writing a descriptor of the game to the mirror as well (driver)",
+	L"[Resource] files: reading the file",
+	L"[Resource] files: comparing with identical files already loaded",
+	L"D3D12: copying what a mod uploads to upload memory",
 };
 
 static const struct {

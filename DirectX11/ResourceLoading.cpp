@@ -13,6 +13,7 @@
 #include "log.h"
 #include "util.h"
 #include "globals.h"
+#include "profiling.h"
 
 #pragma region FileContents
 
@@ -200,7 +201,10 @@ FileContents::FileContents(const wchar_t *path)
 		}
 	}
 
-	error = ReadWhole(file, buffer, want);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_READ, path, want);
+		error = ReadWhole(file, buffer, want);
+	}
 	CloseHandle(file);
 	if (error)
 		return;
@@ -373,6 +377,7 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 {
 	std::vector<SharedEntry> candidates;
 	ID3D11Resource *match = nullptr;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_SHARE, L"bytes", size);
 
 	// Hashed from the data the caller is about to upload, never from the
 	// file at some later point, so an entry always describes what its

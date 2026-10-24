@@ -151,6 +151,9 @@ namespace Profiling {
 			DX12_FILTER,
 			DX12_DESCRIPTORS,
 			DX12_MIRROR,
+			RESOURCE_FILE_READ,
+			RESOURCE_FILE_SHARE,
+			DX12_UPLOAD_COPY,
 
 			NUM_CATEGORIES, // Must be last
 		};

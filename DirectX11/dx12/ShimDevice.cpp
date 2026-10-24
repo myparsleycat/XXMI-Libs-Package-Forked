@@ -147,7 +147,10 @@ bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UI
 	upload = Dx12ShimUpload(size, 16, &upload_buffer, &upload_offset, NULL);
 	if (!upload)
 		return false;
-	memcpy(upload, data, size);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"buffer bytes", size);
+		memcpy(upload, data, size);
+	}
 
 	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_DEST)) {
 		defer_write(resource, 0, offset, 0, data, size);
@@ -201,10 +204,13 @@ bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *
 		row_pitch = (UINT)row_size;
 	if (!slice_pitch)
 		slice_pitch = row_pitch * rows;
-	for (z = 0; z < layout.Footprint.Depth; z++) {
-		for (y = 0; y < rows; y++) {
-			memcpy(upload + ((SIZE_T)z * rows + y) * layout.Footprint.RowPitch,
-				(const BYTE*)data + (SIZE_T)z * slice_pitch + (SIZE_T)y * row_pitch, (size_t)row_size);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"texture bytes", total);
+		for (z = 0; z < layout.Footprint.Depth; z++) {
+			for (y = 0; y < rows; y++) {
+				memcpy(upload + ((SIZE_T)z * rows + y) * layout.Footprint.RowPitch,
+					(const BYTE*)data + (SIZE_T)z * slice_pitch + (SIZE_T)y * row_pitch, (size_t)row_size);
+			}
 		}
 	}
 
