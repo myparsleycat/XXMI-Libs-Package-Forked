@@ -472,7 +472,8 @@ const UINT64 REACH_SPARE_BYTES = 4 << 20;
 const size_t REACH_SPARES = 4;
 
 // The barriers that let a list of ours copy from a buffer of the game and
-// leave it as the game expects it. False if it is in no state to be read.
+// leave it as the game expects it. False if it is in no state to be read, or
+// evicted.
 static bool reach_barrier(ID3D12Resource *resource, D3D12_RESOURCE_BARRIER *barrier, bool *needed)
 {
 	Dx12ResourceInfo info;
@@ -480,6 +481,8 @@ static bool reach_barrier(ID3D12Resource *resource, D3D12_RESOURCE_BARRIER *barr
 	if (!Dx12GetResourceInfo(resource, &info) || info.state == DX12_STATE_UNKNOWN)
 		return false;
 	if (info.state & (D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+		return false;
+	if (!Dx12ShimReadGameResource(resource))
 		return false;
 
 	// From the common state D3D12 promotes a buffer by itself
@@ -5659,6 +5662,12 @@ static void note_memory()
 		dx12_memory.restore_failures);
 	dx12_memory.evictions = dx12_memory.restores = dx12_memory.restore_failures = 0;
 	dx12_memory.eviction_bytes = dx12_memory.restore_bytes = dx12_memory.restore_ticks = 0;
+	Dx12DumpNote("  Evicted by the game: since the last report %ld resources, %ld of them held back as lists of ours had read them "
+		"lately, %ld held back before passed on; %ld resources the game had evicted were made resident again for a list of ours to "
+		"read, %ld reads left out as that failed\n",
+		InterlockedExchange(&dx12_memory.game_evictions, 0), InterlockedExchange(&dx12_memory.game_evictions_held, 0),
+		InterlockedExchange(&dx12_memory.game_evictions_passed, 0), dx12_memory.game_restores, dx12_memory.game_restore_failures);
+	dx12_memory.game_restores = dx12_memory.game_restore_failures = 0;
 }
 
 static void link_shader_regex()

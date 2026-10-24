@@ -4,6 +4,7 @@
 
 #include "util.h"
 
+#include "Bridge.h"
 #include "DescriptorShadow.h"
 #include "Dx12CommandList.h"
 #include "Dx12CommandQueue.h"
@@ -659,18 +660,49 @@ static ID3D12Pageable *const * unwrap_pageables(UINT count, ID3D12Pageable *cons
 	return storage->data();
 }
 
+static void made_resident(UINT count, ID3D12Pageable *const *objects, HRESULT hr)
+{
+	UINT i;
+
+	for (i = 0; i < count; i++) {
+		if (objects[i])
+			Dx12GameMadeResident(objects[i], SUCCEEDED(hr));
+	}
+}
+
 HRESULT STDMETHODCALLTYPE Dx12Device::MakeResident(UINT NumObjects, ID3D12Pageable *const *ppObjects)
 {
 	std::vector<ID3D12Pageable*> storage;
+	ID3D12Pageable *const *objects = unwrap_pageables(NumObjects, ppObjects, &storage);
+	HRESULT hr = mOrig->MakeResident(NumObjects, objects);
 
-	return mOrig->MakeResident(NumObjects, unwrap_pageables(NumObjects, ppObjects, &storage));
+	if (objects)
+		made_resident(NumObjects, objects, hr);
+	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Dx12Device::Evict(UINT NumObjects, ID3D12Pageable *const *ppObjects)
 {
-	std::vector<ID3D12Pageable*> storage;
+	std::vector<ID3D12Pageable*> storage, passed;
+	ID3D12Pageable *const *objects = unwrap_pageables(NumObjects, ppObjects, &storage);
+	ULONGLONG read_since = GetTickCount64() - DX12_GAME_READ_HOLD_MS;
+	UINT i;
 
-	return mOrig->Evict(NumObjects, unwrap_pageables(NumObjects, ppObjects, &storage));
+	if (!objects)
+		return mOrig->Evict(NumObjects, objects);
+	for (i = 0; i < NumObjects; i++) {
+		if (objects[i]) {
+			InterlockedIncrement(&dx12_memory.game_evictions);
+			if (Dx12GameEvict(objects[i], read_since, Dx12ShimFenceReached)) {
+				InterlockedIncrement(&dx12_memory.game_evictions_held);
+				continue;
+			}
+		}
+		passed.push_back(objects[i]);
+	}
+	if (passed.empty())
+		return S_OK;
+	return mOrig->Evict((UINT)passed.size(), passed.data());
 }
 
 HRESULT STDMETHODCALLTYPE Dx12Device::SetResidencyPriority(UINT NumObjects, ID3D12Pageable *const *ppObjects, const D3D12_RESIDENCY_PRIORITY *pPriorities)
@@ -683,8 +715,12 @@ HRESULT STDMETHODCALLTYPE Dx12Device::SetResidencyPriority(UINT NumObjects, ID3D
 HRESULT STDMETHODCALLTYPE Dx12Device::EnqueueMakeResident(D3D12_RESIDENCY_FLAGS Flags, UINT NumObjects, ID3D12Pageable *const *ppObjects, ID3D12Fence *pFenceToSignal, UINT64 FenceValueToSignal)
 {
 	std::vector<ID3D12Pageable*> storage;
+	ID3D12Pageable *const *objects = unwrap_pageables(NumObjects, ppObjects, &storage);
+	HRESULT hr = mOrig->EnqueueMakeResident(Flags, NumObjects, objects, pFenceToSignal, FenceValueToSignal);
 
-	return mOrig->EnqueueMakeResident(Flags, NumObjects, unwrap_pageables(NumObjects, ppObjects, &storage), pFenceToSignal, FenceValueToSignal);
+	if (objects)
+		made_resident(NumObjects, objects, hr);
+	return hr;
 }
 
 #include "generated/Dx12Device.fwd.inl"

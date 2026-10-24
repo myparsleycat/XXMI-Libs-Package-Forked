@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include <vector>
+
 #include "Dx12Common.h"
 
 // Resources are not wrapped: the game holds the original ID3D12Resource. What
@@ -10,8 +12,9 @@
 // destroys it. Resources that reach the game another way (swap chain buffers,
 // shared handles, another layer's device) are simply not in the table.
 //
-// Nothing here keeps a resource alive, so a resource pointer taken from a
-// descriptor or a view is only ever used as a key, never dereferenced.
+// Nothing here keeps a resource alive, short of the Evict calls held back
+// below, so a resource pointer taken from a descriptor or a view is only ever
+// used as a key, never dereferenced.
 
 const LONG DX12_STATE_UNKNOWN = -1;
 
@@ -42,6 +45,15 @@ struct Dx12ResourceInfo {
 	UINT top_upload_frame;
 	UINT top_upload_hot;
 
+	// See Dx12GameEvict: whether the game's own Evict and MakeResident
+	// calls left the resource evicted, how many of its Evict calls were
+	// held back since, and when a list of ours last read it
+	// (GetTickCount64, 0 for never) in a submission of which fence
+	bool game_evicted;
+	UINT evictions_held;
+	ULONGLONG read_time;
+	UINT64 read_fence;
+
 	// Tells the resource from one created at its address after it was
 	// destroyed. Never 0.
 	UINT64 serial;
@@ -67,6 +79,44 @@ bool Dx12IsGone(const void *object);
 void Dx12TrackResource(REFIID riid, void **ppvResource, LONG initial_state);
 
 bool Dx12GetResourceInfo(ID3D12Resource *resource, Dx12ResourceInfo *info);
+
+// Lists of ours read resources of the game (copies from its buffers) that the
+// game's own lists may not use until later, and an engine that manages
+// residency itself evicts whatever its lists have not used lately once it is
+// over budget: a read of an evicted resource is a page fault that removes the
+// device. MakeResident and Evict are counted, so the device proxy holds back
+// the game's Evict of a resource read since read_since or in a submission the
+// GPU has not finished (true: not to be passed on), which keeps it resident.
+// What was held back is passed on by Dx12TakeExpiredEvictions alone, and the
+// game's MakeResident calls are always passed on, as a call that was not would
+// come back or signal before the resource is resident. The object need not be
+// a tracked resource.
+// Long enough for what a list of ours read to have been executed, and for a
+// read that comes every frame not to have the resource evicted and made
+// resident again in between
+const ULONGLONG DX12_GAME_READ_HOLD_MS = 10000;
+bool Dx12GameEvict(ID3D12Pageable *object, ULONGLONG read_since, bool (*reached)(UINT64 fence));
+// After the game's MakeResident or EnqueueMakeResident was passed on
+void Dx12GameMadeResident(ID3D12Pageable *object, bool succeeded);
+// For a list of ours about to read a resource of the game, in a submission of
+// that fence, which the caller sees is made. If the game has it evicted,
+// make_resident is called for it, and if that works it counts as an Evict held
+// back. The read has to be left out on DX12_GAME_READ_FAILED, which keeps the
+// time and fence of the read before.
+enum Dx12GameReadResult {
+	DX12_GAME_READ_RESIDENT,
+	DX12_GAME_READ_RESTORED,
+	DX12_GAME_READ_FAILED,
+};
+Dx12GameReadResult Dx12GameRead(ID3D12Resource *resource, ULONGLONG now, UINT64 fence, HRESULT (*make_resident)(ID3D12Pageable *object));
+// The Evict calls held back for resources last read before read_before in a
+// submission the GPU has finished, which the caller passes on, then releases
+// each resource once
+struct Dx12HeldEviction {
+	ID3D12Resource *resource;
+	UINT count;
+};
+void Dx12TakeExpiredEvictions(ULONGLONG read_before, bool (*reached)(UINT64 fence), std::vector<Dx12HeldEviction> *expired);
 
 // For a transition barrier of a command list that is being executed.
 // subresource is as in D3D12_RESOURCE_TRANSITION_BARRIER.

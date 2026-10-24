@@ -15,6 +15,7 @@
 #include "ShimDevice.h"
 #include "ShimPipeline.h"
 #include "HashDump.h"
+#include "ResourceTracker.h"
 
 #include "util.h"
 
@@ -850,6 +851,54 @@ static HRESULT make_resident_again(ID3D12Pageable *pageable)
 	return shim.device->MakeResident(1, &pageable);
 }
 
+bool Dx12ShimReadGameResource(ID3D12Resource *resource)
+{
+	static unsigned noted;
+	Dx12GameReadResult result = Dx12GameRead(resource, GetTickCount64(), Dx12ShimPendingFence(), make_resident_again);
+	D3D12_RESOURCE_DESC desc;
+
+	// The fence of the read is signalled with the next submission even if
+	// the caller records nothing after all, which would otherwise hold its
+	// Evict calls back for good
+	if (result != DX12_GAME_READ_FAILED)
+		Dx12ShimList();
+	if (result == DX12_GAME_READ_RESIDENT)
+		return true;
+	if (result == DX12_GAME_READ_RESTORED)
+		dx12_memory.game_restores++;
+	else
+		dx12_memory.game_restore_failures++;
+	if (noted < 20) {
+		noted++;
+		desc = resource->GetDesc();
+		Dx12LogInfo("A resource of the game that it had evicted was to be read by a list of ours (%s, %llu x %u, format %u): %s\n",
+			desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture", desc.Width, desc.Height, desc.Format,
+			result == DX12_GAME_READ_RESTORED ? "made resident again" : "making it resident failed, the read is left out");
+	}
+	return result == DX12_GAME_READ_RESTORED;
+}
+
+// Passes on the Evict calls of the game held back for reads of lists of ours
+// that are over, see Dx12GameEvict
+static void release_held_evictions()
+{
+	static ULONGLONG released_time;
+	std::vector<Dx12HeldEviction> expired;
+	ID3D12Pageable *pageable;
+
+	if (present_time - released_time < EVICT_INTERVAL_MS)
+		return;
+	released_time = present_time;
+	Dx12TakeExpiredEvictions(present_time - DX12_GAME_READ_HOLD_MS, Dx12ShimFenceReached, &expired);
+	for (Dx12HeldEviction &held : expired) {
+		pageable = held.resource;
+		InterlockedAdd(&dx12_memory.game_evictions_passed, held.count);
+		for (; held.count; held.count--)
+			shim.device->Evict(1, &pageable);
+		held.resource->Release();
+	}
+}
+
 void Dx12ShimResidencyWait(ID3D12CommandQueue *queue)
 {
 	UINT64 value = residency_asked;
@@ -1091,6 +1140,7 @@ void Dx12ShimFramePresented()
 		release_idle_upload_buffers(fence->GetCompletedValue(), present_time);
 	presents++;
 	evict_idle();
+	release_held_evictions();
 }
 
 bool Dx12ShimUseOnGameList(ShimResource *resource, Dx12GraphicsCommandList *list)

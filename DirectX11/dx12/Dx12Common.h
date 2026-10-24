@@ -124,6 +124,13 @@ struct Dx12Memory {
 	LONG64 evicted_bytes;
 	LONG evictions, restores, restore_failures;
 	LONG64 eviction_bytes, restore_bytes, restore_ticks;
+	// Since the last report: the game's own Evict calls for its resources,
+	// those held back (Dx12GameEvict) and those held back before that were
+	// passed on, and the resources of the game lists of ours were to read
+	// while it had them evicted, made resident again or left out as that
+	// failed
+	volatile LONG game_evictions, game_evictions_held, game_evictions_passed;
+	LONG game_restores, game_restore_failures;
 };
 extern Dx12Memory dx12_memory;
 

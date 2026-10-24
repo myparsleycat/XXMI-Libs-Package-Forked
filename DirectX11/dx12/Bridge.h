@@ -188,6 +188,11 @@ void Dx12ShimTrackResidency(ShimResource *resource, bool tracked);
 // only use it with a pin on it (Dx12ShimPin), so only those wait.
 HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource);
 void Dx12ShimResidencyWait(ID3D12CommandQueue *queue);
+// For a resource of the game that a list of ours is about to read, see
+// Dx12GameEvict: has it made resident if the game has it evicted, on the
+// GPU's time where that can be. False if it stays evicted, and the read has to
+// be left out.
+bool Dx12ShimReadGameResource(ID3D12Resource *resource);
 // What the process uses of the GPU's local memory and the budget it has, as
 // the system counts them
 bool Dx12ShimProcessMemory(DXGI_QUERY_VIDEO_MEMORY_INFO *info);

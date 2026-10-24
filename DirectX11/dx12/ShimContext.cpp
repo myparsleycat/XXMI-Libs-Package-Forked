@@ -1047,6 +1047,8 @@ static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset)
 	// Never a state a copy can read
 	if (!Dx12GetResourceInfo(resource, &info) || info.heap_type == D3D12_HEAP_TYPE_READBACK)
 		return NULL;
+	if (!Dx12ShimReadGameResource(resource))
+		return NULL;
 
 	Dx12ShimDeferRelease(resource);
 	return resource;

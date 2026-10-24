@@ -220,6 +220,10 @@ static UINT64 record_copy(size_t index, TextureCopy *copy)
 		note(texture, "the state the game has it in is not known");
 		return 0;
 	}
+	if (!Dx12ShimReadGameResource(texture->resource)) {
+		note(texture, "the game has it evicted");
+		return 0;
+	}
 
 	dx12_shim->device->GetCopyableFootprints(&info.desc, 0, 1, 0, &copy->footprint, &copy->rows, &copy->row_bytes, &bytes);
 	if (!bytes || bytes == UINT64_MAX) {

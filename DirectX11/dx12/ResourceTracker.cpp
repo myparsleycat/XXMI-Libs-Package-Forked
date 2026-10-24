@@ -268,6 +268,119 @@ bool Dx12GetResourceInfo(ID3D12Resource *resource, Dx12ResourceInfo *info)
 	return found;
 }
 
+// The resources with Evict calls held back, each with a reference of ours so
+// that Dx12TakeExpiredEvictions can pass those on whatever the game does with
+// it. Taken after the lock of the resource's shard.
+static SRWLOCK held_lock = SRWLOCK_INIT;
+static std::unordered_set<ID3D12Resource*> held_resources;
+
+// With the shard lock held, for the first Evict held back
+static void hold(ID3D12Resource *resource)
+{
+	resource->AddRef();
+	AcquireSRWLockExclusive(&held_lock);
+	held_resources.insert(resource);
+	ReleaseSRWLockExclusive(&held_lock);
+}
+
+// With the shard lock held, once none is held back any longer. The caller
+// releases the reference after the shard lock.
+static void unhold(ID3D12Resource *resource)
+{
+	AcquireSRWLockExclusive(&held_lock);
+	held_resources.erase(resource);
+	ReleaseSRWLockExclusive(&held_lock);
+}
+
+bool Dx12GameEvict(ID3D12Pageable *object, ULONGLONG read_since, bool (*reached)(UINT64 fence))
+{
+	// Only a key: a heap or another pageable is simply not found
+	ID3D12Resource *resource = static_cast<ID3D12Resource*>(object);
+	ResourceShard *shard = shard_of(resource);
+	bool held = false;
+
+	AcquireSRWLockExclusive(&shard->lock);
+	auto i = shard->resources.find(resource);
+	if (i != shard->resources.end()) {
+		Dx12ResourceInfo &info = i->second;
+
+		info.game_evicted = true;
+		// Once one is held back, the rest wait for
+		// Dx12TakeExpiredEvictions as well
+		if (info.evictions_held || (info.read_time && (info.read_time >= read_since || !reached(info.read_fence)))) {
+			if (!info.evictions_held++)
+				hold(resource);
+			held = true;
+		}
+	}
+	ReleaseSRWLockExclusive(&shard->lock);
+	return held;
+}
+
+void Dx12GameMadeResident(ID3D12Pageable *object, bool succeeded)
+{
+	ID3D12Resource *resource = static_cast<ID3D12Resource*>(object);
+	ResourceShard *shard = shard_of(resource);
+
+	AcquireSRWLockExclusive(&shard->lock);
+	auto i = shard->resources.find(resource);
+	if (i != shard->resources.end())
+		i->second.game_evicted = !succeeded;
+	ReleaseSRWLockExclusive(&shard->lock);
+}
+
+Dx12GameReadResult Dx12GameRead(ID3D12Resource *resource, ULONGLONG now, UINT64 fence, HRESULT (*make_resident)(ID3D12Pageable *object))
+{
+	ResourceShard *shard = shard_of(resource);
+	Dx12GameReadResult result = DX12_GAME_READ_RESIDENT;
+
+	// Held while making it resident, so that the game's own calls for it
+	// come after and see whether that worked
+	AcquireSRWLockExclusive(&shard->lock);
+	auto i = shard->resources.find(resource);
+	if (i != shard->resources.end()) {
+		if (i->second.game_evicted && !i->second.evictions_held) {
+			result = DX12_GAME_READ_FAILED;
+			if (SUCCEEDED(make_resident(resource))) {
+				i->second.evictions_held = 1;
+				hold(resource);
+				result = DX12_GAME_READ_RESTORED;
+			}
+		}
+		// A read left out leaves what an earlier one did
+		if (result != DX12_GAME_READ_FAILED) {
+			i->second.read_time = now;
+			i->second.read_fence = fence;
+		}
+	}
+	ReleaseSRWLockExclusive(&shard->lock);
+	return result;
+}
+
+void Dx12TakeExpiredEvictions(ULONGLONG read_before, bool (*reached)(UINT64 fence), std::vector<Dx12HeldEviction> *expired)
+{
+	std::vector<ID3D12Resource*> candidates;
+
+	AcquireSRWLockShared(&held_lock);
+	candidates.assign(held_resources.begin(), held_resources.end());
+	ReleaseSRWLockShared(&held_lock);
+
+	// Alive for the reference that is held with them
+	for (ID3D12Resource *resource : candidates) {
+		ResourceShard *shard = shard_of(resource);
+
+		AcquireSRWLockExclusive(&shard->lock);
+		auto i = shard->resources.find(resource);
+		if (i != shard->resources.end() && i->second.evictions_held
+		    && i->second.read_time < read_before && reached(i->second.read_fence)) {
+			expired->push_back({ resource, i->second.evictions_held });
+			i->second.evictions_held = 0;
+			unhold(resource);
+		}
+		ReleaseSRWLockExclusive(&shard->lock);
+	}
+}
+
 void Dx12ApplyTransition(ID3D12Resource *resource, UINT subresource, LONG state)
 {
 	ResourceShard *shard = shard_of(resource);
