@@ -463,6 +463,12 @@ const size_t REACH_MAX_PENDING = 32;
 const UINT64 REACH_FINISH_BYTES = 8 << 20;
 // An upload recorded this recently may not have been executed yet
 const UINT REACH_UPLOAD_AGE = 3;
+// Known reaches not looked at for a while are only erased beyond this many. A
+// mesh drawn again later, such as a character switched back in, would
+// otherwise be drawn as the game's until its reach was worked out again,
+// behind every other mesh that needs one. Failed ones always go, so that the
+// next time the mesh is drawn the reach is tried again.
+const size_t REACH_KEPT = 16384;
 
 // The buffers the copies were read from, kept for the next meshes while there
 // are any: a scene coming into view has hundreds of them looked at
@@ -841,6 +847,7 @@ static void update_reaches()
 {
 	UINT64 finished = 0, bytes;
 	size_t i;
+	bool kept;
 
 	for (i = 0; i < pending_reaches.size();) {
 		auto found = reaches.find(pending_reaches[i]);
@@ -869,8 +876,10 @@ static void update_reaches()
 		spare_readbacks.clear();
 	}
 	buffer_cache_generation++;
+	kept = reaches.size() <= REACH_KEPT;
 	for (auto j = reaches.begin(); j != reaches.end();) {
-		if (j->second.state != REACH_PENDING && dx12_frame - j->second.frame > 600)
+		if (j->second.state != REACH_PENDING && !(kept && j->second.state == REACH_KNOWN)
+		    && dx12_frame - j->second.frame > 600)
 			j = reaches.erase(j);
 		else
 			++j;
