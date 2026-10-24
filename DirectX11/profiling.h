@@ -154,6 +154,11 @@ namespace Profiling {
 			RESOURCE_FILE_READ,
 			RESOURCE_FILE_SHARE,
 			DX12_UPLOAD_COPY,
+			VK_DRAW,
+			VK_TEXTURE_IMAGE,
+			VK_TEXTURE_COPY,
+			VK_MEMORY,
+			VK_TRANSFERS,
 
 			NUM_CATEGORIES, // Must be last
 		};

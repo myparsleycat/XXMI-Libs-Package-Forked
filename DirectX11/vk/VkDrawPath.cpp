@@ -2099,6 +2099,8 @@ static MirrorBlock* new_mirror_block(const VkMemoryRequirements *needed)
 	void *data;
 	uint32_t type;
 
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_MEMORY, L"buffer block bytes", max(MIRROR_BLOCK_BYTES, needed->size));
+
 	info.allocationSize = max(MIRROR_BLOCK_BYTES, needed->size);
 	for (VkMemoryPropertyFlags flags : wanted) {
 		for (type = 0; type < memory_properties.memoryTypeCount; type++) {
@@ -2808,6 +2810,7 @@ static VkSemaphore finish_transfers(VkQueue queue, UINT64 *value)
 	if (!transfers_pending)
 		return VK_NULL_HANDLE;
 
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_TRANSFERS, L"copies on the CPU", transfers.size());
 	start = ticks();
 	// Nothing the CPU has to copy once the GPU is done
 	if (value && dx12_shim && transfers.empty() && copies_pending) {
@@ -3074,6 +3077,8 @@ static ImageBlock* place_image(const VkMemoryRequirements *needed, VkDeviceSize 
 			return candidate;
 	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_MEMORY, L"image block bytes", max(IMAGE_BLOCK_BYTES, needed->size));
+
 	info.allocationSize = max(IMAGE_BLOCK_BYTES, needed->size);
 	for (VkMemoryPropertyFlags flags : wanted) {
 		for (type = 0; type < memory_properties.memoryTypeCount; type++) {
@@ -3162,6 +3167,7 @@ static bool make_image(ModTexture *texture, const D3D12_RESOURCE_DESC *desc, VkF
 	VkImageViewCreateInfo view_info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
 	VkMemoryRequirements needed;
 	VkDeviceSize offset;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_TEXTURE_IMAGE, L"texels wide", desc->Width);
 
 	// What the shader of the game samples there
 	if (slot->dim == 1) {
@@ -3229,6 +3235,7 @@ static bool fill_image(ModTexture *texture, ShimResource *resource, const D3D12_
 	Readback *readback;
 	Upload upload = {};
 	BYTE *staging;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_TEXTURE_COPY, L"texels wide", desc->Width);
 
 	dx12_shim->device->GetCopyableFootprints(desc, 0, count, 0, layouts.data(), rows.data(), row_sizes.data(), &total);
 	if (!total || total == UINT64_MAX)
@@ -7487,6 +7494,7 @@ bool VkModsDraw(VkCommandBuffer cmd, bool indexed, uint32_t count, uint32_t inst
 		return false;
 	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_DRAW, L"draw with vs", state->pipeline->shaders[DX12_STAGE_VS]);
 	if (timed)
 		times[0] = ticks();
 	Dx12ShimLock();
