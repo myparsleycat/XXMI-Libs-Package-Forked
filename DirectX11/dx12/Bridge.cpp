@@ -240,18 +240,28 @@ static std::vector<UploadPage> upload_idle;
 // An upload larger than a quarter of a page has a buffer to itself. Those
 // are kept a while for the next ones, up to UPLOAD_BIG_KEPT bytes: a mod that
 // appears uploads up to hundreds of MB in a frame or two, and making an
-// upload buffer waits on the CPU until it is resident.
-const UINT64 UPLOAD_BIG_KEPT = 256 << 20;
-const ULONGLONG UPLOAD_BIG_IDLE_MS = 5000;
+// upload buffer waits on the CPU until it is resident, which takes up to
+// 100 ms for one of 128 MB while the game is loading too. Kept long enough
+// for the next characters loaded in the same burst, e.g. looked at one after
+// another in a menu.
+const UINT64 UPLOAD_BIG_KEPT = 512 << 20;
+const ULONGLONG UPLOAD_BIG_IDLE_MS = 15000;
+// Big ones are this much apart in size: rounding up to powers of two made
+// 128 MB of a 100 MB texture
+const UINT64 UPLOAD_BIG_STEP = 16 << 20;
 static std::vector<UploadPage> upload_big_active;
 static std::vector<UploadPage> upload_big_idle;
 static UINT64 upload_big_idle_bytes;
+static bool upload_not_zeroed_refused;
 
-static bool create_upload_buffer(UINT64 size, UploadPage *page)
+// not_zeroed only for a buffer whose every byte the GPU reads is written
+// first, which the copies out of a big upload buffer are
+static bool create_upload_buffer(UINT64 size, UploadPage *page, bool not_zeroed = false)
 {
 	D3D12_HEAP_PROPERTIES heap = {};
 	D3D12_RESOURCE_DESC desc = {};
 	D3D12_RANGE no_read = {};
+	HRESULT hr = E_FAIL;
 
 	heap.Type = D3D12_HEAP_TYPE_UPLOAD;
 	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -265,7 +275,15 @@ static bool create_upload_buffer(UINT64 size, UploadPage *page)
 	*page = {};
 	Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, L"upload page");
 
-	if (FAILED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+	// Saves the clearing of the memory. Windows before 10 2004 refuses the
+	// flag.
+	if (not_zeroed && !upload_not_zeroed_refused) {
+		hr = shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer));
+		if (FAILED(hr))
+			upload_not_zeroed_refused = true;
+	}
+	if (FAILED(hr) && FAILED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
 			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer)))) {
 		Dx12LogInfo("*** Failed to create a %llu byte upload buffer\n", size);
 		return false;
@@ -300,9 +318,11 @@ BYTE* Dx12ShimUpload(UINT64 size, UINT64 alignment, ID3D12Resource **buffer, UIN
 		} else {
 			// Rounded up so that it fits more of the next ones
 			UINT64 capacity = UPLOAD_PAGE_SIZE;
-			while (capacity < size)
+			while (capacity < size && capacity < UPLOAD_BIG_STEP)
 				capacity *= 2;
-			if (!create_upload_buffer(capacity, &page))
+			if (capacity < size)
+				capacity = (size + UPLOAD_BIG_STEP - 1) / UPLOAD_BIG_STEP * UPLOAD_BIG_STEP;
+			if (!create_upload_buffer(capacity, &page, true))
 				return NULL;
 			page.capacity = capacity;
 		}
