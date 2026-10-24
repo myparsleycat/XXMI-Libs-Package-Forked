@@ -986,6 +986,7 @@ static bool analyse_shader_regex_bytecode(UINT64 hash, const wchar_t *shader_typ
 	// game. A render thread that could not use them for a shader may be in
 	// here as well:
 	std::lock_guard<std::mutex> guard(shader_regex_analysis_lock);
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_ANALYSIS);
 
 	// Process ShaderRegex sections that don't require bytecode decompilation.
 	link_shader_regex_groups_without_patterns(shader_type, shader_model, hash, &decompilation_required, &result->match_ids, link);
@@ -1202,6 +1203,7 @@ static ID3D11DeviceChild* create_patched_shader(ID3D11Device *device, const wstr
 	SIZE_T size = patched_bytecode.size();
 	ID3D11DeviceChild *shader = NULL;
 	HRESULT hr;
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_DRIVER);
 
 	if (type == L"vs")
 		hr = device->CreateVertexShader(bytecode, size, linkage, (ID3D11VertexShader**)&shader);
@@ -1233,8 +1235,11 @@ static bool prepare_shader_regex_result(UINT64 hash, const wchar_t *shader_type,
 {
 	std::string shader_model;
 
-	if (!cache_checked && load_shader_regex_cache(hash, shader_type, result, false) != ShaderRegexCache::NO_CACHE)
-		return true;
+	if (!cache_checked) {
+		Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_CACHE);
+		if (load_shader_regex_cache(hash, shader_type, result, false) != ShaderRegexCache::NO_CACHE)
+			return true;
+	}
 
 	*result = ShaderRegexResult();
 	result->regex_hash = shader_regex_hash;
@@ -1613,7 +1618,13 @@ static ShaderRegexResult* resolve_shader_regex(ID3D11Device *device, OriginalSha
 			}
 		}
 
-		switch (load_shader_regex_cache(hash, shader_type, &result, !background)) {
+		ShaderRegexCache cache;
+		{
+			Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_CACHE);
+			cache = load_shader_regex_cache(hash, shader_type, &result, !background);
+		}
+
+		switch (cache) {
 		case ShaderRegexCache::NO_MATCH:
 			LogInfo("%S %016I64x has cached ShaderRegex miss\n", shader_type, hash);
 			return store_shader_regex_result(hash, &result);

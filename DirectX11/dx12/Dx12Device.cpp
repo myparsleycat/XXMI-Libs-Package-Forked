@@ -10,6 +10,7 @@
 #include "Dx12PipelineLibrary.h"
 #include "PipelineRegistry.h"
 #include "ResourceTracker.h"
+#include "../profiling.h"
 
 // {B7EFF590-BAC0-4B25-A617-9374404C9211}
 const GUID Dx12Device::ProxyIID = { 0xb7eff590, 0xbac0, 0x4b25, { 0xa6, 0x17, 0x93, 0x74, 0x40, 0x4c, 0x92, 0x11 } };
@@ -372,8 +373,11 @@ void STDMETHODCALLTYPE Dx12Device::CopyDescriptors(UINT NumDestDescriptorRanges,
 		handles = large.data();
 	}
 
-	Dx12ShadowCopyDescriptors(NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
-		NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Dx12ShadowCopyDescriptors(NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
+			NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes);
+	}
 
 	for (i = 0; i < NumDestDescriptorRanges; i++)
 		handles[i] = Dx12OrigCpuHandle(pDestDescriptorRangeStarts[i]);
@@ -385,6 +389,7 @@ void STDMETHODCALLTYPE Dx12Device::CopyDescriptors(UINT NumDestDescriptorRanges,
 
 	// Once more for the destinations that have a mirror, which usually is
 	// all of them or none
+	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	for (i = 0; i < NumDestDescriptorRanges; i++)
 		mirrored += Dx12MirrorCpuHandle(pDestDescriptorRangeStarts[i], &handles[i]);
 	if (mirrored == NumDestDescriptorRanges) {
@@ -404,8 +409,12 @@ void STDMETHODCALLTYPE Dx12Device::CopyDescriptorsSimple(UINT NumDescriptors, D3
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
-	Dx12ShadowCopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Dx12ShadowCopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart);
+	}
 	mOrig->CopyDescriptorsSimple(NumDescriptors, Dx12OrigCpuHandle(DestDescriptorRangeStart), Dx12OrigCpuHandle(SrcDescriptorRangeStart), DescriptorHeapsType);
+	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptorRangeStart, &mirror))
 		mOrig->CopyDescriptorsSimple(NumDescriptors, mirror, Dx12OrigCpuHandle(SrcDescriptorRangeStart), DescriptorHeapsType);
 }
@@ -414,8 +423,12 @@ void STDMETHODCALLTYPE Dx12Device::CreateConstantBufferView(const D3D12_CONSTANT
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
-	Dx12ShadowConstantBufferView(pDesc, DestDescriptor);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Dx12ShadowConstantBufferView(pDesc, DestDescriptor);
+	}
 	mOrig->CreateConstantBufferView(pDesc, Dx12OrigCpuHandle(DestDescriptor));
+	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptor, &mirror))
 		mOrig->CreateConstantBufferView(pDesc, mirror);
 }
@@ -424,8 +437,12 @@ void STDMETHODCALLTYPE Dx12Device::CreateShaderResourceView(ID3D12Resource *pRes
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
-	Dx12ShadowShaderResourceView(pResource, pDesc, DestDescriptor);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Dx12ShadowShaderResourceView(pResource, pDesc, DestDescriptor);
+	}
 	mOrig->CreateShaderResourceView(pResource, pDesc, Dx12OrigCpuHandle(DestDescriptor));
+	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptor, &mirror))
 		mOrig->CreateShaderResourceView(pResource, pDesc, mirror);
 }
@@ -434,8 +451,12 @@ void STDMETHODCALLTYPE Dx12Device::CreateUnorderedAccessView(ID3D12Resource *pRe
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
-	Dx12ShadowUnorderedAccessView(pResource, pDesc, DestDescriptor);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Dx12ShadowUnorderedAccessView(pResource, pDesc, DestDescriptor);
+	}
 	mOrig->CreateUnorderedAccessView(pResource, pCounterResource, pDesc, Dx12OrigCpuHandle(DestDescriptor));
+	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptor, &mirror))
 		mOrig->CreateUnorderedAccessView(pResource, pCounterResource, pDesc, mirror);
 }
@@ -555,8 +576,13 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateRootSignature(UINT nodeMask, const v
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState)
 {
-	HRESULT hr = mOrig->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_PIPELINE_DRIVER, L"CreateGraphicsPipelineState");
+		hr = mOrig->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_PIPELINE, L"CreateGraphicsPipelineState");
 	if (SUCCEEDED(hr))
 		Dx12RegisterPipeline(ppPipelineState, pDesc);
 	return hr;
@@ -564,8 +590,13 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateGraphicsPipelineState(const D3D12_GR
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc, REFIID riid, void **ppPipelineState)
 {
-	HRESULT hr = mOrig->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_PIPELINE_DRIVER, L"CreateComputePipelineState");
+		hr = mOrig->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_PIPELINE, L"CreateComputePipelineState");
 	if (SUCCEEDED(hr))
 		Dx12RegisterPipeline(ppPipelineState, pDesc);
 	return hr;
@@ -573,8 +604,13 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateComputePipelineState(const D3D12_COM
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc, REFIID riid, void **ppPipelineState)
 {
-	HRESULT hr = mOrig->CreatePipelineState(pDesc, riid, ppPipelineState);
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_PIPELINE_DRIVER, L"CreatePipelineState");
+		hr = mOrig->CreatePipelineState(pDesc, riid, ppPipelineState);
+	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_PIPELINE, L"CreatePipelineState");
 	if (SUCCEEDED(hr))
 		Dx12RegisterPipeline(ppPipelineState, pDesc);
 	return hr;

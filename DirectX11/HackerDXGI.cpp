@@ -613,6 +613,9 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 	LogDebug("  Flags = %d\n", Flags);
 
 	if (!(Flags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::frame();
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
+
 		// Profiling::mode may change below, so make a copy
 		profiling = Profiling::mode == Profiling::Mode::SUMMARY;
 		if (profiling)
@@ -633,11 +636,18 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 			Profiling::end(&profiling_state, &Profiling::present_overhead);
 	}
 
-	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
-	HRESULT hr = mOrigSwapChain1->Present(SyncInterval, Flags);
-	get_tls()->hooking_quirk_protection = false;
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_CALL);
+
+		get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
+		hr = mOrigSwapChain1->Present(SyncInterval, Flags);
+		get_tls()->hooking_quirk_protection = false;
+	}
 
 	if (!(Flags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
+
 		if (profiling)
 			Profiling::start(&profiling_state);
 
@@ -926,6 +936,9 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 	LogDebug("  Flags = %d\n", PresentFlags);
 
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::frame();
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
+
 		// Profiling::mode may change below, so make a copy
 		profiling = Profiling::mode == Profiling::Mode::SUMMARY;
 		if (profiling)
@@ -939,11 +952,18 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 			Profiling::end(&profiling_state, &Profiling::present_overhead);
 	}
 
-	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
-	HRESULT hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
-	get_tls()->hooking_quirk_protection = false;
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_CALL);
+
+		get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
+		hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
+		get_tls()->hooking_quirk_protection = false;
+	}
 
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
+
 		if (profiling)
 			Profiling::start(&profiling_state);
 

@@ -4918,6 +4918,10 @@ void LoadConfigFile()
 	if (GetIniBool(L"Logging", L"debug_locks", false, NULL))
 		enable_lock_dependency_checks();
 
+	wcsrchr(logFilename, L'\\')[1] = 0;
+	Profiling::Spike::init(GetIniFloat(L"Logging", L"spike_log_threshold", 0, NULL),
+			GetIniFloat(L"Logging", L"spike_log_relative", 0, NULL), logFilename);
+
 	G->gShowWarnings = GetIniBool(L"Logging", L"show_warnings", true, NULL);
 
 	// [Include]
@@ -5678,6 +5682,7 @@ static void MarkAllShadersDeferredUnprocessed()
 void ReloadConfig(HackerDevice *device)
 {
 	auto start = std::chrono::high_resolution_clock::now();
+	Profiling::Spike::Scope spike(Profiling::Spike::CONFIG_RELOAD, L"ReloadConfig");
 
 	HackerContext *mHackerContext = device->GetHackerContext();
 

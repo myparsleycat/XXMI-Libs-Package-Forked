@@ -6972,6 +6972,7 @@ static ResourceType* GetResourceFromPool(
 
 	LogInfo("Creating cached resource %S\n", ini_line->c_str());
 	Profiling::resources_created++;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_LOAD, ini_line->c_str());
 
 	hr = (state->mOrigDevice1->*CreateResource)(desc, NULL, &resource);
 	if (FAILED(hr)) {
@@ -7197,6 +7198,7 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 		return;
 
 	Profiling::resources_created++;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_LOAD, filename.empty() ? name.c_str() : filename.c_str());
 
 	// Add any extra bind flags necessary for the current assignment. This
 	// covers many (but not all) of the cases 3DMigoto cannot deduce

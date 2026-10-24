@@ -2,6 +2,7 @@
 #include "globals.h"
 
 #include <algorithm>
+#include <atomic>
 
 void Profiling::Overhead::clear()
 {
@@ -501,4 +502,404 @@ void Profiling::clear()
 
 	start_frame_no = G->frame_no;
 	QueryPerformanceCounter(&profiling_start_time);
+}
+
+namespace Profiling {
+	namespace Spike {
+		INT64 threshold;
+		const wchar_t *reason_names[NUM_REASONS];
+		volatile LONG reason_counts[NUM_REASONS];
+	}
+}
+
+using Profiling::Spike::Category;
+using Profiling::Spike::NUM_CATEGORIES;
+
+static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
+	L"frame actions before Present (input, [Present], overlay)",
+	L"the original Present call (driver, GPU, vsync)",
+	L"post [Present] command list",
+	L"3DMigoto work before draw calls",
+	L"3DMigoto work after draw calls",
+	L"Map/Unmap tracking",
+	L"shader creation requested by the game",
+	L"resource creation requested by the game",
+	L"D3D12: applying what the mods set to a draw, and the draw",
+	L"D3D12: ExecuteCommandLists, our part",
+	L"D3D12: ExecuteCommandLists, the driver's part",
+	L"D3D12: looking at a pipeline the game created",
+	L"D3D12: pipeline creation requested by the game (driver)",
+	L"D3D12: hashing a texture the game uploads",
+	L"D3D12: hashing a buffer the game uploads",
+	L"custom resource creation ([Resource] files, copies)",
+	L"shader creation: the driver's part",
+	L"ShaderRegex",
+	L"ShaderRegex: reading the cache files",
+	L"ShaderRegex: analysis (disassemble, match, assemble)",
+	L"ShaderRegex: creating the patched shader (driver)",
+	L"config reload",
+	L"waiting for a 3DMigoto lock",
+	L"D3D12: draws the mods are asked about, in all",
+	L"D3D12: dispatches the mods are asked about, in all",
+	L"D3D12: submitting our command list",
+	L"D3D12: waiting for the GPU",
+	L"D3D12: creating a pipeline for a mod (driver)",
+	L"D3D12: creating a resource for a mod (driver)",
+	L"D3D12: copying a mod's resource for a write while the game's lists use it",
+	L"D3D12: upkeep of the draw path at present",
+	L"D3D12: working out how far an index buffer reaches",
+	L"D3D12: deciding without the lock whether a draw or dispatch concerns the mods",
+	L"D3D12: noting what the game writes to a descriptor",
+	L"D3D12: writing a descriptor of the game to the mirror as well (driver)",
+};
+
+static const struct {
+	const wchar_t *name;
+	unsigned *counter;
+} spike_counters[] = {
+	{L"resources [re]created", &Profiling::resources_created},
+	{L"resources shared between files", &Profiling::resources_shared},
+	{L"full resource copies", &Profiling::resource_full_copies},
+	{L"inter-device resource copies", &Profiling::inter_device_copies},
+	{L"MSAA resolves", &Profiling::msaa_resolutions},
+	{L"region buffer copies", &Profiling::buffer_region_copies},
+	{L"by-reference copies", &Profiling::resource_reference_copies},
+	{L"resource pool swaps", &Profiling::resource_pool_swaps},
+	{L"injected draw calls", &Profiling::injected_draw_calls},
+	{L"skipped draw calls", &Profiling::skipped_draw_calls},
+	{L"IniParams updates", &Profiling::iniparams_updates},
+};
+static unsigned spike_counters_prev[ARRAYSIZE(spike_counters)];
+
+struct SpikeTotal {
+	std::atomic<INT64> ticks;
+	std::atomic<unsigned> count;
+};
+// Games create shaders and resources on worker threads, which costs the frame
+// nothing unless the render thread ends up waiting on them, so the thread that
+// calls Present [0] is kept apart from all the others [1]:
+static SpikeTotal spike_totals[NUM_CATEGORIES][2];
+static std::atomic<DWORD> spike_present_thread;
+
+struct SpikeEvent {
+	Category category;
+	bool other_thread;
+	INT64 ticks;
+	wstring name;
+};
+static const size_t spike_max_events = 64;
+static const size_t spike_max_events_logged = 16;
+static vector<SpikeEvent> spike_events;
+static unsigned spike_events_dropped;
+static SRWLOCK spike_events_lock = SRWLOCK_INIT;
+
+static FILE *spike_log;
+static INT64 spike_freq;
+static INT64 spike_event_min;
+static INT64 spike_last_present;
+static double spike_average_ms;
+static double spike_relative;
+
+// What a run with the mods is compared against one without by: every few
+// seconds, and whenever the mods are switched, the frame times since and where
+// the time went on average
+static const double spike_window_ms = 5000;
+static vector<float> spike_window_frames;
+static double spike_window_total_ms;
+static unsigned spike_window_spikes;
+static INT64 spike_window_ticks[NUM_CATEGORIES][2];
+static unsigned spike_window_count[NUM_CATEGORIES][2];
+static UINT64 spike_window_reasons[Profiling::Spike::NUM_REASONS];
+static bool spike_mods_disabled;
+
+void Profiling::Spike::init(float threshold_ms, float relative, const wchar_t *log_dir)
+{
+	LARGE_INTEGER freq;
+	wchar_t path[MAX_PATH];
+	bool was_enabled = !!threshold;
+
+	threshold = 0;
+
+	if (threshold_ms < 0)
+		threshold_ms = 0;
+	if (relative <= 1)
+		relative = 0;
+	if ((!threshold_ms && !relative) || !QueryPerformanceFrequency(&freq) || !freq.QuadPart)
+		return;
+
+	if (!spike_log) {
+		_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%lsd3d11_spike_log.txt", log_dir);
+		// Mod paths are frequently not ASCII. Started afresh with every
+		// run of the game, like d3d11_log.txt:
+		spike_log = _wfsopen(path, L"w, ccs=UTF-8", _SH_DENYNO);
+		if (!spike_log) {
+			LogInfo("  *** Unable to create %S\n", path);
+			return;
+		}
+	}
+
+	spike_freq = freq.QuadPart;
+	spike_event_min = freq.QuadPart / 1000;
+	if (!was_enabled) {
+		// The time since the last Present we saw is not a frame time:
+		spike_last_present = 0;
+		spike_average_ms = 0;
+	}
+
+	// The config is loaded more than once while the game starts
+	static float header_threshold_ms = -1, header_relative = -1;
+	if (threshold_ms == header_threshold_ms && relative == header_relative)
+		goto enable;
+	header_threshold_ms = threshold_ms;
+	header_relative = relative;
+
+	fwprintf(spike_log, L"Logging frames that take longer than");
+	if (threshold_ms)
+		fwprintf(spike_log, L" %.1fms", threshold_ms);
+	if (relative)
+		fwprintf(spike_log, L"%ls %.2f times the recent average", threshold_ms ? L" or" : L"", relative);
+	fwprintf(spike_log, L". Times listed per frame:\n"
+			L"  Render thread: where the thread that calls Present spent the frame\n"
+			L"  Included in the above: parts of those times worth singling out\n"
+			L"  Other threads: ran concurrently, only matters if the render thread waited on it\n"
+			L"  Slowest operations: individual operations that took at least 1ms\n"
+			L"Every %.0f seconds a summary of the frames since is written as well.\n\n",
+			spike_window_ms / 1000);
+	fflush(spike_log);
+
+enable:
+	spike_relative = relative;
+	threshold = threshold_ms ? (INT64)((double)threshold_ms * freq.QuadPart / 1000.0) : INT64_MAX;
+}
+
+void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, UINT64 id)
+{
+	LARGE_INTEGER end;
+	wchar_t buf[32];
+
+	QueryPerformanceCounter(&end);
+	INT64 ticks = end.QuadPart - start;
+	bool other_thread = GetCurrentThreadId() != spike_present_thread.load(std::memory_order_relaxed);
+
+	SpikeTotal &total = spike_totals[category][other_thread];
+	total.ticks.fetch_add(ticks, std::memory_order_relaxed);
+	total.count.fetch_add(1, std::memory_order_relaxed);
+
+	if (!name || ticks < spike_event_min)
+		return;
+
+	SpikeEvent event = {category, other_thread, ticks, name};
+	if (id) {
+		_snwprintf_s(buf, ARRAYSIZE(buf), _TRUNCATE, L" %016I64x", id);
+		event.name += buf;
+	}
+
+	AcquireSRWLockExclusive(&spike_events_lock);
+	if (spike_events.size() < spike_max_events)
+		spike_events.push_back(std::move(event));
+	else
+		spike_events_dropped++;
+	ReleaseSRWLockExclusive(&spike_events_lock);
+}
+
+static double spike_ms(INT64 ticks)
+{
+	return ticks * 1000.0 / spike_freq;
+}
+
+static void spike_log_totals(const wchar_t *heading, INT64 ticks[][2], unsigned count[][2],
+		int first, int last, int thread)
+{
+	bool heading_logged = !heading;
+
+	for (int i = first; i < last; i++) {
+		if (!count[i][thread])
+			continue;
+		if (!heading_logged) {
+			fwprintf(spike_log, L"  %ls:\n", heading);
+			heading_logged = true;
+		}
+		fwprintf(spike_log, L"  %10.2fms  %ls (x%u)\n",
+				spike_ms(ticks[i][thread]), spike_category_names[i], count[i][thread]);
+	}
+}
+
+static void spike_log_window()
+{
+	size_t frames = spike_window_frames.size();
+	bool heading_logged = false;
+	SYSTEMTIME time;
+
+	if (!frames)
+		return;
+
+	// The slowest 1% of the frames start here
+	size_t nth = frames - 1 - frames / 100;
+	std::nth_element(spike_window_frames.begin(), spike_window_frames.begin() + nth, spike_window_frames.end());
+	float percentile = spike_window_frames[nth];
+	float worst = *std::max_element(spike_window_frames.begin(), spike_window_frames.end());
+
+	GetLocalTime(&time);
+	fwprintf(spike_log, L"[%02u:%02u:%02u.%03u] summary of %.1fs with mods %ls: %Iu frames, average %.2fms (%.1f fps), "
+			L"99th percentile %.2fms, worst %.2fms, %u logged as slow\n",
+			time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, spike_window_total_ms / 1000,
+			spike_mods_disabled ? L"OFF" : L"on", frames, spike_window_total_ms / frames,
+			frames * 1000.0 / spike_window_total_ms, percentile, worst, spike_window_spikes);
+	for (int i = 0; i < NUM_CATEGORIES; i++) {
+		if (!spike_window_count[i][0] && !spike_window_count[i][1])
+			continue;
+		if (!heading_logged)
+			fwprintf(spike_log, L"  Per frame, on the render thread and on other threads:\n");
+		heading_logged = true;
+		fwprintf(spike_log, L"  %8.3fms (x%-7.1f) %8.3fms (x%-7.1f)  %ls\n",
+				spike_ms(spike_window_ticks[i][0]) / frames, (double)spike_window_count[i][0] / frames,
+				spike_ms(spike_window_ticks[i][1]) / frames, (double)spike_window_count[i][1] / frames,
+				spike_category_names[i]);
+	}
+	heading_logged = false;
+	for (unsigned i = 0; i < Profiling::Spike::NUM_REASONS; i++) {
+		if (!spike_window_reasons[i])
+			continue;
+		fwprintf(spike_log, L"%ls%ls %.1f", heading_logged ? L", " : L"  Per frame: ",
+				Profiling::Spike::reason_names[i], (double)spike_window_reasons[i] / frames);
+		heading_logged = true;
+	}
+	fwprintf(spike_log, heading_logged ? L"\n\n" : L"\n");
+	fflush(spike_log);
+
+	memset(spike_window_reasons, 0, sizeof(spike_window_reasons));
+	spike_window_frames.clear();
+	spike_window_total_ms = 0;
+	spike_window_spikes = 0;
+	memset(spike_window_ticks, 0, sizeof(spike_window_ticks));
+	memset(spike_window_count, 0, sizeof(spike_window_count));
+}
+
+void Profiling::Spike::frame(bool mods_disabled)
+{
+	INT64 ticks[NUM_CATEGORIES][2];
+	unsigned count[NUM_CATEGORIES][2];
+	unsigned counters[ARRAYSIZE(spike_counters)];
+	LONG reasons[NUM_REASONS];
+	vector<SpikeEvent> events;
+	unsigned events_dropped;
+	LARGE_INTEGER now;
+	SYSTEMTIME time;
+
+	if (!threshold)
+		return;
+
+	QueryPerformanceCounter(&now);
+	INT64 frame_ticks = now.QuadPart - spike_last_present;
+	bool first_frame = !spike_last_present;
+	spike_last_present = now.QuadPart;
+	spike_present_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+
+	for (int i = 0; i < NUM_CATEGORIES; i++) {
+		for (int thread = 0; thread < 2; thread++) {
+			ticks[i][thread] = spike_totals[i][thread].ticks.exchange(0, std::memory_order_relaxed);
+			count[i][thread] = spike_totals[i][thread].count.exchange(0, std::memory_order_relaxed);
+		}
+	}
+
+	for (size_t i = 0; i < ARRAYSIZE(spike_counters); i++) {
+		unsigned current = *spike_counters[i].counter;
+		// The performance monitor zeroes these whenever it starts a new interval:
+		counters[i] = current >= spike_counters_prev[i] ? current - spike_counters_prev[i] : current;
+		spike_counters_prev[i] = current;
+	}
+
+	for (unsigned i = 0; i < NUM_REASONS; i++)
+		reasons[i] = InterlockedExchange(&reason_counts[i], 0);
+
+	AcquireSRWLockExclusive(&spike_events_lock);
+	events.swap(spike_events);
+	events_dropped = spike_events_dropped;
+	spike_events_dropped = 0;
+	ReleaseSRWLockExclusive(&spike_events_lock);
+
+	if (first_frame)
+		return;
+
+	double frame_ms = spike_ms(frame_ticks);
+
+	if (mods_disabled != spike_mods_disabled) {
+		spike_log_window();
+		spike_mods_disabled = mods_disabled;
+	}
+	spike_window_frames.push_back((float)frame_ms);
+	spike_window_total_ms += frame_ms;
+	for (unsigned i = 0; i < NUM_REASONS; i++)
+		spike_window_reasons[i] += reasons[i];
+	for (int i = 0; i < NUM_CATEGORIES; i++) {
+		for (int thread = 0; thread < 2; thread++) {
+			spike_window_ticks[i][thread] += ticks[i][thread];
+			spike_window_count[i][thread] += count[i][thread];
+		}
+	}
+
+	bool slow = frame_ticks >= threshold
+		|| (spike_relative && spike_average_ms && frame_ms >= spike_average_ms * spike_relative);
+	if (slow)
+		spike_window_spikes++;
+	if (spike_window_total_ms >= spike_window_ms)
+		spike_log_window();
+
+	if (!slow) {
+		if (spike_average_ms == 0)
+			spike_average_ms = frame_ms;
+		else
+			spike_average_ms += (frame_ms - spike_average_ms) * 0.05;
+		return;
+	}
+
+	GetLocalTime(&time);
+	fwprintf(spike_log, L"[%02u:%02u:%02u.%03u] frame %u: %.2fms (recent average %.2fms)%ls\n",
+			time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
+			G->frame_no, frame_ms, spike_average_ms, mods_disabled ? L", mods OFF" : L"");
+
+	INT64 accounted = 0;
+	for (int i = 0; i < FIRST_NESTED; i++)
+		accounted += ticks[i][0];
+	fwprintf(spike_log, L"  Render thread:\n");
+	spike_log_totals(NULL, ticks, count, 0, FIRST_NESTED, 0);
+	fwprintf(spike_log, L"  %10.2fms  outside 3DMigoto (game, driver)\n",
+			spike_ms(frame_ticks > accounted ? frame_ticks - accounted : 0));
+	spike_log_totals(L"Included in the above", ticks, count, FIRST_NESTED, NUM_CATEGORIES, 0);
+	spike_log_totals(L"Other threads", ticks, count, 0, NUM_CATEGORIES, 1);
+
+	if (!events.empty()) {
+		std::sort(events.begin(), events.end(), [](const SpikeEvent &lhs, const SpikeEvent &rhs) {
+			return lhs.ticks > rhs.ticks;
+		});
+		fwprintf(spike_log, L"  Slowest operations:\n");
+		size_t logged = events.size() < spike_max_events_logged ? events.size() : spike_max_events_logged;
+		for (size_t i = 0; i < logged; i++) {
+			fwprintf(spike_log, L"  %10.2fms  %ls: %ls%ls\n",
+					spike_ms(events[i].ticks), spike_category_names[events[i].category],
+					events[i].name.c_str(), events[i].other_thread ? L" (other thread)" : L"");
+		}
+		if (events.size() + events_dropped > logged)
+			fwprintf(spike_log, L"              ... and %Iu more\n", events.size() + events_dropped - logged);
+	}
+
+	bool reasons_logged = false;
+	for (unsigned i = 0; i < NUM_REASONS; i++) {
+		if (!reasons[i])
+			continue;
+		fwprintf(spike_log, L"%ls%ls %d", reasons_logged ? L", " : L"  Stopped for: ", reason_names[i], reasons[i]);
+		reasons_logged = true;
+	}
+	if (reasons_logged)
+		fwprintf(spike_log, L"\n");
+
+	bool counters_logged = false;
+	for (size_t i = 0; i < ARRAYSIZE(spike_counters); i++) {
+		if (!counters[i])
+			continue;
+		fwprintf(spike_log, L"%ls%ls %u", counters_logged ? L", " : L"  Counters: ", spike_counters[i].name, counters[i]);
+		counters_logged = true;
+	}
+	fwprintf(spike_log, counters_logged ? L"\n\n" : L"\n");
+	fflush(spike_log);
 }

@@ -8,6 +8,7 @@
 #include "util.h"
 
 #include "HashDump.h"
+#include "../profiling.h"
 
 Dx12BufferStats dx12_buffer_stats;
 
@@ -167,6 +168,8 @@ void Dx12CopyBufferRegion(ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource
 
 	if (!dst || !src || !bytes || bytes > MAX_HASHED_BYTES)
 		return;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_BUFFER_HASH, L"bytes", bytes);
 
 	if (!Dx12GetResourceInfo(src, &src_info) || !Dx12GetResourceInfo(dst, &dst_info)) {
 		InterlockedIncrement64(&dx12_buffer_stats.untracked);

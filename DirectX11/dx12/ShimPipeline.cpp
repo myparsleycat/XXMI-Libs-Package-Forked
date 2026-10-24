@@ -5,6 +5,7 @@
 
 #include "ShimDevice.h"
 #include "util.h"
+#include "../profiling.h"
 
 // The shaders of mods are D3D11 shaders: every stage has its own registers,
 // all in space 0, and binds by slot. The root signature for a set of them
@@ -594,7 +595,10 @@ static ID3D12PipelineState* get_pipeline(const ShimState *state, const PipelineK
 	desc.DSVFormat = key->dsv_format;
 	desc.SampleDesc = key->samples;
 
-	hr = dx12_shim->device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"for a draw of a mod, vs", key->ids[DX12_STAGE_VS]);
+		hr = dx12_shim->device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
+	}
 	if (FAILED(hr)) {
 		Dx12LogInfo("*** Failed to create a pipeline state for a mod = 0x%x: shaders vs=%llu ps=%llu gs=%llu hs=%llu ds=%llu, "
 			"input layout %llu with %u elements, %u render targets, first format %d, depth format %d, topology type %d\n",
@@ -798,6 +802,7 @@ bool Dx12ShimPrepareDispatch(const ShimState *state)
 		desc.CS.pShaderBytecode = shader->bytecode.data();
 		desc.CS.BytecodeLength = shader->bytecode.size();
 		pipeline = NULL;
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"for a dispatch of a mod, cs", shader->id);
 		if (FAILED(dx12_shim->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
 			Dx12LogInfo("*** Failed to create a compute pipeline state for shader %llu of a mod\n", shader->id);
 		compute_pipelines[shader->id] = pipeline;

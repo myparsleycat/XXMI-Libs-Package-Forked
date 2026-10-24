@@ -8,6 +8,7 @@
 #include "ShimContext.h"
 #include "ShimPipeline.h"
 #include "util.h"
+#include "../profiling.h"
 
 #include "../globals.h"
 
@@ -273,7 +274,10 @@ static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC
 {
 	HRESULT hr;
 
-	hr = Dx12ShimCreateResource(desc, &resource->resource);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, L"bytes or texels wide", desc->Width);
+		hr = Dx12ShimCreateResource(desc, &resource->resource);
+	}
 	if (FAILED(hr)) {
 		Dx12LogInfo("*** Failed to create a resource for a mod: dimension %d, %llux%ux%u, %u mips, format %d, flags 0x%x = 0x%x\n",
 			desc->Dimension, desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels,
@@ -309,6 +313,7 @@ bool ShimRenameResource(ShimResource *resource)
 	D3D12_HEAP_PROPERTIES heap = {};
 	D3D12_RESOURCE_BARRIER barrier = {};
 	size_t i;
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_RENAME, L"bytes or texels wide", resource->desc.Width);
 
 	// One the lists are done with comes before a new one
 	for (i = 0; i < resource->spares.size(); i++) {

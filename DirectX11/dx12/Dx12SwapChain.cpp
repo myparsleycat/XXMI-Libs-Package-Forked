@@ -4,7 +4,9 @@
 
 #include "Dx12CommandQueue.h"
 #include "Dx12Device.h"
+#include "DrawPath.h"
 #include "PresentPass.h"
+#include "../profiling.h"
 
 // {6216F1D1-6BC6-4B1C-8CB5-7D5F8A18C381}
 const GUID Dx12SwapChain::ProxyIID = { 0x6216f1d1, 0x6bc6, 0x4b1c, { 0x8c, 0xb5, 0x7d, 0x5f, 0x8a, 0x18, 0xc3, 0x81 } };
@@ -118,9 +120,17 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	if (Flags & DXGI_PRESENT_TEST)
 		return mOrig->Present(SyncInterval, Flags);
 
-	Dx12PresentBegin(this);
-	Dx12FramePresented();
-	hr = mOrig->Present(SyncInterval, Flags);
+	Profiling::Spike::frame(dx12_mods_disabled);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
+		Dx12PresentBegin(this);
+		Dx12FramePresented();
+	}
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_CALL);
+		hr = mOrig->Present(SyncInterval, Flags);
+	}
+	Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
 	Dx12PresentEnd(this);
 	return hr;
 }
@@ -132,9 +142,17 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present1(UINT SyncInterval, UINT Presen
 	if (PresentFlags & DXGI_PRESENT_TEST)
 		return mOrig->Present1(SyncInterval, PresentFlags, pPresentParameters);
 
-	Dx12PresentBegin(this);
-	Dx12FramePresented();
-	hr = mOrig->Present1(SyncInterval, PresentFlags, pPresentParameters);
+	Profiling::Spike::frame(dx12_mods_disabled);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
+		Dx12PresentBegin(this);
+		Dx12FramePresented();
+	}
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_CALL);
+		hr = mOrig->Present1(SyncInterval, PresentFlags, pPresentParameters);
+	}
+	Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
 	Dx12PresentEnd(this);
 	return hr;
 }

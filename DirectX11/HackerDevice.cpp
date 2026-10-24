@@ -1392,7 +1392,10 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 	HRESULT hr;
 
 	*ppShader = NULL; // Appease the static analysis gods
-	hr = (mOrigDevice1->*OrigCreateShader)(pShaderBytecode, BytecodeLength, pClassLinkage, ppShader);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::SHADER_CREATE_DRIVER);
+		hr = (mOrigDevice1->*OrigCreateShader)(pShaderBytecode, BytecodeLength, pClassLinkage, ppShader);
+	}
 	if (FAILED(hr))
 		return hr;
 
@@ -2253,6 +2256,7 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 {
 	D3D11_BUFFER_DESC newDesc;
 	const D3D11_BUFFER_DESC *pNewDesc = NULL;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"buffer");
 
 	LogDebug("HackerDevice::CreateBuffer called\n");
 	if (pDesc)
@@ -2305,6 +2309,7 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 	D3D11_TEXTURE1D_DESC newDesc;
 	const D3D11_TEXTURE1D_DESC *pNewDesc = NULL;
 	uint32_t data_hash, hash;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"texture1d");
 
 	LogDebug("HackerDevice::CreateTexture1D called\n");
 	if (pDesc)
@@ -2371,6 +2376,7 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 {
 	D3D11_TEXTURE2D_DESC newDesc;
 	const D3D11_TEXTURE2D_DESC *pNewDesc = NULL;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"texture2d");
 
 	LogDebug("HackerDevice::CreateTexture2D called with parameters\n");
 	if (pDesc)
@@ -2460,6 +2466,7 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 {
 	D3D11_TEXTURE3D_DESC newDesc;
 	const D3D11_TEXTURE3D_DESC *pNewDesc = NULL;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"texture3d");
 
 	LogInfo("HackerDevice::CreateTexture3D called with parameters\n");
 	if (pDesc)
@@ -2707,6 +2714,8 @@ STDMETHODIMP HackerDevice::CreateShader(THIS_
 
 	// Calculate hash
 	hash = hash_shader(pShaderBytecode, BytecodeLength);
+
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_CREATE, shaderType, hash);
 
 	//constexpr int iterations = 10000;
 	//auto start = std::chrono::steady_clock::now();

@@ -24,6 +24,7 @@
 #include "../HackerContext.h"
 #include "../Hunting.h"
 #include "../Overlay.h"
+#include "../profiling.h"
 #include "../ResourceHash.h"
 #include "../vk/VkScope.h"
 
@@ -499,6 +500,7 @@ static bool start_reach(const ReachKey *key, VertexReach *reach, UINT64 vb_bytes
 	D3D12_RESOURCE_DESC desc = {};
 	ID3D12GraphicsCommandList *list;
 	bool needed[2] = {};
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_REACH, L"start, bytes", vb_bytes);
 	UINT count = 0, i;
 
 	if (!reach_barrier(key->vb, &barriers[0], &needed[0]))
@@ -754,6 +756,7 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 	D3D12_RANGE range = { 0, (SIZE_T)(key->ib_bytes + reach->vb_bytes) }, nothing = {};
 	UINT64 last = 0, limit = reach->vb_bytes / key->stride;
 	size_t next_end = 0;
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_REACH, L"finish, bytes", reach->vb_bytes);
 	// Vertices used up to the end of each section, which never go down
 	std::vector<UINT64> ends;
 	Dx12BufferHash hash = {}, matched = {}, packed_hash = {};
@@ -4548,6 +4551,11 @@ enum SlowReason {
 };
 static volatile LONG slow_draws[SLOW_REASONS];
 
+static const wchar_t *const slow_reason_names[SLOW_REASONS] = {
+	L"settings", L"pipeline not looked at", L"lists doing more than asking", L"a condition", L"IniParams",
+	L"vb not known", L"vb wanted", L"vb written since", L"ib", L"cb", L"skinned buffer", L"texture",
+};
+
 static bool stage_of_shader_type(wchar_t shader_type, Dx12ShaderStage *stage)
 {
 	switch (shader_type) {
@@ -5323,7 +5331,10 @@ bool Dx12Draw(Dx12GraphicsCommandList *list, bool indexed, UINT count, UINT inst
 
 	if (!pipeline)
 		return false;
-	reason = draw_is_boring(list, pipeline);
+	{
+		Profiling::Spike::Scope spike_filter(Profiling::Spike::DX12_FILTER);
+		reason = draw_is_boring(list, pipeline);
+	}
 	if (reason == SLOW_NOT) {
 		list->mFastDraws++;
 		return false;
@@ -5331,9 +5342,12 @@ bool Dx12Draw(Dx12GraphicsCommandList *list, bool indexed, UINT count, UINT inst
 	Dx12FlushFastDraws(list);
 	if (timed)
 		InterlockedIncrement(&slow_draws[reason]);
+	Profiling::Spike::reason(reason, slow_reason_names[reason]);
 
 	for (stage = 0; stage < DX12_STAGE_COUNT; stage++)
 		hashes[stage] = pipeline->shaders[stage] ? pipeline->shaders[stage]->hash : 0;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_DRAW, L"draw with vs", hashes[DX12_STAGE_VS]);
 
 	if (timed)
 		times[0] = ticks();
@@ -5379,6 +5393,7 @@ bool Dx12Draw(Dx12GraphicsCommandList *list, bool indexed, UINT count, UINT inst
 	stats.draws++;
 	stats.skipped += c.call_info.skip;
 	if (!c.call_info.skip) {
+		Profiling::Spike::Scope spike_apply(Profiling::Spike::DX12_APPLY);
 		apply_overrides(false);
 		if (indexed)
 			list->mOrig->DrawIndexedInstanced(count, instances, start, base_vertex, start_instance);
@@ -5418,13 +5433,19 @@ bool Dx12Dispatch(Dx12GraphicsCommandList *list, UINT x, UINT y, UINT z)
 
 	// Settled without the lock: the dispatch may be one the engine would
 	// do nothing about, see skin_is_boring
-	skinning = is_skinning_shader(pipeline->shaders[DX12_STAGE_CS]);
-	if (skinning && !resolve_skin(list, Dx12ListRootSignature(list, true), x, y, z, &skin)) {
-		skinning = false;
-		unconfirmed = true;
+	reason = SLOW_NOT;
+	{
+		Profiling::Spike::Scope spike_filter(Profiling::Spike::DX12_FILTER);
+
+		skinning = is_skinning_shader(pipeline->shaders[DX12_STAGE_CS]);
+		if (skinning && !resolve_skin(list, Dx12ListRootSignature(list, true), x, y, z, &skin)) {
+			skinning = false;
+			unconfirmed = true;
+		}
+		if (skinning)
+			reason = skin_is_boring(pipeline, &skin);
 	}
 	if (skinning) {
-		reason = skin_is_boring(pipeline, &skin);
 		if (reason == SLOW_NOT) {
 			if (G->dx12_dump_hashes)
 				InterlockedIncrement(&fast_skins);
@@ -5433,9 +5454,14 @@ bool Dx12Dispatch(Dx12GraphicsCommandList *list, UINT x, UINT y, UINT z)
 		}
 		if (G->dx12_dump_hashes)
 			InterlockedIncrement(&slow_draws[reason]);
+		Profiling::Spike::reason(16 + reason, slow_reason_names[reason]);
+	} else {
+		Profiling::Spike::reason(31, L"dispatch that does not skin");
 	}
 
 	Dx12FlushFastDraws(list);
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_DISPATCH, L"dispatch with cs", pipeline->shaders[DX12_STAGE_CS]->hash);
 
 	Dx12ShimLock();
 	if (!dx12_shim || scope) {
@@ -5667,6 +5693,7 @@ void Dx12DrawPathFramePresented()
 	LONG reasons[SLOW_REASONS];
 	double per_frame;
 	HashSet *hashes;
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPKEEP, L"upkeep");
 
 	if (G->hunting == HUNTING_MODE_ENABLED)
 		log_selected_shaders();

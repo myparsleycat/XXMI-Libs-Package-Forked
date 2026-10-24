@@ -5,6 +5,7 @@
 #include "../ResourceHash.h"
 
 #include "HashDump.h"
+#include "../profiling.h"
 
 // For GetSurfaceInfo, which is what ResourceHash.cpp sizes a texture with
 #include "DirectXTK/Src/pch.h"
@@ -168,6 +169,11 @@ static void texture_uploaded(ID3D12Resource *texture, UINT subresource, UINT x, 
 		InterlockedIncrement64(&dx12_texture_stats.out_of_bounds);
 		return;
 	}
+
+	wchar_t what[48] = L"";
+	if (Profiling::Spike::threshold)
+		swprintf_s(what, L"%ux%u format %d", width, height, (int)info.desc.Format);
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_TEXTURE_HASH, what);
 
 	if (FAILED(buffer->Map(0, NULL, (void**)&data)) || !data) {
 		InterlockedIncrement64(&dx12_texture_stats.not_mappable);

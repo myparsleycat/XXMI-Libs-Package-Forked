@@ -22,6 +22,7 @@
 #include "../HackerContext.h"
 #include "../HackerDevice.h"
 #include "../IniHandler.h"
+#include "../profiling.h"
 
 Dx12Shim *dx12_shim;
 bool dx12_unloading;
@@ -140,6 +141,14 @@ static BOOL CALLBACK init_shim_lock(PINIT_ONCE once, PVOID parameter, PVOID *con
 void Dx12ShimLock()
 {
 	InitOnceExecuteOnce(&shim_lock_once, init_shim_lock, NULL, NULL);
+	// Only a contended lock is worth the cost of timing it:
+	if (!Profiling::Spike::threshold) {
+		EnterCriticalSection(&shim_lock);
+		return;
+	}
+	if (TryEnterCriticalSection(&shim_lock))
+		return;
+	Profiling::Spike::Scope spike(Profiling::Spike::LOCK_WAIT, L"the D3D12 shim's");
 	EnterCriticalSection(&shim_lock);
 }
 
@@ -253,6 +262,8 @@ static bool create_upload_buffer(UINT64 size, UploadPage *page)
 	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
 	*page = {};
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, L"upload page");
+
 	if (FAILED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
 			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer)))) {
 		Dx12LogInfo("*** Failed to create a %llu byte upload buffer\n", size);
@@ -1358,6 +1369,8 @@ void Dx12ShimSubmit()
 		return;
 	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_SUBMIT);
+
 	// By index: the first transition of a resource in a submission is
 	// what adds it, which none of these is
 	for (size_t i = 0; i < touched.size(); i++)
@@ -1405,6 +1418,8 @@ void Dx12ShimSubmitAndWait()
 
 	if (fence->GetCompletedValue() >= fence_signalled)
 		return;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_GPU_WAIT, L"for a mod to read back or a swap chain to resize");
 
 	if (FAILED(fence->SetEventOnCompletion(fence_signalled, fence_event))
 	    || WaitForSingleObject(fence_event, 10000) != WAIT_OBJECT_0)

@@ -8,6 +8,7 @@
 #include "DxilMetadata.h"
 #include "HashDump.h"
 #include "ResourceTracker.h"
+#include "../profiling.h"
 
 const char *const dx12_stage_names[DX12_STAGE_COUNT] = { "vs", "ps", "gs", "hs", "ds", "cs" };
 
@@ -829,8 +830,10 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		desc->InputLayout.pInputElementDescs = elements;
 		desc->InputLayout.NumElements = count;
 		desc->CachedPSO = {};
-		if (!failed)
+		if (!failed) {
+			Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"a pipeline of the game with a mod's input layout");
 			hr = device->CreateGraphicsPipelineState(desc, IID_PPV_ARGS(&pipeline));
+		}
 	} else {
 		for (pos = 0; !failed && pos < creation.size(); pos += size) {
 			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(creation.data() + pos);
@@ -868,6 +871,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		if (!failed) {
 			D3D12_PIPELINE_STATE_STREAM_DESC desc = { creation.size(), creation.data() };
 
+			Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"a pipeline of the game with a mod's input layout");
 			hr = device2->CreatePipelineState(&desc, IID_PPV_ARGS(&pipeline));
 		}
 		if (device2)

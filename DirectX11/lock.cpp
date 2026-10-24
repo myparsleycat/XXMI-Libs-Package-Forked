@@ -1,5 +1,6 @@
 #include "lock.h"
 #include "overlay.h"
+#include "profiling.h"
 
 #include <psapi.h>
 #include <inttypes.h>
@@ -357,8 +358,15 @@ static void EnterCriticalSectionHook(CRITICAL_SECTION *lock)
 
 void _EnterCriticalSectionPretty(CRITICAL_SECTION *lock, char *function, int line)
 {
-	if (!lock_dependency_checks_enabled)
+	if (!lock_dependency_checks_enabled) {
+		// Only a contended lock is worth the cost of timing it:
+		if (!Profiling::Spike::threshold)
+			return EnterCriticalSection(lock);
+		if (TryEnterCriticalSection(lock))
+			return;
+		Profiling::Spike::Scope spike(Profiling::Spike::LOCK_WAIT);
 		return EnterCriticalSection(lock);
+	}
 
 	// Protect against reentrancy:
 	if (get_tls()->hooking_quirk_protection)

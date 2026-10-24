@@ -8,6 +8,7 @@
 #include "Dx12CommandList.h"
 #include "Dx12Device.h"
 #include "ResourceTracker.h"
+#include "../profiling.h"
 
 // {1B67B403-353E-45FD-B468-760207CA7886}
 const GUID Dx12CommandQueue::ProxyIID = { 0x1b67b403, 0x353e, 0x45fd, { 0xb4, 0x68, 0x76, 0x02, 0x07, 0xca, 0x78, 0x86 } };
@@ -132,6 +133,10 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 		return;
 	}
 
+	LARGE_INTEGER start = {};
+	if (Profiling::Spike::threshold)
+		QueryPerformanceCounter(&start);
+
 	if (NumCommandLists > ARRAYSIZE(stack)) {
 		large.resize(NumCommandLists);
 		lists = large.data();
@@ -183,10 +188,18 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 	// the game's lists that use none go ahead of what is being paged in
 	if (!pins.empty())
 		Dx12ShimResidencyWait(mOrig);
-	mOrig->ExecuteCommandLists(NumCommandLists, lists);
 
-	if (!pins.empty())
+	if (start.QuadPart)
+		Profiling::Spike::add(Profiling::Spike::DX12_EXECUTE, start.QuadPart, L"before", 0);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE_DRIVER, L"lists", NumCommandLists);
+		mOrig->ExecuteCommandLists(NumCommandLists, lists);
+	}
+
+	if (!pins.empty()) {
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE, L"after");
 		Dx12ShimPinsExecuted(mOrig, &pins, &first);
+	}
 }
 
 // The signals and waits the queues were handed, in order: the waits their

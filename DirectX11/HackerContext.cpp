@@ -576,6 +576,7 @@ bool HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 	UINT num_instances = 0;
 	bool pending = false;
 	unsigned i;
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX, shader_type, hash);
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
@@ -952,6 +953,8 @@ void HackerContext::RestoreInputLayout()
 
 void HackerContext::BeforeDraw(DrawContext &data)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::DRAW_PRE);
+
 	draw_number++;
 
 	mCheckTextureOverrideResultCount = 0;
@@ -1178,6 +1181,7 @@ void HackerContext::AfterDraw(DrawContext &data)
 {
 	int i;
 	Profiling::State profiling_state;
+	Profiling::Spike::Scope spike(Profiling::Spike::DRAW_POST);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
@@ -1479,6 +1483,7 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 	bool divertable = false, divert = false, track = false;
 	bool write = false, read = false, deny = false;
 	Profiling::State profiling_state;
+	Profiling::Spike::Scope spike(Profiling::Spike::MAP);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
@@ -1624,6 +1629,7 @@ void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresou
 	size_t i;
 	MappedResourceInfo *map_info = NULL;
 	Profiling::State profiling_state;
+	Profiling::Spike::Scope spike(Profiling::Spike::MAP);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
