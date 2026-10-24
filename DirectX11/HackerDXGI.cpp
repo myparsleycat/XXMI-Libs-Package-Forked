@@ -70,6 +70,7 @@
 #include "IniHandler.h"
 #include "CommandList.h"
 #include "profiling.h"
+#include "ResourceLoading.h"
 #include "cursor.h" // For InstallHookLate
 #include "dx12/Bridge.h"
 #include "vk/VkHooks.h"
@@ -272,6 +273,7 @@ void HackerSwapChain::RunFrameActions()
 	G->gSystemTickCount = system_tick_count;
 
 	G->gFPSCounter.Update(system_tick_count);
+	ReleaseIdleReadBuffers();
 
 	// Run the command list here, before drawing the overlay so that a
 	// custom shader on the present call won't remove the overlay. Also,

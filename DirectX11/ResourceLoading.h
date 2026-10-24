@@ -4,10 +4,11 @@
 #include <cstdint>
 #include <string>
 
-// A whole file read into memory. One ReadFile into a buffer kept for the
-// next file is much faster than faulting the pages of a mapped view in one
-// by one while a D3D create call copies from it, and the buffer is warm in
-// the cache for that copy.
+// A whole file read into memory. Reading into a buffer kept for the next
+// file is much faster than faulting the pages of a mapped view in one by one
+// while a D3D create call copies from it, and the buffer is warm in the
+// cache for that copy. A file of several MB is read by thread pool threads
+// as well, before the constructor returns.
 class FileContents
 {
 public:
@@ -27,6 +28,10 @@ private:
 	uint8_t *buffer = nullptr;
 	size_t capacity = 0;
 };
+
+// Once a frame: frees the buffer of files too big for the kept ones once it
+// has gone unused for some seconds
+void ReleaseIdleReadBuffers();
 
 enum class SharedResourceLoader {
 	DDS,

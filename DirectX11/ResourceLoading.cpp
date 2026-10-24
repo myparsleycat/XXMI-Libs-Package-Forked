@@ -17,11 +17,130 @@
 #pragma region FileContents
 
 // Idle read buffers, kept for the next file. A file bigger than the largest
-// kept size is read into a buffer of its own, freed once it is done with.
+// kept size goes into the one large buffer, which is freed once it has gone
+// unused for a while: such files come in bursts when a mod is first drawn,
+// and a fresh buffer costs more in page faults than the read itself.
 static std::mutex read_buffers_lock;
 static std::vector<std::pair<uint8_t*, size_t>> read_buffers;
 static const size_t kept_read_buffers = 2;
-static const size_t kept_read_buffer_size = 64 << 20;
+// A 64 MB texture is 64 MB and the DDS header
+static const size_t kept_read_buffer_size = 65 << 20;
+static uint8_t *large_read_buffer = nullptr;
+static size_t large_read_buffer_capacity = 0;
+static ULONGLONG large_read_buffer_idle_since = 0;
+static std::atomic<bool> large_read_buffer_kept{false};
+static const size_t kept_large_read_buffer_size = 512 << 20;
+static const ULONGLONG large_read_buffer_idle_ms = 5000;
+
+// A file of two chunks or more is read by the thread pool as well as by the
+// loading thread, which waits for it anyway. Copying out of the file cache is
+// bound by one core, and a cold file is read at a higher queue depth:
+static const size_t read_chunk_size = 2 << 20;
+static const unsigned max_read_helpers = 3;
+
+struct SplitRead
+{
+	HANDLE file;
+	uint8_t *buffer;
+	size_t size;
+	std::atomic<size_t> next{0};
+	std::atomic<DWORD> error{0};
+};
+
+static void ReadChunks(SplitRead *read)
+{
+	HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+	if (!event) {
+		DWORD expected = 0;
+		read->error.compare_exchange_strong(expected, GetLastError());
+		return;
+	}
+
+	for (;;) {
+		size_t at = read->next.fetch_add(read_chunk_size);
+		if (at >= read->size || read->error)
+			break;
+
+		DWORD len = (DWORD)std::min<size_t>(read_chunk_size, read->size - at), got = 0, error = 0;
+		OVERLAPPED overlapped = {};
+		overlapped.Offset = (DWORD)at;
+		overlapped.OffsetHigh = (DWORD)((uint64_t)at >> 32);
+		overlapped.hEvent = event;
+
+		BOOL ok = ReadFile(read->file, read->buffer + at, len, &got, &overlapped);
+		if (!ok && GetLastError() == ERROR_IO_PENDING)
+			ok = GetOverlappedResult(read->file, &overlapped, &got, TRUE);
+		if (!ok)
+			error = GetLastError();
+		else if (got != len)
+			error = ERROR_HANDLE_EOF;
+		if (error) {
+			DWORD expected = 0;
+			read->error.compare_exchange_strong(expected, error);
+			break;
+		}
+	}
+	CloseHandle(event);
+}
+
+static void CALLBACK ReadChunksCallback(PTP_CALLBACK_INSTANCE instance, void *context, PTP_WORK work)
+{
+	ReadChunks((SplitRead*)context);
+}
+
+static unsigned ReadHelpers()
+{
+	static unsigned helpers = std::min<unsigned>(max_read_helpers, std::max<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), 1) - 1);
+	return helpers;
+}
+
+// Returns 0 or the error of the first chunk that could not be read
+static DWORD ReadWhole(HANDLE file, uint8_t *buffer, size_t size)
+{
+	SplitRead read;
+	PTP_WORK work = NULL;
+	// Below two chunks a helper would cost more than it reads
+	unsigned helpers = (unsigned)std::min<size_t>(ReadHelpers(), std::max<size_t>(size / read_chunk_size, 1) - 1);
+
+	read.file = file;
+	read.buffer = buffer;
+	read.size = size;
+
+	if (helpers)
+		work = CreateThreadpoolWork(ReadChunksCallback, &read, NULL);
+	for (unsigned i = 0; work && i < helpers; i++)
+		SubmitThreadpoolWork(work);
+
+	ReadChunks(&read);
+
+	if (work) {
+		// Helpers still reading are waited for. One that has not
+		// started is cancelled: nothing is left for it to read.
+		WaitForThreadpoolWorkCallbacks(work, TRUE);
+		CloseThreadpoolWork(work);
+	}
+	return read.error;
+}
+
+void ReleaseIdleReadBuffers()
+{
+	uint8_t *released = nullptr;
+
+	if (!large_read_buffer_kept.load(std::memory_order_relaxed))
+		return;
+
+	{
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		if (!large_read_buffer || GetTickCount64() - large_read_buffer_idle_since < large_read_buffer_idle_ms)
+			return;
+		released = large_read_buffer;
+		large_read_buffer = nullptr;
+		large_read_buffer_capacity = 0;
+		large_read_buffer_kept = false;
+	}
+	VirtualFree(released, 0, MEM_RELEASE);
+}
 
 FileContents::FileContents(const wchar_t *path)
 {
@@ -30,7 +149,7 @@ FileContents::FileContents(const wchar_t *path)
 	size_t want;
 
 	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, NULL);
 	if (file == INVALID_HANDLE_VALUE) {
 		error = GetLastError();
 		return;
@@ -58,6 +177,15 @@ FileContents::FileContents(const wchar_t *path)
 			capacity = best->second;
 			read_buffers.erase(best);
 		}
+	} else {
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		if (large_read_buffer && large_read_buffer_capacity >= want) {
+			buffer = large_read_buffer;
+			capacity = large_read_buffer_capacity;
+			large_read_buffer = nullptr;
+			large_read_buffer_capacity = 0;
+			large_read_buffer_kept = false;
+		}
 	}
 	if (capacity < want) {
 		if (buffer)
@@ -72,18 +200,10 @@ FileContents::FileContents(const wchar_t *path)
 		}
 	}
 
-	for (size_t at = 0; at < want; ) {
-		DWORD got = 0, chunk = (DWORD)std::min<size_t>(want - at, (size_t)1 << 30);
-		if (!ReadFile(file, buffer + at, chunk, &got, NULL) || !got) {
-			error = GetLastError();
-			if (!error)
-				error = ERROR_HANDLE_EOF;
-			CloseHandle(file);
-			return;
-		}
-		at += got;
-	}
+	error = ReadWhole(file, buffer, want);
 	CloseHandle(file);
+	if (error)
+		return;
 
 	data = buffer;
 	size = want;
@@ -100,8 +220,18 @@ FileContents::~FileContents()
 			read_buffers.push_back({ buffer, capacity });
 			return;
 		}
+	} else if (capacity <= kept_large_read_buffer_size) {
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		// Of two, the bigger one is kept
+		if (large_read_buffer_capacity < capacity) {
+			std::swap(buffer, large_read_buffer);
+			std::swap(capacity, large_read_buffer_capacity);
+		}
+		large_read_buffer_idle_since = GetTickCount64();
+		large_read_buffer_kept = true;
 	}
-	VirtualFree(buffer, 0, MEM_RELEASE);
+	if (buffer)
+		VirtualFree(buffer, 0, MEM_RELEASE);
 }
 
 #pragma endregion FileContents

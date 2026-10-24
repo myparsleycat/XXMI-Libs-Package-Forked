@@ -2,6 +2,7 @@
 
 #include <time.h>
 
+#include "../ResourceLoading.h"
 #include "Bridge.h"
 #include "DrawPath.h"
 #include "Dx12CommandQueue.h"
@@ -261,6 +262,7 @@ static void frame_actions()
 	G->gTime = (ticks - G->ticks_at_launch) / 1'000'000.0f;
 	G->gSystemTickCount = ticks;
 	G->gFPSCounter.Update(ticks);
+	ReleaseIdleReadBuffers();
 
 	present_repeated = repeat && present_seen_valid && params_seen.size() == G->iniParams.size() && !dx12_mods_disabled;
 	frame_writes_open = false;
