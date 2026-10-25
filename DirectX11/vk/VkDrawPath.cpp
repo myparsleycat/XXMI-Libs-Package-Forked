@@ -2585,8 +2585,15 @@ struct SharedBuffer {
 
 static std::vector<SharedBuffer> shared_buffers;
 static PFN_vkGetMemoryWin32HandlePropertiesKHR handle_properties;
-// Not tried for every buffer of every draw once it did not work
-static bool sharing_failed;
+// Once making one did not work, as when the GPU's memory ran out, no other
+// is tried until sharing_retry_frame, which is SHARING_RETRY_FRAMES later and
+// twice as far each time it fails again, up to SHARING_RETRY_FRAMES_MAX for a
+// device that cannot share memory at all. Those already made are still given
+// out meanwhile.
+const UINT SHARING_RETRY_FRAMES = 120;
+const UINT SHARING_RETRY_FRAMES_MAX = SHARING_RETRY_FRAMES << 6;
+static UINT sharing_retry_frames;
+static UINT sharing_retry_frame;
 // A list of the shim has copies to shared buffers that the game's command
 // buffers read
 static bool copies_pending;
@@ -2689,7 +2696,7 @@ static SharedBuffer* shared_bytes(VkDeviceSize bytes, VkDeviceSize reach, VkDevi
 	VkDeviceSize start = 0;
 	UINT frame = mods_frame;
 
-	if (sharing_failed || !handle_properties || !dx12_shim)
+	if (!handle_properties || !dx12_shim)
 		return NULL;
 
 	for (SharedBuffer &shared : shared_buffers) {
@@ -2723,14 +2730,20 @@ static SharedBuffer* shared_bytes(VkDeviceSize bytes, VkDeviceSize reach, VkDevi
 		return NULL;
 	}
 	if (!found) {
+		if (sharing_retry_frames && (int)(frame - sharing_retry_frame) < 0)
+			return NULL;
 		found = new_shared_buffer(reach);
 		start = 0;
-	}
-	if (!found) {
-		sharing_failed = true;
-		VkDumpNote("*** Mods: the D3D12 device and the game's could not be given a buffer in the same memory. "
-			"What the shaders of mods write is brought to the game's device by the CPU.\n");
-		return NULL;
+		if (!found) {
+			if (!sharing_retry_frames) {
+				VkDumpNote("*** Mods: the D3D12 device and the game's could not be given a buffer in the same memory. "
+					"What the shaders of mods write is brought to the game's device by the CPU until one can be made.\n");
+			}
+			sharing_retry_frames = sharing_retry_frames ? min(sharing_retry_frames * 2, SHARING_RETRY_FRAMES_MAX) : SHARING_RETRY_FRAMES;
+			sharing_retry_frame = frame + sharing_retry_frames;
+			return NULL;
+		}
+		sharing_retry_frames = 0;
 	}
 
 	found->used = start + bytes;
@@ -3527,7 +3540,7 @@ void VkModsDevice(VkDevice device, VkPhysicalDevice physical_device, const VkMod
 		mods_device_key = *(void**)device;
 		mods_device = device;
 		handle_properties = handle_properties_function;
-		sharing_failed = false;
+		sharing_retry_frames = 0;
 		import_semaphore = import_semaphore_function;
 		chaining_failed = false;
 	}
