@@ -3511,6 +3511,46 @@ static bool skin_bind_count(const SkinDispatch *skin, UINT vertices)
 	return true;
 }
 
+// Keeps the buffer the output has if it holds that many bytes of the stride,
+// or makes another. False if none could be made.
+static bool skin_output_buffer(SkinOutput *output, UINT64 bytes, UINT stride)
+{
+	D3D12_RESOURCE_DESC desc = {};
+
+	if (output->buffer && output->bytes >= bytes && output->stride == stride)
+		return true;
+
+	// The lists that use it have it pinned
+	if (output->buffer)
+		output->buffer->Release();
+	if (output->stride != stride) {
+		if (output->spare)
+			output->spare->Release();
+		output->spare = NULL;
+		output->spare_bytes = 0;
+		output->vertices = 0;
+	}
+	output->buffer = NULL;
+	output->bytes = 0;
+	output->list = NULL;
+
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = bytes;
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer))) {
+		output->buffer = NULL;
+		return false;
+	}
+	output->bytes = bytes;
+	output->stride = stride;
+	return true;
+}
+
 // A draw of a mod in the scope of a dispatch that skins: skins that many
 // vertices of what the mod has bound
 static void skin_draw(UINT vertices)
@@ -3521,9 +3561,7 @@ static void skin_draw(UINT vertices)
 	const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 	const SkinDispatch *skin = scope->skin;
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
-	D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
 	D3D12_RESOURCE_BARRIER barrier = {};
-	D3D12_RESOURCE_DESC desc = {};
 	UINT64 bytes = (UINT64)vertices * skin->stride;
 	SkinOutput *output;
 
@@ -3536,53 +3574,27 @@ static void skin_draw(UINT vertices)
 		std::swap(output->bytes, output->spare_bytes);
 		output->list = NULL;
 	}
-	if (!output->buffer || output->bytes < bytes || output->stride != skin->stride) {
-		// The lists that use it have it pinned
-		if (output->buffer)
-			output->buffer->Release();
-		if (output->stride != skin->stride) {
-			if (output->spare)
-				output->spare->Release();
-			output->spare = NULL;
-			output->spare_bytes = 0;
-			output->vertices = 0;
-		}
-		output->buffer = NULL;
-		output->bytes = 0;
-		output->list = NULL;
 
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc.Width = bytes;
-		desc.Height = 1;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-		if (FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-				D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&output->buffer)))) {
-			log_once(&no_buffer, "Unable to create a buffer for the vertices of a mod to be skinned to. Not skinned.");
-			forget_skin_output(skin->output_va);
-			return;
-		}
-		output->bytes = bytes;
-		output->stride = skin->stride;
-	}
-
+	// What the mod has bound goes first: a mod whose buffers the game's
+	// shader cannot be given fails that way every frame, and a buffer made
+	// to skin to would be let go of again every time
 	restore_overrides();
 	if (!skin_bind_mod_buffer(0, 0, skin->stride, vertices))
 		failed = "the mod's vertices";
 	else if (!skin_bind_mod_buffer(1, SKIN_BLEND_SLOT, skin->weight_stride, vertices))
 		failed = "the mod's bone weights";
-	else if (!skin_bind_buffer(0, true, output->buffer, 0, vertices, skin->stride))
-		failed = "the buffer to skin to";
 	else if (!skin_bind_count(skin, vertices))
 		failed = "the number of vertices";
-	if (failed) {
+	else if (!skin_output_buffer(output, bytes, skin->stride))
+		log_once(&no_buffer, "Unable to create a buffer for the vertices of a mod to be skinned to. Not skinned.");
+	else if (!skin_bind_buffer(0, true, output->buffer, 0, vertices, skin->stride))
+		failed = "the buffer to skin to";
+	if (failed || !output->buffer) {
 		const ShimState *mod = dx12_shim->shim_context->mState;
 
-		stats.skin_failed++;
-		if (reported.insert(failed).second) {
+		if (failed)
+			stats.skin_failed++;
+		if (failed && reported.insert(failed).second) {
 			Dx12DumpNote("*** A mod's mesh was not skinned, as the game's shader could not be given %s. (%u vertices where the game "
 				"has %u of %u bytes with weights of %u; the mod's buffers have strides %u and %u at offsets %u and %u)\n",
 				failed, vertices, skin->count, skin->stride, skin->weight_stride, mod->vb_strides[0],
