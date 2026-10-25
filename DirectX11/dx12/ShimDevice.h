@@ -37,8 +37,14 @@ void ShimFlushWrite(ShimResource *resource);
 bool ShimApplyDeferredWrites(ShimResource *resource);
 // Gives the resource a fresh D3D12 resource with the contents of the one it
 // has, which the game's lists that use it keep: for a write those lists are
-// not to see, see Bridge.h. Dx12ShimTransition does it for any write.
-bool ShimRenameResource(ShimResource *resource);
+// not to see, see Bridge.h. Dx12ShimTransition does it for any write. Without
+// keep_contents the fresh one is left as it is, for a write of all of it.
+bool ShimRenameResource(ShimResource *resource, bool keep_contents);
+// Lets go of the spares no list has used for a while, of every resource
+void ShimTrimSpares();
+// Lets go of all of a resource's spares, which ShimCountResource has
+// already taken out of dx12_memory
+void ShimForgetSpares(ShimResource *resource);
 // Adds what the resource takes to dx12_memory, or with -1 takes it away
 void ShimCountResource(ShimResource *resource, int sign);
 

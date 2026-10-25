@@ -166,8 +166,9 @@ void Dx12ShimFreeDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE type, D3D12_CPU_DESCRIPTO
 // not there already. Read states accumulate, as a resource may be read in
 // several ways by one draw. False if there is nothing the GPU may use: no
 // resource, or one that is not ready (ShimNotReady), which whatever was to
-// use it leaves out.
-bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state);
+// use it leaves out. overwrite is for a write that will cover all of the
+// resource, which then need not keep what it held if it is renamed for it.
+bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite = false);
 void Dx12ShimForgetResource(ShimResource *resource);
 
 // D3D12 keeps what mods load in the GPU's memory for good, where D3D11 has

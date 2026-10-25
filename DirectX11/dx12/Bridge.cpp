@@ -626,7 +626,7 @@ static bool read_only(D3D12_RESOURCE_STATES state)
 	return state && !(state & ~READ_STATES);
 }
 
-bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state)
+bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite)
 {
 	D3D12_RESOURCE_BARRIER barrier = {};
 
@@ -642,7 +642,7 @@ bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state)
 	// were recorded before and will be executed after: they keep it as it
 	// is, see Bridge.h
 	if ((state & ~READ_STATES) && !resource->foreign && game_list_uses(resource->resource))
-		ShimRenameResource(resource);
+		ShimRenameResource(resource, !overwrite);
 	if (state & ~READ_STATES)
 		resource->version++;
 
@@ -896,6 +896,16 @@ bool Dx12ShimReadGameResource(ID3D12Resource *resource)
 			result == DX12_GAME_READ_RESTORED ? "made resident again" : "making it resident failed, the read is left out");
 	}
 	return result == DX12_GAME_READ_RESTORED;
+}
+
+static void trim_spares()
+{
+	static ULONGLONG trimmed_time;
+
+	if (present_time - trimmed_time < EVICT_INTERVAL_MS)
+		return;
+	trimmed_time = present_time;
+	ShimTrimSpares();
 }
 
 // Passes on the Evict calls of the game held back for reads of lists of ours
@@ -1161,6 +1171,7 @@ void Dx12ShimFramePresented()
 	presents++;
 	evict_idle();
 	release_held_evictions();
+	trim_spares();
 }
 
 bool Dx12ShimUseOnGameList(ShimResource *resource, Dx12GraphicsCommandList *list)

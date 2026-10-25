@@ -1061,7 +1061,7 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	ShimResourceDesc dst_desc, src_desc;
 	ID3D12Resource *game;
 	UINT64 game_offset;
-	bool src_in_shadow;
+	bool src_in_shadow, whole;
 
 	// The vertices skinned for a mod are in no buffer a list of ours could
 	// copy from, and are not there before the game's list is executed. A
@@ -1074,6 +1074,7 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	if (src_offset >= src_desc.byte_width || dst_offset >= dst_desc.byte_width)
 		return;
 	size = min(size, min(src_desc.byte_width - src_offset, dst_desc.byte_width - dst_offset));
+	whole = !dst_offset && size == dst_desc.byte_width;
 
 	ShimUploadShadow(src);
 	src_in_shadow = src->cpu_only && !src->readback_pending;
@@ -1105,10 +1106,10 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	if (src_in_shadow) {
 		ShimWriteBuffer(dst, dst_offset, src->shadow.data() + src_offset, size);
 	} else if (dst->resource && (game = game_source(src, &game_offset))) {
-		if (Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST))
+		if (Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole))
 			Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
 	} else if (src->resource && dst->resource && src != dst && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
-		   && Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST)) {
+		   && Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole)) {
 		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, src->resource, src_offset, size);
 	}
 }
@@ -1161,7 +1162,7 @@ void STDMETHODCALLTYPE ShimContext::CopyResource(ID3D11Resource *pDstResource, I
 	}
 
 	if (dst == src || !Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
-	    || !Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST))
+	    || !Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, true))
 		return;
 
 	Dx12ShimList()->CopyResource(dst->resource, src->resource);
