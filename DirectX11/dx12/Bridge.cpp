@@ -223,7 +223,13 @@ void Dx12LogDebugMessages()
 // Upload memory
 
 const UINT64 UPLOAD_PAGE_SIZE = 4 << 20;
+// Pages the GPU is still reading are kept whatever their number, as letting
+// go of them frees nothing until it is done. Of those it is done with, the
+// ones beyond UPLOAD_PAGES_KEPT go once unused for UPLOAD_PAGE_IDLE_MS, so a
+// frame uploading more than the kept pages hold takes the pages of the frames
+// before it instead of making new ones.
 const size_t UPLOAD_PAGES_KEPT = 8;
+const ULONGLONG UPLOAD_PAGE_IDLE_MS = 1000;
 
 struct UploadPage {
 	ID3D12Resource *buffer;
@@ -387,6 +393,24 @@ static void release_idle_upload_buffers(UINT64 completed, ULONGLONG now)
 	}
 }
 
+// At every submission, and at present for when none follows a burst of uploads
+static void release_idle_upload_pages(UINT64 completed, ULONGLONG now)
+{
+	size_t i, done;
+
+	if (upload_idle.size() <= UPLOAD_PAGES_KEPT)
+		return;
+	done = (size_t)std::count_if(upload_idle.begin(), upload_idle.end(), [=](const UploadPage &page) { return page.fence <= completed; });
+	for (i = upload_idle.size(); i-- > 0 && done > UPLOAD_PAGES_KEPT;) {
+		if (upload_idle[i].fence > completed || now - upload_idle[i].retired_time < UPLOAD_PAGE_IDLE_MS)
+			continue;
+		upload_idle[i].buffer->Release();
+		upload_idle.erase(upload_idle.begin() + i);
+		done--;
+		InterlockedIncrement64(&dx12_stats.upload_pages_released);
+	}
+}
+
 static void retire_upload_pages()
 {
 	UINT64 completed = fence->GetCompletedValue();
@@ -402,6 +426,7 @@ static void retire_upload_pages()
 
 	for (i = 0; i + keep < upload_active.size(); i++) {
 		upload_active[i].fence = fence_signalled;
+		upload_active[i].retired_time = now;
 		upload_idle.push_back(upload_active[i]);
 	}
 	upload_active.erase(upload_active.begin(), upload_active.end() - keep);
@@ -414,14 +439,7 @@ static void retire_upload_pages()
 	}
 	upload_big_active.clear();
 	release_idle_upload_buffers(completed, now);
-
-	for (i = upload_idle.size(); i-- > 0 && upload_idle.size() > UPLOAD_PAGES_KEPT;) {
-		if (upload_idle[i].fence > completed)
-			continue;
-		upload_idle[i].buffer->Release();
-		upload_idle.erase(upload_idle.begin() + i);
-		InterlockedIncrement64(&dx12_stats.upload_pages_released);
-	}
+	release_idle_upload_pages(completed, now);
 }
 
 // -----------------------------------------------------------------------------
@@ -1168,6 +1186,7 @@ void Dx12ShimFramePresented()
 	present_time = GetTickCount64();
 	if (!upload_big_idle.empty())
 		release_idle_upload_buffers(fence->GetCompletedValue(), present_time);
+	release_idle_upload_pages(fence->GetCompletedValue(), present_time);
 	presents++;
 	evict_idle();
 	release_held_evictions();
