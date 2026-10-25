@@ -3,6 +3,7 @@
 #include "globals.h" // For ShaderOverride FIXME: This should be in a separate header
 #include "log.h"
 #include "Overlay.h"
+#include "dx12/PipelineRegistry.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -12,6 +13,7 @@
 #include <unordered_map>
 
 ShaderRegexGroups shader_regex_groups;
+bool shader_regex_d3d_groups;
 std::vector<ShaderRegexGroup*> shader_regex_group_index;
 uint32_t shader_regex_hash;
 
@@ -245,7 +247,7 @@ out_free:
 	return match;
 }
 
-static void replacement_search_and_replace(std::string &str, std::string *search, std::string *replace)
+static void replacement_search_and_replace(std::string &str, const std::string *search, const std::string *replace)
 {
 	size_t pos;
 
@@ -257,39 +259,47 @@ static void replacement_search_and_replace(std::string &str, std::string *search
 	}
 }
 
+void substitute_shader_regex_temp(std::string &replacement, const std::string &temp, const std::string &with)
+{
+	std::string search_str;
+
+	search_str = std::string("$") + temp;
+	replacement_search_and_replace(replacement, &search_str, &with);
+
+	search_str = std::string("${") + temp + std::string("}");
+	replacement_search_and_replace(replacement, &search_str, &with);
+}
+
 static void substitute_temp_regs(std::string &replacement, ShaderRegexTemps *temp_regs, unsigned dcl_temps)
 {
 	ShaderRegexTemps::iterator i;
 	unsigned tmp_reg = dcl_temps;
-	std::string search_str, repl_str;
 
-	for (i = temp_regs->begin(); i != temp_regs->end(); i++, tmp_reg++) {
-		repl_str = std::string("r") + std::to_string(tmp_reg);
-
-		search_str = std::string("$") + *i;
-		replacement_search_and_replace(replacement, &search_str, &repl_str);
-
-		search_str = std::string("${") + *i + std::string("}");
-		replacement_search_and_replace(replacement, &search_str, &repl_str);
-	}
+	for (i = temp_regs->begin(); i != temp_regs->end(); i++, tmp_reg++)
+		substitute_shader_regex_temp(replacement, *i, std::string("r") + std::to_string(tmp_reg));
 }
 
 bool ShaderRegexPattern::patch(std::string *asm_text, ShaderRegexTemps *temp_regs, unsigned dcl_temps)
 {
+	std::string replace_copy;
+
+	// We operate on a copy of the replace string so that future shaders
+	// don't get our temporary register numbers:
+	replace_copy = replace;
+	substitute_temp_regs(replace_copy, temp_regs, dcl_temps);
+	return patch_with(asm_text, replace_copy);
+}
+
+bool ShaderRegexPattern::patch_with(std::string *asm_text, const std::string &replace_copy)
+{
 	pcre2_match_data *match_data = NULL;
 	PCRE2_SIZE est_size, output_size;
-	std::string replace_copy;
 	PCRE2_UCHAR *buf = NULL;
 	bool patch = false;
 	uint32_t options;
 	int rc;
 
 	static_assert(PCRE2_CODE_UNIT_WIDTH == 8, "Need to fix output buffer allocation for non-8bit pcre2");
-
-	// We operate on a copy of the replace string so that future shaders
-	// don't get our temporary register numbers:
-	replace_copy = replace;
-	substitute_temp_regs(replace_copy, temp_regs, dcl_temps);
 
 	// TODO: Allow named capture groups from other patterns in the same
 	// regex group to be substituted in, and provide some simple arithmetic
@@ -344,6 +354,31 @@ out_free:
 	delete [] buf;
 
 	return patch;
+}
+
+bool parse_spirv_declaration(const std::string &line, int ini_params_reg, SpirvDeclaration *declaration)
+{
+	unsigned reg;
+	int len = 0;
+
+	if (sscanf_s(line.c_str(), "dcl_resource_texture2d (float,float,float,float) t%u%n", &reg, &len) == 1
+	    && (size_t)len == line.size() && reg < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+		*declaration = { SpirvDeclarationKind::TEXTURE2D, reg };
+		return true;
+	}
+	len = 0;
+	if (sscanf_s(line.c_str(), "dcl_resource_texture1d (float,float,float,float) t%u%n", &reg, &len) == 1
+	    && (size_t)len == line.size() && (int)reg == ini_params_reg) {
+		*declaration = { SpirvDeclarationKind::INI_PARAMS, reg };
+		return true;
+	}
+	len = 0;
+	if (sscanf_s(line.c_str(), "dcl_sampler s%u, mode_default%n", &reg, &len) == 1
+	    && (size_t)len == line.size() && reg < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+		*declaration = { SpirvDeclarationKind::SAMPLER, reg };
+		return true;
+	}
+	return false;
 }
 
 void ShaderRegexGroup::apply_regex_patterns(std::string *asm_text, bool *match, bool *patch)
@@ -447,6 +482,86 @@ void ShaderRegexGroup::link_command_lists_and_filter_index(UINT64 shader_hash)
 
 	if (!post_command_list.noop())
 		post_link = LinkCommandLists(&shader_override->post_command_list, &post_command_list, &ini_line);
+}
+
+bool ShaderRegexGroup::dx12_matches(const Dx12ShaderInfo *shader) const
+{
+	UINT i;
+
+	// Nothing is known about a shader that could not be read
+	if (!shader->reflected)
+		return false;
+	if ((shader->srv[0] & dx12_srv[0]) != dx12_srv[0] || (shader->srv[1] & dx12_srv[1]) != dx12_srv[1]
+	    || (shader->cbv & dx12_cbv) != dx12_cbv || (shader->uav & dx12_uav) != dx12_uav)
+		return false;
+	if (!dx12_targets.matches_uint(shader->targets))
+		return false;
+	for (i = 0; i < ARRAYSIZE(dx12_cb_bytes) && i < DX12_CB_SIZES; i++) {
+		if (!dx12_cb_bytes[i].matches_uint(shader->cb_bytes[i]))
+			return false;
+	}
+	return true;
+}
+
+bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
+{
+	const char *shader_type = dx12_stage_names[shader->stage];
+	size_t length = strlen(shader_type);
+	bool linked = false;
+
+	for (auto &entry : shader_regex_groups) {
+		ShaderRegexGroup *group = &entry.second;
+
+		if (group->spirv() || (group->dx12_match ? !group->dx12_matches(shader) : !group->patterns.empty()))
+			continue;
+		if (group->command_list.noop() && group->post_command_list.noop() && group->filter_index == FLT_MAX)
+			continue;
+
+		for (const std::string &model : group->shader_models) {
+			if (model.compare(0, length, shader_type) || model[length] != '_')
+				continue;
+			group->link_command_lists_and_filter_index(shader->hash);
+			linked = true;
+			break;
+		}
+	}
+
+	return linked;
+}
+
+bool link_shader_regex_groups_declared(const char *shader_type, UINT64 hash, std::string *declarations)
+{
+	size_t length = strlen(shader_type);
+	bool linked = false;
+
+	for (auto &entry : shader_regex_groups) {
+		ShaderRegexGroup *group = &entry.second;
+		bool match = true;
+
+		if (group->patterns.empty() || group->dx12_match || !group->declarations.empty() || group->spirv())
+			continue;
+		if (group->command_list.noop() && group->post_command_list.noop() && group->filter_index == FLT_MAX)
+			continue;
+		if (std::none_of(group->shader_models.begin(), group->shader_models.end(), [&](const std::string &model) {
+			return !model.compare(0, length, shader_type) && model[length] == '_'; }))
+			continue;
+
+		for (auto &pattern : group->patterns) {
+			// One that rewrites the shader is after its instructions
+			if (pattern.second.do_replace || !pattern.second.matches(declarations)) {
+				match = false;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+
+		LogInfo("ShaderRegex: %s %016I64x matches [%S] by its declarations\n", shader_type, hash, group->ini_section.c_str());
+		group->link_command_lists_and_filter_index(hash);
+		linked = true;
+	}
+
+	return linked;
 }
 
 bool unlink_shader_regex_command_lists_and_filter_index(UINT64 shader_hash)
@@ -761,8 +876,8 @@ static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type
 	for (i = shader_regex_groups.begin(), j = 0; i != shader_regex_groups.end(); i++, j++) {
 		ShaderRegexGroup* group = &i->second;
 
-		// Skip group without matching shader model.
-		if (!group->shader_models.count(*shader_model)) {
+		// Skip group without matching shader model, and those for SPIR-V.
+		if (!group->shader_models.count(*shader_model) || group->spirv()) {
 			continue;
 		}
 
@@ -808,8 +923,8 @@ bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type
 	for (i = shader_regex_groups.begin(), j = 0; i != shader_regex_groups.end(); i++, j++) {
 		group = &i->second;
 
-		// Skip group without matching shader model.
-		if (!group->shader_models.count(*shader_model)) {
+		// Skip group without matching shader model, and those for SPIR-V.
+		if (!group->shader_models.count(*shader_model) || group->spirv()) {
 			continue;
 		}
 
@@ -871,6 +986,7 @@ static bool analyse_shader_regex_bytecode(UINT64 hash, const wchar_t *shader_typ
 	// game. A render thread that could not use them for a shader may be in
 	// here as well:
 	std::lock_guard<std::mutex> guard(shader_regex_analysis_lock);
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_ANALYSIS);
 
 	// Process ShaderRegex sections that don't require bytecode decompilation.
 	link_shader_regex_groups_without_patterns(shader_type, shader_model, hash, &decompilation_required, &result->match_ids, link);
@@ -998,6 +1114,16 @@ ShaderRegexConfigUpdate::~ShaderRegexConfigUpdate()
 	ReleaseSRWLockExclusive(&shader_regex_config_lock);
 }
 
+ShaderRegexConfigRead::ShaderRegexConfigRead()
+{
+	AcquireSRWLockShared(&shader_regex_config_lock);
+}
+
+ShaderRegexConfigRead::~ShaderRegexConfigRead()
+{
+	ReleaseSRWLockShared(&shader_regex_config_lock);
+}
+
 void set_shader_regex_background(int mode)
 {
 	shader_regex_background_mode = mode;
@@ -1077,6 +1203,7 @@ static ID3D11DeviceChild* create_patched_shader(ID3D11Device *device, const wstr
 	SIZE_T size = patched_bytecode.size();
 	ID3D11DeviceChild *shader = NULL;
 	HRESULT hr;
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_DRIVER);
 
 	if (type == L"vs")
 		hr = device->CreateVertexShader(bytecode, size, linkage, (ID3D11VertexShader**)&shader);
@@ -1108,8 +1235,11 @@ static bool prepare_shader_regex_result(UINT64 hash, const wchar_t *shader_type,
 {
 	std::string shader_model;
 
-	if (!cache_checked && load_shader_regex_cache(hash, shader_type, result, false) != ShaderRegexCache::NO_CACHE)
-		return true;
+	if (!cache_checked) {
+		Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_CACHE);
+		if (load_shader_regex_cache(hash, shader_type, result, false) != ShaderRegexCache::NO_CACHE)
+			return true;
+	}
 
 	*result = ShaderRegexResult();
 	result->regex_hash = shader_regex_hash;
@@ -1313,7 +1443,7 @@ static bool shader_regex_background_allowed(ID3D11Device *device, ID3D11ClassLin
 void prewarm_shader_regex(ID3D11Device *device, UINT64 hash, const wchar_t *shader_type,
 		ID3DBlob *bytecode, ID3D11ClassLinkage *linkage)
 {
-	if (shader_regex_groups.empty() || !bytecode || !shader_regex_background_allowed(device, linkage))
+	if (!shader_regex_d3d_groups || !bytecode || !shader_regex_background_allowed(device, linkage))
 		return;
 
 	ShaderRegexJobs &j = shader_regex_jobs();
@@ -1488,7 +1618,13 @@ static ShaderRegexResult* resolve_shader_regex(ID3D11Device *device, OriginalSha
 			}
 		}
 
-		switch (load_shader_regex_cache(hash, shader_type, &result, !background)) {
+		ShaderRegexCache cache;
+		{
+			Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX_CACHE);
+			cache = load_shader_regex_cache(hash, shader_type, &result, !background);
+		}
+
+		switch (cache) {
 		case ShaderRegexCache::NO_MATCH:
 			LogInfo("%S %016I64x has cached ShaderRegex miss\n", shader_type, hash);
 			return store_shader_regex_result(hash, &result);

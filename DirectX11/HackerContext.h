@@ -111,6 +111,11 @@ struct CheckTextureOverrideResult {
 	static const unsigned MAX_MATCHES = 4;
 
 	const CheckTextureOverrideCommand *command;
+	// The slot the command names, which is all that forgetting a result
+	// by slot asks of it:
+	ResourceCopyTargetType type;
+	wchar_t shader_type;
+	unsigned slot;
 	unsigned count;
 	TextureOverride *matches[MAX_MATCHES];
 };
@@ -150,8 +155,20 @@ private:
 	HackerInputLayout* mOverrideInputLayout;
 
 	// Used for deny_cpu_read, track_texture_updates and constant buffer matching
-	typedef std::unordered_map<ID3D11Resource*, MappedResourceInfo> MappedResources;
-	MappedResources mMappedResources;
+	// What this context has mapped and tracks, which is rarely more than
+	// one resource at a time and comes and goes with every constant buffer
+	// a game writes: side by side arrays searched in order, which unlike a
+	// map allocate nothing once they have grown:
+	std::vector<ID3D11Resource*> mMappedResources;
+	std::vector<MappedResourceInfo> mMappedResourceInfos;
+
+	// The memory a small mapping was diverted to, kept for the next one of
+	// the same size: one block a size, for sizes that are multiples of 16
+	// (as those of constant buffers are):
+	static const size_t DIVERT_REUSE_MAX = 4096;
+	void *mDivertSpares[DIVERT_REUSE_MAX / 16 + 1];
+	void* AllocDiverted(size_t size);
+	void FreeDiverted(void *data, size_t size);
 
 	unsigned draw_number;
 	unsigned dispatch_number;
@@ -182,6 +199,21 @@ private:
 	} mShaderOverrideCache[1 << SHADER_OVERRIDE_CACHE_BITS];
 	struct ShaderOverride* LookupShaderOverride(UINT64 hash);
 
+	// What mShaders and mReloadedShaders have for a shader the game binds,
+	// which it does about as often as it draws. Entries are only valid
+	// while G->shader_handle_generation matches, and reload_info points
+	// into mReloadedShaders, so what it says of the shader is read as it
+	// is now:
+	static const unsigned SHADER_HANDLE_CACHE_BITS = 11;
+	struct ShaderHandleCacheEntry {
+		ID3D11DeviceChild *shader;
+		UINT64 hash;
+		struct OriginalShaderInfo *reload_info;
+		unsigned generation;
+		bool hash_found;
+	} mShaderHandleCache[1 << SHADER_HANDLE_CACHE_BITS];
+	const ShaderHandleCacheEntry* LookupShaderHandle(ID3D11DeviceChild *shader);
+
 	// What the checktextureoverride commands that ran so far during the
 	// draw call in progress matched (for most of them: nothing), so that
 	// running the same commands again (typically from the post command
@@ -196,6 +228,9 @@ private:
 	static const unsigned MAX_CHECK_TEXTURE_OVERRIDE_RESULTS = 32;
 	CheckTextureOverrideResult mCheckTextureOverrideResults[MAX_CHECK_TEXTURE_OVERRIDE_RESULTS];
 	unsigned mCheckTextureOverrideResultCount;
+	// Where the search for a result starts: a command list asks for them
+	// in the order it noted them, so that is the one after the last found:
+	mutable unsigned mCheckTextureOverrideResultHint;
 	const DrawCallInfo *mCheckTextureOverrideResultsDraw;
 
 	// Views that command lists created to bind a resource by reference to a
@@ -308,6 +343,24 @@ protected:
 	UINT64 mCurrentComputeShader;
 
 public:
+	// On D3D12 there are no Draw* and Dispatch methods of ours for the
+	// game to call: dx12/DrawPath.cpp tells us of the game's calls with
+	// these, along with the shaders the Set*Shader methods would have seen
+	void Dx12BeforeDraw(DrawContext &data, const UINT64 *shader_hashes);
+	void Dx12AfterDraw(DrawContext &data);
+	// Has the input layout of the pipeline of the game's draw set as the
+	// current one, which D3D12 has no call for
+	void Dx12PublishInputLayout();
+	bool Dx12BeforeDispatch(DispatchContext *context, UINT64 shader_hash);
+	void Dx12AfterDispatch(DispatchContext *context);
+	// The shader of the type ('v', 'p', ...) in the game's draw or dispatch
+	// that is being handled, which has no D3D11 object to look up. 0 if
+	// there is none or this is not D3D12.
+	UINT64 Dx12CurrentShader(wchar_t shader_type);
+	// What that shader declares at its registers, where that is known
+	// without a D3D11 object: for a draw of a Vulkan game. NULL otherwise.
+	const struct ShaderBindings* Dx12CurrentShaderBindings(wchar_t shader_type);
+
 	HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1);
 	~HackerContext();
 
@@ -340,6 +393,9 @@ public:
 
 		CheckTextureOverrideResult &result = mCheckTextureOverrideResults[mCheckTextureOverrideResultCount++];
 		result.command = command;
+		result.type = command->target.type;
+		result.shader_type = command->target.shader_type;
+		result.slot = command->target.slot;
 		result.count = (unsigned)matches.size();
 		for (unsigned i = 0; i < result.count; i++)
 			result.matches[i] = matches[i];
@@ -351,9 +407,16 @@ public:
 	{
 		if (!call_info || call_info != mCheckTextureOverrideResultsDraw)
 			return NULL;
+		unsigned hint = mCheckTextureOverrideResultHint;
+		if (hint < mCheckTextureOverrideResultCount && mCheckTextureOverrideResults[hint].command == command) {
+			mCheckTextureOverrideResultHint = hint + 1;
+			return &mCheckTextureOverrideResults[hint];
+		}
 		for (unsigned i = 0; i < mCheckTextureOverrideResultCount; i++) {
-			if (mCheckTextureOverrideResults[i].command == command)
+			if (mCheckTextureOverrideResults[i].command == command) {
+				mCheckTextureOverrideResultHint = i + 1;
 				return &mCheckTextureOverrideResults[i];
+			}
 		}
 		return NULL;
 	}
@@ -363,7 +426,7 @@ public:
 	void ForgetCheckTextureOverrideResults(ResourceCopyTargetType type, wchar_t shader_type, unsigned first_slot, unsigned slot_count)
 	{
 		for (unsigned i = 0; i < mCheckTextureOverrideResultCount; ) {
-			const ResourceCopyTarget &target = mCheckTextureOverrideResults[i].command->target;
+			const CheckTextureOverrideResult &target = mCheckTextureOverrideResults[i];
 			bool bound = target.type == type;
 
 			// There is only the one ib, and vb slots belong to no stage:

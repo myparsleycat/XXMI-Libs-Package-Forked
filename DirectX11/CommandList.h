@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <array>
+#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 #include <forward_list>
@@ -27,7 +28,7 @@ class HackerDevice;
 class HackerContext;
 enum class FrameAnalysisOptions;
 class ResourceCopyTarget;
-class MappedFile;
+class FileContents;
 
 struct InputLayoutElementOverride {
 	struct Match {
@@ -181,6 +182,19 @@ extern std::vector<CommandListVariable*> persistent_variables;
 // through their pool instead (see custom_resource_pool_path_keys):
 extern std::unordered_map<std::wstring, CommandListVariable*> persistent_variable_path_keys;
 extern std::map<std::wstring, float> unknown_variables;
+
+// While set, every write of a variable by a command list first notes what the
+// variable held, so the writes can be undone (dx12/PresentPass.cpp: the
+// presents frame generation adds repeat the frame's [Present] and keep none of
+// what it wrote). Only set with the lock of dx12/Bridge.h held, which every
+// run of command lists in a game where it can be set holds as well.
+typedef std::vector<std::pair<float*, float>> VariableWriteLog;
+extern VariableWriteLog *variable_write_log;
+static inline void LogVariableWrite(float *fval)
+{
+	if (variable_write_log)
+		variable_write_log->emplace_back(fval, *fval);
+}
 
 // The scope object is used to declare local variables in a command list. The
 // multiple levels are to isolate variables declared inside if blocks from
@@ -369,6 +383,9 @@ public:
 
 	ID3DBlob *vs_bytecode, *hs_bytecode, *ds_bytecode;
 	ID3DBlob *gs_bytecode, *ps_bytecode, *cs_bytecode;
+	// The HLSL those were compiled from, for compiling it again for the
+	// D3D12 game's shader model (add_dxil)
+	wstring vs_source, hs_source, ds_source, gs_source, ps_source, cs_source;
 
 	int blend_override;
 	D3D11_BLEND_DESC blend_desc;
@@ -392,12 +409,18 @@ public:
 	D3D11_SAMPLER_DESC sampler_desc;
 	ID3D11SamplerState* sampler_state;
 
+	// Slots the *-s# lines of this section bind, one bit a slot for each
+	// stage (vs, hs, ds, gs, ps, cs). Running the section puts back what
+	// was there before.
+	UINT16 sampler_slots[6];
+
 	D3D11_PRIMITIVE_TOPOLOGY topology;
 
 	CommandList command_list;
 	CommandList post_command_list;
 
 	bool substantiated;
+	bool dxil_added;
 
 	int max_executions_per_frame;
 	unsigned frame_no;
@@ -408,6 +431,9 @@ public:
 
 	bool compile(char type, wchar_t *filename, const wstring *wname, const wstring *mod_namespace);
 	void substantiate(ID3D11Device *mOrigDevice);
+	void add_dxil(ID3D11Device *mOrigDevice);
+	// Fills sampler_slots in, once the section's command lists are parsed
+	void find_sampler_slots();
 
 	void merge_blend_states(ID3D11BlendState *state, FLOAT blend_factor[4], UINT sample_mask, ID3D11Device *mOrigDevice);
 	void merge_depth_stencil_states(ID3D11DepthStencilState *state, UINT stencil_ref, ID3D11Device *mOrigDevice);
@@ -464,6 +490,7 @@ enum class CustomResourceType {
 	TEXTURE2D,
 	TEXTURE3D,
 	CUBE,
+	SAMPLER_STATE,
 };
 static EnumName_t<const wchar_t *, CustomResourceType> CustomResourceTypeNames[] = {
 	// Use the same names as HLSL here since they are what shaderhackers
@@ -485,6 +512,8 @@ static EnumName_t<const wchar_t *, CustomResourceType> CustomResourceTypeNames[]
 	{L"RWTexture1D", CustomResourceType::TEXTURE1D},
 	{L"RWTexture2D", CustomResourceType::TEXTURE2D},
 	{L"RWTexture3D", CustomResourceType::TEXTURE3D},
+	// Not a resource, only for the *-s# slots:
+	{L"SamplerState", CustomResourceType::SAMPLER_STATE},
 
 	{NULL, CustomResourceType::INVALID} // End of list marker
 };
@@ -579,6 +608,28 @@ public:
 
 class CustomResourcePool;
 
+// What a [Resource] section with type = SamplerState holds instead of a
+// resource. The sampler is made the first time it is bound, for the device of
+// the command list binding it.
+class CustomSamplerState
+{
+public:
+	D3D11_SAMPLER_DESC desc;
+
+	CustomSamplerState();
+	~CustomSamplerState();
+
+	// NULL (with a warning the first time) if the device refused the
+	// description
+	ID3D11SamplerState* Get(ID3D11Device *device, const wstring &name);
+
+private:
+	ID3D11SamplerState *state = nullptr;
+	// Set after state, see Get()
+	std::atomic<ID3D11Device*> device{nullptr};
+	bool warned = false;
+};
+
 class CustomResource
 {
 public:
@@ -638,6 +689,9 @@ public:
 	void *initial_data;
 	size_t initial_data_size;
 
+	// Only for override_type SAMPLER_STATE
+	std::unique_ptr<CustomSamplerState> sampler;
+
 	CustomResource();
 	~CustomResource();
 
@@ -665,7 +719,7 @@ private:
 	void LoadBufferFromFile(ID3D11Device *mOrigDevice);
 	// share_file is the mapped file the data came from when its GPU
 	// resource may be shared with other sections loading identical data:
-	void SubstantiateBuffer(ID3D11Device *mOrigDevice, const void *data, DWORD size, const MappedFile *share_file);
+	void SubstantiateBuffer(ID3D11Device *mOrigDevice, const void *data, DWORD size, const FileContents *share_file);
 	void SubstantiateTexture1D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture2D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture3D(ID3D11Device *mOrigDevice);
@@ -673,6 +727,19 @@ private:
 
 typedef std::unordered_map<std::wstring, class CustomResource> CustomResources;
 extern CustomResources customResources;
+
+// ps-s0 = ResourceSampler / ps-s0 = null. A sampler is not an ID3D11Resource,
+// so the *-s# slots are a target of their own rather than one of
+// ResourceCopyOperation's.
+class SamplerBindCommand : public CommandListCommand {
+public:
+	wchar_t shader_type = L'\0';
+	unsigned slot = 0;
+	// NULL to unbind
+	CustomResource *resource = nullptr;
+
+	void run(CommandListState*) override;
+};
 
 enum class PoolIndexType : uint8_t {
 	INVALID          = 0b00000000,
@@ -764,7 +831,23 @@ public:
 	void ResetElements(PoolElement::ResetType reset_type = PoolElement::ResetType::All);
 	void ResetPool(bool reset_elements = true);
 
+	// The slots of a pool as they were before it was first touched while
+	// pool_undo_log was set. The elements keep their variables and
+	// resources, which are registered by name and cannot be made again.
+	struct SavedState {
+		CustomResourcePool *source_pool;
+		std::vector<PoolElement::Type> types;
+		std::unique_ptr<FlatHashMap<uint32_t, size_t>> index_map;
+		std::vector<PoolSlot> index_table;
+		size_t last_replacement_index;
+		unsigned last_expiration_run;
+	};
+	void SaveStateForUndo();
+	void RestoreState(const SavedState &state);
+
 private:
+	unsigned saved_in_undo_epoch = 0;
+
 	void InitializeResource(size_t pool_index);
 	void InitializeVariable(size_t pool_index);
 
@@ -793,6 +876,22 @@ private:
 
 typedef std::unordered_map<std::wstring, CustomResourcePool> CustomResourcePools;
 extern CustomResourcePools customResourcePools;
+
+// Like variable_write_log, for the slots of pools. pool_undo_epoch is moved
+// on each time the log starts over.
+typedef std::vector<std::pair<CustomResourcePool*, CustomResourcePool::SavedState>> PoolUndoLog;
+extern PoolUndoLog *pool_undo_log;
+extern unsigned pool_undo_epoch;
+
+// Lookups of spatial pools outside the cell of any slot: given the slot of a
+// nearby cell, given none within the radius, and how many of those had one
+// within twice the radius. For vk_report.txt, read and cleared together
+struct SpatialPoolMisses
+{
+	unsigned nearby, outside, within_twice;
+};
+SpatialPoolMisses TakeSpatialPoolMisses();
+
 // Pools indexed by their persist_path_name, so d3dx_user.ini entries of pool
 // variables saved under the path key can be resolved:
 extern std::unordered_map<std::wstring, CustomResourcePool*> custom_resource_pool_path_keys;
@@ -1034,6 +1133,9 @@ enum class ShaderTargetEvaluationMode : uint32_t {
 	DCL_SRV_TYPE       = 0b00000000000000000000000000100000,
 	DCL_SRV_DIMENSION  = 0b00000000000000000000000001000000,
 	DCL_SRV_STRIDE     = 0b00000000000000000000000010000000,
+	DCL_SRV_SAMPLED    = 0b00000000000000000000000100000000,
+	DCL_SRV_SET        = 0b00000000000000000000001000000000,
+	DCL_SRV_ORIGINAL_FORMAT = 0b00000000000000000000010000000000,
 };
 SENSIBLE_ENUM(ShaderTargetEvaluationMode);
 //static EnumName_t<const wchar_t*, ShaderTargetEvaluationMode> ShaderTargetEvaluationModeNames[] = {
@@ -1381,8 +1483,15 @@ public:
 // Expression nodes that are evaluatable - nodes start off as non-evaluatable
 // tokens and are later transformed into evaluatable operators and operands
 // that inherit from this class.
+class CommandListOperand;
+
 class CommandListEvaluatable {
 public:
+	// The object itself where it is an operand, for whoever evaluates it
+	// to read a constant or a variable without a call, see
+	// evaluate_operand_or_call():
+	CommandListOperand *as_operand = NULL;
+
 	virtual ~CommandListEvaluatable() {}; // Because C++
 
 	virtual float evaluate(CommandListState *state, HackerDevice *device=NULL) = 0;
@@ -1558,6 +1667,8 @@ enum class ParamOverrideType {
 	DISPATCH_NUMBER,
 	FRAME_TIME,
 	FPS,
+	DX12,
+	DLL_SAMPLER_SLOTS,
 };
 static EnumName_t<const wchar_t *, ParamOverrideType> ParamOverrideTypeNames[] = {
 	{L"rt_width", ParamOverrideType::RT_WIDTH},
@@ -1602,6 +1713,8 @@ static EnumName_t<const wchar_t *, ParamOverrideType> ParamOverrideTypeNames[] =
 	{L"dispatch_number", ParamOverrideType::DISPATCH_NUMBER},
 	{L"frame_time", ParamOverrideType::FRAME_TIME},
 	{L"fps", ParamOverrideType::FPS},
+	{L"dx12", ParamOverrideType::DX12},
+	{L"dll_sampler_slots", ParamOverrideType::DLL_SAMPLER_SLOTS},
 	{NULL, ParamOverrideType::INVALID} // End of list marker
 };
 class CommandListOperand :
@@ -1610,6 +1723,7 @@ class CommandListOperand :
 	public CommandListEvaluatable {
 	float process_texture_filter(CommandListState*);
 	float process_shader_filter(CommandListState*);
+	float evaluate_shader_bindings(CommandListState*, const struct ShaderBindings&);
 public:
 	// TODO: Break up into separate classes for each operand type
 	ParamOverrideType type;
@@ -1637,7 +1751,9 @@ public:
 		param_idx(0),
 		var_ftarget(NULL),
 		scissor(0)
-	{}
+	{
+		as_operand = this;
+	}
 
 	bool parse_float(const wstring* operand, const wstring* ini_namespace, CommandListScope* scope, size_t& out_length);
 	bool parse_ini_param(const wstring* operand, const wstring* ini_namespace, CommandListScope* scope);
@@ -2014,6 +2130,68 @@ void RunCommandList(HackerDevice *mHackerDevice,
 		HackerContext *mHackerContext,
 		CommandList *command_list, DrawCallInfo *call_info,
 		bool post);
+
+// An assignment that changes nothing while what it assigns to has the value
+// already
+struct CommandListCheckedAssignment {
+	// The global variable assigned to, or NULL for the ini param below
+	CommandListVariable *var;
+	int param_idx;
+	float DirectX::XMFLOAT4::*param_component;
+	// What is assigned, which depends on nothing but IniParams and global
+	// variables, or NULL for val
+	CommandListExpression *expression;
+	float val;
+
+	bool operator==(const CommandListCheckedAssignment &other) const
+	{
+		return var == other.var && param_idx == other.param_idx && param_component == other.param_component
+			&& expression == other.expression && val == other.val;
+	}
+};
+
+// The slots a command list may run checktextureoverride on, see
+// CommandListOnlyChecksTextureOverrides():
+struct CommandListCheckedSlots {
+	UINT vbs;
+	bool ib;
+	unsigned cb_count;
+	struct {
+		wchar_t shader_type;
+		unsigned slot;
+	} cbs[8];
+	unsigned texture_count;
+	struct {
+		wchar_t shader_type;
+		unsigned slot;
+	} textures[16];
+	// Besides the checks the list may assign these, so it only does
+	// nothing while they would change nothing
+	unsigned assignment_count;
+	CommandListCheckedAssignment assignments[8];
+	// Conditions that have to evaluate to non-zero (or to zero) for the
+	// list to do no more than that. Each depends on nothing but IniParams
+	// and variables, so it can be evaluated outside of a draw call and
+	// holds until something assigns to those.
+	unsigned guard_count;
+	struct {
+		CommandListExpression *expression;
+		bool nonzero;
+	} guards[8];
+};
+
+// Whether running the command list can do nothing but look up the
+// TextureOverride sections of fixed vertex, index and constant buffer and
+// texture slots, as long as the guards hold and its assignments are of the
+// values already in place (all added to slots). If none of those slots holds
+// something a TextureOverride section could match, running the list has no
+// effect: the D3D12 draw path uses this to skip draws of the game. Frame
+// analysis dumps count as nothing, which the caller has to make sure of.
+//
+// A local variable given a value that comes of the draw alone counts as
+// nothing too. One the list reads before giving it a value in the same run is
+// left as the last run that was not skipped had it.
+bool CommandListOnlyChecksTextureOverrides(CommandList *command_list, CommandListCheckedSlots *slots, unsigned depth = 0);
 void RunResourceCommandList(HackerDevice *mHackerDevice,
 		HackerContext *mHackerContext,
 		CommandList *command_list, ID3D11Resource **resource,

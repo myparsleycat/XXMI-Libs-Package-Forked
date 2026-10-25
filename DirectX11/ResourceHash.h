@@ -9,6 +9,7 @@
 #include <iterator>
 #include <memory>
 #include <atomic>
+#include <functional>
 
 #include "util.h"
 #include "DrawCallInfo.h"
@@ -81,8 +82,9 @@ public:
 	// - May trigger rehash if load factor exceeds threshold
 	inline void insert(const K& key, const V& value)
 	{
-		// Maintain load factor <= 0.5
-		if ((count * 2) >= table.size()) {
+		// Maintain load factor <= 0.5, counting the entry that may be added:
+		// a table that fills up has no empty slot for a lookup to stop at
+		if (((count + 1) * 2) > table.size()) {
 			rehash(table.size() * 2);
 		}
 
@@ -417,6 +419,11 @@ struct ResourceHandleInfo
 	uint32_t orig_hash = 0;	// Original hash at the time of creation
 	uint32_t data_hash = 0;	// Just the data hash for track_texture_updates
 
+	// Writes of subresource 0 for track_texture_updates, see note_top_update()
+	bool top_updated = false;
+	unsigned top_update_frame = 0;
+	unsigned top_update_hot = 0;
+
 	// Cleared on config reload, rebuilt on next lookup. The hash list is
 	// also rebuilt when track_texture_updates changes the hash:
 	bool texture_override_candidates_valid = false;
@@ -429,6 +436,9 @@ struct ResourceHandleInfo
 	std::shared_ptr<uint8_t[]> cached_data;
 	size_t cached_data_offset = 0;
 	size_t cached_data_size = 0;
+	// Not 0 only while cached_data is a block of this many bytes that
+	// SetDataCache() adopted, which RefreshDataCache() may then write over:
+	size_t cached_data_block_size = 0;
 	//uint32_t cached_data_hash = 0;
 
 	std::unique_ptr<RegionHashesCache> region_hashes_cache;
@@ -448,11 +458,22 @@ struct ResourceHandleInfo
 
 	void InitializeDataCache(size_t size, size_t offset = 0);
 	void SetDataCache(void* src, size_t size);
+	// What SetDataCache() of a copy of src would leave, without a block
+	// changing hands. False, with nothing done, unless the cache has a
+	// block of this size that nothing else shares:
+	bool RefreshDataCache(const void* src, size_t size);
 	void SetDataCacheRegion(const void* src, size_t size, UINT offset);
 	// Clears cached region hashes and invalidates cached buffer data.
 	// Should be called when the underlying resource contents change.
 	void ClearDataCache();
 	uint8_t* GetCachedData();
+	// The same, for reading size bytes at offset: a cache set up with
+	// SetLazyDataCache has them read first.
+	uint8_t* GetCachedData(size_t offset, size_t size);
+	// A cache whose data is read from where the resource has it only when
+	// it is asked for, a page at a time. read is given the offset in the
+	// data and has to fill all it is asked for.
+	void SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read);
 
 	void CacheRegionHash(const RegionHashKeyL2& key, uint32_t hash);
 	uint32_t GetCachedRegionHash(const RegionHashKeyL2& key);
@@ -641,8 +662,10 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 		ID3D11Resource *src, UINT srcSubresource, char type,
 		UINT DstX, UINT DstY, UINT DstZ, const D3D11_BOX *SrcBox);
 
+// note_update is false where MapTrackResourceHashUpdate() already counted
+// the write
 void UpdateResourceHashFromCPU(ID3D11Resource *resource,
-	const void *data, UINT rowPitch, UINT depthPitch);
+	const void *data, UINT rowPitch, UINT depthPitch, bool note_update);
 
 void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src);
 
@@ -939,5 +962,13 @@ void InvalidateTextureOverrideCandidates();
 // could start matching a TextureOverride (handle info registered at its
 // address, hash changed), see texture_override_miss_cache.
 void ForgetTextureOverrideMiss(ID3D11Resource* resource);
+// Whether the resource of the view is known to match no TextureOverride, as
+// far as can be told without asking the view for it. The caller holds a
+// reference to the view, for both:
+bool TextureOverrideViewKnownMiss(ID3D11View* view);
+void NoteTextureOverrideViewResource(ID3D11View* view, ID3D11Resource* resource);
+// Whether no TextureOverride section can match the resource, whatever the draw
+// call it is looked up for:
+bool TextureOverrideCandidatesEmpty(ID3D11Resource *resource);
 
 void ClearRegionHashesGlobalCache();

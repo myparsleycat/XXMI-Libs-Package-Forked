@@ -70,7 +70,10 @@
 #include "IniHandler.h"
 #include "CommandList.h"
 #include "profiling.h"
+#include "ResourceLoading.h"
 #include "cursor.h" // For InstallHookLate
+#include "dx12/Bridge.h"
+#include "vk/VkHooks.h"
 
 
 // -----------------------------------------------------------------------------
@@ -255,6 +258,9 @@ void HackerSwapChain::RunFrameActions()
 {
 	LogDebug("Running frame actions.  Device: %p\n", mHackerDevice);
 
+	if (!dx12_d3d11_presented.load(std::memory_order_relaxed) && !dx12_d3d11_presented.exchange(true))
+		VkDisableModsForD3D11();
+
 	// Regardless of log settings, since this runs every frame, let's flush the log
 	// so that the most lost will be one frame worth.  Tradeoff of performance to accuracy
 	if (LogFile) fflush(LogFile);
@@ -267,6 +273,7 @@ void HackerSwapChain::RunFrameActions()
 	G->gSystemTickCount = system_tick_count;
 
 	G->gFPSCounter.Update(system_tick_count);
+	ReleaseIdleReadBuffers();
 
 	// Run the command list here, before drawing the overlay so that a
 	// custom shader on the present call won't remove the overlay. Also,
@@ -608,30 +615,16 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 	LogDebug("  Flags = %d\n", Flags);
 
 	if (!(Flags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::frame();
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
+
 		// Profiling::mode may change below, so make a copy
 		profiling = Profiling::mode == Profiling::Mode::SUMMARY;
 		if (profiling)
 			Profiling::start(&profiling_state);
 
-		if (G->hunting == HUNTING_MODE_ENABLED) {
-			if (G->overlay_buffer_hash_lifetime >= 0)
-				PurgeStaleVisitedBufferHashes(mHackerDevice);
-			if (G->mSelectedIndexBufferPos == INT_MAX) {
-				G->mSelectedIndexBufferPos = G->mVisitedIndexBuffers.size() - 1;
-				G->mSelectedIndexBuffer = *std::prev(G->mVisitedIndexBuffers.end());
-			}
-			if (G->mSelectedVertexBufferPos == INT_MAX) {
-				G->mSelectedVertexBufferPos = G->mVisitedVertexBuffers.size() - 1;
-				G->mSelectedVertexBuffer = *std::prev(G->mVisitedVertexBuffers.end());
-			}
-			if (G->gResetSelectedVertexBufferSlotId) {
-				if (!G->mVisitedVertexBuffers.empty()) {
-					G->mSelectedVertexBuffer = *G->mVisitedVertexBuffers.begin();
-					G->mSelectedVertexBufferPos = 0;
-					G->gResetSelectedVertexBufferSlotId = false;
-				}
-			}
-		}
+		if (G->hunting == HUNTING_MODE_ENABLED)
+			UpdateHuntingBufferSelection(mHackerDevice);
 
 		if (G->track_region_hashes) {
 			ClearRegionHashesGlobalCache();
@@ -645,11 +638,18 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 			Profiling::end(&profiling_state, &Profiling::present_overhead);
 	}
 
-	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
-	HRESULT hr = mOrigSwapChain1->Present(SyncInterval, Flags);
-	get_tls()->hooking_quirk_protection = false;
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_CALL);
+
+		get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
+		hr = mOrigSwapChain1->Present(SyncInterval, Flags);
+		get_tls()->hooking_quirk_protection = false;
+	}
 
 	if (!(Flags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
+
 		if (profiling)
 			Profiling::start(&profiling_state);
 
@@ -938,6 +938,9 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 	LogDebug("  Flags = %d\n", PresentFlags);
 
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::frame();
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
+
 		// Profiling::mode may change below, so make a copy
 		profiling = Profiling::mode == Profiling::Mode::SUMMARY;
 		if (profiling)
@@ -951,11 +954,18 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 			Profiling::end(&profiling_state, &Profiling::present_overhead);
 	}
 
-	get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
-	HRESULT hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
-	get_tls()->hooking_quirk_protection = false;
+	HRESULT hr;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_CALL);
+
+		get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
+		hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
+		get_tls()->hooking_quirk_protection = false;
+	}
 
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {
+		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
+
 		if (profiling)
 			Profiling::start(&profiling_state);
 

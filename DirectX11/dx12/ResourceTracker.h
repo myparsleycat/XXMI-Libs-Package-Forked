@@ -1,0 +1,143 @@
+#pragma once
+
+#include <stdint.h>
+
+#include <vector>
+
+#include "Dx12Common.h"
+
+// Resources are not wrapped: the game holds the original ID3D12Resource. What
+// we know about each one lives in a table keyed by its address, filled when
+// the resource is created through the device proxy and emptied when D3D12
+// destroys it. Resources that reach the game another way (swap chain buffers,
+// shared handles, another layer's device) are simply not in the table.
+//
+// Nothing here keeps a resource alive, short of the Evict calls held back
+// below, so a resource pointer taken from a descriptor or a view is only ever
+// used as a key, never dereferenced.
+
+const LONG DX12_STATE_UNKNOWN = -1;
+
+struct Dx12ResourceInfo {
+	D3D12_RESOURCE_DESC desc;
+	D3D12_HEAP_TYPE heap_type;
+	// Whether Map can be expected to work
+	bool cpu_accessible;
+	// Buffers only
+	UINT64 va;
+
+	// The state the executed command lists left the whole resource in, or
+	// DX12_STATE_UNKNOWN: subresources in different states, enhanced
+	// barriers, or a resource created with a layout.
+	LONG state;
+	// The same for subresource 0 alone, which is known more often: a
+	// texture whose mips were transitioned one by one has no state above
+	LONG top_state;
+
+	// Textures: crc32c of the top mip as 3DMigoto calculates it for
+	// D3D11, see TextureHash.h
+	bool has_data_hash;
+	uint32_t data_hash;
+	// D3D12 does not tell a cube map from a 2D array until a view is made
+	bool cube;
+	// Textures: see Dx12NoteTopMipUpload
+	bool top_uploaded;
+	UINT top_upload_frame;
+	UINT top_upload_hot;
+
+	// See Dx12GameEvict: whether the game's own Evict and MakeResident
+	// calls left the resource evicted, how many of its Evict calls were
+	// held back since, and when a list of ours last read it
+	// (GetTickCount64, 0 for never) in a submission of which fence
+	bool game_evicted;
+	UINT evictions_held;
+	ULONGLONG read_time;
+	UINT64 read_fence;
+
+	// Tells the resource from one created at its address after it was
+	// destroyed. Never 0.
+	UINT64 serial;
+};
+
+// Calls back once when D3D12 destroys the object. One callback per object.
+void Dx12NotifyDestruction(ID3D12Object *object, void (*callback)(void *object));
+// The same for callbacks of another kind, which need a GUID of their own to
+// not take the place of the above. False if it could not be arranged.
+bool Dx12NotifyDestruction(ID3D12Object *object, REFGUID guid, void (*callback)(void *context), void *context);
+
+// For the operator delete of device and queue proxies: their storage is kept,
+// never freed, so that no other object can be made at the address. Overlays
+// keep such pointers after the game made its swap chain again (RTSS hands them
+// to D3D11On12CreateDevice), and calling into one crashes.
+void Dx12KeepGone(void *storage);
+// Whether the object is a deleted proxy, which with the storage kept cannot be
+// anything alive
+bool Dx12IsGone(const void *object);
+
+// For the device's Create*Resource methods, on success. ppvResource is what
+// the game asked for, which may be nothing at all.
+void Dx12TrackResource(REFIID riid, void **ppvResource, LONG initial_state);
+
+bool Dx12GetResourceInfo(ID3D12Resource *resource, Dx12ResourceInfo *info);
+
+// Lists of ours read resources of the game (copies from its buffers) that the
+// game's own lists may not use until later, and an engine that manages
+// residency itself evicts whatever its lists have not used lately once it is
+// over budget: a read of an evicted resource is a page fault that removes the
+// device. MakeResident and Evict are counted, so the device proxy holds back
+// the game's Evict of a resource read since read_since or in a submission the
+// GPU has not finished (true: not to be passed on), which keeps it resident.
+// What was held back is passed on by Dx12TakeExpiredEvictions alone, and the
+// game's MakeResident calls are always passed on, as a call that was not would
+// come back or signal before the resource is resident. The object need not be
+// a tracked resource.
+// Long enough for what a list of ours read to have been executed, and for a
+// read that comes every frame not to have the resource evicted and made
+// resident again in between
+const ULONGLONG DX12_GAME_READ_HOLD_MS = 10000;
+bool Dx12GameEvict(ID3D12Pageable *object, ULONGLONG read_since, bool (*reached)(UINT64 fence));
+// After the game's MakeResident or EnqueueMakeResident was passed on
+void Dx12GameMadeResident(ID3D12Pageable *object, bool succeeded);
+// For a list of ours about to read a resource of the game, in a submission of
+// that fence, which the caller sees is made. If the game has it evicted,
+// make_resident is called for it, and if that works it counts as an Evict held
+// back. The read has to be left out on DX12_GAME_READ_FAILED, which keeps the
+// time and fence of the read before.
+enum Dx12GameReadResult {
+	DX12_GAME_READ_RESIDENT,
+	DX12_GAME_READ_RESTORED,
+	DX12_GAME_READ_FAILED,
+};
+Dx12GameReadResult Dx12GameRead(ID3D12Resource *resource, ULONGLONG now, UINT64 fence, HRESULT (*make_resident)(ID3D12Pageable *object));
+// The Evict calls held back for resources last read before read_before in a
+// submission the GPU has finished, which the caller passes on, then releases
+// each resource once
+struct Dx12HeldEviction {
+	ID3D12Resource *resource;
+	UINT count;
+};
+void Dx12TakeExpiredEvictions(ULONGLONG read_before, bool (*reached)(UINT64 fence), std::vector<Dx12HeldEviction> *expired);
+
+// For a transition barrier of a command list that is being executed.
+// subresource is as in D3D12_RESOURCE_TRANSITION_BARRIER.
+void Dx12ApplyTransition(ID3D12Resource *resource, UINT subresource, LONG state);
+
+void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32_t data_hash);
+void Dx12MarkCubeTexture(ID3D12Resource *resource);
+// For a copy that writes a texture's whole top mip: false while the game keeps
+// writing it, by the DX12_HOT_FRAMES and DX12_HOT_TEXTURE_LIMIT rule
+bool Dx12NoteTopMipUpload(ID3D12Resource *resource);
+// For remembering what Dx12GetResourceInfo said of a texture without asking
+// again: a number that has changed if the resource at the address, the hash of
+// its data or whether it is a cube map has since, and may have changed without
+// that. Taken before asking.
+UINT64 Dx12TextureStamp(ID3D12Resource *resource);
+
+bool Dx12FindBuffer(UINT64 va, ID3D12Resource **resource, UINT64 *offset);
+// For remembering what Dx12FindBuffer said about an address: a number that
+// has changed if a buffer was created or destroyed there since, and may have
+// changed without that. Taken before asking.
+UINT64 Dx12FindBufferStamp(UINT64 va);
+// The counters that stamp is the sum of, for keeping the stamps of several
+// addresses as one: they only go up
+void Dx12FindBufferStampCounters(UINT64 va, const volatile LONG64 *counters[2]);

@@ -49,12 +49,18 @@ struct ShaderResource
 
 	// Only meaningful for ShaderResourceType::STRUCTURED.
 	uint32_t stride = 0;
+
+	// The descriptor set a Vulkan shader has it in, -1 otherwise
+	int32_t set = -1;
 };
 
 struct ShaderBindings
 {
 	std::array<ShaderConstantBuffer, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> constant_buffers{};
 	std::array<ShaderResource, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> resources{};
+	// The registers of the textures the code samples, in the order it first
+	// does. Only known of a Vulkan shader.
+	std::vector<uint8_t> sampled;
 };
 
 struct OriginalShaderInfo;
@@ -62,6 +68,16 @@ struct OriginalShaderInfo;
 bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out = NULL, bool link = true);
 void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode);
 bool unlink_shader_regex_command_lists_and_filter_index(UINT64 shader_hash);
+// For the shader of a D3D12 game, which there is no assembly text of for a
+// pattern to match: links the groups that name any shader model of its type
+// ("vs", "ps", ...) and either have no patterns or say with dx12_match_* keys
+// what the shader has to declare, which it does. True if there was one.
+struct Dx12ShaderInfo;
+bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader);
+// For a shader there is only a list of declarations of, written the way the
+// D3D11 disassembler would: links the groups of its type ("vs", "ps", ...)
+// whose patterns all match that and replace nothing.
+bool link_shader_regex_groups_declared(const char *shader_type, UINT64 hash, std::string *declarations);
 
 // Works out and applies the ShaderRegex outcome for one shader registered in
 // G->mReloadedShaders: links the command lists of the matched groups to its
@@ -87,6 +103,13 @@ class ShaderRegexConfigUpdate {
 public:
 	ShaderRegexConfigUpdate();
 	~ShaderRegexConfigUpdate();
+};
+
+// And for other threads of their own reading the sections while it does not
+class ShaderRegexConfigRead {
+public:
+	ShaderRegexConfigRead();
+	~ShaderRegexConfigRead();
 };
 
 // Config reload: forgets the results of the previous ShaderRegex sections.
@@ -116,12 +139,33 @@ public:
 	bool named_group_overlaps(ShaderRegexTemps &other_set);
 	bool matches(std::string *asm_text);
 	bool patch(std::string *asm_text, ShaderRegexTemps *temp_regs, unsigned dcl_temps);
+	// With the temps already substituted in that
+	bool patch_with(std::string *asm_text, const std::string &replace);
 };
+
+// $temp and ${temp} in a replacement
+void substitute_shader_regex_temp(std::string &replacement, const std::string &temp, const std::string &with);
 
 // These are sorted to make sure we get consistent results between runs
 // in case the user does something that winds up depending on the order:
 typedef std::map<std::wstring, ShaderRegexPattern> ShaderRegexPatterns;
 typedef std::vector<std::string> ShaderRegexDeclarations;
+
+// What the InsertDeclarations of a group with SpirvPattern subsections add to
+// a SPIR-V shader, see vk/SpirvPatch.h
+enum class SpirvDeclarationKind {
+	TEXTURE2D,
+	INI_PARAMS,
+	SAMPLER,
+};
+
+struct SpirvDeclaration {
+	SpirvDeclarationKind kind;
+	unsigned reg;
+};
+
+// A line of InsertDeclarations, as a D3D11 shader would have it
+bool parse_spirv_declaration(const std::string &line, int ini_params_reg, SpirvDeclaration *declaration);
 
 class ShaderRegexGroup {
 public:
@@ -129,21 +173,43 @@ public:
 
 	ShaderRegexPatterns patterns;
 
+	// SpirvPattern* subsections, applied by name to the text of a Vulkan
+	// game's SPIR-V shader. A group with any is for those alone, and its
+	// Pattern subsections (which may not replace) only say which shaders,
+	// by what they declare as a D3D11 one would. The other paths leave it
+	// alone.
+	ShaderRegexPatterns spirv_patterns;
+	std::vector<SpirvDeclaration> spirv_declarations;
+
 	ShaderRegexDeclarations declarations;
 	ShaderRegexModels shader_models;
 	ShaderRegexTemps temp_regs;
 	float filter_index;
+
+	// The dx12_match_* keys: registers of space 0 the shader of a D3D12
+	// game has to declare (t0-t127, b0-b63, u0-u63), how many render
+	// targets it writes and how many bytes its constant buffers have
+	bool dx12_match;
+	UINT64 dx12_srv[2], dx12_cbv, dx12_uav;
+	FuzzyMatch dx12_targets;
+	FuzzyMatch dx12_cb_bytes[16];
 
 	CommandList command_list;
 	CommandList post_command_list;
 	std::shared_ptr<RunLinkedCommandList> link;
 	std::shared_ptr<RunLinkedCommandList> post_link;
 
+	bool spirv() const { return !spirv_patterns.empty(); }
 	void apply_regex_patterns(std::string *asm_text, bool *match, bool *patch);
 	void link_command_lists_and_filter_index(UINT64 shader_hash);
+	bool dx12_matches(const Dx12ShaderInfo *shader) const;
 
 	ShaderRegexGroup() :
-		filter_index(FLT_MAX)
+		filter_index(FLT_MAX),
+		dx12_match(false),
+		dx12_srv(),
+		dx12_cbv(0),
+		dx12_uav(0)
 	{}
 };
 
@@ -151,6 +217,9 @@ public:
 // order, in case the user writes multiple patterns that depend on each other:
 typedef std::map<std::wstring, ShaderRegexGroup> ShaderRegexGroups;
 extern ShaderRegexGroups shader_regex_groups;
+// Whether any of them is for D3D11 or D3D12 shaders: those with SpirvPattern
+// subsections are not
+extern bool shader_regex_d3d_groups;
 extern std::vector<ShaderRegexGroup*> shader_regex_group_index;
 
 // This hash is of all ShaderRegex sections and is used to determine if a

@@ -50,6 +50,38 @@
     <ClCompile Include="cursor.cpp" />
     <ClCompile Include="D3D11Wrapper.cpp" />
     <ClCompile Include="DLLMainHook.cpp" />
+    <ClCompile Include="dx12\Dx12Hooks.cpp" />
+    <ClCompile Include="dx12\Dx12CommandList.cpp" />
+    <ClCompile Include="dx12\Dx12CommandQueue.cpp" />
+    <ClCompile Include="dx12\Dx12Common.cpp" />
+    <ClCompile Include="dx12\BufferHash.cpp" />
+    <ClCompile Include="dx12\CmdState.cpp" />
+    <ClCompile Include="dx12\DescriptorShadow.cpp" />
+    <ClCompile Include="dx12\Dx12PipelineLibrary.cpp" />
+    <ClCompile Include="dx12\FrameDump.cpp" />
+    <ClCompile Include="dx12\HashDump.cpp" />
+    <ClCompile Include="dx12\PipelineRegistry.cpp" />
+    <ClCompile Include="dx12\ResourceTracker.cpp" />
+    <ClCompile Include="dx12\TextureHash.cpp" />
+    <ClCompile Include="dx12\Dx12DescriptorHeap.cpp" />
+    <ClCompile Include="dx12\Dx12Device.cpp" />
+    <ClCompile Include="dx12\Dx12SwapChain.cpp" />
+    <ClCompile Include="dx12\Bridge.cpp" />
+    <ClCompile Include="dx12\DrawPath.cpp" />
+    <ClCompile Include="dx12\Dxc.cpp" />
+    <ClCompile Include="dx12\DxilMetadata.cpp" />
+    <ClCompile Include="dx12\PresentPass.cpp" />
+    <ClCompile Include="dx12\ShimContext.cpp" />
+    <ClCompile Include="dx12\ShimDevice.cpp" />
+    <ClCompile Include="dx12\ShimObjects.cpp" />
+    <ClCompile Include="dx12\ShimPipeline.cpp" />
+    <ClCompile Include="vk\Spirv.cpp" />
+    <ClCompile Include="vk\SpirvConvert.cpp" />
+    <ClCompile Include="vk\SpirvPatch.cpp" />
+    <ClCompile Include="vk\SpirvTools.cpp" />
+    <ClCompile Include="vk\VkDrawPath.cpp" />
+    <ClCompile Include="vk\VkDump.cpp" />
+    <ClCompile Include="vk\VkHooks.cpp" />
     <ClCompile Include="FrameAnalysis.cpp" />
     <ClCompile Include="HackerContext.cpp" />
     <ClCompile Include="HackerDevice.cpp" />
@@ -85,6 +117,41 @@
     <ClInclude Include="d3d11TokenizedProgramFormat.hpp" />
     <ClInclude Include="D3D11Wrapper.h" />
     <ClInclude Include="DLLMainHook.h" />
+    <ClInclude Include="dx12\Dx12Common.h" />
+    <ClInclude Include="dx12\BufferHash.h" />
+    <ClInclude Include="dx12\CmdState.h" />
+    <ClInclude Include="dx12\DescriptorShadow.h" />
+    <ClInclude Include="dx12\Dx12PipelineLibrary.h" />
+    <ClInclude Include="dx12\FrameDump.h" />
+    <ClInclude Include="dx12\HashDump.h" />
+    <ClInclude Include="dx12\PipelineRegistry.h" />
+    <ClInclude Include="dx12\ResourceTracker.h" />
+    <ClInclude Include="dx12\TextureHash.h" />
+    <ClInclude Include="dx12\Dx12Hooks.h" />
+    <ClInclude Include="dx12\Dx12CommandList.h" />
+    <ClInclude Include="dx12\Dx12CommandQueue.h" />
+    <ClInclude Include="dx12\Dx12DescriptorHeap.h" />
+    <ClInclude Include="dx12\Dx12Device.h" />
+    <ClInclude Include="dx12\Dx12SwapChain.h" />
+    <ClInclude Include="dx12\Bridge.h" />
+    <ClInclude Include="dx12\DrawPath.h" />
+    <ClInclude Include="dx12\Dxc.h" />
+    <ClInclude Include="dx12\DxilMetadata.h" />
+    <ClInclude Include="dx12\PresentPass.h" />
+    <ClInclude Include="dx12\ShimContext.h" />
+    <ClInclude Include="dx12\ShimDevice.h" />
+    <ClInclude Include="dx12\ShimObjects.h" />
+    <ClInclude Include="dx12\ShimPipeline.h" />
+    <ClInclude Include="vk\Spirv.h" />
+    <ClInclude Include="vk\SpirvConvert.h" />
+    <ClInclude Include="vk\SpirvPatch.h" />
+    <ClInclude Include="vk\SpirvTools.h" />
+    <ClInclude Include="vk\VkCommon.h" />
+    <ClInclude Include="vk\VkDrawPath.h" />
+    <ClInclude Include="vk\VkDump.h" />
+    <ClInclude Include="vk\VkHooks.h" />
+    <ClInclude Include="vk\VkObjectLifetime.h" />
+    <ClInclude Include="vk\VkScope.h" />
     <ClInclude Include="FrameAnalysis.h" />
     <ClInclude Include="Globals.h" />
     <ClInclude Include="HackerContext.h" />
@@ -236,7 +303,7 @@
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <ExceptionHandling>Async</ExceptionHandling>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2;$(SolutionDir)Vulkan-Headers\include</AdditionalIncludeDirectories>
       <BufferSecurityCheck>true</BufferSecurityCheck>
     </ClCompile>
     <Link>
@@ -262,7 +329,7 @@ call "$(SolutionDir)CopyToGames.bat" "$(TargetDir)" "$(TargetedSDKArchitecture)"
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <ExceptionHandling>Async</ExceptionHandling>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2;$(SolutionDir)Vulkan-Headers\include</AdditionalIncludeDirectories>
       <BufferSecurityCheck>true</BufferSecurityCheck>
     </ClCompile>
     <Link>
@@ -289,7 +356,7 @@ call "$(SolutionDir)CopyToGames.bat" "$(TargetDir)" "$(TargetedSDKArchitecture)"
       <PreprocessorDefinitions>CRC32C_STATIC=1;PCRE2_STATIC;PCRE2_CODE_UNIT_WIDTH=8;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES=1;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES_COUNT=1;_WINDOWS;_USRDLL;MIGOTO_DX=11;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ExceptionHandling>Async</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2;$(SolutionDir)Vulkan-Headers\include</AdditionalIncludeDirectories>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -322,7 +389,7 @@ call "$(SolutionDir)CopyToGames.bat" "$(TargetDir)" "$(TargetedSDKArchitecture)"
       <PreprocessorDefinitions>CRC32C_STATIC=1;PCRE2_STATIC;PCRE2_CODE_UNIT_WIDTH=8;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES=1;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES_COUNT=1;_WINDOWS;_USRDLL;MIGOTO_DX=11;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ExceptionHandling>Async</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2;$(SolutionDir)Vulkan-Headers\include</AdditionalIncludeDirectories>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -353,7 +420,7 @@ xcopy "$(SolutionDir)Dependencies\*.*" "$(TargetDir)"  /E /Y /s
       <PreprocessorDefinitions>CRC32C_STATIC=1;PCRE2_STATIC;PCRE2_CODE_UNIT_WIDTH=8;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES=1;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES_COUNT=1;_WINDOWS;_USRDLL;MIGOTO_DX=11;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ExceptionHandling>Async</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2;$(SolutionDir)Vulkan-Headers\include</AdditionalIncludeDirectories>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
@@ -383,7 +450,7 @@ xcopy "$(SolutionDir)Dependencies\*.*" "$(TargetDir)"  /E /Y /s
       <PreprocessorDefinitions>CRC32C_STATIC=1;PCRE2_STATIC;PCRE2_CODE_UNIT_WIDTH=8;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES=1;_CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES_COUNT=1;_WINDOWS;_USRDLL;MIGOTO_DX=11;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ExceptionHandling>Async</ExceptionHandling>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir);$(SolutionDir)HLSLDecompiler;$(SolutionDir)DirectXTK\Inc;$(SolutionDir)D3D_Shaders;$(SolutionDir)pcre2;$(SolutionDir)Vulkan-Headers\include</AdditionalIncludeDirectories>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
       <BufferSecurityCheck>false</BufferSecurityCheck>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>

@@ -1,0 +1,158 @@
+#pragma once
+
+#include <stdint.h>
+
+#include <d3d12.h>
+#include <dxgi1_5.h>
+
+#include "log.h"
+
+#define Dx12LogInfo(fmt, ...) LogInfo("[DX12] " fmt, __VA_ARGS__)
+#define Dx12LogDebug(fmt, ...) LogDebug("[DX12] " fmt, __VA_ARGS__)
+
+// The D3D12 objects the game sees are proxies: COM objects of our own that
+// derive from the newest version of the interface in the SDK and forward to
+// the original. generated/*.inl holds the forwarding half of each class, see
+// tools/gen_dx12_proxies.py.
+//
+// Reference counting follows the original object: every reference on a proxy
+// is also a reference on its original, so the counts the game reads back stay
+// what it expects, and the proxy goes away with its last reference.
+//
+// A proxy asks the original for the newest interface it implements once, when
+// it is created, and from then on answers QueryInterface for that version and
+// everything below it with itself. Anything else is forwarded, which hands out
+// an unwrapped interface: fine for the side interfaces that exist today, but a
+// newer ID3D12Device or ID3D12GraphicsCommandList than this SDK knows would
+// bypass us, hence the log line.
+void Dx12LogForwardedQuery(const char *proxy, REFIID riid, HRESULT hr);
+
+// Returns the original of an object that may be one of our proxies. Proxy
+// classes are final, so comparing the vtable pointer identifies them without
+// a QueryInterface round trip, which matters for ExecuteCommandLists and
+// SetDescriptorHeaps.
+template <class Proxy, class Interface>
+static inline Interface* Dx12Unwrap(Interface *object)
+{
+	if (object && *(void**)object == Proxy::sVtbl)
+		return static_cast<Proxy*>(object)->mOrig;
+	return object;
+}
+
+// Finds our proxy behind an arbitrary interface pointer, which may be another
+// layer's wrapper around it. The caller releases the result.
+template <class Proxy>
+static inline Proxy* Dx12QueryProxy(IUnknown *unknown)
+{
+	Proxy *proxy = NULL;
+
+	if (!unknown || FAILED(unknown->QueryInterface(Proxy::ProxyIID, (void**)&proxy)))
+		return NULL;
+	return proxy;
+}
+
+// For the interface version tables of the proxies, ordered oldest first.
+// Returns the index of the newest interface the object implements and that
+// interface, with a reference, in *newest.
+static inline int Dx12QueryNewest(IUnknown *unknown, const IID *const *iids, int count, void **newest)
+{
+	int i;
+
+	for (i = count - 1; i >= 0; i--) {
+		if (SUCCEEDED(unknown->QueryInterface(*iids[i], newest)))
+			return i;
+	}
+	*newest = NULL;
+	return -1;
+}
+
+static inline int Dx12FindIID(const IID *const *iids, int count, REFIID riid)
+{
+	int i;
+
+	for (i = 0; i < count; i++) {
+		if (IsEqualIID(*iids[i], riid))
+			return i;
+	}
+	return -1;
+}
+
+// Counters since the last report, see Dx12FramePresented.
+struct Dx12Stats {
+	volatile LONG64 draws;
+	volatile LONG64 dispatches;
+	volatile LONG64 lists_closed;
+	volatile LONG64 lists_executed;
+	volatile LONG64 execute_calls;
+	volatile LONG64 blas_builds;
+	volatile LONG64 dispatch_rays;
+	// Signals of the fence for what game lists had pinned
+	volatile LONG64 pin_signals;
+	// The times those lists were executed on another queue than ours,
+	// which gets a fence of its own for them
+	volatile LONG64 pin_lates;
+	// The times such a queue was made to wait for ours, and the times its
+	// lists were executed without for it not being possible, see
+	// Dx12ShimQueueWaits
+	volatile LONG64 queue_waits;
+	volatile LONG64 queue_waits_skipped;
+	// The pages Dx12ShimUpload hands out memory from
+	volatile LONG64 upload_pages_created;
+	volatile LONG64 upload_pages_released;
+	// Resources of mods given another D3D12 resource for a write, see
+	// ShimRenameResource
+	volatile LONG64 resources_renamed;
+};
+extern Dx12Stats dx12_stats;
+
+// What the resources of mods take of the memory of the GPU now, by what
+// GetResourceAllocationInfo says of them
+struct Dx12Memory {
+	volatile LONG64 texture_bytes, buffer_bytes;
+	volatile LONG textures, buffers;
+	// Buffers of less than 64 KB, which take 64 KB each, and the bytes
+	// they were asked for
+	volatile LONG small_buffers;
+	volatile LONG64 small_buffer_asked;
+	// Kept by ShimRenameResource
+	volatile LONG64 spare_bytes;
+	volatile LONG spares, renamed;
+	// Evicted by Dx12ShimEvictIdle now, and since the last report: evicted,
+	// made resident again, with the time that took in performance counter
+	// ticks, and left out of what was recorded as that failed
+	LONG evicted;
+	LONG64 evicted_bytes;
+	LONG evictions, restores, restore_failures;
+	LONG64 eviction_bytes, restore_bytes, restore_ticks;
+	// Since the last report: the game's own Evict calls for its resources,
+	// those held back (Dx12GameEvict) and those held back before that were
+	// passed on, and the resources of the game lists of ours were to read
+	// while it had them evicted, made resident again or left out as that
+	// failed
+	volatile LONG game_evictions, game_evictions_held, game_evictions_passed;
+	LONG game_restores, game_restore_failures;
+};
+extern Dx12Memory dx12_memory;
+
+// The last frame the game built an acceleration structure or dispatched rays
+// in, 0 if never: whether it is ray tracing, which changes how it skins
+extern volatile UINT dx12_raytracing_frame;
+
+// Presents so far, for telling how long ago something happened
+extern volatile UINT dx12_frame;
+
+// A buffer range written again within this many frames, this many times in a
+// row, is taken for dynamic and no longer hashed
+const UINT DX12_HOT_FRAMES = 30;
+const UINT DX12_HOT_LIMIT = 4;
+// The same for a texture's top mip, counting writes within one frame once. A
+// game may fill a texture over a few frames while it loads, then keep it, and
+// a mod can only match the hash of what it ends up with.
+const UINT DX12_HOT_TEXTURE_LIMIT = 16;
+
+void Dx12FramePresented();
+
+// crc32c_hw for memory that may be an upload heap. Those are write combined,
+// where ordinary reads are an order of magnitude slower than the streaming
+// loads this uses.
+uint32_t Dx12Crc32cWriteCombined(uint32_t hash, const BYTE *src, size_t length);

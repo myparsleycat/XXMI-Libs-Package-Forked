@@ -4,30 +4,34 @@
 #include <cstdint>
 #include <string>
 
-// Read-only view of a whole file. The pages are only faulted in as they
-// are touched, so prefetch() asks the OS to read the whole file at once
-// before the view is passed to a D3D create call that copies from it. That
-// is a hint: the OS may read only part of the file, or nothing.
-class MappedFile
+// A whole file read into memory. Reading into a buffer kept for the next
+// file is much faster than faulting the pages of a mapped view in one by one
+// while a D3D create call copies from it, and the buffer is warm in the
+// cache for that copy. A file of several MB is read by thread pool threads
+// as well, before the constructor returns.
+class FileContents
 {
 public:
-	explicit MappedFile(const wchar_t *path);
-	~MappedFile();
+	explicit FileContents(const wchar_t *path);
+	~FileContents();
 
-	MappedFile(const MappedFile&) = delete;
-	MappedFile& operator=(const MappedFile&) = delete;
+	FileContents(const FileContents&) = delete;
+	FileContents& operator=(const FileContents&) = delete;
 
 	bool valid() const { return data != nullptr; }
-	void prefetch() const;
 
 	const uint8_t *data = nullptr;
 	size_t size = 0;
 	DWORD error = 0;
 
 private:
-	HANDLE file = INVALID_HANDLE_VALUE;
-	HANDLE mapping = NULL;
+	uint8_t *buffer = nullptr;
+	size_t capacity = 0;
 };
+
+// Once a frame: frees the buffer of files too big for the kept ones once it
+// has gone unused for some seconds
+void ReleaseIdleReadBuffers();
 
 enum class SharedResourceLoader {
 	DDS,

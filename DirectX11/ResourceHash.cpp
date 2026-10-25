@@ -6,6 +6,7 @@
 #include "globals.h"
 #include "profiling.h"
 #include "overlay.h"
+#include "vk/VkScope.h"
 
 // DirectXTK headers fail to include their own pre-requisits. We just want
 // GetSurfaceInfo from LoaderHelpers
@@ -1121,8 +1122,68 @@ out_profile:
 		Profiling::end(&profiling_state, &Profiling::hash_tracking_overhead);
 }
 
+// A texture whose subresource 0 is written again within this many frames, this
+// many times in a row, is one the game streams into, such as a video it plays,
+// and keeps the hash of its description alone. Hashing each write would cost a
+// copy and a CRC of the whole texture every frame, under the lock the render
+// thread takes for every draw, for a hash no mod can know in advance. The same
+// rule as DX12_HOT_FRAMES and DX12_HOT_TEXTURE_LIMIT on D3D12.
+static const unsigned hot_update_frames = 30;
+static const unsigned hot_update_limit = 16;
+
+// Called with G->mCriticalSection held. False once the texture is taken for
+// one the game streams into.
+static bool note_top_update(ID3D11Resource *resource, ResourceHandleInfo *info)
+{
+	unsigned frame = G->frame_no;
+	bool became_hot = false;
+	uint32_t old_hash;
+
+	// Writes within one frame count once, so that a texture filled in
+	// several pieces while it is set up, possibly before anything was
+	// presented, keeps the hash of what it ends up with:
+	if (!info->top_updated || frame != info->top_update_frame) {
+		if (info->top_updated && frame - info->top_update_frame < hot_update_frames) {
+			if (info->top_update_hot < hot_update_limit)
+				became_hot = ++info->top_update_hot == hot_update_limit;
+		} else {
+			info->top_update_hot = 0;
+		}
+		info->top_updated = true;
+		info->top_update_frame = frame;
+	}
+
+	if (info->top_update_hot < hot_update_limit)
+		return true;
+
+	// Also on a later write within the frame: a copy from another texture
+	// may have propagated a data hash to this one since
+	if (!info->data_hash)
+		return false;
+
+	old_hash = info->hash;
+	info->data_hash = 0;
+	switch (info->type) {
+		case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+			info->hash = CalcTexture2DDescHash(0, &info->desc2D);
+			break;
+		case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+			info->hash = CalcTexture3DDescHash(0, &info->desc3D);
+			break;
+	}
+	ForgetTextureOverrideMiss(resource);
+
+	if (became_hot)
+		LogInfo("Texture %p is written every frame, no longer hashing its data: hash %08x -> %08x\n",
+				resource, old_hash, info->hash);
+	else
+		LogDebug("Texture %p written every frame, dropped data hash: hash %08x -> %08x\n",
+				resource, old_hash, info->hash);
+	return false;
+}
+
 void UpdateResourceHashFromCPU(ID3D11Resource *resource,
-	const void *data, UINT rowPitch, UINT depthPitch)
+	const void *data, UINT rowPitch, UINT depthPitch, bool note_update)
 {
 	D3D11_RESOURCE_DIMENSION dim;
 	D3D11_SUBRESOURCE_DATA initialData;
@@ -1155,6 +1216,9 @@ void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 		goto out_unlock;
 
 	if (!supports_hash_tracking(info))
+		goto out_unlock;
+
+	if (note_update && !note_top_update(resource, info))
 		goto out_unlock;
 
 	// Ever noticed that D3D11_SUBRESOURCE_DATA is binary identical to
@@ -1313,7 +1377,18 @@ bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource, D3D
 	// updates regardless (just not the full resource hash) so the option
 	// can be turned on live and work. But there's a few pieces we would
 	// need for that to work so for now let's not over-complicate things.
-	return G->track_texture_updates == 1 && Subresource == 0;
+	if (G->track_texture_updates != 1 || Subresource != 0)
+		return false;
+
+	// A texture the game streams into is then mapped as it would be
+	// without us, rather than through a copy of all of it:
+	bool track = true;
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	ResourceHandleInfo *info = GetResourceHandleInfo(pResource);
+	if (info && supports_hash_tracking(info))
+		track = note_top_update(pResource, info);
+	LeaveCriticalSection(&G->mCriticalSection);
+	return track;
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -1849,6 +1924,150 @@ void ForgetTextureOverrideMiss(ID3D11Resource *resource)
 		slot->compare_exchange_strong(resource, nullptr);
 }
 
+// A view is of the same resource for as long as it exists, yet asking it which
+// is a call into DirectX and a reference to give back, for every texture slot
+// checktextureoverride looks at, every draw call. This direct mapped table
+// remembers the resource of views seen with one that matches nothing, so that
+// texture_override_miss_cache can answer for the view without either call.
+//
+// An entry is only right while its view exists: every view entered has a
+// ViewReleaseTracker that takes the entry out when DirectX destroys the view,
+// before the address can be given to another. Whoever looks a view up or
+// enters one must hold a reference to it. A resource outlives its views, so
+// the resource of an entry is never a stale address either, and whether it
+// still matches nothing is asked of texture_override_miss_cache every time.
+struct ViewResourceSlot {
+	// Odd while the slot is being written
+	std::atomic<uint32_t> sequence;
+	std::atomic<ID3D11View*> view;
+	std::atomic<ID3D11Resource*> resource;
+};
+#define VIEW_RESOURCE_CACHE_BITS 14
+static ViewResourceSlot view_resource_cache[1 << VIEW_RESOURCE_CACHE_BITS];
+
+static inline ViewResourceSlot* view_resource_slot(ID3D11View *view)
+{
+	uint64_t slot = (uint64_t)(uintptr_t)view * 0x9E3779B97F4A7C15ull;
+	return &view_resource_cache[slot >> (64 - VIEW_RESOURCE_CACHE_BITS)];
+}
+
+// {6E1B0C5D-3F0A-4B0E-9B5C-0A6D0C1E7F42}
+DEFINE_GUID(ViewReleaseTrackerGuid,
+0x6e1b0c5d, 0x3f0a, 0x4b0e, 0x9b, 0x5c, 0xa, 0x6d, 0xc, 0x1e, 0x7f, 0x42);
+
+class ViewReleaseTracker : public IUnknown
+{
+	std::atomic_ulong ref;
+	ID3D11View *view;
+
+public:
+	ViewReleaseTracker(ID3D11View *view) : ref(1), view(view) {}
+
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, _COM_Outptr_ void **ppvObject)
+	{
+		if (ppvObject && IsEqualIID(riid, IID_IUnknown)) {
+			AddRef();
+			*ppvObject = this;
+			return S_OK;
+		}
+
+		return E_NOINTERFACE;
+	}
+
+	ULONG STDMETHODCALLTYPE AddRef(void)
+	{
+		return ++ref;
+	}
+
+	ULONG STDMETHODCALLTYPE Release(void)
+	{
+		ULONG ret = --ref;
+		if (ret == 0) {
+			// DirectX calls this with a lock of its own held: nothing
+			// in here may call into DirectX or wait on a lock that is
+			// held across such a call
+			ViewResourceSlot *slot = view_resource_slot(view);
+			if (slot->view.load() == view) {
+				uint32_t sequence;
+				do {
+					sequence = slot->sequence.load() & ~1u;
+				} while (!slot->sequence.compare_exchange_weak(sequence, sequence + 1));
+				if (slot->view.load() == view) {
+					slot->view.store(nullptr);
+					slot->resource.store(nullptr);
+				}
+				slot->sequence.store(sequence + 2);
+			}
+			delete this;
+		}
+		return ret;
+	}
+};
+
+bool TextureOverrideViewKnownMiss(ID3D11View *view)
+{
+	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())
+		return true;
+
+	ViewResourceSlot *slot = view_resource_slot(view);
+	uint32_t sequence = slot->sequence.load();
+	if (sequence & 1)
+		return false;
+	ID3D11View *slot_view = slot->view.load();
+	ID3D11Resource *resource = slot->resource.load();
+	if (slot_view != view || slot->sequence.load() != sequence)
+		return false;
+
+	if (texture_override_miss_slot(resource)->load(std::memory_order_relaxed) != resource)
+		return false;
+
+	// As find_texture_overrides_for_resource() counts the lookup it ends
+	// in its miss cache:
+	if (Profiling::mode == Profiling::Mode::SUMMARY)
+		Profiling::texture_override_candidates_lookup_overhead.count++;
+	return true;
+}
+
+void NoteTextureOverrideViewResource(ID3D11View *view, ID3D11Resource *resource)
+{
+	// Only worth an entry if the resource is known to match nothing, which
+	// is all TextureOverrideViewKnownMiss() can answer:
+	if (texture_override_miss_slot(resource)->load(std::memory_order_relaxed) != resource)
+		return;
+
+	ViewResourceSlot *slot = view_resource_slot(view);
+	ID3D11View *occupant = slot->view.load();
+	if (occupant == view)
+		return;
+
+	// Two views of a frame in one slot would otherwise take it from each
+	// other at every lookup, each time with a tracker to make and set, which
+	// costs more than the GetResource() the entry saves. One whose resource
+	// started matching is no use any more and gives the slot up. Read
+	// without the sequence: a torn read only picks the wrong one of the two.
+	if (occupant) {
+		ID3D11Resource *occupant_resource = slot->resource.load();
+		if (occupant_resource && texture_override_miss_slot(occupant_resource)->load(std::memory_order_relaxed) == occupant_resource)
+			return;
+	}
+
+	// Replaces the tracker the view has if it was entered before and lost
+	// its slot to another since. That one going may take an entry of the
+	// view out, hence before entering it:
+	ViewReleaseTracker *tracker = new ViewReleaseTracker(view);
+	HRESULT hr = view->SetPrivateDataInterface(ViewReleaseTrackerGuid, tracker);
+	tracker->Release();
+	if (FAILED(hr))
+		return;
+
+	uint32_t sequence = slot->sequence.load();
+	if ((sequence & 1) || !slot->sequence.compare_exchange_strong(sequence, sequence + 1))
+		return;
+	slot->view.store(view);
+	slot->resource.store(resource);
+	slot->sequence.store(sequence + 2);
+}
+
 void InvalidateTextureOverrideCandidates()
 {
 	EnterCriticalSectionPretty(&G->mResourcesLock);
@@ -2032,6 +2251,22 @@ void find_texture_overrides_for_resource(ID3D11Resource *resource, TextureOverri
 	}
 }
 
+bool TextureOverrideCandidatesEmpty(ID3D11Resource *resource)
+{
+	TextureOverrideCandidates *candidates;
+	bool empty;
+
+	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())
+		return true;
+
+	EnterCriticalSectionPretty(&G->mCriticalSection);
+	candidates = get_texture_override_candidates(resource);
+	empty = !candidates || (!candidates->hash_matches && candidates->fuzzy_matches.empty());
+	LeaveCriticalSection(&G->mCriticalSection);
+
+	return empty;
+}
+
 bool TextureOverrideLess(const struct TextureOverride &lhs, const struct TextureOverride &rhs)
 {
 	// For texture create time overrides we want the highest priority
@@ -2160,6 +2395,7 @@ void ResourceHandleInfo::InitializeDataCache(size_t size, size_t offset)
 	cached_data.reset();
 	cached_data_offset = offset;
 	cached_data_size = size;
+	cached_data_block_size = 0;
 
 	// Initialize region hashes cache.
 	if (!region_hashes_cache)
@@ -2177,9 +2413,22 @@ void ResourceHandleInfo::SetDataCache(void* src, size_t size)
 
 	// Adopt memory pointer as shared_ptr, no re-allocation involved.
 	cached_data = std::shared_ptr<uint8_t[]>(static_cast<uint8_t*>(src), free);
+	cached_data_block_size = size;
 
 	//cached_data_hash = crc32c_hw(0, GetCachedData(), size);
 	//LogInfo("SetDataCache size=%d, data_hash=%08lx\n", size, cached_data_hash);
+}
+
+bool ResourceHandleInfo::RefreshDataCache(const void* src, size_t size)
+{
+	if (!src || !size || cached_data_block_size != size || !cached_data || cached_data.use_count() != 1)
+		return false;
+
+	memcpy(cached_data.get(), src, size);
+	// The rest of InitializeDataCache(), offset and size being what it
+	// would set already:
+	region_hashes_cache->Initialize(size);
+	return true;
 }
 
 void ResourceHandleInfo::SetDataCacheRegion(const void* src, size_t region_size, UINT offset)
@@ -2220,6 +2469,51 @@ uint8_t* ResourceHandleInfo::GetCachedData() {
 	return cached_data.get() + cached_data_offset;
 }
 
+// The deleter of the data of a lazy cache, which is what the views of the
+// data share with it (CustomResource::SetHandleInfo)
+struct LazyDataCache {
+	static const size_t PAGE = 4096;
+
+	std::function<void(uint8_t *dst, size_t offset, size_t size)> read;
+	size_t size;
+	std::vector<bool> pages;
+
+	void operator()(uint8_t *data) const { free(data); }
+};
+
+uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
+{
+	LazyDataCache *lazy = cached_data ? std::get_deleter<LazyDataCache>(cached_data) : nullptr;
+	size_t page, start = cached_data_offset + offset;
+
+	if (lazy && start < lazy->size) {
+		size = min(size, lazy->size - start);
+		for (page = start / LazyDataCache::PAGE; page * LazyDataCache::PAGE < start + size; page++) {
+			if (lazy->pages[page])
+				continue;
+			lazy->pages[page] = true;
+			lazy->read(cached_data.get() + page * LazyDataCache::PAGE, page * LazyDataCache::PAGE,
+				min(LazyDataCache::PAGE, lazy->size - page * LazyDataCache::PAGE));
+		}
+	}
+	return GetCachedData();
+}
+
+void ResourceHandleInfo::SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read)
+{
+	LazyDataCache lazy;
+	uint8_t *data = static_cast<uint8_t*>(malloc(size));
+
+	if (!data)
+		return;
+
+	InitializeDataCache(size);
+	lazy.read = std::move(read);
+	lazy.size = size;
+	lazy.pages.assign((size + LazyDataCache::PAGE - 1) / LazyDataCache::PAGE, false);
+	cached_data = std::shared_ptr<uint8_t[]>(data, std::move(lazy));
+}
+
 // Clears all cached region hashes and invalidates the CPU-side buffer snapshot.
 // This forces region hashes to be recomputed the next time they are requested.
 void ResourceHandleInfo::ClearDataCache()
@@ -2232,6 +2526,7 @@ void ResourceHandleInfo::ClearDataCache()
 	cached_data.reset();
 	cached_data_offset = 0;
 	cached_data_size = 0;
+	cached_data_block_size = 0;
 
 	// Drop all cached hashes and CPU snapshot.
 	if (region_hashes_cache)
@@ -2390,6 +2685,12 @@ uint32_t GetRegionHash(HackerContext* context, ID3D11Buffer* buffer, UINT offset
 		return 0;
 	}
 
+	// A buffer of a Vulkan game is not there to be read back, and has no
+	// calls that say when it is written to go by for the caches below
+	uint32_t vk_hash;
+	if (custom_resource == nullptr && VkScopeRegionHash(buffer, offset, size, &vk_hash))
+		return vk_hash;
+
 	// Lookup offset in fast L3 cache without any locking involved.
 	RegionHashKeyL3 level_3_cache_key{ (uint64_t)buffer, offset, size };
 	if (uint32_t* h = region_hashes_global_cache.find_ptr(level_3_cache_key))
@@ -2448,7 +2749,7 @@ uint32_t GetRegionHash(HackerContext* context, ID3D11Buffer* buffer, UINT offset
 	}
 
 	// Make pointer for given offset in L1 cache (raw data).
-	const uint8_t* ptr = handle_info->GetCachedData() + offset;
+	const uint8_t* ptr = handle_info->GetCachedData(offset, size) + offset;
 
 	// Compute CRC32 hash for the region.
 	hash = crc32c_hw(0, ptr, size);
@@ -2676,7 +2977,9 @@ uint32_t GetSpatialHash(HackerContext* context, ID3D11Buffer* buffer, UINT offse
 	}
 
 	// Make pointer for given offset in L1 cache (raw data).
-	const uint8_t* ptr = handle_info->GetCachedData();
+	handle_info->GetCachedData(offset_x * 4, 4);
+	handle_info->GetCachedData(offset_y * 4, 4);
+	const uint8_t* ptr = handle_info->GetCachedData(offset_z * 4, 4);
 
 	const float* data = reinterpret_cast<const float*>(ptr);
 

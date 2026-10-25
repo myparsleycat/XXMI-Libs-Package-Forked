@@ -94,7 +94,10 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mComputeShaderDeferredPending = false;
 	mDeferredShaderGeneration = G->deferred_shader_generation;
 	memset(mShaderOverrideCache, 0, sizeof(mShaderOverrideCache));
+	memset(mShaderHandleCache, 0, sizeof(mShaderHandleCache));
+	memset(mDivertSpares, 0, sizeof(mDivertSpares));
 	mCheckTextureOverrideResultCount = 0;
+	mCheckTextureOverrideResultHint = 0;
 	mCheckTextureOverrideResultsDraw = NULL;
 	memset(mShaderResourceViewCache, 0, sizeof(mShaderResourceViewCache));
 	mShaderResourceViewCacheCount = 0;
@@ -119,6 +122,27 @@ HackerContext::~HackerContext()
 		if (entry.view)
 			entry.view->Release();
 	}
+
+	for (void *spare : mDivertSpares)
+		free(spare);
+}
+
+void* HackerContext::AllocDiverted(size_t size)
+{
+	if (size <= DIVERT_REUSE_MAX && !(size % 16) && mDivertSpares[size / 16]) {
+		void *data = mDivertSpares[size / 16];
+		mDivertSpares[size / 16] = NULL;
+		return data;
+	}
+	return malloc(size);
+}
+
+void HackerContext::FreeDiverted(void *data, size_t size)
+{
+	if (data && size <= DIVERT_REUSE_MAX && !(size % 16) && !mDivertSpares[size / 16])
+		mDivertSpares[size / 16] = data;
+	else
+		free(data);
 }
 
 // Save the corresponding HackerDevice, as we need to use it periodically to get
@@ -552,6 +576,7 @@ bool HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 
 	UINT num_instances = 0;
 	bool pending = false;
 	unsigned i;
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_REGEX, shader_type, hash);
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
@@ -658,11 +683,40 @@ ShaderOverride* HackerContext::LookupShaderOverride(UINT64 hash)
 	return entry->shader_override;
 }
 
+const HackerContext::ShaderHandleCacheEntry* HackerContext::LookupShaderHandle(ID3D11DeviceChild *shader)
+{
+	ShaderHandleCacheEntry *entry = &mShaderHandleCache[
+		((uint64_t)(uintptr_t)shader * 0x9E3779B97F4A7C15ull) >> (64 - SHADER_HANDLE_CACHE_BITS)];
+	// Read before the lookups, as LookupShaderOverride() does:
+	unsigned generation = G->shader_handle_generation;
+
+	if (entry->shader == shader && entry->generation == generation) {
+		if (Profiling::mode == Profiling::Mode::SUMMARY) {
+			Profiling::shader_hash_lookup_overhead.count++;
+			if (entry->hash_found)
+				Profiling::shader_hash_lookup_overhead.hits++;
+			Profiling::shader_reload_lookup_overhead.count++;
+			if (entry->reload_info)
+				Profiling::shader_reload_lookup_overhead.hits++;
+		}
+		return entry;
+	}
+
+	ShaderMap::iterator i = lookup_shader_hash(shader);
+	ShaderReloadMap::iterator j = lookup_reloaded_shader(shader);
+	entry->shader = shader;
+	entry->generation = generation;
+	entry->hash_found = i != G->mShaders.end();
+	entry->hash = entry->hash_found ? i->second : 0;
+	entry->reload_info = (j != G->mReloadedShaders.end()) ? &j->second : NULL;
+	return entry;
+}
+
 void HackerContext::DeferredShaderReplacementBeforeDraw()
 {
 	Profiling::State profiling_state;
 
-	if (shader_regex_groups.empty())
+	if (!shader_regex_d3d_groups)
 		return;
 
 	UpdateDeferredShaderGeneration();
@@ -712,7 +766,7 @@ void HackerContext::DeferredShaderReplacementBeforeDraw()
 
 void HackerContext::DeferredShaderReplacementBeforeDispatch()
 {
-	if (shader_regex_groups.empty())
+	if (!shader_regex_d3d_groups)
 		return;
 
 	UpdateDeferredShaderGeneration();
@@ -899,6 +953,8 @@ void HackerContext::RestoreInputLayout()
 
 void HackerContext::BeforeDraw(DrawContext &data)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::DRAW_PRE);
+
 	draw_number++;
 
 	mCheckTextureOverrideResultCount = 0;
@@ -1125,6 +1181,7 @@ void HackerContext::AfterDraw(DrawContext &data)
 {
 	int i;
 	Profiling::State profiling_state;
+	Profiling::Spike::Scope spike(Profiling::Spike::DRAW_POST);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
@@ -1426,6 +1483,7 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 	bool divertable = false, divert = false, track = false;
 	bool write = false, read = false, deny = false;
 	Profiling::State profiling_state;
+	Profiling::Spike::Scope spike(Profiling::Spike::MAP);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
@@ -1473,7 +1531,14 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 	if (!track && !divert)
 		goto out_profile;
 
-	map_info = &mMappedResources[pResource];
+	{
+		size_t at = std::find(mMappedResources.begin(), mMappedResources.end(), pResource) - mMappedResources.begin();
+		if (at == mMappedResources.size()) {
+			mMappedResources.push_back(pResource);
+			mMappedResourceInfos.emplace_back();
+		}
+		map_info = &mMappedResourceInfos[at];
+	}
 	map_info->mapped_writable = write;
 	memcpy(&map_info->map, pMappedResource, sizeof(D3D11_MAPPED_SUBRESOURCE));
 
@@ -1509,7 +1574,7 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 			goto out_profile;
 	}
 
-	replace = malloc(map_info->size);
+	replace = AllocDiverted(map_info->size);
 	if (!replace) {
 		LogInfo("TrackAndDivertMap out of memory\n");
 		goto out_profile;
@@ -1527,7 +1592,7 @@ out_profile:
 		Profiling::end(&profiling_state, &Profiling::map_overhead);
 }
 
-void UpdateResourceDataCacheFromMap(ID3D11Resource* pResource, void* data, size_t size, bool* deallocate_diverted_memory)
+void UpdateResourceDataCacheFromMap(ID3D11Resource* pResource, void* data, size_t size, bool* deallocate_diverted_memory, bool refresh)
 {
 	if (!data || !size)
 		return;
@@ -1542,6 +1607,13 @@ void UpdateResourceDataCacheFromMap(ID3D11Resource* pResource, void* data, size_
 	}
 
 	//LogInfo("UpdateResourceDataCacheFromMap size=%d, pResource=%p\n", size, pResource);
+	// A buffer written over and over, as a constant buffer is for every
+	// draw, has its cache written over as well rather than handed a new
+	// block for the old one each time. The caller keeps data then:
+	if (refresh && info->RefreshDataCache(data, size)) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return;
+	}
 	info->SetDataCache(data, size);
 
 	if (deallocate_diverted_memory)
@@ -1554,9 +1626,10 @@ void UpdateResourceDataCacheFromMap(ID3D11Resource* pResource, void* data, size_
 
 void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresource)
 {
-	MappedResources::iterator i;
+	size_t i;
 	MappedResourceInfo *map_info = NULL;
 	Profiling::State profiling_state;
+	Profiling::Spike::Scope spike(Profiling::Spike::MAP);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::start(&profiling_state);
@@ -1564,18 +1637,19 @@ void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresou
 	if (mMappedResources.empty())
 		goto out_profile;
 
-	i = mMappedResources.find(pResource);
-	if (i == mMappedResources.end())
+	i = std::find(mMappedResources.begin(), mMappedResources.end(), pResource) - mMappedResources.begin();
+	if (i == mMappedResources.size())
 		goto out_profile;
-	map_info = &i->second;
+	map_info = &mMappedResourceInfos[i];
 
 	bool deallocate_diverted_memory = true;
 
 	if ((map_info->bind_flags & (D3D11_BIND_FLAG)G->cache_resource_data) != 0)
-		UpdateResourceDataCacheFromMap(pResource, map_info->map.pData, map_info->size, &deallocate_diverted_memory);
+		UpdateResourceDataCacheFromMap(pResource, map_info->map.pData, map_info->size, &deallocate_diverted_memory,
+				map_info->orig_pData && map_info->size <= DIVERT_REUSE_MAX);
 
 	if (G->track_texture_updates == 1 && Subresource == 0 && map_info->mapped_writable)
-		UpdateResourceHashFromCPU(pResource, map_info->map.pData, map_info->map.RowPitch, map_info->map.DepthPitch);
+		UpdateResourceHashFromCPU(pResource, map_info->map.pData, map_info->map.RowPitch, map_info->map.DepthPitch, false);
 
 	if (map_info->orig_pData) {
 		// TODO: Measure performance vs. not diverting:
@@ -1583,11 +1657,14 @@ void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresou
 			memcpy(map_info->orig_pData, map_info->map.pData, map_info->size);
 
 		if (deallocate_diverted_memory) {
-			free(map_info->map.pData);
+			FreeDiverted(map_info->map.pData, map_info->size);
 		}
 	}
 
-	mMappedResources.erase(i);
+	mMappedResources[i] = mMappedResources.back();
+	mMappedResources.pop_back();
+	mMappedResourceInfos[i] = mMappedResourceInfos.back();
+	mMappedResourceInfos.pop_back();
 
 out_profile:
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
@@ -2055,7 +2132,7 @@ void CopySubresourceRegionCache(ID3D11Resource* pSrcResource, ID3D11Resource* pD
 		if (!dst_info->cached_data_size)
 			dst_info->InitializeDataCache(dst_desc.ByteWidth);
 
-		dst_info->SetDataCacheRegion(src_info->GetCachedData() + src_offset, region_size, DstX);
+		dst_info->SetDataCacheRegion(src_info->GetCachedData(src_offset, region_size) + src_offset, region_size, DstX);
 
 		//dst_info->cached_data_hash = crc32c_hw(0, dst_info->cached_data, dst_desc.ByteWidth);
 	}
@@ -2197,7 +2274,7 @@ STDMETHODIMP_(void) HackerContext::UpdateSubresource(THIS_
 	// and the hashes might be less predictable. Possibly something to
 	// enable as an option in the future if there is a proven need.
 	if (G->track_texture_updates == 1 && DstSubresource == 0 && pDstBox == NULL)
-		UpdateResourceHashFromCPU(pDstResource, pSrcData, SrcRowPitch, SrcDepthPitch);
+		UpdateResourceHashFromCPU(pDstResource, pSrcData, SrcRowPitch, SrcDepthPitch, true);
 }
 
 STDMETHODIMP_(void) HackerContext::CopyStructureCount(THIS_
@@ -2464,6 +2541,8 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 	*deferredPending = false;
 
 	if (pShader) {
+		OriginalShaderInfo *reload_info = NULL;
+
 		// Store as current shader. Need to do this even while
 		// not hunting for ShaderOverride section in BeforeDraw
 		// We also set the current shader hash, but as an optimization,
@@ -2471,15 +2550,17 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 		// lookup/find takes measurable amounts of CPU time.
 		//
 		// grumble grumble this optimisation caught me out *TWICE* grumble grumble -DSS
-		if (!G->mShaderOverrideMap.empty() || !shader_regex_groups.empty() || (G->hunting == HUNTING_MODE_ENABLED)) {
-			ShaderMap::iterator i = lookup_shader_hash(pShader);
-			if (i != G->mShaders.end()) {
-				*currentShaderHash = i->second;
+		if (!G->mShaderOverrideMap.empty() || shader_regex_d3d_groups || (G->hunting == HUNTING_MODE_ENABLED)) {
+			// Both this lookup and the one in mReloadedShaders below:
+			const ShaderHandleCacheEntry *entry = LookupShaderHandle(pShader);
+			reload_info = entry->reload_info;
+			if (entry->hash_found) {
+				*currentShaderHash = entry->hash;
 				LogDebug("  shader found: handle = %p, hash = %016I64x\n", *currentShaderHandle, *currentShaderHash);
 
 				if ((G->hunting == HUNTING_MODE_ENABLED) && visitedShaders) {
 					EnterCriticalSectionPretty(&G->mCriticalSection);
-					visitedShaders->insert(i->second);
+					visitedShaders->insert(entry->hash);
 					LeaveCriticalSection(&G->mCriticalSection);
 				}
 			}
@@ -2490,21 +2571,24 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 			// reference this at least make sure we don't use the
 			// *wrong* hash
 			*currentShaderHash = 0;
+
+			ShaderReloadMap::iterator it = lookup_reloaded_shader(pShader);
+			if (it != G->mReloadedShaders.end())
+				reload_info = &it->second;
 		}
 
 		// If the shader has been live reloaded from ShaderFixes, use the new one
 		// No longer conditional on G->hunting now that hunting may be soft enabled via key binding
-		ShaderReloadMap::iterator it = lookup_reloaded_shader(pShader);
 
 		// Only a shader that DeferredShaderReplacement() would actually
 		// analyse is worth its locked lookup before the next draw:
-		if (it != G->mReloadedShaders.end()) {
-			*deferredPending = it->second.deferred_replacement_candidate
-				&& !it->second.deferred_replacement_processed;
+		if (reload_info) {
+			*deferredPending = reload_info->deferred_replacement_candidate
+				&& !reload_info->deferred_replacement_processed;
 		}
 
-		if (it != G->mReloadedShaders.end() && it->second.replacement != NULL) {
-			LogDebug("  shader replaced by: %p\n", it->second.replacement);
+		if (reload_info && reload_info->replacement != NULL) {
+			LogDebug("  shader replaced by: %p\n", reload_info->replacement);
 
 			// It might make sense to Release() the original shader, to recover memory on GPU
 			//   -Bo3b
@@ -2515,7 +2599,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 			// If we did want to do better here we could return a wrapper object when the game
 			// creates the original shader, and manage original/replaced/reverted/etc from there.
 			//   -DSS
-			repl_shader = (ID3D11Shader*)it->second.replacement;
+			repl_shader = (ID3D11Shader*)reload_info->replacement;
 		}
 
 		if (G->hunting == HUNTING_MODE_ENABLED) {

@@ -105,4 +105,109 @@ namespace Profiling {
 	extern unsigned max_executions_per_frame_exceeded;
 	extern unsigned iniparams_updates;
 
+	// Spike log: the performance monitor above averages over its interval,
+	// which hides a single slow frame. This instead keeps per-frame totals
+	// that are thrown away at every Present unless the frame took longer
+	// than the threshold, in which case they are written to
+	// d3d11_spike_log.txt along with the individual slow operations.
+	namespace Spike {
+		enum Category {
+			// Mutually exclusive on the render thread, so the frame
+			// time left after subtracting these was spent outside
+			// 3DMigoto (game or driver):
+			PRESENT_PRE,
+			PRESENT_CALL,
+			PRESENT_POST,
+			DRAW_PRE,
+			DRAW_POST,
+			MAP,
+			SHADER_CREATE,
+			RESOURCE_CREATE,
+			DX12_APPLY,
+			DX12_EXECUTE,
+			DX12_EXECUTE_DRIVER,
+			DX12_PIPELINE,
+			DX12_PIPELINE_DRIVER,
+			DX12_TEXTURE_HASH,
+			DX12_BUFFER_HASH,
+			// Nested inside the above (or inside each other):
+			RESOURCE_LOAD,
+			SHADER_CREATE_DRIVER,
+			SHADER_REGEX,
+			SHADER_REGEX_CACHE,
+			SHADER_REGEX_ANALYSIS,
+			SHADER_REGEX_DRIVER,
+			CONFIG_RELOAD,
+			LOCK_WAIT,
+			DX12_DRAW,
+			DX12_DISPATCH,
+			DX12_SUBMIT,
+			DX12_GPU_WAIT,
+			DX12_MOD_PIPELINE,
+			DX12_MOD_RESOURCE,
+			DX12_RENAME,
+			DX12_UPKEEP,
+			DX12_REACH,
+			DX12_FILTER,
+			DX12_DESCRIPTORS,
+			DX12_MIRROR,
+			RESOURCE_FILE_READ,
+			RESOURCE_FILE_SHARE,
+			DX12_UPLOAD_COPY,
+			VK_DRAW,
+			VK_TEXTURE_IMAGE,
+			VK_TEXTURE_COPY,
+			VK_MEMORY,
+			VK_TRANSFERS,
+
+			NUM_CATEGORIES, // Must be last
+		};
+		const Category FIRST_NESTED = RESOURCE_LOAD;
+
+		// In QueryPerformanceCounter ticks, 0 while disabled:
+		extern INT64 threshold;
+
+		// A frame is logged for taking threshold_ms, or relative times
+		// the recent average, whichever is given
+		void init(float threshold_ms, float relative, const wchar_t *log_dir);
+		void add(Category category, INT64 start, const wchar_t *name, UINT64 id);
+		void frame(bool mods_disabled = false);
+
+		// Things counted per frame for whoever has names for them,
+		// listed with the summaries and the slow frames
+		const unsigned NUM_REASONS = 32;
+		extern const wchar_t *reason_names[NUM_REASONS];
+		extern volatile LONG reason_counts[NUM_REASONS];
+		static inline void reason(unsigned index, const wchar_t *name)
+		{
+			if (!threshold || index >= NUM_REASONS)
+				return;
+			reason_names[index] = name;
+			InterlockedIncrement(&reason_counts[index]);
+		}
+
+		class Scope {
+			LARGE_INTEGER start;
+			Category category;
+			// Only read if the operation turns out slow enough to
+			// be listed by itself, so has to outlive the scope:
+			const wchar_t *name;
+			UINT64 id;
+		public:
+			Scope(Category category, const wchar_t *name = NULL, UINT64 id = 0) :
+				category(category), name(name), id(id)
+			{
+				start.QuadPart = 0;
+				if (threshold)
+					QueryPerformanceCounter(&start);
+			}
+
+			~Scope()
+			{
+				if (start.QuadPart)
+					add(category, start.QuadPart, name, id);
+			}
+		};
+	}
+
 }

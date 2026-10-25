@@ -13,30 +13,144 @@
 #include "log.h"
 #include "util.h"
 #include "globals.h"
+#include "profiling.h"
 
-#pragma region MappedFile
+#pragma region FileContents
 
-struct MemoryRangeEntry {
-	PVOID VirtualAddress;
-	SIZE_T NumberOfBytes;
-};
-typedef BOOL (WINAPI *PrefetchVirtualMemory_t)(HANDLE, ULONG_PTR, MemoryRangeEntry*, ULONG);
+// Idle read buffers, kept for the next file. A file bigger than the largest
+// kept size goes into the one large buffer, which is freed once it has gone
+// unused for a while: such files come in bursts when a mod is first drawn,
+// and a fresh buffer costs more in page faults than the read itself.
+static std::mutex read_buffers_lock;
+static std::vector<std::pair<uint8_t*, size_t>> read_buffers;
+static const size_t kept_read_buffers = 2;
+// A 64 MB texture is 64 MB and the DDS header
+static const size_t kept_read_buffer_size = 65 << 20;
+static uint8_t *large_read_buffer = nullptr;
+static size_t large_read_buffer_capacity = 0;
+static ULONGLONG large_read_buffer_idle_since = 0;
+static std::atomic<bool> large_read_buffer_kept{false};
+static const size_t kept_large_read_buffer_size = 512 << 20;
+static const ULONGLONG large_read_buffer_idle_ms = 5000;
 
-// Windows 8+; resolved at runtime so the DLL still loads on Windows 7,
-// where the pages are simply faulted in on first touch instead:
-static PrefetchVirtualMemory_t GetPrefetchVirtualMemory()
+// A file of two chunks or more is read by the thread pool as well as by the
+// loading thread, which waits for it anyway. Copying out of the file cache is
+// bound by one core, and a cold file is read at a higher queue depth:
+static const size_t read_chunk_size = 2 << 20;
+static const unsigned max_read_helpers = 3;
+
+struct SplitRead
 {
-	static PrefetchVirtualMemory_t fn = (PrefetchVirtualMemory_t)
-		GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
-	return fn;
+	HANDLE file;
+	uint8_t *buffer;
+	size_t size;
+	std::atomic<size_t> next{0};
+	std::atomic<DWORD> error{0};
+};
+
+static void ReadChunks(SplitRead *read)
+{
+	HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+	if (!event) {
+		DWORD expected = 0;
+		read->error.compare_exchange_strong(expected, GetLastError());
+		return;
+	}
+
+	for (;;) {
+		size_t at = read->next.fetch_add(read_chunk_size);
+		if (at >= read->size || read->error)
+			break;
+
+		DWORD len = (DWORD)std::min<size_t>(read_chunk_size, read->size - at), got = 0, error = 0;
+		OVERLAPPED overlapped = {};
+		overlapped.Offset = (DWORD)at;
+		overlapped.OffsetHigh = (DWORD)((uint64_t)at >> 32);
+		overlapped.hEvent = event;
+
+		BOOL ok = ReadFile(read->file, read->buffer + at, len, &got, &overlapped);
+		if (!ok && GetLastError() == ERROR_IO_PENDING)
+			ok = GetOverlappedResult(read->file, &overlapped, &got, TRUE);
+		if (!ok)
+			error = GetLastError();
+		else if (got != len)
+			error = ERROR_HANDLE_EOF;
+		if (error) {
+			DWORD expected = 0;
+			read->error.compare_exchange_strong(expected, error);
+			break;
+		}
+	}
+	CloseHandle(event);
 }
 
-MappedFile::MappedFile(const wchar_t *path)
+static void CALLBACK ReadChunksCallback(PTP_CALLBACK_INSTANCE instance, void *context, PTP_WORK work)
+{
+	ReadChunks((SplitRead*)context);
+}
+
+static unsigned ReadHelpers()
+{
+	static unsigned helpers = std::min<unsigned>(max_read_helpers, std::max<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), 1) - 1);
+	return helpers;
+}
+
+// Returns 0 or the error of the first chunk that could not be read
+static DWORD ReadWhole(HANDLE file, uint8_t *buffer, size_t size)
+{
+	SplitRead read;
+	PTP_WORK work = NULL;
+	// Below two chunks a helper would cost more than it reads
+	unsigned helpers = (unsigned)std::min<size_t>(ReadHelpers(), std::max<size_t>(size / read_chunk_size, 1) - 1);
+
+	read.file = file;
+	read.buffer = buffer;
+	read.size = size;
+
+	if (helpers)
+		work = CreateThreadpoolWork(ReadChunksCallback, &read, NULL);
+	for (unsigned i = 0; work && i < helpers; i++)
+		SubmitThreadpoolWork(work);
+
+	ReadChunks(&read);
+
+	if (work) {
+		// Helpers still reading are waited for. One that has not
+		// started is cancelled: nothing is left for it to read.
+		WaitForThreadpoolWorkCallbacks(work, TRUE);
+		CloseThreadpoolWork(work);
+	}
+	return read.error;
+}
+
+void ReleaseIdleReadBuffers()
+{
+	uint8_t *released = nullptr;
+
+	if (!large_read_buffer_kept.load(std::memory_order_relaxed))
+		return;
+
+	{
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		if (!large_read_buffer || GetTickCount64() - large_read_buffer_idle_since < large_read_buffer_idle_ms)
+			return;
+		released = large_read_buffer;
+		large_read_buffer = nullptr;
+		large_read_buffer_capacity = 0;
+		large_read_buffer_kept = false;
+	}
+	VirtualFree(released, 0, MEM_RELEASE);
+}
+
+FileContents::FileContents(const wchar_t *path)
 {
 	LARGE_INTEGER file_size;
+	HANDLE file;
+	size_t want;
 
 	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, NULL);
 	if (file == INVALID_HANDLE_VALUE) {
 		error = GetLastError();
 		return;
@@ -47,20 +161,156 @@ MappedFile::MappedFile(const wchar_t *path)
 		error = GetLastError();
 		if (!error)
 			error = ERROR_FILE_INVALID;
+		CloseHandle(file);
 		return;
 	}
+	want = (size_t)file_size.QuadPart;
+
+	if (want <= kept_read_buffer_size) {
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		auto best = read_buffers.end();
+		for (auto i = read_buffers.begin(); i != read_buffers.end(); i++) {
+			if (best == read_buffers.end() || i->second > best->second)
+				best = i;
+		}
+		if (best != read_buffers.end()) {
+			buffer = best->first;
+			capacity = best->second;
+			read_buffers.erase(best);
+		}
+	} else {
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		if (large_read_buffer && large_read_buffer_capacity >= want) {
+			buffer = large_read_buffer;
+			capacity = large_read_buffer_capacity;
+			large_read_buffer = nullptr;
+			large_read_buffer_capacity = 0;
+			large_read_buffer_kept = false;
+		}
+	}
+	if (capacity < want) {
+		if (buffer)
+			VirtualFree(buffer, 0, MEM_RELEASE);
+		capacity = (want + 0xfffff) & ~(size_t)0xfffff;
+		buffer = (uint8_t*)VirtualAlloc(NULL, capacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		if (!buffer) {
+			capacity = 0;
+			error = ERROR_NOT_ENOUGH_MEMORY;
+			CloseHandle(file);
+			return;
+		}
+	}
+
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_READ, path, want);
+		error = ReadWhole(file, buffer, want);
+	}
+	CloseHandle(file);
+	if (error)
+		return;
+
+	data = buffer;
+	size = want;
+}
+
+FileContents::~FileContents()
+{
+	if (!buffer)
+		return;
+
+	if (capacity <= kept_read_buffer_size) {
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		if (read_buffers.size() < kept_read_buffers) {
+			read_buffers.push_back({ buffer, capacity });
+			return;
+		}
+	} else if (capacity <= kept_large_read_buffer_size) {
+		std::lock_guard<std::mutex> lock(read_buffers_lock);
+		// Of two, the bigger one is kept
+		if (large_read_buffer_capacity < capacity) {
+			std::swap(buffer, large_read_buffer);
+			std::swap(capacity, large_read_buffer_capacity);
+		}
+		large_read_buffer_idle_since = GetTickCount64();
+		large_read_buffer_kept = true;
+	}
+	if (buffer)
+		VirtualFree(buffer, 0, MEM_RELEASE);
+}
+
+#pragma endregion FileContents
+
+#pragma region MappedFile
+
+struct MemoryRangeEntry {
+	PVOID VirtualAddress;
+	SIZE_T NumberOfBytes;
+};
+typedef BOOL (WINAPI *PrefetchVirtualMemory_t)(HANDLE, ULONG_PTR, MemoryRangeEntry*, ULONG);
+
+// Windows 8+; resolved at runtime so the DLL still loads on Windows 7,
+// where the prefetch thread reads the files through a scratch buffer:
+static PrefetchVirtualMemory_t GetPrefetchVirtualMemory()
+{
+	static PrefetchVirtualMemory_t fn = (PrefetchVirtualMemory_t)
+		GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+	return fn;
+}
+
+typedef BOOL (WINAPI *SetThreadInformation_t)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+
+// Windows 8+ as well
+static SetThreadInformation_t GetSetThreadInformation()
+{
+	static SetThreadInformation_t fn = (SetThreadInformation_t)
+		GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+	return fn;
+}
+
+// Read-only view of a whole file, only there so that prefetch() can ask the
+// OS to read the file into its file cache at the thread's low I/O priority
+// without copying it anywhere. That is a hint: the OS may read only part of
+// the file, or nothing.
+class MappedFile
+{
+public:
+	explicit MappedFile(const wchar_t *path);
+	~MappedFile();
+
+	MappedFile(const MappedFile&) = delete;
+	MappedFile& operator=(const MappedFile&) = delete;
+
+	bool valid() const { return data != nullptr; }
+	void prefetch() const;
+
+	const uint8_t *data = nullptr;
+	size_t size = 0;
+
+private:
+	HANDLE file = INVALID_HANDLE_VALUE;
+	HANDLE mapping = NULL;
+};
+
+MappedFile::MappedFile(const wchar_t *path)
+{
+	LARGE_INTEGER file_size;
+
+	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return;
+
+	if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0
+			|| (uint64_t)file_size.QuadPart > (uint64_t)SIZE_MAX)
+		return;
 
 	mapping = CreateFileMappingW(file, NULL, PAGE_READONLY, 0, 0, NULL);
-	if (!mapping) {
-		error = GetLastError();
+	if (!mapping)
 		return;
-	}
 
 	data = (const uint8_t*)MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
-	if (!data) {
-		error = GetLastError();
+	if (!data)
 		return;
-	}
 
 	size = (size_t)file_size.QuadPart;
 }
@@ -118,7 +368,7 @@ static std::unordered_map<uint64_t, std::vector<SharedEntry>> shared_resources;
 
 static bool FileContentsEqual(const std::wstring &path, const void *data, size_t size)
 {
-	MappedFile file(path.c_str());
+	FileContents file(path.c_str());
 
 	return file.valid() && file.size == size && !memcmp(file.data, data, size);
 }
@@ -127,6 +377,7 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 {
 	std::vector<SharedEntry> candidates;
 	ID3D11Resource *match = nullptr;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_SHARE, L"bytes", size);
 
 	// Hashed from the data the caller is about to upload, never from the
 	// file at some later point, so an entry always describes what its
@@ -269,7 +520,7 @@ static bool AppendToFileLog(const std::wstring &path, unsigned age)
 static ResourceFileLog LoadResourceFileLog()
 {
 	std::wstring path = PrefetchLogPath();
-	MappedFile file(path.c_str());
+	FileContents file(path.c_str());
 	std::unordered_set<std::wstring> seen;
 	ResourceFileLog lines, log;
 	const char *p, *end, *line, *tab;
@@ -391,8 +642,15 @@ static DWORD WINAPI PrefetchThread(LPVOID param)
 	ResourceFileLog *log = (ResourceFileLog*)param;
 
 	// Background mode lowers the CPU, I/O and memory priority of this
-	// thread so that it yields to the game's own loading:
+	// thread so that it yields to the game's own loading. The memory
+	// priority goes back up: pages read at the lowest one are the first
+	// the system takes back when the game allocates, so they were gone
+	// again by the time a mod was first drawn.
 	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+	if (SetThreadInformation_t set_info = GetSetThreadInformation()) {
+		MEMORY_PRIORITY_INFORMATION normal = { MEMORY_PRIORITY_NORMAL };
+		set_info(GetCurrentThread(), ThreadMemoryPriority, &normal, sizeof(normal));
+	}
 	PrefetchFiles(*log);
 	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
 	delete log;

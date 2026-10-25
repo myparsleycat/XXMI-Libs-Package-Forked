@@ -517,6 +517,14 @@ struct Globals
 	std::unordered_set<void*> frame_analysis_seen_rts;
 
 	ShaderHashType shader_hash_type;
+	bool extended_rendering;
+	bool dx12_dump_hashes;
+	bool dx12_debug_layer;
+	bool dx12_evict_idle;
+	UINT dx12_evict_idle_seconds;
+	UINT dx12_evict_budget_percent;
+	bool vk_dump_hashes;
+	bool vk_buffers_first;
 	bool track_region_hashes;
 	DataCacheBindFlags cache_resource_data = (DataCacheBindFlags)0;
 	bool track_implicit_index_buffers;
@@ -629,6 +637,9 @@ struct Globals
 	// to invalidate the lookups each context caches for its draw calls
 	// (HackerContext::LookupShaderOverride):
 	unsigned shader_override_generation;
+	// Bumped whenever an entry is added to or taken out of mShaders or
+	// mReloadedShaders, see HackerContext::LookupShaderHandle():
+	unsigned shader_handle_generation;
 
 	std::set<UINT64> mVisitedComputeShaders;
 	UINT64 mSelectedComputeShader;
@@ -743,6 +754,7 @@ struct Globals
 		mPinkingShader(0),
 		deferred_shader_generation(0),
 		shader_override_generation(1), // 0 marks unused cache entries
+		shader_handle_generation(1), // likewise
 
 		hunting(HUNTING_MODE_DISABLED),
 		overlay_buffer_hash_lifetime(-1),
@@ -764,6 +776,14 @@ struct Globals
 		cur_analyse_options(FrameAnalysisOptions::INVALID),
 
 		shader_hash_type(ShaderHashType::FNV),
+		extended_rendering(true),
+		dx12_dump_hashes(false),
+		dx12_debug_layer(false),
+		dx12_evict_idle(true),
+		dx12_evict_idle_seconds(10),
+		dx12_evict_budget_percent(75),
+		vk_dump_hashes(false),
+		vk_buffers_first(false),
 		track_region_hashes(false),
 		track_implicit_index_buffers(false),
 		any_override_byte_width(false),
@@ -776,7 +796,7 @@ struct Globals
 		EXPORT_HLSL(0),
 		EXPORT_FIXED(false),
 		EXPORT_BINARY(false),
-		CACHE_SHADERS(false),
+		CACHE_SHADERS(true),
 		DumpUsage(false),
 		ENABLE_TUNE(false),
 		gTuneStep(0.001f),
@@ -830,7 +850,7 @@ struct Globals
 		gFallbackScreenHeight(0),
 		gForceDetectColorSpace(false),
 		share_duplicate_resources(true),
-		prefetch_resource_files(false),
+		prefetch_resource_files(true),
 		dump_all_profiles(false),
 		gSystemTickCount(0),
 		gTime(0),

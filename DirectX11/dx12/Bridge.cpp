@@ -1,0 +1,1613 @@
+#include "Bridge.h"
+
+#include <algorithm>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+#include "Dx12CommandList.h"
+#include "Dx12CommandQueue.h"
+#include "Dx12Device.h"
+#include "DrawPath.h"
+#include "ShimContext.h"
+#include "ShimDevice.h"
+#include "ShimPipeline.h"
+#include "HashDump.h"
+#include "ResourceTracker.h"
+
+#include "util.h"
+
+#include "../globals.h"
+#include "../HackerContext.h"
+#include "../HackerDevice.h"
+#include "../IniHandler.h"
+#include "../profiling.h"
+
+Dx12Shim *dx12_shim;
+bool dx12_unloading;
+std::atomic<bool> dx12_d3d11_presented;
+
+// dx12_shim for Dx12IsD3D11Game, which is called without the shim's lock
+static std::atomic<bool> shim_created;
+
+bool Dx12IsD3D11Game()
+{
+	return dx12_d3d11_presented && !shim_created;
+}
+UINT dx12_shim_epoch = 1;
+UINT dx12_shim_view_increment;
+
+static Dx12Shim shim;
+
+struct Allocator {
+	ID3D12CommandAllocator *allocator;
+	// Of the last submission recorded with it
+	UINT64 fence;
+};
+
+static std::vector<Allocator> allocators;
+static size_t current_allocator;
+static ID3D12GraphicsCommandList *shim_list;
+static bool list_open;
+// Read without the lock by Dx12ShimFlush
+static volatile bool list_used;
+
+// See Dx12ShimEarlyList
+static ID3D12GraphicsCommandList *early_list;
+static std::vector<Allocator> early_allocators;
+static size_t current_early_allocator;
+static bool early_open;
+static void (*before_submit)();
+
+static ID3D12Fence *fence;
+static UINT64 fence_signalled;
+static HANDLE fence_event;
+
+struct Retired {
+	IUnknown *object;
+	UINT64 fence;
+};
+static std::deque<Retired> retired;
+
+// What the lists executed on another queue than ours pinned is held until a
+// fence of our own that queue signals says they are done with it
+struct ForeignQueue {
+	// Referenced
+	ID3D12CommandQueue *queue;
+	// NULL if none could be made, which is not tried again
+	ID3D12Fence *fence;
+	UINT64 signalled;
+	std::deque<Retired> retired;
+	// Not referenced, each is in retired with the same value: what its
+	// lists use of our resources until it is done with them, see game_uses
+	std::deque<Retired> uses;
+	// The value of our own fence it was last made to wait for
+	UINT64 waited;
+	// Whether it is one of dx12_unordered_queues, the frame until which
+	// it stays one at least, and for how many frames it was made one
+	// the last time, which is twice that the next time
+	bool unordered;
+	UINT unordered_until;
+	UINT unordered_frames;
+};
+static std::vector<ForeignQueue*> foreign_queues;
+static ForeignQueue* foreign_queue(ID3D12CommandQueue *queue);
+// What was pinned by lists executed on a queue that could not be given a
+// fence: nothing tells when that queue is done with it, so it is kept for
+// good rather than handed out again too soon
+static std::vector<IUnknown*> stranded;
+static void release_retired();
+
+static std::vector<ShimResource*> touched;
+
+// How many unexecuted lists of the game use each D3D12 resource of ours,
+// counting only what Dx12ShimUseOnGameList pinned. An execution on another
+// queue than ours counts too until that queue is done with it: what we write
+// after handing it the list is not after it for the GPU.
+static std::unordered_map<IUnknown*, UINT> game_uses;
+
+// With the lock held
+static void end_game_use(IUnknown *object)
+{
+	auto found = game_uses.find(object);
+
+	if (found != game_uses.end() && !--found->second)
+		game_uses.erase(found);
+}
+
+static void end_game_uses(const std::vector<IUnknown*> *pins)
+{
+	for (IUnknown *object : *pins)
+		end_game_use(object);
+}
+
+static bool game_list_uses(IUnknown *object)
+{
+	return !game_uses.empty() && game_uses.count(object);
+}
+
+static CRITICAL_SECTION shim_lock;
+static INIT_ONCE shim_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK init_shim_lock(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+	// Held for a draw of the game at a time by the threads recording its
+	// command lists, which is short enough to wait out without sleeping
+	InitializeCriticalSectionAndSpinCount(&shim_lock, 4000);
+	return TRUE;
+}
+
+void Dx12ShimLock()
+{
+	InitOnceExecuteOnce(&shim_lock_once, init_shim_lock, NULL, NULL);
+	// Only a contended lock is worth the cost of timing it:
+	if (!Profiling::Spike::threshold) {
+		EnterCriticalSection(&shim_lock);
+		return;
+	}
+	if (TryEnterCriticalSection(&shim_lock))
+		return;
+	Profiling::Spike::Scope spike(Profiling::Spike::LOCK_WAIT, L"the D3D12 shim's");
+	EnterCriticalSection(&shim_lock);
+}
+
+void Dx12ShimUnlock()
+{
+	LeaveCriticalSection(&shim_lock);
+}
+
+bool Dx12ShimLockHeld()
+{
+	return shim_lock.OwningThread == (HANDLE)(ULONG_PTR)GetCurrentThreadId();
+}
+
+void Dx12ShimNotImplemented(const char *method, bool *reported)
+{
+	if (*reported)
+		return;
+	*reported = true;
+	Dx12LogInfo("*** %s is not implemented on D3D12\n", method);
+}
+
+void Dx12LogDebugMessages()
+{
+	static const char *const severities[] = { "corruption", "error", "warning", "info", "message" };
+	static unsigned logged;
+	static bool said;
+	static std::unordered_map<int, unsigned> noted;
+	ID3D12InfoQueue *queue;
+	D3D12_MESSAGE *message;
+	std::vector<BYTE> storage;
+	UINT64 count, i;
+	SIZE_T length;
+
+	if (!G->dx12_debug_layer)
+		return;
+	if (FAILED(shim.device->QueryInterface(IID_PPV_ARGS(&queue)))) {
+		if (!said)
+			Dx12DumpNote("*** dx12_debug_layer: the device has no debug layer, which comes with the Graphics Tools optional feature of Windows\n");
+		said = true;
+		return;
+	}
+	if (!said)
+		Dx12DumpNote("dx12_debug_layer: the debug layer is on, its errors and warnings follow as they come\n");
+	said = true;
+
+	count = queue->GetNumStoredMessages();
+	for (i = 0; i < count; i++) {
+		length = 0;
+		queue->GetMessage(i, NULL, &length);
+		storage.resize(length);
+		message = (D3D12_MESSAGE*)storage.data();
+		if (FAILED(queue->GetMessage(i, message, &length)))
+			continue;
+		// A mistake repeated every frame would fill the disk, and one
+		// kind of them is not to keep the others out
+		if (message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+			if (noted[message->ID]++ >= 8)
+				continue;
+			// The log may be off where the report is on
+			Dx12DumpNote("*** debug layer %s %d: %s\n", severities[min(message->Severity, 4)], message->ID, message->pDescription);
+		} else if (logged++ >= 1000) {
+			continue;
+		}
+		Dx12LogInfo("debug layer %s %d: %s\n", severities[min(message->Severity, 4)], message->ID, message->pDescription);
+	}
+	queue->ClearStoredMessages();
+	queue->Release();
+}
+
+// -----------------------------------------------------------------------------
+// Upload memory
+
+const UINT64 UPLOAD_PAGE_SIZE = 4 << 20;
+const size_t UPLOAD_PAGES_KEPT = 8;
+
+struct UploadPage {
+	ID3D12Resource *buffer;
+	BYTE *cpu;
+	UINT64 va;
+	UINT64 used;
+	UINT64 fence;
+	// Of a big one, see upload_big_idle, and when it was last retired
+	UINT64 capacity;
+	ULONGLONG retired_time;
+};
+static std::vector<UploadPage> upload_active;
+static std::vector<UploadPage> upload_idle;
+// An upload larger than a quarter of a page has a buffer to itself. Those
+// are kept a while for the next ones, up to UPLOAD_BIG_KEPT bytes: a mod that
+// appears uploads up to hundreds of MB in a frame or two, and making an
+// upload buffer waits on the CPU until it is resident, which takes up to
+// 100 ms for one of 128 MB while the game is loading too. Kept long enough
+// for the next characters loaded in the same burst, e.g. looked at one after
+// another in a menu.
+const UINT64 UPLOAD_BIG_KEPT = 512 << 20;
+const ULONGLONG UPLOAD_BIG_IDLE_MS = 15000;
+// Big ones are this much apart in size: rounding up to powers of two made
+// 128 MB of a 100 MB texture
+const UINT64 UPLOAD_BIG_STEP = 16 << 20;
+static std::vector<UploadPage> upload_big_active;
+static std::vector<UploadPage> upload_big_idle;
+static UINT64 upload_big_idle_bytes;
+static bool upload_not_zeroed_refused;
+
+// not_zeroed only for a buffer whose every byte the GPU reads is written
+// first, which the copies out of a big upload buffer are
+static bool create_upload_buffer(UINT64 size, UploadPage *page, bool not_zeroed = false)
+{
+	D3D12_HEAP_PROPERTIES heap = {};
+	D3D12_RESOURCE_DESC desc = {};
+	D3D12_RANGE no_read = {};
+	HRESULT hr = E_FAIL;
+
+	heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = size;
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	*page = {};
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, L"upload page");
+
+	// Saves the clearing of the memory. Windows before 10 2004 refuses the
+	// flag.
+	if (not_zeroed && !upload_not_zeroed_refused) {
+		hr = shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer));
+		if (FAILED(hr))
+			upload_not_zeroed_refused = true;
+	}
+	if (FAILED(hr) && FAILED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer)))) {
+		Dx12LogInfo("*** Failed to create a %llu byte upload buffer\n", size);
+		return false;
+	}
+	if (FAILED(page->buffer->Map(0, &no_read, (void**)&page->cpu))) {
+		page->buffer->Release();
+		return false;
+	}
+	page->va = page->buffer->GetGPUVirtualAddress();
+	return true;
+}
+
+BYTE* Dx12ShimUpload(UINT64 size, UINT64 alignment, ID3D12Resource **buffer, UINT64 *offset, UINT64 *va)
+{
+	UINT64 completed, start;
+	UploadPage page;
+	size_t i;
+
+	if (size > UPLOAD_PAGE_SIZE / 4) {
+		auto best = upload_big_idle.end();
+
+		completed = fence->GetCompletedValue();
+		for (auto it = upload_big_idle.begin(); it != upload_big_idle.end(); it++) {
+			if (it->fence <= completed && it->capacity >= size
+					&& (best == upload_big_idle.end() || it->capacity < best->capacity))
+				best = it;
+		}
+		if (best != upload_big_idle.end()) {
+			page = *best;
+			upload_big_idle.erase(best);
+			upload_big_idle_bytes -= page.capacity;
+		} else {
+			// Rounded up so that it fits more of the next ones
+			UINT64 capacity = UPLOAD_PAGE_SIZE;
+			while (capacity < size && capacity < UPLOAD_BIG_STEP)
+				capacity *= 2;
+			if (capacity < size)
+				capacity = (size + UPLOAD_BIG_STEP - 1) / UPLOAD_BIG_STEP * UPLOAD_BIG_STEP;
+			if (!create_upload_buffer(capacity, &page, true))
+				return NULL;
+			page.capacity = capacity;
+		}
+		upload_big_active.push_back(page);
+		if (buffer)
+			*buffer = page.buffer;
+		if (offset)
+			*offset = 0;
+		if (va)
+			*va = page.va;
+		return page.cpu;
+	}
+
+	start = UPLOAD_PAGE_SIZE;
+	if (!upload_active.empty())
+		start = (upload_active.back().used + alignment - 1) / alignment * alignment;
+
+	if (start + size > UPLOAD_PAGE_SIZE) {
+		completed = fence->GetCompletedValue();
+		for (i = 0; i < upload_idle.size(); i++) {
+			if (upload_idle[i].fence <= completed)
+				break;
+		}
+		if (i < upload_idle.size()) {
+			page = upload_idle[i];
+			upload_idle.erase(upload_idle.begin() + i);
+		} else if (!create_upload_buffer(UPLOAD_PAGE_SIZE, &page)) {
+			return NULL;
+		} else {
+			InterlockedIncrement64(&dx12_stats.upload_pages_created);
+		}
+		page.used = 0;
+		upload_active.push_back(page);
+		start = 0;
+	}
+
+	UploadPage &active = upload_active.back();
+	active.used = start + size;
+	if (buffer)
+		*buffer = active.buffer;
+	if (offset)
+		*offset = start;
+	if (va)
+		*va = active.va + start;
+	return active.cpu + start;
+}
+
+// Also called at every present, as nothing may be submitted for a while
+static void release_idle_upload_buffers(UINT64 completed, ULONGLONG now)
+{
+	// Over UPLOAD_BIG_KEPT, the oldest go first
+	for (size_t i = 0; i < upload_big_idle.size(); ) {
+		UploadPage &page = upload_big_idle[i];
+		if (page.fence > completed || (upload_big_idle_bytes <= UPLOAD_BIG_KEPT
+				&& now - page.retired_time < UPLOAD_BIG_IDLE_MS)) {
+			i++;
+			continue;
+		}
+		upload_big_idle_bytes -= page.capacity;
+		page.buffer->Release();
+		upload_big_idle.erase(upload_big_idle.begin() + i);
+	}
+}
+
+static void retire_upload_pages()
+{
+	UINT64 completed = fence->GetCompletedValue();
+	ULONGLONG now = GetTickCount64();
+	size_t i, keep = 0;
+
+	// Keep filling the last page where this submission left off, or every
+	// submission with something small to upload would take a page of its
+	// own. It gets the fence value of the last submission that used it
+	// when it is retired.
+	if (!upload_active.empty() && upload_active.back().used < UPLOAD_PAGE_SIZE)
+		keep = 1;
+
+	for (i = 0; i + keep < upload_active.size(); i++) {
+		upload_active[i].fence = fence_signalled;
+		upload_idle.push_back(upload_active[i]);
+	}
+	upload_active.erase(upload_active.begin(), upload_active.end() - keep);
+
+	for (UploadPage &page : upload_big_active) {
+		page.fence = fence_signalled;
+		page.retired_time = now;
+		upload_big_idle.push_back(page);
+		upload_big_idle_bytes += page.capacity;
+	}
+	upload_big_active.clear();
+	release_idle_upload_buffers(completed, now);
+
+	for (i = upload_idle.size(); i-- > 0 && upload_idle.size() > UPLOAD_PAGES_KEPT;) {
+		if (upload_idle[i].fence > completed)
+			continue;
+		upload_idle[i].buffer->Release();
+		upload_idle.erase(upload_idle.begin() + i);
+		InterlockedIncrement64(&dx12_stats.upload_pages_released);
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Descriptors shaders can use
+
+const UINT VIEW_PAGE_SIZE = 4096;
+const UINT SAMPLER_PAGE_SIZE = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+
+struct DescriptorPage {
+	ID3D12DescriptorHeap *heap;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+	UINT used;
+	UINT64 fence;
+};
+
+struct DescriptorPages {
+	D3D12_DESCRIPTOR_HEAP_TYPE type;
+	UINT size;
+	UINT increment;
+	// heap is NULL until the first allocation
+	DescriptorPage current;
+	std::vector<DescriptorPage> idle;
+};
+static DescriptorPages view_pages = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, VIEW_PAGE_SIZE };
+static DescriptorPages sampler_pages = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, SAMPLER_PAGE_SIZE };
+
+static std::map<std::vector<SIZE_T>, UINT> sampler_tables;
+static ID3D12DescriptorHeap *bound_view_heap;
+static ID3D12DescriptorHeap *bound_sampler_heap;
+
+static bool next_descriptor_page(DescriptorPages *pages)
+{
+	UINT64 completed = fence->GetCompletedValue();
+	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+	DescriptorPage page = {};
+	size_t i;
+
+	if (pages->current.heap) {
+		pages->current.fence = Dx12ShimPendingFence();
+		pages->idle.push_back(pages->current);
+		pages->current = {};
+	}
+
+	for (i = 0; i < pages->idle.size(); i++) {
+		if (pages->idle[i].fence <= completed) {
+			pages->current = pages->idle[i];
+			pages->current.used = 0;
+			pages->idle.erase(pages->idle.begin() + i);
+			return true;
+		}
+	}
+
+	desc.Type = pages->type;
+	desc.NumDescriptors = pages->size;
+	desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	if (FAILED(shim.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&page.heap)))) {
+		Dx12LogInfo("*** Failed to create a shader visible descriptor heap of type %d\n", pages->type);
+		return false;
+	}
+	page.cpu = page.heap->GetCPUDescriptorHandleForHeapStart();
+	page.gpu = page.heap->GetGPUDescriptorHandleForHeapStart();
+	pages->current = page;
+	return true;
+}
+
+static bool reserve_descriptors(DescriptorPages *pages, UINT count)
+{
+	if (pages->current.heap && pages->current.used + count <= pages->size)
+		return true;
+	return count <= pages->size && next_descriptor_page(pages);
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimAllocViews(UINT count, D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+{
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu = {};
+
+	*gpu = {};
+	if (!reserve_descriptors(&view_pages, count))
+		return cpu;
+
+	cpu.ptr = view_pages.current.cpu.ptr + (SIZE_T)view_pages.current.used * view_pages.increment;
+	gpu->ptr = view_pages.current.gpu.ptr + (UINT64)view_pages.current.used * view_pages.increment;
+	view_pages.current.used += count;
+	return cpu;
+}
+
+void Dx12ShimReserveSamplers(UINT count)
+{
+	ID3D12DescriptorHeap *heap = sampler_pages.current.heap;
+
+	reserve_descriptors(&sampler_pages, count);
+	if (sampler_pages.current.heap != heap)
+		sampler_tables.clear();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE Dx12ShimSamplerTable(const D3D12_CPU_DESCRIPTOR_HANDLE *samplers, UINT count)
+{
+	DescriptorPage *page = &sampler_pages.current;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu = {};
+	std::vector<SIZE_T> key(count);
+	UINT i, start;
+
+	if (!page->heap || page->used + count > sampler_pages.size)
+		return gpu;
+
+	for (i = 0; i < count; i++)
+		key[i] = samplers[i].ptr;
+
+	auto found = sampler_tables.find(key);
+	if (found != sampler_tables.end()) {
+		start = found->second;
+	} else {
+		start = page->used;
+		page->used += count;
+		cpu.ptr = page->cpu.ptr + (SIZE_T)start * sampler_pages.increment;
+		shim.device->CopyDescriptors(1, &cpu, &count, count, samplers, NULL, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+		sampler_tables[key] = start;
+	}
+
+	gpu.ptr = page->gpu.ptr + (UINT64)start * sampler_pages.increment;
+	return gpu;
+}
+
+void Dx12ShimBindHeaps()
+{
+	ID3D12DescriptorHeap *heaps[2];
+	UINT count = 0;
+
+	if (view_pages.current.heap == bound_view_heap && sampler_pages.current.heap == bound_sampler_heap)
+		return;
+
+	bound_view_heap = view_pages.current.heap;
+	bound_sampler_heap = sampler_pages.current.heap;
+	if (bound_view_heap)
+		heaps[count++] = bound_view_heap;
+	if (bound_sampler_heap)
+		heaps[count++] = bound_sampler_heap;
+	if (count)
+		Dx12ShimList()->SetDescriptorHeaps(count, heaps);
+}
+
+// -----------------------------------------------------------------------------
+// Descriptors of views and samplers
+
+struct DescriptorPool {
+	UINT chunk;
+	UINT increment;
+	std::vector<ID3D12DescriptorHeap*> heaps;
+	std::vector<SIZE_T> free;
+};
+static DescriptorPool pools[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES] = { { 4096 }, { 256 }, { 256 }, { 64 } };
+
+D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimAllocDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE type)
+{
+	DescriptorPool *pool = &pools[type];
+	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+	D3D12_CPU_DESCRIPTOR_HANDLE handle = {};
+	ID3D12DescriptorHeap *heap;
+	SIZE_T start;
+	UINT i;
+
+	if (pool->free.empty()) {
+		desc.Type = type;
+		desc.NumDescriptors = pool->chunk;
+		if (FAILED(shim.device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap)))) {
+			Dx12LogInfo("*** Failed to create a descriptor heap of type %d\n", type);
+			return handle;
+		}
+		pool->heaps.push_back(heap);
+		start = heap->GetCPUDescriptorHandleForHeapStart().ptr;
+		for (i = pool->chunk; i-- > 0;)
+			pool->free.push_back(start + (SIZE_T)i * pool->increment);
+	}
+
+	handle.ptr = pool->free.back();
+	pool->free.pop_back();
+	return handle;
+}
+
+void Dx12ShimFreeDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE type, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+{
+	if (!handle.ptr)
+		return;
+
+	pools[type].free.push_back(handle.ptr);
+	// The next sampler to get this descriptor must not be taken for the
+	// one that had it
+	if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+		sampler_tables.clear();
+}
+
+// -----------------------------------------------------------------------------
+// Resource states
+
+const D3D12_RESOURCE_STATES READ_STATES = D3D12_RESOURCE_STATE_GENERIC_READ
+	| D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+
+static bool read_only(D3D12_RESOURCE_STATES state)
+{
+	return state && !(state & ~READ_STATES);
+}
+
+bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state)
+{
+	D3D12_RESOURCE_BARRIER barrier = {};
+
+	if (!resource->resource || !Dx12ShimUseResource(resource))
+		return false;
+
+	if (!resource->deferred_writes.empty() && !ShimApplyDeferredWrites(resource))
+		return false;
+	if (resource->write_pending)
+		ShimFlushWrite(resource);
+
+	// What is about to be written is in use by lists of the game that
+	// were recorded before and will be executed after: they keep it as it
+	// is, see Bridge.h
+	if ((state & ~READ_STATES) && !resource->foreign && game_list_uses(resource->resource))
+		ShimRenameResource(resource);
+	if (state & ~READ_STATES)
+		resource->version++;
+
+	if (!resource->foreign && resource->touched_epoch != dx12_shim_epoch) {
+		resource->touched_epoch = dx12_shim_epoch;
+		touched.push_back(resource);
+	}
+
+	if (resource->state == state) {
+		if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+			barrier.UAV.pResource = resource->resource;
+			Dx12ShimList()->ResourceBarrier(1, &barrier);
+		}
+		return true;
+	}
+
+	if (read_only(resource->state) && read_only(state)) {
+		if ((resource->state & state) == state)
+			return true;
+		state |= resource->state;
+	}
+
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = resource->resource;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = resource->state;
+	barrier.Transition.StateAfter = state;
+	Dx12ShimList()->ResourceBarrier(1, &barrier);
+	resource->state = state;
+	return true;
+}
+
+void Dx12ShimForgetResource(ShimResource *resource)
+{
+	size_t i;
+
+	for (i = 0; i < touched.size(); i++) {
+		if (touched[i] == resource) {
+			touched.erase(touched.begin() + i);
+			return;
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Residency
+
+// Smaller resources are not worth the time it takes to make them resident
+const UINT64 EVICTED_BYTES_MIN = 1 << 20;
+const ULONGLONG EVICT_INTERVAL_MS = 1000;
+
+static std::vector<ShimResource*> residents;
+// GetTickCount64 at the last present, for Dx12ShimUseResource
+static ULONGLONG present_time;
+static ULONGLONG evicted_time;
+// Counts the presents, and the one after which making a resource resident
+// again last failed
+static UINT presents = 1, failed_present;
+
+void Dx12ShimTrackResidency(ShimResource *resource, bool tracked)
+{
+	if (tracked) {
+		resource->residency_index = residents.size();
+		resource->used_time = present_time;
+		residents.push_back(resource);
+		return;
+	}
+
+	residents.back()->residency_index = resource->residency_index;
+	residents[resource->residency_index] = residents.back();
+	residents.pop_back();
+	if (resource->evicted) {
+		resource->evicted = false;
+		dx12_memory.evicted--;
+		dx12_memory.evicted_bytes -= resource->allocated;
+	}
+}
+
+bool Dx12ShimProcessMemory(DXGI_QUERY_VIDEO_MEMORY_INFO *info)
+{
+	static IDXGIAdapter3 *adapter;
+	static bool failed;
+	IDXGIFactory4 *factory;
+
+	if (!adapter && !failed) {
+		failed = true;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+			failed = FAILED(factory->EnumAdapterByLuid(shim.device->GetAdapterLuid(), IID_PPV_ARGS(&adapter)));
+			factory->Release();
+		}
+	}
+	return adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, info));
+}
+
+// Nothing recorded or executed, or yet to be, uses it: none of our
+// submissions since the GPU finished the last that did, nothing recorded on
+// our list since (touched in this epoch is not enough: the fence also moves
+// on for the game's lists while ours stays empty), and no list of the game,
+// which keeps a reference until it has been executed (Dx12ShimPin), as does
+// whatever else is yet to use it
+static bool resource_idle(ShimResource *resource, ULONGLONG idle_since)
+{
+	if (resource->evicted || resource->foreign || !resource->resource || resource->allocated < EVICTED_BYTES_MIN
+	    || resource->used_time > idle_since || !Dx12ShimFenceReached(resource->used_fence)
+	    || (resource->touched_epoch == dx12_shim_epoch && (list_used || resource->state != D3D12_RESOURCE_STATE_COMMON)))
+		return false;
+	resource->resource->AddRef();
+	return resource->resource->Release() == 1;
+}
+
+// Evicts the resources idle since then, oldest first, until that many bytes
+// are freed. Whether any was.
+static bool evict(UINT64 bytes, ULONGLONG idle_since)
+{
+	std::vector<std::pair<ULONGLONG, ShimResource*>> idle;
+	std::vector<ID3D12Pageable*> pageables;
+	UINT64 freed = 0;
+
+	for (ShimResource *resource : residents) {
+		if (resource_idle(resource, idle_since))
+			idle.push_back({ resource->used_time, resource });
+	}
+	std::sort(idle.begin(), idle.end());
+	for (auto &entry : idle) {
+		if (freed >= bytes)
+			break;
+		// Its transition to the common state at the next submission
+		// has nothing to do, and would make it resident again
+		if (entry.second->touched_epoch == dx12_shim_epoch) {
+			Dx12ShimForgetResource(entry.second);
+			entry.second->touched_epoch = 0;
+		}
+		pageables.push_back(entry.second->resource);
+		entry.second->evicted = true;
+		freed += entry.second->allocated;
+		dx12_memory.evicted++;
+		dx12_memory.evicted_bytes += entry.second->allocated;
+		dx12_memory.evictions++;
+		dx12_memory.eviction_bytes += entry.second->allocated;
+	}
+	if (pageables.empty())
+		return false;
+	shim.device->Evict((UINT)pageables.size(), pageables.data());
+	return true;
+}
+
+static void evict_idle()
+{
+	DXGI_QUERY_VIDEO_MEMORY_INFO memory;
+	ULONGLONG idle_ms = (ULONGLONG)G->dx12_evict_idle_seconds * 1000;
+	UINT64 limit;
+
+	if (!G->dx12_evict_idle || present_time - evicted_time < EVICT_INTERVAL_MS)
+		return;
+	evicted_time = present_time;
+	if (!Dx12ShimProcessMemory(&memory))
+		return;
+	limit = memory.Budget / 100 * G->dx12_evict_budget_percent;
+	if (memory.CurrentUsage > limit && present_time >= idle_ms)
+		evict(memory.CurrentUsage - limit, present_time - idle_ms);
+}
+
+// CreateCommittedResource waits on the CPU until what it made is resident,
+// a millisecond or two for a texture of a few tens of MB, and so does
+// MakeResident for an evicted one. Instead a resource of a mod is made
+// resident on the GPU's time, and a queue about to execute what uses resources
+// of the mods waits there for the last that was asked for. NULL where that
+// cannot be done:
+static ID3D12Device3 *residency_device;
+static ID3D12Fence *residency_fence;
+static std::mutex residency_lock;
+static std::atomic<UINT64> residency_asked;
+
+static HRESULT enqueue_make_resident(ID3D12Pageable *pageable)
+{
+	// The fence is signalled in the order of the values
+	std::lock_guard<std::mutex> lock(residency_lock);
+	UINT64 value = residency_asked + 1;
+	HRESULT hr = residency_device->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, &pageable, residency_fence, value);
+
+	if (SUCCEEDED(hr))
+		residency_asked = value;
+	return hr;
+}
+
+static void residency_init()
+{
+	if (FAILED(shim.device->QueryInterface(IID_PPV_ARGS(&residency_device))))
+		return;
+	if (FAILED(shim.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&residency_fence)))) {
+		residency_device->Release();
+		residency_device = NULL;
+	}
+}
+
+HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource)
+{
+	D3D12_HEAP_PROPERTIES heap = {};
+	ID3D12Pageable *pageable;
+	HRESULT hr;
+
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	if (residency_device && SUCCEEDED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
+			desc, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(resource)))) {
+		pageable = *resource;
+		hr = enqueue_make_resident(pageable);
+		if (SUCCEEDED(hr))
+			return hr;
+		(*resource)->Release();
+		*resource = NULL;
+	}
+
+	return shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc,
+			D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(resource));
+}
+
+// Every use of an evicted resource is recorded after this and executed by a
+// queue that calls Dx12ShimResidencyWait first, so it need not be resident
+// before then. MakeResident would hold the draw up until it is, which with a
+// party of a few characters' mods switched in is many of them in a row.
+static HRESULT make_resident_again(ID3D12Pageable *pageable)
+{
+	if (residency_device)
+		return enqueue_make_resident(pageable);
+	return shim.device->MakeResident(1, &pageable);
+}
+
+bool Dx12ShimReadGameResource(ID3D12Resource *resource)
+{
+	static unsigned noted;
+	Dx12GameReadResult result = Dx12GameRead(resource, GetTickCount64(), Dx12ShimPendingFence(), make_resident_again);
+	D3D12_RESOURCE_DESC desc;
+
+	// The fence of the read is signalled with the next submission even if
+	// the caller records nothing after all, which would otherwise hold its
+	// Evict calls back for good
+	if (result != DX12_GAME_READ_FAILED)
+		Dx12ShimList();
+	if (result == DX12_GAME_READ_RESIDENT)
+		return true;
+	if (result == DX12_GAME_READ_RESTORED)
+		dx12_memory.game_restores++;
+	else
+		dx12_memory.game_restore_failures++;
+	if (noted < 20) {
+		noted++;
+		desc = resource->GetDesc();
+		Dx12LogInfo("A resource of the game that it had evicted was to be read by a list of ours (%s, %llu x %u, format %u): %s\n",
+			desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture", desc.Width, desc.Height, desc.Format,
+			result == DX12_GAME_READ_RESTORED ? "made resident again" : "making it resident failed, the read is left out");
+	}
+	return result == DX12_GAME_READ_RESTORED;
+}
+
+// Passes on the Evict calls of the game held back for reads of lists of ours
+// that are over, see Dx12GameEvict
+static void release_held_evictions()
+{
+	static ULONGLONG released_time;
+	std::vector<Dx12HeldEviction> expired;
+	ID3D12Pageable *pageable;
+
+	if (present_time - released_time < EVICT_INTERVAL_MS)
+		return;
+	released_time = present_time;
+	Dx12TakeExpiredEvictions(present_time - DX12_GAME_READ_HOLD_MS, Dx12ShimFenceReached, &expired);
+	for (Dx12HeldEviction &held : expired) {
+		pageable = held.resource;
+		InterlockedAdd(&dx12_memory.game_evictions_passed, held.count);
+		for (; held.count; held.count--)
+			shim.device->Evict(1, &pageable);
+		held.resource->Release();
+	}
+}
+
+void Dx12ShimResidencyWait(ID3D12CommandQueue *queue)
+{
+	UINT64 value = residency_asked;
+
+	if (value && residency_fence->GetCompletedValue() < value)
+		queue->Wait(residency_fence, value);
+}
+
+bool Dx12ShimUseResource(ShimResource *resource)
+{
+	static bool failed;
+	LARGE_INTEGER start, end;
+	ID3D12Pageable *pageable = resource->resource;
+	HRESULT hr;
+
+	resource->used_time = present_time;
+	resource->used_fence = Dx12ShimPendingFence();
+	if (!resource->evicted)
+		return true;
+	// Each try takes long, and a frame has many uses: once one failed,
+	// the rest wait for the next present
+	if (failed_present == presents) {
+		dx12_memory.restore_failures++;
+		return false;
+	}
+
+	QueryPerformanceCounter(&start);
+	hr = make_resident_again(pageable);
+	// With room made by evicting whatever else is not in use, short of
+	// what was used since the last present
+	if (FAILED(hr) && evict(resource->allocated, present_time - 1))
+		hr = make_resident_again(pageable);
+	QueryPerformanceCounter(&end);
+	dx12_memory.restore_ticks += end.QuadPart - start.QuadPart;
+	if (FAILED(hr)) {
+		if (!failed)
+			Dx12LogInfo("*** Failed to make a resource of a mod resident again, what uses it is left out until it can be: 0x%x\n", hr);
+		failed = true;
+		failed_present = presents;
+		dx12_memory.restore_failures++;
+		return false;
+	}
+	resource->evicted = false;
+	dx12_memory.evicted--;
+	dx12_memory.evicted_bytes -= resource->allocated;
+	dx12_memory.restores++;
+	dx12_memory.restore_bytes += resource->allocated;
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Game lists
+
+const UINT64 GAME_UPLOAD_BLOCK_SIZE = 1 << 20;
+
+// For how long the lists of a queue go without the mods the first time it
+// could not be made to wait for them
+const UINT UNORDERED_FRAMES = 600;
+
+const size_t GAME_UPLOAD_BLOCKS_KEPT = 8;
+
+// The upload buffer being handed out for game lists. Those that are full are
+// kept alive by the lists and buffers using them, and a few of them by a
+// reference of ours as well: once that is the only one left, the lists have
+// been executed and the buffers have their contents elsewhere, and the block
+// is handed out again.
+static UploadPage game_upload;
+static std::vector<UploadPage> game_upload_full;
+
+static bool next_game_upload(UploadPage *page)
+{
+	size_t i;
+
+	for (i = 0; i < game_upload_full.size(); i++) {
+		game_upload_full[i].buffer->AddRef();
+		if (game_upload_full[i].buffer->Release() != 1)
+			continue;
+		*page = game_upload_full[i];
+		page->used = 0;
+		game_upload_full.erase(game_upload_full.begin() + i);
+		return true;
+	}
+	return create_upload_buffer(GAME_UPLOAD_BLOCK_SIZE, page);
+}
+
+bool Dx12ShimPin(Dx12GraphicsCommandList *list, IUnknown *object)
+{
+	IUnknown **pinned = &list->mPinned[((UINT64)(uintptr_t)object * 0x9e3779b97f4a7c15ull) >> 59];
+
+	// What was done to the object for the list is in the submission being
+	// recorded, if not in one before it
+	list->mShimFence = Dx12ShimPendingFence();
+	if (*pinned == object)
+		return false;
+	*pinned = object;
+	object->AddRef();
+	list->mPins.push_back(object);
+	return true;
+}
+
+void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pins, std::vector<IUnknown*> *first)
+{
+	Dx12ShimLock();
+	if (dx12_shim && queue == shim.queue) {
+		end_game_uses(first);
+		// What another thread recorded since the queue proxy had our
+		// list executed was promised the value signalled next
+		Dx12ShimSubmit();
+		shim.queue->Signal(fence, ++fence_signalled);
+		Dx12QueueSignalled(shim.queue, fence, fence_signalled);
+		InterlockedIncrement64(&dx12_stats.pin_signals);
+		for (IUnknown *object : *pins)
+			retired.push_back({ object, fence_signalled });
+	} else {
+		ForeignQueue *foreign = foreign_queue(queue);
+
+		InterlockedIncrement64(&dx12_stats.pin_lates);
+		if (foreign->fence) {
+			queue->Signal(foreign->fence, ++foreign->signalled);
+			for (IUnknown *object : *pins) {
+				game_uses[object]++;
+				foreign->uses.push_back({ object, foreign->signalled });
+				foreign->retired.push_back({ object, foreign->signalled });
+			}
+			end_game_uses(first);
+		} else {
+			// Never is not an option for these: every write would
+			// take another resource, kept for good as well
+			end_game_uses(first);
+			stranded.insert(stranded.end(), pins->begin(), pins->end());
+		}
+	}
+	pins->clear();
+	Dx12ShimUnlock();
+}
+
+ID3D12CommandQueue *volatile dx12_unordered_queues[4];
+
+// With the lock held
+static void set_queue_unordered(ForeignQueue *foreign, bool unordered)
+{
+	ID3D12CommandQueue *wanted = unordered ? NULL : foreign->queue;
+
+	for (ID3D12CommandQueue *volatile &slot : dx12_unordered_queues) {
+		if (slot != wanted)
+			continue;
+		slot = unordered ? foreign->queue : NULL;
+		foreign->unordered = unordered;
+		// What the lists had worked out for their draws went by this
+		dx12_draw_generation++;
+		if (unordered) {
+			Dx12LogInfo("*** ID3D12CommandQueue %p cannot be made to wait for what the mods have done for its lists, "
+				"they are left out of those for %u frames at least\n", foreign->queue, foreign->unordered_frames);
+		} else {
+			Dx12LogInfo("ID3D12CommandQueue %p can be made to wait for the mods again\n", foreign->queue);
+		}
+		return;
+	}
+}
+
+void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods)
+{
+	ForeignQueue *foreign;
+	bool ordered = true;
+
+	Dx12ShimLock();
+	if (dx12_shim && queue != shim.queue) {
+		foreign = foreign_queue(queue);
+		// Nothing was recorded since for a value not signalled yet
+		needed = needed ? min(needed, fence_signalled) : fence_signalled;
+		if (foreign->waited < needed && fence->GetCompletedValue() < needed) {
+			// Our queue may be behind a wait for what this one is
+			// yet to be handed, and would then never get to it
+			if (!Dx12QueueCanWait(fence, needed)) {
+				ordered = false;
+			} else if (uses_mods) {
+				Dx12QueueWaits(queue, fence, needed);
+				if (SUCCEEDED(queue->Wait(fence, needed))) {
+					foreign->waited = needed;
+					InterlockedIncrement64(&dx12_stats.queue_waits);
+				} else {
+					ordered = false;
+				}
+			}
+		}
+
+		if (!ordered) {
+			if (uses_mods)
+				InterlockedIncrement64(&dx12_stats.queue_waits_skipped);
+			if (!foreign->unordered) {
+				foreign->unordered_frames = foreign->unordered_frames ? min(foreign->unordered_frames * 2, 1u << 20) : UNORDERED_FRAMES;
+				set_queue_unordered(foreign, true);
+			}
+			foreign->unordered_until = dx12_frame + foreign->unordered_frames;
+		} else if (foreign->unordered && (int)(dx12_frame - foreign->unordered_until) >= 0) {
+			set_queue_unordered(foreign, false);
+		}
+	}
+	Dx12ShimUnlock();
+}
+
+void Dx12ShimPinsInherited(Dx12GraphicsCommandList *list, Dx12GraphicsCommandList *bundle)
+{
+	Dx12ShimLock();
+	for (IUnknown *object : bundle->mPins) {
+		ID3D12Resource *resource;
+
+		if (!Dx12ShimPin(list, object))
+			continue;
+		// A resource is in use by the list now, see game_uses. The
+		// bundle's own uses stay until it is reset: it may be
+		// executed again by another list, with what it was recorded
+		// with.
+		if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&resource)))) {
+			game_uses[object]++;
+			resource->Release();
+		}
+	}
+	Dx12ShimUnlock();
+}
+
+void Dx12ShimPinsAbandoned(std::vector<IUnknown*> *pins, bool executed)
+{
+	if (!executed) {
+		Dx12ShimLock();
+		end_game_uses(pins);
+		Dx12ShimUnlock();
+	}
+	for (IUnknown *object : *pins)
+		object->Release();
+	pins->clear();
+}
+
+void Dx12ShimFramePresented()
+{
+	release_retired();
+	present_time = GetTickCount64();
+	if (!upload_big_idle.empty())
+		release_idle_upload_buffers(fence->GetCompletedValue(), present_time);
+	presents++;
+	evict_idle();
+	release_held_evictions();
+}
+
+bool Dx12ShimUseOnGameList(ShimResource *resource, Dx12GraphicsCommandList *list)
+{
+	if (!resource->resource || resource->foreign || !Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COMMON))
+		return false;
+
+	if (Dx12ShimPin(list, resource->resource))
+		game_uses[resource->resource]++;
+	return true;
+}
+
+// Copies the shadow of a cpu_only buffer to where the game's lists can read
+// it, bytes of it with the padding. alone is for a buffer of its own, where
+// the contents start at the start of a resource.
+static bool upload_for_game_lists(ShimResource *resource, UINT64 bytes, bool alone)
+{
+	UploadPage page;
+	UINT64 start;
+	BYTE *cpu;
+
+	if (alone || bytes > GAME_UPLOAD_BLOCK_SIZE / 4) {
+		if (!create_upload_buffer(bytes, &page))
+			return false;
+		start = 0;
+	} else {
+		if (!game_upload.buffer || game_upload.used + bytes > GAME_UPLOAD_BLOCK_SIZE) {
+			if (!next_game_upload(&page))
+				return false;
+			if (game_upload.buffer && game_upload_full.size() < GAME_UPLOAD_BLOCKS_KEPT)
+				game_upload_full.push_back(game_upload);
+			else if (game_upload.buffer)
+				game_upload.buffer->Release();
+			game_upload = page;
+		}
+		page = game_upload;
+		page.buffer->AddRef();
+		start = game_upload.used;
+		game_upload.used += bytes;
+	}
+
+	cpu = page.cpu + start;
+	ShimReadShadow(resource);
+	memcpy(cpu, resource->shadow.data(), resource->shadow.size());
+	memset(cpu + resource->shadow.size(), 0, bytes - resource->shadow.size());
+
+	if (resource->game_upload)
+		resource->game_upload->Release();
+	resource->game_upload = page.buffer;
+	resource->game_upload_va = page.va + start;
+	resource->game_upload_version = resource->version;
+	return true;
+}
+
+UINT64 Dx12ShimGameBufferAddress(ID3D11Buffer *buffer, Dx12GraphicsCommandList *list, UINT *size)
+{
+	ShimResource *resource = ShimResourceOf(buffer);
+	UINT64 bytes;
+
+	if (!resource->cpu_only) {
+		if (!Dx12ShimUseOnGameList(resource, list))
+			return 0;
+		*size = (UINT)min(resource->desc.Width, (UINT64)UINT_MAX);
+		return resource->resource->GetGPUVirtualAddress();
+	}
+
+	bytes = (resource->shadow.size() + 255) & ~(UINT64)255;
+	*size = (UINT)bytes;
+	if (!bytes)
+		return 0;
+
+	if ((!resource->game_upload || resource->game_upload_version != resource->version)
+	    && !upload_for_game_lists(resource, bytes, false))
+		return 0;
+
+	Dx12ShimPin(list, resource->game_upload);
+	return resource->game_upload_va;
+}
+
+bool Dx12ShimGameBufferView(ID3D11Buffer *buffer, Dx12GraphicsCommandList *list, UINT stride, ID3D12Resource **view_resource,
+		UINT64 *offset, UINT *size)
+{
+	ShimResource *resource = ShimResourceOf(buffer);
+	D3D11_BUFFER_DESC desc;
+	UINT64 bytes;
+
+	if (!stride)
+		return false;
+
+	if (!resource->cpu_only) {
+		if (!Dx12ShimUseOnGameList(resource, list))
+			return false;
+		buffer->GetDesc(&desc);
+		*view_resource = resource->resource;
+		*offset = 0;
+		*size = desc.ByteWidth;
+		return true;
+	}
+
+	bytes = (resource->shadow.size() + 255) & ~(UINT64)255;
+	if (!bytes)
+		return false;
+
+	if (!resource->game_upload || resource->game_upload_version != resource->version
+	    || (resource->game_upload_va - resource->game_upload->GetGPUVirtualAddress()) % stride) {
+		if (!upload_for_game_lists(resource, bytes, true))
+			return false;
+	}
+
+	Dx12ShimPin(list, resource->game_upload);
+	*view_resource = resource->game_upload;
+	*offset = resource->game_upload_va - resource->game_upload->GetGPUVirtualAddress();
+	*size = (UINT)resource->shadow.size();
+	return true;
+}
+
+// -----------------------------------------------------------------------------
+// Command list and fence
+
+void Dx12ShimDeferRelease(IUnknown *object)
+{
+	object->AddRef();
+	retired.push_back({ object, Dx12ShimPendingFence() });
+}
+
+static void release_retired()
+{
+	UINT64 completed = fence->GetCompletedValue();
+
+	while (!retired.empty() && retired.front().fence <= completed) {
+		retired.front().object->Release();
+		retired.pop_front();
+	}
+
+	for (ForeignQueue *foreign : foreign_queues) {
+		if (!foreign->fence || foreign->retired.empty())
+			continue;
+		completed = foreign->fence->GetCompletedValue();
+		while (!foreign->uses.empty() && foreign->uses.front().fence <= completed) {
+			end_game_use(foreign->uses.front().object);
+			foreign->uses.pop_front();
+		}
+		while (!foreign->retired.empty() && foreign->retired.front().fence <= completed) {
+			foreign->retired.front().object->Release();
+			foreign->retired.pop_front();
+		}
+	}
+}
+
+static ForeignQueue* foreign_queue(ID3D12CommandQueue *queue)
+{
+	ForeignQueue *foreign;
+	ID3D12Device *device;
+	ID3D12Fence *queue_fence = NULL;
+
+	for (ForeignQueue *known : foreign_queues) {
+		if (known->queue == queue)
+			return known;
+	}
+
+	if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
+		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue_fence))))
+			queue_fence = NULL;
+		device->Release();
+	}
+	if (queue_fence)
+		Dx12LogInfo("Lists executed on ID3D12CommandQueue %p use what mods gave them, which a fence of ours on it now guards\n", queue);
+	else
+		Dx12LogInfo("*** Failed to create a fence for ID3D12CommandQueue %p, what its lists use of the mods is kept for good\n", queue);
+
+	foreign = new ForeignQueue();
+	foreign->queue = queue;
+	foreign->fence = queue_fence;
+	foreign->signalled = 0;
+	foreign->waited = 0;
+	foreign->unordered = false;
+	foreign->unordered_until = 0;
+	foreign->unordered_frames = 0;
+	queue->AddRef();
+	foreign_queues.push_back(foreign);
+	return foreign;
+}
+
+UINT64 Dx12ShimPendingFence()
+{
+	return fence_signalled + 1;
+}
+
+bool Dx12ShimFenceReached(UINT64 value)
+{
+	return fence->GetCompletedValue() >= value;
+}
+
+// An allocator of the pool the GPU is done with, reset
+static size_t free_allocator(std::vector<Allocator> *pool)
+{
+	UINT64 completed = fence->GetCompletedValue();
+	Allocator allocator;
+	size_t i;
+
+	for (i = 0; i < pool->size(); i++) {
+		if ((*pool)[i].fence <= completed)
+			break;
+	}
+	if (i == pool->size()) {
+		allocator.fence = 0;
+		// Recording to the allocator of an executing list is not an
+		// option, so there is nothing to fall back to
+		if (FAILED(shim.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.allocator)))) {
+			Dx12LogInfo("*** Failed to create a command allocator\n");
+			DoubleBeepExit();
+		}
+		pool->push_back(allocator);
+	}
+	(*pool)[i].allocator->Reset();
+	return i;
+}
+
+ID3D12GraphicsCommandList* Dx12ShimList()
+{
+	list_used = true;
+	if (list_open)
+		return shim_list;
+
+	current_allocator = free_allocator(&allocators);
+	shim_list->Reset(allocators[current_allocator].allocator, NULL);
+	list_open = true;
+	bound_view_heap = NULL;
+	bound_sampler_heap = NULL;
+	return shim_list;
+}
+
+ID3D12GraphicsCommandList* Dx12ShimEarlyList()
+{
+	if (early_open)
+		return early_list;
+
+	// Which is what submits it
+	Dx12ShimList();
+	current_early_allocator = free_allocator(&early_allocators);
+	if (early_list) {
+		early_list->Reset(early_allocators[current_early_allocator].allocator, NULL);
+	} else if (FAILED(shim.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+			early_allocators[current_early_allocator].allocator, NULL, IID_PPV_ARGS(&early_list)))) {
+		early_list = NULL;
+		return NULL;
+	} else {
+		early_list->SetName(L"3DMigoto mods, early");
+	}
+	early_open = true;
+	return early_list;
+}
+
+void Dx12ShimBeforeSubmit(void (*callback)())
+{
+	before_submit = callback;
+}
+
+void Dx12ShimSubmit()
+{
+	ID3D12CommandList *lists[2];
+	UINT count = 0;
+
+	if (before_submit)
+		before_submit();
+
+	if (!list_used) {
+		// Nothing recorded since the last submission can be using
+		// what was retired since
+		if (!retired.empty() && fence->GetCompletedValue() >= fence_signalled) {
+			for (Retired &entry : retired)
+				entry.object->Release();
+			retired.clear();
+		}
+		release_retired();
+		return;
+	}
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_SUBMIT);
+
+	// By index: the first transition of a resource in a submission is
+	// what adds it, which none of these is
+	for (size_t i = 0; i < touched.size(); i++)
+		Dx12ShimTransition(touched[i], D3D12_RESOURCE_STATE_COMMON);
+	touched.clear();
+
+	if (early_open) {
+		early_list->Close();
+		lists[count++] = early_list;
+	}
+	shim_list->Close();
+	lists[count++] = shim_list;
+	Dx12ShimResidencyWait(shim.queue);
+	shim.queue->ExecuteCommandLists(count, lists);
+	shim.queue->Signal(fence, ++fence_signalled);
+	Dx12QueueSignalled(shim.queue, fence, fence_signalled);
+	allocators[current_allocator].fence = fence_signalled;
+	if (early_open)
+		early_allocators[current_early_allocator].fence = fence_signalled;
+	early_open = false;
+	list_open = false;
+	list_used = false;
+	dx12_shim_epoch++;
+
+	retire_upload_pages();
+	release_retired();
+}
+
+void Dx12ShimFlush()
+{
+	// Whatever the lists about to be executed depend on was recorded
+	// before they were closed, by the threads the game had them from
+	if (!list_used)
+		return;
+
+	Dx12ShimLock();
+	if (dx12_shim)
+		Dx12ShimSubmit();
+	Dx12ShimUnlock();
+}
+
+void Dx12ShimSubmitAndWait()
+{
+	Dx12ShimSubmit();
+
+	if (fence->GetCompletedValue() >= fence_signalled)
+		return;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_GPU_WAIT, L"for a mod to read back or a swap chain to resize");
+
+	if (FAILED(fence->SetEventOnCompletion(fence_signalled, fence_event))
+	    || WaitForSingleObject(fence_event, 10000) != WAIT_OBJECT_0)
+		Dx12LogInfo("*** Gave up waiting for the GPU to reach fence value %llu\n", fence_signalled);
+
+	release_retired();
+}
+
+ID3D12Fence* Dx12ShimFence(UINT64 *signalled)
+{
+	*signalled = fence_signalled;
+	return fence;
+}
+
+void Dx12ShimSetQueue(Dx12CommandQueue *queue)
+{
+	if (shim.queue == queue->mOrig)
+		return;
+
+	// The fence must have been signalled by the old queue before the new
+	// one may signal a higher value
+	Dx12ShimSubmitAndWait();
+
+	Dx12LogInfo("Shim commands now go to ID3D12CommandQueue %p\n", queue->mOrig);
+	shim.queue->Release();
+	shim.queue = queue->mOrig;
+	shim.queue->AddRef();
+}
+
+bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue)
+{
+	static bool failed;
+	Allocator allocator = {};
+	UINT type;
+
+	if (dx12_shim)
+		return true;
+	if (failed)
+		return false;
+	failed = true;
+
+	// A device wrapped before the game's D3D11 swap chain presented
+	if (Dx12IsD3D11Game()) {
+		Dx12LogInfo("The game presents with D3D11, leaving the D3D12 swap chain alone\n");
+		return false;
+	}
+
+	// Our objects are created on the original device: they are not the
+	// game's, so nothing about them belongs in what the proxies record.
+	shim.device = device->mOrig;
+	shim.queue = queue->mOrig;
+
+	if (shim.queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
+		Dx12LogInfo("*** The swap chain's queue is not a direct queue, mods will not be applied\n");
+		return false;
+	}
+
+	// The driver may present through D3D12 before the Vulkan device is known.
+	// Keep its fence shareable so Vulkan can use the same engine later.
+	HRESULT fence_hr = shim.device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence));
+	if (FAILED(fence_hr))
+		fence_hr = shim.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+	if (FAILED(fence_hr)
+	    || FAILED(shim.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.allocator)))
+	    || FAILED(shim.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.allocator, NULL, IID_PPV_ARGS(&shim_list)))) {
+		Dx12LogInfo("*** Failed to create the command list for mods, they will not be applied\n");
+		return false;
+	}
+	shim_list->SetName(L"3DMigoto mods");
+	fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	allocators.push_back(allocator);
+	list_open = true;
+
+	shim.device->AddRef();
+	shim.queue->AddRef();
+	residency_init();
+
+	for (type = 0; type < D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES; type++)
+		pools[type].increment = shim.device->GetDescriptorHandleIncrementSize((D3D12_DESCRIPTOR_HEAP_TYPE)type);
+	view_pages.increment = pools[D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV].increment;
+	sampler_pages.increment = pools[D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER].increment;
+	dx12_shim_view_increment = view_pages.increment;
+
+	// Everything from here on finds the device through this
+	dx12_shim = &shim;
+	if (!Dx12ShimPipelineInit()) {
+		dx12_shim = NULL;
+		return false;
+	}
+
+	shim.shim_device = new ShimDevice();
+	shim.shim_context = new ShimContext();
+
+	shim.hacker_device = new HackerDevice(shim.shim_device, shim.shim_context);
+	// Not HackerContextFactory: frame analysis reads back what the game
+	// renders in ways the shim has no answer to yet
+	shim.hacker_context = new HackerContext(shim.shim_device, shim.shim_context);
+	shim.hacker_device->SetHackerContext(shim.hacker_context);
+	// The constructor leaves it uninitialised, and the engine takes
+	// anything but NULL for a D3D11 swap chain
+	shim.hacker_device->SetHackerSwapChain(NULL);
+	shim.hacker_context->SetHackerDevice(shim.hacker_device);
+
+	shim.hacker_device->Create3DMigotoResources();
+	shim.hacker_context->Bind3DMigotoResources();
+	if (!G->constants_run)
+		shim.hacker_context->InitIniParams();
+
+	Dx12LogInfo("HackerDevice %p and HackerContext %p created on the D3D11 shim of ID3D12Device %p, commands go to ID3D12CommandQueue %p\n",
+		shim.hacker_device, shim.hacker_context, shim.device, shim.queue);
+	shim_created = true;
+
+	// The shader overrides were read before the game was known to be
+	// D3D12, and are not read again at the first present when
+	// config_initialization_delay says not to
+	if (G->gConfigInitialized && !G->gReloadConfigPending && IniDx12HashesProvisional()) {
+		Dx12LogInfo("Reloading the configuration for the hash_dx12 of the shader overrides\n");
+		G->gReloadConfigPending = true;
+	}
+	return true;
+}

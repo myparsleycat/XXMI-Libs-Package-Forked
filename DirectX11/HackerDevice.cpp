@@ -535,6 +535,7 @@ static void RegisterForReload(ID3D11DeviceChild* ppShader, UINT64 hash, wstring 
 	G->mReloadedShaders[ppShader].infoText = text;
 	G->mReloadedShaders[ppShader].deferred_replacement_candidate = deferred_replacement_candidate;
 	G->mReloadedShaders[ppShader].deferred_replacement_processed = false;
+	G->shader_handle_generation++;
 }
 
 
@@ -1391,7 +1392,10 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 	HRESULT hr;
 
 	*ppShader = NULL; // Appease the static analysis gods
-	hr = (mOrigDevice1->*OrigCreateShader)(pShaderBytecode, BytecodeLength, pClassLinkage, ppShader);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::SHADER_CREATE_DRIVER);
+		hr = (mOrigDevice1->*OrigCreateShader)(pShaderBytecode, BytecodeLength, pClassLinkage, ppShader);
+	}
 	if (FAILED(hr))
 		return hr;
 
@@ -1401,7 +1405,7 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 	// have a copy for every shader seen. If we are performing any sort of deferred shader replacement, such as pipline
 	// state analysis we always need to keep a copy of the original bytecode for later analysis. For now the shader
 	// regex engine counts as deferred, though that may change with optimisations in the future.
-	if (G->hunting || !shader_regex_groups.empty()) {
+	if (G->hunting || shader_regex_d3d_groups) {
 		// The copy is made before taking the lock the render thread
 		// holds for every draw call:
 		ID3DBlob* blob;
@@ -1482,6 +1486,7 @@ void CleanupShaderMaps(ID3D11DeviceChild *handle)
 		if (i != G->mShaders.end()) {
 			LogInfo("Shader handle %p reused, previous hash was: %016llx\n", handle, i->second);
 			G->mShaders.erase(i);
+			G->shader_handle_generation++;
 		}
 	}
 
@@ -1496,6 +1501,7 @@ void CleanupShaderMaps(ID3D11DeviceChild *handle)
 			if (i->second.linkage)
 				i->second.linkage->Release();
 			G->mReloadedShaders.erase(i);
+			G->shader_handle_generation++;
 		}
 	}
 
@@ -2250,6 +2256,7 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 {
 	D3D11_BUFFER_DESC newDesc;
 	const D3D11_BUFFER_DESC *pNewDesc = NULL;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"buffer");
 
 	LogDebug("HackerDevice::CreateBuffer called\n");
 	if (pDesc)
@@ -2302,6 +2309,7 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 	D3D11_TEXTURE1D_DESC newDesc;
 	const D3D11_TEXTURE1D_DESC *pNewDesc = NULL;
 	uint32_t data_hash, hash;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"texture1d");
 
 	LogDebug("HackerDevice::CreateTexture1D called\n");
 	if (pDesc)
@@ -2368,6 +2376,7 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 {
 	D3D11_TEXTURE2D_DESC newDesc;
 	const D3D11_TEXTURE2D_DESC *pNewDesc = NULL;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"texture2d");
 
 	LogDebug("HackerDevice::CreateTexture2D called with parameters\n");
 	if (pDesc)
@@ -2457,6 +2466,7 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 {
 	D3D11_TEXTURE3D_DESC newDesc;
 	const D3D11_TEXTURE3D_DESC *pNewDesc = NULL;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_CREATE, L"texture3d");
 
 	LogInfo("HackerDevice::CreateTexture3D called with parameters\n");
 	if (pDesc)
@@ -2705,6 +2715,8 @@ STDMETHODIMP HackerDevice::CreateShader(THIS_
 	// Calculate hash
 	hash = hash_shader(pShaderBytecode, BytecodeLength);
 
+	Profiling::Spike::Scope spike(Profiling::Spike::SHADER_CREATE, shaderType, hash);
+
 	//constexpr int iterations = 10000;
 	//auto start = std::chrono::steady_clock::now();
 	//for (int i = 0; i < iterations; ++i)
@@ -2730,6 +2742,7 @@ STDMETHODIMP HackerDevice::CreateShader(THIS_
 	if (hr == S_OK) {
 		EnterCriticalSectionPretty(&G->mCriticalSection);
 			G->mShaders[*ppShader] = hash;
+			G->shader_handle_generation++;
 			LogDebugW(L"    %ls: handle = %p, hash = %016I64x\n", shaderType, *ppShader, hash);
 		LeaveCriticalSection(&G->mCriticalSection);
 	}

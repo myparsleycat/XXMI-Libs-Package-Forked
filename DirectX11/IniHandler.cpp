@@ -16,6 +16,8 @@
 #include "Hunting.h"
 #include "ShaderRegex.h"
 #include "cursor.h"
+#include "dx12/Bridge.h"
+#include "dx12/PipelineRegistry.h"
 #include <chrono>
 #include <mutex>
 #include <atomic>
@@ -2053,6 +2055,8 @@ static void ParseResourceInitialData(CustomResource *custom_resource, const wcha
 	}
 }
 
+static void ParseResourceSamplerState(CustomResource *custom_resource, const wchar_t *section);
+
 static CustomResource* ParseResourceSection(const wchar_t* section_name, const wchar_t* resource_id_suffix)
 {
 	wchar_t setting[MAX_PATH];
@@ -2101,6 +2105,20 @@ static CustomResource* ParseResourceSection(const wchar_t* section_name, const w
 	}
 
 	custom_resource->override_type = GetIniEnumClass(section_name, L"type", CustomResourceType::INVALID, NULL, CustomResourceTypeNames);
+
+	if (custom_resource->override_type == CustomResourceType::SAMPLER_STATE) {
+		if (resource_id_suffix) {
+			IniWarningW(L"type = SamplerState is only supported in [Resource] sections\n - [%ls]\n", section_name);
+			custom_resource->override_type = CustomResourceType::INVALID;
+		} else {
+			if (!custom_resource->filename.empty()) {
+				IniWarningW(L"A SamplerState cannot be loaded from a file, filename ignored\n - [%ls]\n", section_name);
+				custom_resource->filename.clear();
+			}
+			ParseResourceSamplerState(custom_resource, section_name);
+			return custom_resource;
+		}
+	}
 
 	if (GetIniString(section_name, L"format", 0, setting, MAX_PATH)) {
 		custom_resource->override_format = ParseFormatString(setting, true);
@@ -2610,6 +2628,7 @@ static void warn_deprecated_shaderoverride_options(const wchar_t *id, ShaderOver
 // function. Used by ParseCommandList to find any unrecognised lines.
 wchar_t *ShaderOverrideIniKeys[] = {
 	L"hash",
+	L"hash_dx12",
 	L"allow_duplicate_hash",
 	L"depth_filter",
 	L"model",
@@ -2617,15 +2636,23 @@ wchar_t *ShaderOverrideIniKeys[] = {
 	L"filter_index",
 	NULL
 };
+static bool dx12_hashes_provisional;
+
+bool IniDx12HashesProvisional()
+{
+	return dx12_hashes_provisional;
+}
+
 static void ParseShaderOverrideSections()
 {
 	IniSections::iterator lower, upper, i;
 	wchar_t setting[MAX_PATH];
 	const wchar_t *id;
 	ShaderOverride *override;
-	UINT64 hash;
-	bool duplicate, found;
+	UINT64 hash, hash_dx12;
+	bool duplicate, found, found_dx12;
 	bool disable_scissor;
+	bool dx12 = dx12_shim != NULL;
 
 	// Lock entire routine. This can be re-inited live.  These shaderoverrides
 	// are unlikely to be changing much, but for consistency.
@@ -2634,6 +2661,7 @@ static void ParseShaderOverrideSections()
 
 	G->mShaderOverrideMap.clear();
 	G->shader_override_generation++;
+	dx12_hashes_provisional = false;
 
 	lower = ini_sections.lower_bound(wstring(L"ShaderOverride"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderOverride"));
@@ -2643,6 +2671,20 @@ static void ParseShaderOverrideSections()
 		LogInfo("[%S]\n", id);
 
 		hash = GetIniHash(id, L"Hash", 0, &found);
+		// A D3D12 game compiles its shaders differently, so their
+		// hashes are not the D3D11 ones. A section can name both.
+		hash_dx12 = GetIniHash(id, L"hash_dx12", 0, &found_dx12);
+		if (dx12) {
+			if (found_dx12)
+				hash = hash_dx12;
+			found |= found_dx12;
+		} else if (found_dx12) {
+			// Read again once the shim is there, see Dx12ShimCreate
+			if (G->extended_rendering)
+				dx12_hashes_provisional = true;
+			if (!found)
+				continue;
+		}
 		if (!found) {
 			IniWarningW(L"Section missing Hash=\n - [%ls]\n", id);
 			continue;
@@ -2739,10 +2781,58 @@ wchar_t *ShaderRegexIniKeys[] = {
 	L"shader_model",
 	L"temps",
 	L"filter_index",
+	L"dx12_match_registers",
+	L"dx12_match_render_targets",
+	L"dx12_match_cb0_size", L"dx12_match_cb1_size", L"dx12_match_cb2_size", L"dx12_match_cb3_size",
+	L"dx12_match_cb4_size", L"dx12_match_cb5_size", L"dx12_match_cb6_size", L"dx12_match_cb7_size",
+	L"dx12_match_cb8_size", L"dx12_match_cb9_size", L"dx12_match_cb10_size", L"dx12_match_cb11_size",
+	L"dx12_match_cb12_size", L"dx12_match_cb13_size", L"dx12_match_cb14_size", L"dx12_match_cb15_size",
 	// L"type" =asm/hlsl? I'd rather not encourage autofixes on HLSL
 	//         shaders, because there is too much potential for trouble
 	NULL
 };
+
+static void parse_fuzzy_numeric_match_expression(const wchar_t *setting, FuzzyMatch *matcher);
+
+// The patterns of a group cannot be matched against the DXIL of a D3D12 game,
+// so a group says with these what such a shader has to declare instead
+static void parse_shader_regex_dx12_matches(const wchar_t *section, ShaderRegexGroup *regex_group)
+{
+	wchar_t setting[MAX_PATH], key[32];
+	std::string registers;
+	unsigned reg, i;
+	int len;
+
+	if (GetIniStringAndLog(section, L"dx12_match_registers", NULL, &registers)) {
+		regex_group->dx12_match = true;
+		for (const std::string &name : split_string(&registers, ' ')) {
+			if (name.empty())
+				continue;
+			len = 0;
+			if (sscanf_s(name.c_str() + 1, "%u%n", &reg, &len) != 1 || (size_t)len != name.size() - 1)
+				reg = UINT_MAX;
+			if ((name[0] == 't' || name[0] == 'T') && reg < 128)
+				regex_group->dx12_srv[reg / 64] |= 1ull << (reg % 64);
+			else if ((name[0] == 'b' || name[0] == 'B') && reg < 64)
+				regex_group->dx12_cbv |= 1ull << reg;
+			else if ((name[0] == 'u' || name[0] == 'U') && reg < 64)
+				regex_group->dx12_uav |= 1ull << reg;
+			else
+				IniWarningW(L"Not a register (t0-t127, b0-b63, u0-u63): %S\n - [%ls]\n", name.c_str(), section);
+		}
+	}
+	if (GetIniStringAndLog(section, L"dx12_match_render_targets", 0, setting, MAX_PATH)) {
+		regex_group->dx12_match = true;
+		parse_fuzzy_numeric_match_expression(setting, &regex_group->dx12_targets);
+	}
+	for (i = 0; i < ARRAYSIZE(regex_group->dx12_cb_bytes); i++) {
+		swprintf_s(key, ARRAYSIZE(key), L"dx12_match_cb%u_size", i);
+		if (GetIniStringAndLog(section, key, 0, setting, MAX_PATH)) {
+			regex_group->dx12_match = true;
+			parse_fuzzy_numeric_match_expression(setting, &regex_group->dx12_cb_bytes[i]);
+		}
+	}
+}
 static bool parse_shader_regex_section_main(const std::wstring *section_id, ShaderRegexGroup *regex_group)
 {
 	std::string setting;
@@ -2760,12 +2850,14 @@ static bool parse_shader_regex_section_main(const std::wstring *section_id, Shad
 	regex_group->ini_section = *section_id;
 
 	regex_group->filter_index = GetIniFloat(section_id->c_str(), L"filter_index", FLT_MAX, NULL);
+	parse_shader_regex_dx12_matches(section_id->c_str(), regex_group);
 
 	ParseCommandList(section_id->c_str(), &regex_group->command_list, &regex_group->post_command_list, ShaderRegexIniKeys);
 	return true;
 }
 
-static bool parse_shader_regex_section_pattern(const std::wstring *section_id, const std::wstring *pattern_id, ShaderRegexGroup *regex_group)
+static bool parse_shader_regex_section_pattern(const std::wstring *section_id, const std::wstring *pattern_id, ShaderRegexGroup *regex_group,
+		ShaderRegexPatterns *patterns)
 {
 	IniSectionVector *section = NULL;
 	IniSectionVector::iterator entry;
@@ -2794,7 +2886,7 @@ static bool parse_shader_regex_section_pattern(const std::wstring *section_id, c
 	LogInfo("%s\n", pattern.c_str());
 	LogInfo("--------------------------------------------------------------------\n");
 
-	regex_pattern = &regex_group->patterns[*pattern_id];
+	regex_pattern = &(*patterns)[*pattern_id];
 	if (!regex_pattern->compile(&pattern))
 		return false;
 
@@ -2833,7 +2925,7 @@ static bool parse_shader_regex_section_declarations(const std::wstring *section_
 	return true;
 }
 
-static bool parse_shader_regex_section_replace(const std::wstring *section_id, const std::wstring *pattern_id, ShaderRegexGroup *regex_group)
+static bool parse_shader_regex_section_replace(const std::wstring *section_id, const std::wstring *pattern_id, ShaderRegexPatterns *patterns)
 {
 	IniSectionVector *section = NULL;
 	IniSectionVector::iterator entry;
@@ -2842,7 +2934,7 @@ static bool parse_shader_regex_section_replace(const std::wstring *section_id, c
 	std::string aline;
 
 	try {
-		regex_pattern = &regex_group->patterns.at(*pattern_id);
+		regex_pattern = &patterns->at(*pattern_id);
 	} catch (std::out_of_range) {
 		IniWarningW(L"Missing corresponding pattern section\n - [%ls]\n", section_id->c_str());
 		return false;
@@ -2907,6 +2999,36 @@ static void delete_regex_group(std::wstring* regex_id)
 	shader_regex_groups.erase(i);
 }
 
+// The declarations a SPIR-V shader can be given, see vk/SpirvPatch.h, and
+// what the rest of a group for those may have
+static bool parse_shader_regex_spirv_group(const std::wstring *section_id, ShaderRegexGroup *regex_group)
+{
+	for (auto &pattern : regex_group->patterns) {
+		if (pattern.second.do_replace) {
+			IniWarningW(L"A ShaderRegex group with SpirvPattern can only match with Pattern, not replace\n - [%ls]\n", section_id->c_str());
+			return false;
+		}
+	}
+	if (!regex_group->command_list.noop() || !regex_group->post_command_list.noop() || regex_group->filter_index != FLT_MAX)
+		IniWarningW(L"Commands and filter_index of a ShaderRegex group with SpirvPattern are not run\n - [%ls]\n", section_id->c_str());
+
+	regex_group->spirv_declarations.clear();
+	for (const std::string &line : regex_group->declarations) {
+		SpirvDeclaration declaration;
+
+		if (!parse_spirv_declaration(line, G->IniParamsReg, &declaration)) {
+			IniWarningW(L"A SPIR-V shader can be given texture2d at a t register, texture1d at that of ini_params and "
+				L"samplers, not: %S\n - [%ls]\n", line.c_str(), section_id->c_str());
+			return false;
+		}
+		if (std::none_of(regex_group->spirv_declarations.begin(), regex_group->spirv_declarations.end(),
+				[&](const SpirvDeclaration &other) { return other.kind == declaration.kind && other.reg == declaration.reg; }))
+			regex_group->spirv_declarations.push_back(declaration);
+	}
+	regex_group->declarations.clear();
+	return true;
+}
+
 static void ParseShaderRegexSections()
 {
 	IniSections::iterator lower, upper, i;
@@ -2926,6 +3048,11 @@ static void ParseShaderRegexSections()
 	hash = crc32c_hw(hash, &G->assemble_signature_comments, sizeof(G->assemble_signature_comments));
 	hash = crc32c_hw(hash, &G->disassemble_undecipherable_custom_data, sizeof(G->disassemble_undecipherable_custom_data));
 	hash = crc32c_hw(hash, &G->patch_cb_offsets, sizeof(G->patch_cb_offsets));
+	// The cached patched shaders came out of this build's disassembler,
+	// assembler and patching code, which another build may change. The
+	// company string names the commit:
+	hash = crc32c_hw(hash, VER_FILE_VERSION_STR, sizeof(VER_FILE_VERSION_STR));
+	hash = crc32c_hw(hash, VER_COMPANYNAME_STR, sizeof(VER_COMPANYNAME_STR));
 
 	lower = ini_sections.lower_bound(wstring(L"ShaderRegex"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
@@ -2964,7 +3091,10 @@ static void ParseShaderRegexSections()
 					//
 					// Until then, the user will just have to write longer regex patterns
 					// and substitutions to match everything they need in one go.
-					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group))
+					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group, &regex_group->patterns))
+						continue;
+				} else if (!_wcsnicmp(subsection_names[1].c_str(), L"SpirvPattern", 12)) {
+					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group, &regex_group->spirv_patterns))
 						continue;
 				} else if (!_wcsicmp(subsection_names[1].c_str(), L"InsertDeclarations")) {
 					if (parse_shader_regex_section_declarations(section_id, &subsection_names[1], regex_group))
@@ -2974,7 +3104,11 @@ static void ParseShaderRegexSections()
 			case 3:
 				if (!_wcsnicmp(subsection_names[1].c_str(), L"Pattern", 7)
 				 && !_wcsicmp(subsection_names[2].c_str(), L"Replace")) {
-					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], regex_group))
+					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], &regex_group->patterns))
+						continue;
+				} else if (!_wcsnicmp(subsection_names[1].c_str(), L"SpirvPattern", 12)
+				 && !_wcsicmp(subsection_names[2].c_str(), L"Replace")) {
+					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], &regex_group->spirv_patterns))
 						continue;
 				}
 				break;
@@ -2988,6 +3122,22 @@ static void ParseShaderRegexSections()
 		delete_regex_group(&subsection_names[0]);
 	}
 
+	shader_regex_d3d_groups = false;
+	for (j = shader_regex_groups.begin(); j != shader_regex_groups.end();) {
+		std::wstring regex_id = j->first;
+
+		if (!j->second.spirv()) {
+			shader_regex_d3d_groups = true;
+			j++;
+			continue;
+		}
+		j++;
+		if (!parse_shader_regex_spirv_group(&regex_id, &shader_regex_groups[regex_id])) {
+			IniWarningW(L"Disabling entire shader regex group\n - [%ls]\n", regex_id.c_str());
+			delete_regex_group(&regex_id);
+		}
+	}
+
 	// When we load ShaderRegex metadata from the cache we need to look up
 	// the command lists and filter_index from the data structures. The
 	// shader_regex_hash means we know the data structures should be
@@ -2999,6 +3149,49 @@ static void ParseShaderRegexSections()
 	LogInfo("ShaderRegex hash: %08x\n", shader_regex_hash);
 	for (j = shader_regex_groups.begin(); j != shader_regex_groups.end(); j++)
 		shader_regex_group_index.push_back(&j->second);
+}
+
+void GetShaderRegexSources(std::vector<ShaderRegexSource> *groups, std::set<wstring> *files_with_vulkan_sections)
+{
+	std::map<wstring, size_t, WStringInsensitiveLess> by_id;
+	wstring prefix = L"ShaderRegex";
+
+	groups->clear();
+	files_with_vulkan_sections->clear();
+	for (auto &entry : ini_sections) {
+		const wstring &file = entry.second.ini_path.empty() ? entry.second.ini_namespace : entry.second.ini_path;
+		wstring lower = entry.first;
+		size_t pos;
+
+		// The namespace of a file without one is its path, which may say Vulkan
+		if (!entry.second.ini_namespace.empty() && (pos = lower.find(entry.second.ini_namespace)) != lower.npos)
+			lower.erase(pos, entry.second.ini_namespace.length());
+		std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+		if (lower.find(L"vulkan") != lower.npos)
+			files_with_vulkan_sections->insert(file);
+	}
+	auto upper = prefix_upper_bound(ini_sections, prefix);
+	for (auto i = ini_sections.lower_bound(prefix); i != upper; i++) {
+		size_t namespace_endpos = get_section_namespace_endpos(i->first.c_str());
+		wstring suffix = i->first.substr(namespace_endpos);
+		size_t dot = suffix.find(L'.');
+		wstring name = suffix.substr(0, dot);
+		wstring id = i->first.substr(0, namespace_endpos) + name;
+		wstring subsection = dot == suffix.npos ? L"" : suffix.substr(dot + 1);
+
+		auto found = by_id.find(id);
+		if (found == by_id.end()) {
+			found = by_id.emplace(id, groups->size()).first;
+			groups->emplace_back();
+			groups->back().prefix = i->first.substr(0, namespace_endpos);
+			groups->back().name = name;
+			groups->back().file = i->second.ini_path.empty() ? i->second.ini_namespace : i->second.ini_path;
+		}
+		std::transform(subsection.begin(), subsection.end(), subsection.begin(), ::towlower);
+		std::vector<std::string> &lines = (*groups)[found->second].sections[subsection];
+		for (const IniLine &line : i->second.kv_vec)
+			lines.push_back(std::string(line.raw_line.begin(), line.raw_line.end()));
+	}
 }
 
 // For fuzzy matching instead of using hash. Using terms consistent
@@ -3881,6 +4074,79 @@ static wchar_t *ComparisonFuncs[] = {
 	L"ALWAYS",
 };
 
+static wchar_t *SamplerFilters[] = {
+	L"POINT",
+	L"LINEAR",
+	L"ANISOTROPIC",
+};
+
+static wchar_t *TextureAddressModes[] = {
+	L"",
+	L"WRAP",
+	L"MIRROR",
+	L"CLAMP",
+	L"BORDER",
+	L"MIRROR_ONCE",
+};
+
+static void ParseResourceSamplerState(CustomResource *custom_resource, const wchar_t *section)
+{
+	D3D11_TEXTURE_ADDRESS_MODE address;
+	wchar_t setting[MAX_PATH];
+	D3D11_SAMPLER_DESC *desc;
+	bool comparison;
+	int filter, anisotropy;
+
+	custom_resource->sampler = std::make_unique<CustomSamplerState>();
+	desc = &custom_resource->sampler->desc;
+
+	filter = GetIniEnum(section, L"filter", 1, NULL, NULL, SamplerFilters, ARRAYSIZE(SamplerFilters), 0);
+	desc->ComparisonFunc = (D3D11_COMPARISON_FUNC)GetIniEnum(section, L"comparison", D3D11_COMPARISON_NEVER, &comparison,
+			L"D3D11_COMPARISON_", ComparisonFuncs, ARRAYSIZE(ComparisonFuncs), 1);
+	switch (filter) {
+		case 0:
+			desc->Filter = comparison ? D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_POINT;
+			break;
+		case 1:
+			desc->Filter = comparison ? D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			break;
+		case 2:
+			desc->Filter = comparison ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
+			break;
+	}
+
+	address = (D3D11_TEXTURE_ADDRESS_MODE)GetIniEnum(section, L"address", D3D11_TEXTURE_ADDRESS_CLAMP, NULL,
+			L"D3D11_TEXTURE_ADDRESS_", TextureAddressModes, ARRAYSIZE(TextureAddressModes), 1);
+	desc->AddressU = (D3D11_TEXTURE_ADDRESS_MODE)GetIniEnum(section, L"address_u", address, NULL,
+			L"D3D11_TEXTURE_ADDRESS_", TextureAddressModes, ARRAYSIZE(TextureAddressModes), 1);
+	desc->AddressV = (D3D11_TEXTURE_ADDRESS_MODE)GetIniEnum(section, L"address_v", address, NULL,
+			L"D3D11_TEXTURE_ADDRESS_", TextureAddressModes, ARRAYSIZE(TextureAddressModes), 1);
+	desc->AddressW = (D3D11_TEXTURE_ADDRESS_MODE)GetIniEnum(section, L"address_w", address, NULL,
+			L"D3D11_TEXTURE_ADDRESS_", TextureAddressModes, ARRAYSIZE(TextureAddressModes), 1);
+
+	anisotropy = GetIniInt(section, L"max_anisotropy", desc->Filter == D3D11_FILTER_ANISOTROPIC
+			|| desc->Filter == D3D11_FILTER_COMPARISON_ANISOTROPIC ? 16 : 1, NULL);
+	if (anisotropy < 1 || anisotropy > D3D11_REQ_MAXANISOTROPY) {
+		IniWarningW(L"max_anisotropy goes from 1 to %d\n - [%ls]\n", D3D11_REQ_MAXANISOTROPY, section);
+		anisotropy = anisotropy < 1 ? 1 : D3D11_REQ_MAXANISOTROPY;
+	}
+	desc->MaxAnisotropy = anisotropy;
+
+	desc->MipLODBias = GetIniFloat(section, L"mip_lod_bias", 0.0f, NULL);
+	desc->MinLOD = GetIniFloat(section, L"min_lod", 0.0f, NULL);
+	desc->MaxLOD = GetIniFloat(section, L"max_lod", D3D11_FLOAT32_MAX, NULL);
+
+	if (GetIniStringAndLog(section, L"border_color", 0, setting, MAX_PATH)) {
+		float color[4];
+		int len = 0;
+
+		if (swscanf_s(setting, L"%f %f %f %f%n", &color[0], &color[1], &color[2], &color[3], &len) == 4 && !setting[len])
+			memcpy(desc->BorderColor, color, sizeof(color));
+		else
+			IniWarningW(L"border_color takes four numbers: %ls\n - [%ls]\n", setting, section);
+	}
+}
+
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476219(v=vs.85).aspx
 static wchar_t *StencilOps[] = {
 	L"",
@@ -4277,9 +4543,10 @@ wchar_t *CustomShaderIniKeys[] = {
 	L"rasterizer_state_merge",
 	// IA State overrides:
 	L"topology",
-	// Sampler State overrides
-	L"sampler", // TODO: add additional sampler parameter 
-				// For now due to the lack of sampler as a custom resource only filtering is added no further parameter are implemented
+	// Sampler State overrides. Only point, linear and anisotropic
+	// filtering for ps-s0: a [Resource] with type = SamplerState bound with
+	// ps-s0 = ... and the like does the rest.
+	L"sampler",
 	NULL
 };
 static void _EnumerateCustomShaderSections(IniSections::iterator lower, IniSections::iterator upper)
@@ -4366,6 +4633,13 @@ static void ParseCustomShaderSections()
 			continue;
 		}
 
+		// On D3D12 drawing with these takes making a pipeline of the game
+		// again. The built in ones only draw at present.
+		if (wcsncmp(shader_id->c_str(), L"builtincustomshader", 19)
+		    && (custom_shader->vs_override || custom_shader->hs_override || custom_shader->ds_override
+			|| custom_shader->gs_override || custom_shader->ps_override))
+			dx12_keep_shader_bytecode = true;
+
 		ParseBlendState(custom_shader, shader_id->c_str());
 		ParseDepthStencilState(custom_shader, shader_id->c_str());
 		ParseRSState(custom_shader, shader_id->c_str());
@@ -4376,6 +4650,7 @@ static void ParseCustomShaderSections()
 			GetIniInt(shader_id->c_str(), L"max_executions_per_frame", 0, NULL);
 
 		ParseCommandList(shader_id->c_str(), &custom_shader->command_list, &custom_shader->post_command_list, CustomShaderIniKeys);
+		custom_shader->find_sampler_slots();
 	}
 }
 
@@ -4648,6 +4923,10 @@ void LoadConfigFile()
 	if (GetIniBool(L"Logging", L"debug_locks", false, NULL))
 		enable_lock_dependency_checks();
 
+	wcsrchr(logFilename, L'\\')[1] = 0;
+	Profiling::Spike::init(GetIniFloat(L"Logging", L"spike_log_threshold", 0, NULL),
+			GetIniFloat(L"Logging", L"spike_log_relative", 0, NULL), logFilename);
+
 	G->gShowWarnings = GetIniBool(L"Logging", L"show_warnings", true, NULL);
 
 	// [Include]
@@ -4756,7 +5035,14 @@ void LoadConfigFile()
 
 	G->shader_hash_type = GetIniEnumClass(L"Rendering", L"shader_hash", ShaderHashType::FNV, NULL, ShaderHashNames);
 	G->texture_hash_version = GetIniInt(L"Rendering", L"texture_hash", 0, NULL);
-
+	G->extended_rendering = GetIniBool(L"Rendering", L"extended_rendering", true, NULL);
+	G->dx12_dump_hashes = GetIniBool(L"Hunting", L"dx12_dump_hashes", false, NULL);
+	G->vk_dump_hashes = GetIniBool(L"Hunting", L"vk_dump_hashes", false, NULL);
+	G->vk_buffers_first = GetIniBool(L"Rendering", L"vk_buffers_first", false, NULL);
+	G->dx12_debug_layer = GetIniBool(L"Rendering", L"dx12_debug_layer", false, NULL);
+	G->dx12_evict_idle = GetIniBool(L"Rendering", L"dx12_evict_idle", true, NULL);
+	G->dx12_evict_idle_seconds = max(0, GetIniInt(L"Rendering", L"dx12_evict_idle_seconds", 10, NULL));
+	G->dx12_evict_budget_percent = min(max(0, GetIniInt(L"Rendering", L"dx12_evict_budget_percent", 75, NULL)), 1000);
 	if (GetIniStringAndLog(L"Rendering", L"override_directory", 0, G->SHADER_PATH, MAX_PATH))
 	{
 		while (G->SHADER_PATH[wcslen(G->SHADER_PATH) - 1] == L' ')
@@ -4786,10 +5072,10 @@ void LoadConfigFile()
 		CreateDirectoryEnsuringAccess(G->SHADER_CACHE_PATH);
 	}
 
-	G->CACHE_SHADERS = GetIniBool(L"Rendering", L"cache_shaders", false, NULL);
+	G->CACHE_SHADERS = GetIniBool(L"Rendering", L"cache_shaders", true, NULL);
 	set_shader_regex_background(GetIniInt(L"Rendering", L"shader_regex_background", 0, NULL));
 	G->share_duplicate_resources = GetIniBool(L"Rendering", L"share_duplicate_resources", true, NULL);
-	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", false, NULL);
+	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", true, NULL);
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
 
@@ -5404,6 +5690,7 @@ static void MarkAllShadersDeferredUnprocessed()
 void ReloadConfig(HackerDevice *device)
 {
 	auto start = std::chrono::high_resolution_clock::now();
+	Profiling::Spike::Scope spike(Profiling::Spike::CONFIG_RELOAD, L"ReloadConfig");
 
 	HackerContext *mHackerContext = device->GetHackerContext();
 
@@ -5506,4 +5793,26 @@ void ReloadConfig(HackerDevice *device)
 	std::chrono::duration<float> duration = stop - start;
 
 	LogOverlayW(LOG_INFO, L"> Reloaded config in %.3fs\n", duration.count());
+}
+
+// With skip_early_includes_load the mods are only loaded by the reload at the
+// first present of a D3D11 swap chain. A game on D3D12 never presents one, so
+// this is that reload without the parts that need a HackerDevice.
+void LoadSkippedIncludes()
+{
+	CriticalSectionGuard(&G->mCriticalSection);
+	ShaderRegexConfigUpdate shader_regex_config_update;
+
+	if (G->gConfigInitialized)
+		return;
+	G->gConfigInitialized = true;
+
+	ClearKeyBindings();
+	G->iniParamsReserved = 0;
+	clear_command_list_profiling();
+	ResetUnknownSettingsCache();
+
+	LoadConfigFile();
+
+	G->current_unknown_settings_hash = HashUnknownSettings();
 }

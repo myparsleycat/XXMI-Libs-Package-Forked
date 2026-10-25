@@ -17,6 +17,14 @@
 #include "profiling.h"
 #include "Hunting.h"
 #include "cursor.h"
+#include "dx12/Bridge.h"
+#include "dx12/DrawPath.h"
+#include "dx12/Dxc.h"
+#include "dx12/HashDump.h"
+#include "dx12/PipelineRegistry.h"
+#include "dx12/PresentPass.h"
+#include "dx12/ShimDevice.h"
+#include "vk/VkScope.h"
 
 #include <D3DCompiler.h>
 
@@ -30,6 +38,9 @@ std::vector<CommandListVariable*> persistent_variables;
 std::unordered_map<std::wstring, CommandListVariable*> persistent_variable_path_keys;
 std::map<std::wstring, float> unknown_variables;
 std::vector<CommandList*> registered_command_lists;
+VariableWriteLog *variable_write_log;
+PoolUndoLog *pool_undo_log;
+unsigned pool_undo_epoch = 1;
 std::unordered_set<CommandList*> command_lists_profiling;
 std::unordered_set<CommandListCommand*> command_lists_cmd_profiling;
 std::vector<std::shared_ptr<CommandList>> dynamically_allocated_command_lists;
@@ -357,6 +368,9 @@ static void UpdateInputLayout(const wchar_t* ini_section, CommandListState* stat
 	//LogInfo("UpdateInputLayout called\n");
 
 	HackerInputLayout* current_layout = nullptr;
+
+	if (dx12_shim)
+		state->mHackerContext->Dx12PublishInputLayout();
 
 	state->mHackerContext->IAGetInputLayout(reinterpret_cast<ID3D11InputLayout**>(&current_layout));
 
@@ -1401,6 +1415,8 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 static std::string slot_log_name(const ResourceCopyTarget &target, unsigned slot);
 static CustomResource* pool_element(CustomResourcePool *pool, int pool_first, unsigned index, bool is_assignment);
+static bool is_batchable_check(const CheckTextureOverrideCommand *command);
+static void GetShaderResourcesBatch(ID3D11DeviceContext1 *context, wchar_t shader_type, UINT first, UINT count, ID3D11ShaderResourceView **views);
 
 // Whether the target names a fixed slot of the pipeline, so that it resolves
 // to the same resource for as long as the bindings are left alone. Custom
@@ -1469,7 +1485,26 @@ void CheckTextureOverrideCommand::run(CommandListState *state)
 	if (!memoise || !RecallMatches(state, &matches)) {
 		COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
-		target.FindTextureOverrides(state, NULL, &matches);
+		if (memoise && target.type == ResourceCopyTargetType::SHADER_RESOURCE && is_batchable_check(this)) {
+			// As FindTextureOverrides() for a texture slot, less
+			// asking the view for a resource known to match nothing:
+			ID3D11ShaderResourceView *view = NULL;
+			ID3D11Resource *resource = NULL;
+
+			GetShaderResourcesBatch(state->mOrigContext1, target.shader_type, target.slot, 1, &view);
+			if (view) {
+				if (!TextureOverrideViewKnownMiss(view))
+					view->GetResource(&resource);
+				if (resource) {
+					target.FindTextureOverridesForResource(state, resource, 0, 0, DXGI_FORMAT_UNKNOWN, &matches);
+					NoteTextureOverrideViewResource(view, resource);
+					resource->Release();
+				}
+				view->Release();
+			}
+		} else {
+			target.FindTextureOverrides(state, NULL, &matches);
+		}
 
 		// Before running the matches, see RecallMatches():
 		if (memoise)
@@ -1556,6 +1591,165 @@ bool CheckTextureOverrideCommand::noop(bool post, bool ignore_cto_pre, bool igno
 	if (post)
 		return ignore_cto_post;
 	return ignore_cto_pre;
+}
+
+static bool note_checked_slot(CheckTextureOverrideCommand *check, CommandListCheckedSlots *slots)
+{
+	unsigned i;
+
+	if (!is_static_pipeline_slot(check->target))
+		return false;
+
+	switch (check->target.type) {
+		case ResourceCopyTargetType::VERTEX_BUFFER:
+			if (check->target.slot >= 32)
+				return false;
+			slots->vbs |= 1u << check->target.slot;
+			return true;
+		case ResourceCopyTargetType::INDEX_BUFFER:
+			slots->ib = true;
+			return true;
+		case ResourceCopyTargetType::CONSTANT_BUFFER:
+			for (i = 0; i < slots->cb_count; i++) {
+				if (slots->cbs[i].shader_type == check->target.shader_type && slots->cbs[i].slot == check->target.slot)
+					return true;
+			}
+			if (slots->cb_count == ARRAYSIZE(slots->cbs))
+				return false;
+			slots->cbs[slots->cb_count].shader_type = check->target.shader_type;
+			slots->cbs[slots->cb_count].slot = check->target.slot;
+			slots->cb_count++;
+			return true;
+		case ResourceCopyTargetType::SHADER_RESOURCE:
+			for (i = 0; i < slots->texture_count; i++) {
+				if (slots->textures[i].shader_type == check->target.shader_type && slots->textures[i].slot == check->target.slot)
+					return true;
+			}
+			if (slots->texture_count == ARRAYSIZE(slots->textures))
+				return false;
+			slots->textures[slots->texture_count].shader_type = check->target.shader_type;
+			slots->textures[slots->texture_count].slot = check->target.slot;
+			slots->texture_count++;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool expression_is_stateless(CommandListEvaluatable *evaluatable, bool of_draw = false);
+
+static bool note_assignment(CommandListVariable *var, int param_idx, float DirectX::XMFLOAT4::*param_component,
+		CommandListExpression *expression, float val, CommandListCheckedSlots *slots)
+{
+	CommandListCheckedAssignment assignment = { var, param_idx, param_component, expression, val };
+	unsigned i;
+
+	// Nothing but the list itself reads a local variable of it
+	if (var && !(var->flags & VariableFlags::GLOBAL))
+		return !expression || expression_is_stateless(expression->evaluatable.get(), true);
+
+	if (expression && !expression_is_stateless(expression->evaluatable.get()))
+		return false;
+
+	for (i = 0; i < slots->assignment_count; i++) {
+		if (slots->assignments[i] == assignment)
+			return true;
+	}
+	if (slots->assignment_count == ARRAYSIZE(slots->assignments))
+		return false;
+	slots->assignments[slots->assignment_count++] = assignment;
+	return true;
+}
+
+static bool note_guard(IfCommand *branch, bool nonzero, CommandListCheckedSlots *slots)
+{
+	unsigned i;
+
+	if (!expression_is_stateless(branch->expression.evaluatable.get()))
+		return false;
+
+	for (i = 0; i < slots->guard_count; i++) {
+		if (slots->guards[i].expression == &branch->expression)
+			return slots->guards[i].nonzero == nonzero;
+	}
+	if (slots->guard_count == ARRAYSIZE(slots->guards))
+		return false;
+	slots->guards[slots->guard_count].expression = &branch->expression;
+	slots->guards[slots->guard_count].nonzero = nonzero;
+	slots->guard_count++;
+	return true;
+}
+
+static bool branch_only_checks_texture_overrides(CommandList *pre, CommandList *post, CommandListCheckedSlots *slots, unsigned depth)
+{
+	CommandListCheckedSlots saved = *slots;
+
+	if ((!pre || CommandListOnlyChecksTextureOverrides(pre, slots, depth))
+	    && (!post || CommandListOnlyChecksTextureOverrides(post, slots, depth)))
+		return true;
+
+	*slots = saved;
+	return false;
+}
+
+bool CommandListOnlyChecksTextureOverrides(CommandList *command_list, CommandListCheckedSlots *slots, unsigned depth)
+{
+	// Bounds circular references:
+	if (depth > 8)
+		return false;
+
+	command_list = command_list->ResolveCommandList();
+
+	for (auto &command : command_list->commands) {
+		CommandListCommand *cmd = command.get();
+
+		if (IfCommand *branch = dynamic_cast<IfCommand*>(cmd)) {
+			// Evaluating the condition changes nothing, and either
+			// branch may be the one that runs, unless only one of
+			// them will do and the condition is one that can be
+			// watched:
+			bool if_true = branch_only_checks_texture_overrides(branch->true_commands_pre.get(),
+					branch->true_commands_post.get(), slots, depth + 1);
+			bool if_false = branch_only_checks_texture_overrides(branch->false_commands_pre.get(),
+					branch->false_commands_post.get(), slots, depth + 1);
+
+			if (!if_true && !if_false)
+				return false;
+			if (if_true != if_false && !note_guard(branch, if_true, slots))
+				return false;
+		} else if (RunExplicitCommandList *run = dynamic_cast<RunExplicitCommandList*>(cmd)) {
+			if (!run->command_list_section
+			    || !CommandListOnlyChecksTextureOverrides(&run->command_list_section->command_list, slots, depth + 1)
+			    || !CommandListOnlyChecksTextureOverrides(&run->command_list_section->post_command_list, slots, depth + 1))
+				return false;
+		} else if (RunLinkedCommandList *linked = dynamic_cast<RunLinkedCommandList*>(cmd)) {
+			if (!linked->link || !CommandListOnlyChecksTextureOverrides(linked->link, slots, depth + 1))
+				return false;
+		} else if (CheckTextureOverrideCommand *check = dynamic_cast<CheckTextureOverrideCommand*>(cmd)) {
+			if (!note_checked_slot(check, slots))
+				return false;
+		} else if (CheckTextureOverrideBatch *batch = dynamic_cast<CheckTextureOverrideBatch*>(cmd)) {
+			for (auto &merged : batch->checks) {
+				if (!note_checked_slot(merged.command.get(), slots))
+					return false;
+			}
+		} else if (VariableAssignment *variable = dynamic_cast<VariableAssignment*>(cmd)) {
+			if (!note_assignment(variable->var, -1, NULL, &variable->expression, 0, slots))
+				return false;
+		} else if (ParamOverride *param = dynamic_cast<ParamOverride*>(cmd)) {
+			if (!note_assignment(NULL, param->param_idx, param->param_component, &param->expression, 0, slots))
+				return false;
+		} else if (ConstantAssignmentBatch *constants = dynamic_cast<ConstantAssignmentBatch*>(cmd)) {
+			for (auto &constant : constants->assignments) {
+				if (!note_assignment(constant.var, constant.param_idx, constant.param_component, NULL, constant.val, slots))
+					return false;
+			}
+		} else if (!dynamic_cast<CommandPlaceholder*>(cmd) && !dynamic_cast<FrameAnalysisDumpCommand*>(cmd)) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 ClearViewCommand::ClearViewCommand() :
@@ -2086,7 +2280,7 @@ bool StoreCommand::TryReadValueFromCache(ID3D11Resource* resource, UINT64 byte_o
 		return false;
 	}
 
-	const uint8_t* cached_data = handle_info->GetCachedData();
+	const uint8_t* cached_data = handle_info->GetCachedData((size_t)byte_offset, sizeof(float));
 	memcpy(&value, cached_data + byte_offset, sizeof(float));
 
 	return true;
@@ -2095,6 +2289,7 @@ bool StoreCommand::TryReadValueFromCache(ID3D11Resource* resource, UINT64 byte_o
 void StoreCommand::SetOutputValue(CommandListState* state, float value)
 {
 	CommandListVariable* dst_var = var ? var : pool_var.GetPoolVariable(state, true);
+	LogVariableWrite(&dst_var->fval);
 	dst_var->fval = value;
 }
 
@@ -2424,8 +2619,10 @@ void Draw3DMigotoOverlayCommand::run(CommandListState *state)
 	COMMAND_LIST_LOG(state, "[%S] special = draw_3dmigoto_overlay\n", ini_section.c_str());
 
 	HackerSwapChain *mHackerSwapChain = state->mHackerDevice->GetHackerSwapChain();
-	if (mHackerSwapChain->mOverlay) {
+	if (mHackerSwapChain && mHackerSwapChain->mOverlay) {
 		mHackerSwapChain->mOverlay->DrawOverlay();
+		G->suppress_overlay = true;
+	} else if (dx12_shim && Dx12DrawOverlay()) {
 		G->suppress_overlay = true;
 	}
 }
@@ -2481,7 +2678,7 @@ CustomShader::CustomShader() :
 	stencil_ref(0), stencil_ref_mask(~0),
 	rs_override(0), rs_state(NULL),
 	topology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED),
-	substantiated(false),
+	substantiated(false), dxil_added(false),
 	max_executions_per_frame(0),
 	frame_no(0),
 	executions_this_frame(0),
@@ -2495,6 +2692,7 @@ CustomShader::CustomShader() :
 		blend_factor[i] = 1.0f;
 		blend_factor_merge_mask[i] = ~0;
 	}
+	memset(sampler_slots, 0, sizeof(sampler_slots));
 }
 
 CustomShader::~CustomShader()
@@ -2596,6 +2794,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	ID3DBlob **ppBytecode = NULL;
 	ID3DBlob *pErrorMsgs = NULL;
 	const D3D_SHADER_MACRO *macros = NULL;
+	wstring *source = NULL;
 	bool found = false;
 	FILETIME timestamp;
 
@@ -2605,31 +2804,37 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 		case 'v':
 			ppBytecode = &vs_bytecode;
 			macros = vs_macros;
+			source = &vs_source;
 			vs_override = true;
 			break;
 		case 'h':
 			ppBytecode = &hs_bytecode;
 			macros = hs_macros;
+			source = &hs_source;
 			hs_override = true;
 			break;
 		case 'd':
 			ppBytecode = &ds_bytecode;
 			macros = ds_macros;
+			source = &ds_source;
 			ds_override = true;
 			break;
 		case 'g':
 			ppBytecode = &gs_bytecode;
 			macros = gs_macros;
+			source = &gs_source;
 			gs_override = true;
 			break;
 		case 'p':
 			ppBytecode = &ps_bytecode;
 			macros = ps_macros;
+			source = &ps_source;
 			ps_override = true;
 			break;
 		case 'c':
 			ppBytecode = &cs_bytecode;
 			macros = cs_macros;
+			source = &cs_source;
 			cs_override = true;
 			break;
 		default:
@@ -2668,6 +2873,7 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 		LogOverlayW(LOG_WARNING, L"Shader not found: %ls\n", wpath);
 		goto err;
 	}
+	*source = wpath;
 
 	// Currently always using shader model 5, could allow this to be
 	// overridden in the future:
@@ -2749,10 +2955,118 @@ err:
 	return true;
 }
 
+// A shader of a mod drawn with a pipeline of a D3D12 game whose shaders are
+// DXIL has to be DXIL too (Dx12PipelineVariant), which takes compiling the
+// HLSL again with the DirectX Shader Compiler. Cached next to the source like
+// the output of D3DCompile. The shader keeps its DXBC for the pipelines that
+// are, and is given the DXIL as well.
+static void compile_dxil(char type, const wstring &source, D3DCompileFlags compile_flags, ID3D11DeviceChild *shader)
+{
+	static const struct {
+		char type;
+		const wchar_t *target;
+		const D3D_SHADER_MACRO *macros;
+	} stages[] = {
+		{ 'v', L"vs_6_0", vs_macros }, { 'h', L"hs_6_0", hs_macros }, { 'd', L"ds_6_0", ds_macros },
+		{ 'g', L"gs_6_0", gs_macros }, { 'p', L"ps_6_0", ps_macros }, { 'c', L"cs_6_0", cs_macros },
+	};
+	wchar_t cache_path[MAX_PATH];
+	const wchar_t *target = NULL, *ext;
+	const D3D_SHADER_MACRO *macros = NULL;
+	vector<char> src;
+	DWORD size, read;
+	FILETIME timestamp;
+	ID3DBlob *dxil = NULL;
+	string errors;
+	HANDLE f;
+
+	for (const auto &stage : stages) {
+		if (stage.type == type) {
+			target = stage.target;
+			macros = stage.macros;
+		}
+	}
+	if (!shader || source.empty() || !target)
+		return;
+
+	f = CreateFile(source.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (f == INVALID_HANDLE_VALUE)
+		return;
+	ext = wcsrchr(source.c_str(), L'.');
+	if (ext > wcsrchr(source.c_str(), L'\\'))
+		swprintf_s(cache_path, MAX_PATH, L"%.*s.%s.%x.bin", (int)(ext - source.c_str()), source.c_str(), target, (UINT)compile_flags);
+	else
+		swprintf_s(cache_path, MAX_PATH, L"%s.%s.%x.bin", source.c_str(), target, (UINT)compile_flags);
+	GetFileTime(f, NULL, NULL, &timestamp);
+	if (load_cached_shader(timestamp, cache_path, &dxil)) {
+		CloseHandle(f);
+		Dx12DxcRemember(dxil->GetBufferPointer(), dxil->GetBufferSize(), source.c_str(), target, macros, (UINT)compile_flags);
+		ShimSetShaderDxil(shader, dxil->GetBufferPointer(), dxil->GetBufferSize());
+		dxil->Release();
+		return;
+	}
+
+	size = GetFileSize(f, 0);
+	src.resize(size);
+	if (!ReadFile(f, src.data(), size, &read, 0) || size != read) {
+		CloseHandle(f);
+		return;
+	}
+	CloseHandle(f);
+
+	Dx12DxcCompile(src.data(), size, source.c_str(), target, macros, (UINT)compile_flags, &dxil, &errors);
+	if (!errors.empty()) {
+		LogInfo("--------------------------------------------- BEGIN ---------------------------------------------\n");
+		LogOverlay(dxil ? LOG_NOTICE : LOG_WARNING, "%s\n", errors.c_str());
+		LogInfo("---------------------------------------------- END ----------------------------------------------\n");
+	}
+	if (!dxil) {
+		LogOverlayW(LOG_WARNING, L"Error compiling custom shader %ls as %ls\n", source.c_str(), target);
+		Dx12DumpNote("*** %S could not be compiled as %S, so it stays DXBC: %s\n", source.c_str(), target, errors.c_str());
+		return;
+	}
+	Dx12DumpNote("Compiled %S as %S\n", source.c_str(), target);
+	Dx12DxcRemember(dxil->GetBufferPointer(), dxil->GetBufferSize(), source.c_str(), target, macros, (UINT)compile_flags);
+
+	if (G->CACHE_SHADERS) {
+		FILE *fw;
+
+		wfopen_ensuring_access(&fw, cache_path, L"wb");
+		if (fw) {
+			fwrite(dxil->GetBufferPointer(), 1, dxil->GetBufferSize(), fw);
+			fclose(fw);
+			set_file_last_write_time(cache_path, &timestamp);
+		}
+	}
+
+	ShimSetShaderDxil(shader, dxil->GetBufferPointer(), dxil->GetBufferSize());
+	dxil->Release();
+}
+
+// Once the game has made a pipeline of DXIL, which it may not have by the time
+// the shaders are first run. A compute shader is dispatched on its own and
+// stays as it is.
+void CustomShader::add_dxil(ID3D11Device *mOrigDevice1)
+{
+	if (dxil_added || !dx12_shim || mOrigDevice1 != static_cast<ID3D11Device*>(dx12_shim->shim_device) || !Dx12GameHasDxilShaders())
+		return;
+	dxil_added = true;
+
+	if (!Dx12DxcAvailable())
+		return;
+	compile_dxil('v', vs_source, compile_flags, vs);
+	compile_dxil('h', hs_source, compile_flags, hs);
+	compile_dxil('d', ds_source, compile_flags, ds);
+	compile_dxil('g', gs_source, compile_flags, gs);
+	compile_dxil('p', ps_source, compile_flags, ps);
+}
+
 void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 {
-	if (substantiated)
+	if (substantiated) {
+		add_dxil(mOrigDevice1);
 		return;
+	}
 	substantiated = true;
 
 	if (vs_bytecode) {
@@ -2803,6 +3117,8 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 
 	if (sampler_override == 1)
 		mOrigDevice1->CreateSamplerState(&sampler_desc, &sampler_state);
+
+	add_dxil(mOrigDevice1);
 }
 
 // Similar to memcpy, but also takes a mask. Any bits in the mask that are set
@@ -2935,6 +3251,149 @@ void CustomShader::merge_rasterizer_states(ID3D11RasterizerState *src_state, ID3
 	mOrigDevice1->CreateRasterizerState(&rs_desc, &rs_state);
 }
 
+// The index of CustomShader::sampler_slots for the shader type of vs-s0 ... cs-s0
+static int sampler_stage(wchar_t shader_type)
+{
+	switch (shader_type) {
+		case L'v': return 0;
+		case L'h': return 1;
+		case L'd': return 2;
+		case L'g': return 3;
+		case L'p': return 4;
+		case L'c': return 5;
+	}
+	return -1;
+}
+
+static void get_samplers(ID3D11DeviceContext *context, int stage, UINT first, UINT count, ID3D11SamplerState **samplers)
+{
+	switch (stage) {
+		case 0: context->VSGetSamplers(first, count, samplers); break;
+		case 1: context->HSGetSamplers(first, count, samplers); break;
+		case 2: context->DSGetSamplers(first, count, samplers); break;
+		case 3: context->GSGetSamplers(first, count, samplers); break;
+		case 4: context->PSGetSamplers(first, count, samplers); break;
+		case 5: context->CSGetSamplers(first, count, samplers); break;
+	}
+}
+
+static void set_samplers(ID3D11DeviceContext *context, int stage, UINT first, UINT count, ID3D11SamplerState *const *samplers)
+{
+	switch (stage) {
+		case 0: context->VSSetSamplers(first, count, samplers); break;
+		case 1: context->HSSetSamplers(first, count, samplers); break;
+		case 2: context->DSSetSamplers(first, count, samplers); break;
+		case 3: context->GSSetSamplers(first, count, samplers); break;
+		case 4: context->PSSetSamplers(first, count, samplers); break;
+		case 5: context->CSSetSamplers(first, count, samplers); break;
+	}
+}
+
+static bool is_shim_device(ID3D11Device *device)
+{
+	return dx12_shim && device == static_cast<ID3D11Device*>(dx12_shim->shim_device);
+}
+
+// An if command sits in both the pre and the post list of its parent, and an
+// else if nests one level deeper, so without the visited set each level would
+// double the walk: a menu with 30 options hung the game while loading.
+static void find_sampler_slots(CommandList *command_list, UINT16 slots[6], std::unordered_set<IfCommand*> *visited)
+{
+	SamplerBindCommand *bind;
+	IfCommand *if_command;
+
+	if (!command_list)
+		return;
+
+	for (auto &command : command_list->commands) {
+		if ((bind = dynamic_cast<SamplerBindCommand*>(command.get()))) {
+			slots[sampler_stage(bind->shader_type)] |= 1 << bind->slot;
+		} else if ((if_command = dynamic_cast<IfCommand*>(command.get()))) {
+			if (!visited->insert(if_command).second)
+				continue;
+			find_sampler_slots(if_command->true_commands_pre.get(), slots, visited);
+			find_sampler_slots(if_command->true_commands_post.get(), slots, visited);
+			find_sampler_slots(if_command->false_commands_pre.get(), slots, visited);
+			find_sampler_slots(if_command->false_commands_post.get(), slots, visited);
+		}
+	}
+}
+
+void CustomShader::find_sampler_slots()
+{
+	std::unordered_set<IfCommand*> visited;
+
+	memset(sampler_slots, 0, sizeof(sampler_slots));
+	::find_sampler_slots(&command_list, sampler_slots, &visited);
+	::find_sampler_slots(&post_command_list, sampler_slots, &visited);
+}
+
+// Which sampler slots running the custom shader has to save and restore, false
+// if none
+static bool sampler_slots_to_save(CustomShader *custom_shader, ID3D11Device *device, UINT16 slots[6])
+{
+	bool any = false;
+	int stage;
+
+	// SamplerBindCommand ignores the *-s# lines on D3D12 and Vulkan
+	if (is_shim_device(device))
+		memset(slots, 0, sizeof(custom_shader->sampler_slots));
+	else
+		memcpy(slots, custom_shader->sampler_slots, sizeof(custom_shader->sampler_slots));
+
+	// What sampler = ... has always done
+	if (custom_shader->sampler_override)
+		slots[4] = (1 << D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) - 1;
+
+	for (stage = 0; stage < 6; stage++)
+		any |= !!slots[stage];
+	return any;
+}
+
+// The slots between the lowest and highest of a stage go too, so that each
+// stage takes one call
+static void sampler_slot_range(UINT16 slots, UINT *first, UINT *count)
+{
+	unsigned long low, high;
+
+	_BitScanForward(&low, slots);
+	_BitScanReverse(&high, slots);
+	*first = low;
+	*count = high - low + 1;
+}
+
+static void save_sampler_slots(ID3D11DeviceContext *context, const UINT16 slots[6],
+		ID3D11SamplerState *saved[6][D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT])
+{
+	UINT first, count;
+	int stage;
+
+	for (stage = 0; stage < 6; stage++) {
+		if (!slots[stage])
+			continue;
+		sampler_slot_range(slots[stage], &first, &count);
+		get_samplers(context, stage, first, count, saved[stage] + first);
+	}
+}
+
+static void restore_sampler_slots(ID3D11DeviceContext *context, const UINT16 slots[6],
+		ID3D11SamplerState *saved[6][D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT])
+{
+	UINT first, count, i;
+	int stage;
+
+	for (stage = 0; stage < 6; stage++) {
+		if (!slots[stage])
+			continue;
+		sampler_slot_range(slots[stage], &first, &count);
+		set_samplers(context, stage, first, count, saved[stage] + first);
+		for (i = first; i < first + count; i++) {
+			if (saved[stage][i])
+				saved[stage][i]->Release();
+		}
+	}
+}
+
 struct saved_shader_inst
 {
 	ID3D11ClassInstance *instances[256];
@@ -2975,15 +3434,10 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	UINT saved_stencil_ref;
 	bool saved_post;
 	struct OMState om_state;
-	UINT i;
 	D3D11_PRIMITIVE_TOPOLOGY saved_topology;
-	UINT num_sampler = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;
-	ID3D11SamplerState* saved_sampler_states[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
-
-	for (UINT i = 0; i < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT; ++i)
-	{
-		saved_sampler_states[i] = nullptr;
-	}
+	UINT16 sampler_slots[6];
+	ID3D11SamplerState *saved_samplers[6][D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT];
+	bool save_samplers;
 
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
@@ -2999,6 +3453,7 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	}
 
 	custom_shader->substantiate(mOrigDevice1);
+	save_samplers = sampler_slots_to_save(custom_shader, mOrigDevice1, sampler_slots);
 
 	saved_shader_inst vs_inst, hs_inst, ds_inst, gs_inst, ps_inst, cs_inst;
 
@@ -3052,10 +3507,11 @@ void RunCustomShaderCommand::run(CommandListState *state)
 		mOrigContext1->IAGetPrimitiveTopology(&saved_topology);
 		mOrigContext1->IASetPrimitiveTopology(custom_shader->topology);
 	}
-	if (custom_shader->sampler_override) {
-		mOrigContext1->PSGetSamplers(0, num_sampler, saved_sampler_states);
-		mOrigContext1->PSSetSamplers(0, 1, &custom_shader->sampler_state); //just one slot for the moment TODO: allow more via *.ini file
-	}
+	if (save_samplers)
+		save_sampler_slots(mOrigContext1, sampler_slots, saved_samplers);
+	// A ps-s0 = ... of the command list comes after this and so wins
+	if (custom_shader->sampler_override)
+		mOrigContext1->PSSetSamplers(0, 1, &custom_shader->sampler_state);
 	// We save off the viewports unconditionally for now. We could
 	// potentially skip this by flagging if a command list may alter them,
 	// but that probably wouldn't buy us anything:
@@ -3095,8 +3551,8 @@ void RunCustomShaderCommand::run(CommandListState *state)
 		mOrigContext1->RSSetState(saved_rs);
 	if (custom_shader->topology != D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
 		mOrigContext1->IASetPrimitiveTopology(saved_topology);
-	if (custom_shader->sampler_override)
-		mOrigContext1->PSSetSamplers(0, num_sampler, saved_sampler_states);
+	if (save_samplers)
+		restore_sampler_slots(mOrigContext1, sampler_slots, saved_samplers);
 
 	mOrigContext1->RSSetViewports(num_viewports, saved_viewports);
 	restore_om_state(mOrigContext1, &om_state);
@@ -3119,16 +3575,31 @@ void RunCustomShaderCommand::run(CommandListState *state)
 		saved_depth_stencil->Release();
 	if (saved_rs)
 		saved_rs->Release();
-
-	for (i = 0; i < num_sampler; ++i) {
-		if (saved_sampler_states[i])
-			saved_sampler_states[i]->Release();
-	}
 }
 
 bool RunCustomShaderCommand::noop(bool post, bool ignore_cto_pre, bool ignore_cto_post)
 {
 	return (custom_shader->command_list.noop() && custom_shader->post_command_list.noop());
+}
+
+void SamplerBindCommand::run(CommandListState *state)
+{
+	ID3D11SamplerState *sampler = NULL;
+
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	if (is_shim_device(state->mOrigDevice1)) {
+		Dx12SamplerBindingIgnored(ini_line.c_str());
+		return;
+	}
+
+	if (resource) {
+		sampler = resource->sampler->Get(state->mOrigDevice1, resource->name);
+		if (!sampler)
+			return;
+	}
+
+	set_samplers(state->mOrigContext1, sampler_stage(shader_type), slot, 1, &sampler);
 }
 
 #pragma endregion CustomShader
@@ -3363,6 +3834,19 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 
 float CommandListOperand::process_shader_filter(CommandListState *state)
 {
+	if (shader_target.evaluation_mode == ShaderTargetEvaluationMode::DCL_SRV_ORIGINAL_FORMAT) {
+		if (shader_target.shader_type != L'p' || !VkInDrawScope())
+			return -1.0f;
+		UINT slot = (UINT)shader_target.member_args[0].GetValue(state);
+		// Bypass the shim's replacement bindings when identifying a game's material slots.
+		ID3D11ShaderResourceView *view = VkScopeShaderResource(DX12_STAGE_PS, slot);
+		if (!view)
+			return -1.0f;
+		D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+		view->GetDesc(&desc);
+		return desc.Format != DXGI_FORMAT_UNKNOWN ? (float)desc.Format : -1.0f;
+	}
+
 	HackerContext *mHackerContext = state->mHackerContext;
 	ID3D11DeviceChild *shader = NULL;
 
@@ -3391,8 +3875,21 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 			break;
 	}
 
-	if (!shader)
-		return -0.0;  // Negative zero means no shader bound.
+	if (!shader) {
+		// The shaders of a D3D12 game are known by hash alone
+		UINT64 hash = mHackerContext->Dx12CurrentShader(shader_target.shader_type);
+		if (!hash)
+			return -0.0;  // Negative zero means no shader bound.
+		if (shader_target.evaluation_mode != ShaderTargetEvaluationMode::SHADER) {
+			const ShaderBindings *declared = mHackerContext->Dx12CurrentShaderBindings(shader_target.shader_type);
+			return declared ? evaluate_shader_bindings(state, *declared) : 0.0f;
+		}
+
+		ShaderOverrideMap::iterator override = lookup_shaderoverride(hash);
+		if (override == G->mShaderOverrideMap.end())
+			return 0.0;
+		return override->second.filter_index != FLT_MAX ? override->second.filter_index : 1.0f;
+	}
 
 	ShaderMap::iterator shader_it = lookup_shader_hash(shader);
 
@@ -3419,19 +3916,32 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 		return 0.0;  // Safety check, should never happen;
 	}
 
+	return evaluate_shader_bindings(state, it->second);
+}
+
+float CommandListOperand::evaluate_shader_bindings(CommandListState *state, const ShaderBindings &bindings)
+{
 	UINT slot_id = (UINT)shader_target.member_args[0].GetValue(state);
+
+	// Negative one means there is no such: the shader samples fewer textures.
+	if (shader_target.evaluation_mode == ShaderTargetEvaluationMode::DCL_SRV_SAMPLED)
+		return slot_id < bindings.sampled.size() ? (float)bindings.sampled[slot_id] : -1.0f;
+	if (slot_id >= bindings.resources.size())
+		return -1.0;
 
 	switch (shader_target.evaluation_mode)
 	{
+	case ShaderTargetEvaluationMode::DCL_SRV_SET:
+		return (float)bindings.resources[slot_id].set;
 	case ShaderTargetEvaluationMode::DCL_CB_TYPE:
 	{
-		ShaderConstantBuffer& cb = it->second.constant_buffers[slot_id];
+		const ShaderConstantBuffer& cb = bindings.constant_buffers[slot_id];
 
 		return (float)cb.type;
 	}
 	case ShaderTargetEvaluationMode::DCL_CB_SIZE:
 	{
-		ShaderConstantBuffer& cb = it->second.constant_buffers[slot_id];
+		const ShaderConstantBuffer& cb = bindings.constant_buffers[slot_id];
 
 		if (cb.type == ShaderConstantBufferType::NONE)
 			return -1.0;  // Negative one means CB is not declared for this slot.
@@ -3440,13 +3950,13 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 	}
 	case ShaderTargetEvaluationMode::DCL_SRV_TYPE:
 	{
-		ShaderResource& t = it->second.resources[slot_id];
+		const ShaderResource& t = bindings.resources[slot_id];
 
 		return (float)t.type;
 	}
 	case ShaderTargetEvaluationMode::DCL_SRV_STRIDE:
 	{
-		ShaderResource& t = it->second.resources[slot_id];
+		const ShaderResource& t = bindings.resources[slot_id];
 
 		if (t.type == ShaderResourceType::NONE)
 			return -1.0;  // Negative one means SRV is not declared for this slot.
@@ -3455,7 +3965,7 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 	}
 	case ShaderTargetEvaluationMode::DCL_SRV_DIMENSION:
 	{
-		ShaderResource& t = it->second.resources[slot_id];
+		const ShaderResource& t = bindings.resources[slot_id];
 
 		if (t.type == ShaderResourceType::NONE)
 			return -1.0;  // Negative one means SRV is not declared for this slot.
@@ -3940,6 +4450,11 @@ float CommandListOperand::evaluate(CommandListState *state, HackerDevice *device
 			return 0;
 		case ParamOverrideType::STEREO_AVAILABLE:
 			return 0;
+		case ParamOverrideType::DX12:
+			return dx12_shim ? 1.0f : 0.0f;
+		case ParamOverrideType::DLL_SAMPLER_SLOTS:
+			// SamplerBindCommand ignores *-s# lines on D3D12 and Vulkan
+			return dx12_shim ? 0.0f : 1.0f;
 		// XXX: If updating this list, be sure to also update
 		// XXX: operand_allowed_in_context()
 	}
@@ -5352,6 +5867,46 @@ DEFINE_OPERATOR(saturate_operator,      "saturate",  max(0.0, min(rhs, 1.0)));
 
 DEFINE_OPERATOR(random_operator,        "random",    random(rhs));
 
+// Whether the value depends on nothing but IniParams and global variables, see
+// CommandListCheckedSlots. A local variable is as the command list that has it
+// left it, which is not for anything outside of that list to go by. of_draw
+// lets in what the draw call was made with as well.
+static bool expression_is_stateless(CommandListEvaluatable *evaluatable, bool of_draw)
+{
+	if (CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable)) {
+		if (dynamic_cast<random_operatorT*>(op) || !op->rhs)
+			return false;
+		return (!op->lhs || expression_is_stateless(op->lhs.get(), of_draw)) && expression_is_stateless(op->rhs.get(), of_draw);
+	}
+	if (CommandListOperand *operand = dynamic_cast<CommandListOperand*>(evaluatable)) {
+		switch (operand->type) {
+			case ParamOverrideType::VALUE:
+			case ParamOverrideType::INI_PARAM:
+			case ParamOverrideType::DX12:
+			case ParamOverrideType::DLL_SAMPLER_SLOTS:
+				return true;
+			case ParamOverrideType::VARIABLE:
+				// var_ftarget is the fval of a CommandListVariable
+				return !!(CONTAINING_RECORD(operand->var_ftarget, CommandListVariable, fval)->flags & VariableFlags::GLOBAL);
+			case ParamOverrideType::VERTEX_COUNT:
+			case ParamOverrideType::INDEX_COUNT:
+			case ParamOverrideType::INSTANCE_COUNT:
+			case ParamOverrideType::FIRST_VERTEX:
+			case ParamOverrideType::FIRST_INDEX:
+			case ParamOverrideType::FIRST_INSTANCE:
+			case ParamOverrideType::THREAD_GROUP_COUNT_X:
+			case ParamOverrideType::THREAD_GROUP_COUNT_Y:
+			case ParamOverrideType::THREAD_GROUP_COUNT_Z:
+			case ParamOverrideType::INDIRECT_OFFSET:
+			case ParamOverrideType::DRAW_TYPE:
+				return of_draw;
+			default:
+				return false;
+		}
+	}
+	return false;
+}
+
 // High level of precedence, right-associative. Lower than unary operators, so
 // that 4**-2 works for square root
 DEFINE_OPERATOR(exponent_operator,      "**", (pow(lhs, rhs)));
@@ -5752,9 +6307,26 @@ bool CommandListExpression::parse(const wstring *expression, const wstring *ini_
 	}
 }
 
+// What evaluatable->evaluate() returns. Most of what an expression is made
+// of is a number or a variable, which CommandListOperand::evaluate() returns
+// as it is (given a state or a device, which it complains about the lack
+// of first):
+static inline float evaluate_operand_or_call(CommandListEvaluatable *evaluatable, CommandListState *state, HackerDevice *device)
+{
+	CommandListOperand *operand = evaluatable->as_operand;
+
+	if (operand && (state || device)) {
+		if (operand->type == ParamOverrideType::VALUE)
+			return operand->val;
+		if (operand->type == ParamOverrideType::VARIABLE)
+			return *operand->var_ftarget;
+	}
+	return evaluatable->evaluate(state, device);
+}
+
 float CommandListExpression::evaluate(CommandListState *state, HackerDevice *device)
 {
-	return evaluatable->evaluate(state, device);
+	return evaluate_operand_or_call(evaluatable.get(), state, device);
 }
 
 bool CommandListExpression::static_evaluate(float *ret, HackerDevice *device, bool evaluate_variables)
@@ -5885,8 +6457,8 @@ CommandListSyntaxTree::Walk CommandListSyntaxTree::walk()
 float CommandListOperator::evaluate(CommandListState *state, HackerDevice *device)
 {
 	if (lhs) // Binary operator
-		return evaluate(lhs->evaluate(state, device), rhs->evaluate(state, device));
-	return evaluate(std::numeric_limits<float>::quiet_NaN(), rhs->evaluate(state, device));
+		return evaluate(evaluate_operand_or_call(lhs.get(), state, device), evaluate_operand_or_call(rhs.get(), state, device));
+	return evaluate(std::numeric_limits<float>::quiet_NaN(), evaluate_operand_or_call(rhs.get(), state, device));
 }
 
 bool CommandListOperator::static_evaluate(float *ret, HackerDevice *device, bool evaluate_variables)
@@ -5984,6 +6556,7 @@ void VariableAssignment::run(CommandListState *state)
 
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
+	LogVariableWrite(&var->fval);
 	var->fval = expression.evaluate(state);
 
 	COMMAND_LIST_LOG(state, "  = %f\n", var->fval);
@@ -6017,6 +6590,8 @@ static bool operand_allowed_in_context(ParamOverrideType type, CommandListScope 
 		case ParamOverrideType::SLI:
 		case ParamOverrideType::STEREO_ACTIVE:
 		case ParamOverrideType::STEREO_AVAILABLE:
+		case ParamOverrideType::DX12:
+		case ParamOverrideType::DLL_SAMPLER_SLOTS:
 			return true;
 	}
 	return false;
@@ -6397,6 +6972,7 @@ static ResourceType* GetResourceFromPool(
 
 	LogInfo("Creating cached resource %S\n", ini_line->c_str());
 	Profiling::resources_created++;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_LOAD, ini_line->c_str());
 
 	hr = (state->mOrigDevice1->*CreateResource)(desc, NULL, &resource);
 	if (FAILED(hr)) {
@@ -6424,6 +7000,52 @@ static ResourceType* GetResourceFromPool(
 
 
 #pragma region CustomResource
+
+CustomSamplerState::CustomSamplerState()
+{
+	memset(&desc, 0, sizeof(desc));
+	desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	desc.MaxAnisotropy = 1;
+	desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	desc.MaxLOD = D3D11_FLOAT32_MAX;
+}
+
+CustomSamplerState::~CustomSamplerState()
+{
+	if (state)
+		state->Release();
+}
+
+ID3D11SamplerState* CustomSamplerState::Get(ID3D11Device *device, const wstring &name)
+{
+	ID3D11SamplerState *created = NULL, *old = state;
+	HRESULT hr;
+
+	// A description the device refused stays refused, so a failure is
+	// not retried until the device changes
+	if (device == this->device.load(std::memory_order_acquire))
+		return state;
+
+	hr = device->CreateSamplerState(&desc, &created);
+	if (FAILED(hr)) {
+		created = NULL;
+		if (!warned)
+			LogOverlayW(LOG_WARNING, L"Could not create the sampler of [%ls]: 0x%x\n", name.c_str(), hr);
+		warned = true;
+	}
+
+	// Command lists of deferred contexts may get here at the same time
+	// without a lock: the device is only set once state is the sampler
+	// made for it
+	state = created;
+	this->device.store(device, std::memory_order_release);
+	if (old)
+		old->Release();
+	return created;
+}
 
 CustomResource::CustomResource() :
 	resource(NULL),
@@ -6576,6 +7198,7 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 		return;
 
 	Profiling::resources_created++;
+	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_LOAD, filename.empty() ? name.c_str() : filename.c_str());
 
 	// Add any extra bind flags necessary for the current assignment. This
 	// covers many (but not all) of the cases 3DMigoto cannot deduce
@@ -6634,7 +7257,7 @@ bool CustomResource::ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags)
 
 void CustomResource::LoadBufferFromFile(ID3D11Device *mOrigDevice1)
 {
-	MappedFile file(filename.c_str());
+	FileContents file(filename.c_str());
 
 	if (!file.valid()) {
 		LogOverlayW(LOG_WARNING, L"Failed to load custom buffer resource %ls: %d\n", filename.c_str(), file.error);
@@ -6645,7 +7268,6 @@ void CustomResource::LoadBufferFromFile(ID3D11Device *mOrigDevice1)
 		return;
 	}
 	RecordResourceFileUse(filename);
-	file.prefetch();
 
 	SubstantiateBuffer(mOrigDevice1, file.data, (DWORD)file.size, &file);
 
@@ -6730,15 +7352,12 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 	// Needs to be called at some point before CreateXXXTextureFromMemory:
 	EnsureCOM();
 
-	MappedFile file(filename.c_str());
+	FileContents file(filename.c_str());
 	if (!file.valid()) {
 		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: %d\n", filename.c_str(), file.error);
 		return;
 	}
 	RecordResourceFileUse(filename);
-	// Asks for the whole file to be read at once, instead of a page fault per 4K
-	// while the runtime copies the initial data out of the mapping:
-	file.prefetch();
 
 	dot = filename.rfind(L'.');
 	dds = dot != wstring::npos && !_wcsicmp(filename.c_str() + dot, L".dds");
@@ -6787,7 +7406,7 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: 0x%x\n", filename.c_str(), hr);
 }
 
-void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, const void *data, DWORD size, const MappedFile *share_file)
+void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, const void *data, DWORD size, const FileContents *share_file)
 {
 	D3D11_SUBRESOURCE_DATA init_data = {0}, *pInitialData = NULL;
 	SharedResourceKey share_key;
@@ -7544,8 +8163,19 @@ bool CustomResourcePool::PropagateFlags(D3D11_BIND_FLAG bind_flags, D3D11_RESOUR
 	return ret;
 }
 
+static SpatialPoolMisses spatial_misses;
+
+SpatialPoolMisses TakeSpatialPoolMisses()
+{
+	SpatialPoolMisses taken = spatial_misses;
+
+	spatial_misses = {};
+	return taken;
+}
+
 size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool is_assignment)
 {
+	SaveStateForUndo();
 	ExpireElements();
 
 	size_t pool_index;
@@ -7561,7 +8191,10 @@ size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool i
 		// For pool [ResourceA, ResourceB, ResourceC]
 		//   ResourcePoolFoo[-1] returns ResourceC pool_index (2)
 		//   ResourcePoolFoo[3] returns ResourceA pool_index (0)
-		pool_index = ((int)id % pool_size + pool_size) % pool_size;
+		if (id >= 0 && id < pool_size)
+			pool_index = (size_t)id;
+		else
+			pool_index = ((int)id % pool_size + pool_size) % pool_size;
 
 		if (expiration_timeout_frames != UINT32_MAX)
 			PostponeExpiration(index_table[pool_index], is_assignment);
@@ -7693,8 +8326,13 @@ size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool i
 
 			AssignSlot(pool_index, spatial_hash, is_assignment);
 
+			spatial_misses.nearby++;
 			return pool_index;
 		}
+
+		spatial_misses.outside++;
+		if (nearest_slot != SIZE_MAX && closest_distance <= effective_radius * 2)
+			spatial_misses.within_twice++;
 
 		// No cached resource matches this lookup.
 		// Prevent new slot allocation on read access when `allocate_slot_on_missing` is disabled.
@@ -7803,6 +8441,8 @@ bool CustomResourcePool::SetSourcePool(CustomResourcePool* src)
 	if (src == source_pool)
 		return true;
 
+	SaveStateForUndo();
+
 	if (!src)
 	{
 		source_pool = nullptr;
@@ -7861,12 +8501,14 @@ void CustomResourcePool::ResetElements(PoolElement::ResetType reset_type)
 	if (source_pool)
 		return source_pool->ResetElements(reset_type);
 
+	SaveStateForUndo();
 	for (size_t i = 0; i < pool_size; ++i)
 		ResetElement(i, reset_type);
 }
 
 void CustomResourcePool::ResetPool(bool reset_elements)
 {
+	SaveStateForUndo();
 	// Disable pool proxy mode.
 	if (source_pool) {
 		source_pool = nullptr;
@@ -7893,9 +8535,48 @@ void CustomResourcePool::ResetPool(bool reset_elements)
 		ResetElements();
 }
 
+void CustomResourcePool::RestoreState(const SavedState &state)
+{
+	source_pool = state.source_pool;
+	for (size_t i = 0; i < state.types.size() && i < elements.size(); i++)
+		elements[i].type = state.types[i];
+	if (state.index_map)
+		index_map = std::make_unique<FlatHashMap<uint32_t, size_t>>(*state.index_map);
+	else
+		index_map.reset();
+	index_table = state.index_table;
+	last_replacement_index = state.last_replacement_index;
+	last_expiration_run = state.last_expiration_run;
+}
+
 #pragma endregion CustomResourcePoolAPI
 
 #pragma region CustomResourcePoolImpl
+
+void CustomResourcePool::SaveStateForUndo()
+{
+	if (!pool_undo_log || saved_in_undo_epoch == pool_undo_epoch)
+		return;
+	saved_in_undo_epoch = pool_undo_epoch;
+
+	// Expiry comes out the same whoever touches the pool first in a frame,
+	// and resets resources, which nothing undoes. So it is done before, and
+	// kept: a repeat of [Present] put back to the slots saved here does not
+	// expire again what the frame's [Present] did already.
+	ExpireElements();
+
+	SavedState state;
+	state.source_pool = source_pool;
+	state.types.reserve(elements.size());
+	for (const PoolElement &element : elements)
+		state.types.push_back(element.type);
+	if (index_map)
+		state.index_map = std::make_unique<FlatHashMap<uint32_t, size_t>>(*index_map);
+	state.index_table = index_table;
+	state.last_replacement_index = last_replacement_index;
+	state.last_expiration_run = last_expiration_run;
+	pool_undo_log->emplace_back(this, std::move(state));
+}
 
 void CustomResourcePool::InitializeResource(size_t pool_index)
 {
@@ -7925,6 +8606,7 @@ void CustomResourcePool::InitializeVariable(size_t pool_index)
 			element.variable->persist_path_name = L"$" + persist_path_name + L"[" + std::to_wstring(pool_index) + L"]";
 	}
 	else {
+		LogVariableWrite(&element.variable->fval);
 		element.variable->fval = variable_template->fval;
 		element.variable->flags = variable_template->flags;
 	}
@@ -7987,6 +8669,7 @@ void CustomResourcePool::ResetVariable(CommandListVariable* variable)
 	if (!variable)
 		return;
 
+	LogVariableWrite(&variable->fval);
 	variable->fval = variable_template->fval;
 }
 
@@ -8053,6 +8736,10 @@ void CustomResourcePool::ExpireElements()
 
 	last_expiration_run = G->frame_no;
 
+	// Kept like the slots it frees (see SaveStateForUndo)
+	VariableWriteLog *write_log = variable_write_log;
+	variable_write_log = nullptr;
+
 	for (size_t i = 0; i < index_table.size(); ++i)
 	{
 		PoolSlot& pool_slot = index_table[i];
@@ -8074,6 +8761,8 @@ void CustomResourcePool::ExpireElements()
 				ResetElement(i);
 		}
 	}
+
+	variable_write_log = write_log;
 }
 
 #pragma endregion CustomResourcePoolImpl
@@ -8307,6 +8996,9 @@ IniParserResult ShaderTarget::ParseTargetMember(
 		{ L"->cb_size",         9, ShaderTargetEvaluationMode::DCL_CB_SIZE, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
+		{ L"->srv_set",         9, ShaderTargetEvaluationMode::DCL_SRV_SET, {{
+			MemberArg::Type::Unsigned, // Slot ID
+		}} },
 		{ L"->srv_mask",       10, ShaderTargetEvaluationMode::DCL_SRV_MASK },
 		{ L"->srv_type",       10, ShaderTargetEvaluationMode::DCL_SRV_TYPE, {{
 			MemberArg::Type::Unsigned, // Slot ID
@@ -8314,7 +9006,13 @@ IniParserResult ShaderTarget::ParseTargetMember(
 		{ L"->srv_stride",     12, ShaderTargetEvaluationMode::DCL_SRV_STRIDE, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
+		{ L"->srv_sampled",    13, ShaderTargetEvaluationMode::DCL_SRV_SAMPLED, {{
+			MemberArg::Type::Unsigned, // Place in the order the code samples its textures
+		}} },
 		{ L"->srv_dimension",  15, ShaderTargetEvaluationMode::DCL_SRV_DIMENSION, {{
+			MemberArg::Type::Unsigned, // Slot ID
+		}} },
+		{ L"->srv_original_format", 21, ShaderTargetEvaluationMode::DCL_SRV_ORIGINAL_FORMAT, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
 	};
@@ -8733,9 +9431,7 @@ IniParserResult ResourceCopyTarget::ParseTargetPipelineSlot(const wchar_t*& targ
 		{ L"cursor_mask",  11, ResourceCopyTargetType::CURSOR_MASK,           true,                                                           },
 		{ L"cursor_color", 12, ResourceCopyTargetType::CURSOR_COLOR,          true,                                                           },
 
-		// TODO
-		// vs-s15 (length: min = 5, max = 6)
-		//{ L"%lcs-s%u%n",    5, ResourceCopyTargetType::SHADER_RESOURCE,      true,   true, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT           },
+		// vs-s15 is not here: samplers are not resources, see parse_sampler_binding()
 	};
 
 	// Consume member keyword (adjust `target` and `length` accordingly).
@@ -9272,6 +9968,7 @@ void PoolVariableOperation::SetVariableValue(CommandListState* state, CommandLis
 
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
+	LogVariableWrite(&dst->fval);
 	dst->fval = value;
 
 	COMMAND_LIST_LOG(state, "  = %f\n", dst->fval);
@@ -9375,11 +10072,105 @@ static CommandListCommand* parse_slot_range_operation(
 	const wchar_t* section, ResourceCopyTarget& dst, ResourceCopyTarget& src, ResourceCopyOptions options, CommandList* command_list, const wstring* ini_namespace
 );
 
+// vs-s0 ... cs-s15
+static IniParserResult parse_sampler_slot(const wchar_t *text, wchar_t *shader_type, unsigned *slot)
+{
+	int len = 0;
+
+	// Every resource copy line comes through here, so the cheap test first
+	if (!text[0] || wcsncmp(text + 1, L"s-s", 3))
+		return IniParserResult::TOKEN_NOT_FOUND;
+	if (swscanf_s(text, L"%lcs-s%u%n", shader_type, 1, slot, &len) != 2
+	    || (size_t)len != wcslen(text) || !is_shader_resource(*shader_type))
+		return IniParserResult::TOKEN_NOT_FOUND;
+	if (*slot >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT)
+		return IniParserResult::SYNTAX_ERROR;
+	return IniParserResult::TOKEN_FOUND;
+}
+
+static bool is_sampler_resource(ResourceCopyTarget &target)
+{
+	CustomResource *resource;
+
+	if (target.type != ResourceCopyTargetType::CUSTOM_RESOURCE || target.custom_resource_pool)
+		return false;
+	resource = target.GetCustomResource(nullptr);
+	return resource && resource->sampler;
+}
+
+// ps-s0 = [ref] ResourceSampler and ps-s0 = null. A line that is about
+// sampler slots but cannot be done is warned about and dropped here, so this
+// only returns false for lines that are not about them.
+static bool parse_sampler_binding(const wchar_t *section, const wchar_t *key, const wstring *val,
+		CommandList *command_list, const wstring *ini_namespace)
+{
+	std::vector<wstring> words;
+	SamplerBindCommand *command;
+	CustomResource *resource = nullptr;
+	ResourceCopyTarget src;
+	wchar_t shader_type;
+	unsigned slot;
+	size_t last_blank;
+	wstring word;
+
+	switch (parse_sampler_slot(key, &shader_type, &slot)) {
+	case IniParserResult::SYNTAX_ERROR:
+		LogOverlayW(LOG_WARNING, L"Sampler slots go from 0 to %u: \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
+			D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT - 1, key, val->c_str(), section, ini_namespace->c_str());
+		return true;
+	case IniParserResult::TOKEN_NOT_FOUND:
+		// Values have their surrounding whitespace stripped, so the last
+		// word starts after the last blank
+		last_blank = val->find_last_of(L" \t");
+		if (parse_sampler_slot(val->c_str() + (last_blank == wstring::npos ? 0 : last_blank + 1), &shader_type, &slot)
+		    == IniParserResult::TOKEN_NOT_FOUND)
+			return false;
+		LogOverlayW(LOG_WARNING, L"The samplers of the game cannot be read, only bound over: \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
+			key, val->c_str(), section, ini_namespace->c_str());
+		return true;
+	}
+
+	std::wistringstream tokens(*val);
+	while (tokens >> word)
+		words.push_back(word);
+
+	if (words.size() == 2 && (!_wcsicmp(words[0].c_str(), L"ref") || !_wcsicmp(words[0].c_str(), L"reference")))
+		words.erase(words.begin());
+
+	if (words.size() != 1) {
+		LogOverlayW(LOG_WARNING, L"A sampler slot takes a SamplerState resource or null, with nothing but an optional ref: \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
+			key, val->c_str(), section, ini_namespace->c_str());
+		return true;
+	}
+
+	if (_wcsicmp(words[0].c_str(), L"null")) {
+		if (!src.ParseTarget(words[0].c_str(), true, ini_namespace, command_list->scope)
+		    || src.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE
+		    || !is_sampler_resource(src)) {
+			LogOverlayW(LOG_WARNING, L"%ls is not a [Resource] section with type = SamplerState: \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
+				words[0].c_str(), key, val->c_str(), section, ini_namespace->c_str());
+			return true;
+		}
+		resource = src.GetCustomResource(nullptr);
+	}
+
+	command = new SamplerBindCommand();
+	command->shader_type = shader_type;
+	command->slot = slot;
+	command->resource = resource;
+	command->ini_line = L"[" + wstring(section) + L"] " + wstring(key) + L" = " + *val;
+	command_list->commands.push_back(std::shared_ptr<CommandListCommand>(command));
+	return true;
+}
+
 bool ParseCommandListResourceCopyTargetDirective(
 	const wchar_t *section, const wchar_t *key, wstring *val, CommandList *command_list, const wstring *ini_namespace
 )
 {
 	//LogInfo("Parsing CommandListResourceCopyTargetDirective: `%ls = %ls`\n", key, val->c_str());
+
+	if (parse_sampler_binding(section, key, val, command_list, ini_namespace))
+		return true;
 
 	ResourceCopyTarget dst = ResourceCopyTarget();
 
@@ -9398,6 +10189,8 @@ bool ParseCommandListResourceCopyTargetDirective(
 		// Vertex Buffer Layout Override
 		// vb0->ElementFormat(BLENDINDICES, 0) = R16G16B16A16_FLOAT
 		operation = parse_layout_operation(section, dst, val, command_list, ini_namespace);
+		// On D3D12 the layout takes making a pipeline of the game again
+		dx12_keep_shader_bytecode = true;
 		break;
 
 	case ResourceCopyTargetEvaluationMode::VARIABLE:
@@ -9423,6 +10216,12 @@ bool ParseCommandListResourceCopyTargetDirective(
 
 		if (!parse_resource_copy_target_source(section, *val, src, options, command_list, ini_namespace, key))
 			return false;
+
+		if (is_sampler_resource(dst) || is_sampler_resource(src)) {
+			LogOverlayW(LOG_WARNING, L"A SamplerState resource can only be bound to a sampler slot (ps-s0 = ResourceFoo): \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
+				key, val->c_str(), section, ini_namespace->c_str());
+			return true;
+		}
 
 		if (dst.evaluation_mode == ResourceCopyTargetEvaluationMode::SLOT_RANGE
 			|| src.evaluation_mode == ResourceCopyTargetEvaluationMode::SLOT_RANGE)
@@ -10142,7 +10941,7 @@ ID3D11Resource *ResourceCopyTarget::GetResource(
 					mHackerSwapChain->GetBuffer(0, __uuidof(ID3D11Resource), (void**)&res);
 				else
 					mHackerSwapChain->GetOrigSwapChain1()->GetBuffer(0, __uuidof(ID3D11Resource), (void**)&res);
-			} else
+			} else if (!(res = Dx12ShimBackBuffer()))
 				COMMAND_LIST_LOG(state, "  Unable to get access to swap chain\n");
 		}
 		return res;
@@ -10152,7 +10951,7 @@ ID3D11Resource *ResourceCopyTarget::GetResource(
 			HackerSwapChain *mHackerSwapChain = mHackerDevice->GetHackerSwapChain();
 			if (mHackerSwapChain)
 				mHackerSwapChain->GetOrigSwapChain1()->GetBuffer(0, __uuidof(ID3D11Resource), (void**)&res);
-			else
+			else if (!(res = Dx12ShimBackBuffer()))
 				COMMAND_LIST_LOG(state, "  Unable to get access to real swap chain\n");
 		}
 		return res;
@@ -10162,7 +10961,7 @@ ID3D11Resource *ResourceCopyTarget::GetResource(
 			HackerSwapChain *mHackerSwapChain = mHackerDevice->GetHackerSwapChain();
 			if (mHackerSwapChain)
 				mHackerSwapChain->GetBuffer(0, __uuidof(ID3D11Resource), (void**)&res);
-			else
+			else if (!(res = Dx12ShimBackBuffer()))
 				COMMAND_LIST_LOG(state, "  Unable to get access to fake swap chain\n");
 		}
 		return res;
@@ -12952,6 +13751,16 @@ void ResourceCopyOperation::run(CommandListState *state)
 		buf_src_size = (UINT)src.member_args[1].GetValue(state);
 	}
 
+	// A D3D12 constant buffer of the game does not keep its contents: a
+	// reference kept for later draws would be to whatever that draw has in
+	// the slot, so the contents are copied instead.
+	const ResourceCopyOptions ini_options = options;
+	if (dx12_shim && src_resource && (options & ResourceCopyOptions::REFERENCE)
+		&& src.type == ResourceCopyTargetType::CONSTANT_BUFFER
+		&& (dst.type == ResourceCopyTargetType::CUSTOM_RESOURCE || dst.type == ResourceCopyTargetType::POOL)
+		&& Dx12ShimIsGameConstants(src_resource))
+		options = (ResourceCopyOptions)(((int)options & ~(int)ResourceCopyOptions::REFERENCE) | (int)ResourceCopyOptions::COPY);
+
 	switch (dst.type)
 	{
 	case ResourceCopyTargetType::POOL:
@@ -12962,6 +13771,8 @@ void ResourceCopyOperation::run(CommandListState *state)
 		CopyResourceToResource(state, src_resource, src_view, stride, offset, format, buf_src_size);
 		break;
 	}
+
+	options = ini_options;
 
 	if (src_view)
 		src_view->Release();
@@ -13001,7 +13812,10 @@ static void SetShaderResourcesBatch(ID3D11DeviceContext1 *context, wchar_t shade
 
 void ShaderResourceBindBatch::run(CommandListState *state)
 {
-	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+
+	// Only the slots of the batch are looked at:
+	memset(views, 0, count * sizeof(views[0]));
 
 	COMMAND_LIST_LOG(state, "batched %lcs-t%u..%u {\n", shader_type, first_slot, first_slot + count - 1);
 
@@ -13040,7 +13854,10 @@ void ShaderResourceBindBatch::run(CommandListState *state)
 
 void ShaderResourceFetchBatch::run(CommandListState *state)
 {
-	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+
+	// Only the slots of the batch are looked at:
+	memset(views, 0, count * sizeof(views[0]));
 
 	COMMAND_LIST_LOG(state, "batched %lcs-t%u..%u {\n", shader_type, first_slot, first_slot + count - 1);
 
@@ -13323,7 +14140,9 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		// What GetResource() would have returned for the slot:
 		switch (fetch.type) {
 			case ResourceCopyTargetType::SHADER_RESOURCE:
-				if (views[b])
+				// Most views are of a resource that matches
+				// nothing, which is known without asking them:
+				if (views[b] && !TextureOverrideViewKnownMiss(views[b]))
 					views[b]->GetResource(&resource);
 				break;
 			case ResourceCopyTargetType::VERTEX_BUFFER:
@@ -13340,8 +14159,10 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 
 		if (resource) {
 			command->target.FindTextureOverridesForResource(state, resource, stride, offset, format, &matches);
-			if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE)
+			if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE) {
+				NoteTextureOverrideViewResource(views[b], resource);
 				resource->Release();
+			}
 		}
 
 		// Before running the matches, see RecallMatches():
@@ -13568,6 +14389,7 @@ void ConstantAssignmentBatch::run(CommandListState *state)
 		if (assignment.var) {
 			float orig = assignment.var->fval;
 
+			LogVariableWrite(&assignment.var->fval);
 			assignment.var->fval = assignment.val;
 
 			if ((assignment.var->flags & VariableFlags::PERSIST) && assignment.val != orig)

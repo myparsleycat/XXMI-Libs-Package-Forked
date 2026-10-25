@@ -19,6 +19,8 @@
 #include "profiling.h"
 #include "FrameAnalysis.h"
 #include "ShaderRegex.h"
+#include "dx12/Bridge.h"
+#include "dx12/DrawPath.h"
 
 // bo3b: For this routine, we have a lot of warnings in x64, from converting a size_t result into the needed
 //  DWORD type for the Write calls.  These are writing 256 byte strings, so there is never a chance that it 
@@ -329,7 +331,7 @@ static void MarkingScreenShots(HackerDevice *device, HashType hash, char *short_
 // This is pretty heavyweight obviously, so it is only being done during Mark operations.
 // Todo: another copy/paste job, we really need some subroutines, utility library.
 
-static string Decompile(ID3DBlob *pShaderByteCode, string *asmText)
+static string Decompile(const void *bytecode, string *asmText)
 {
 	LogInfo("    creating HLSL representation.\n");
 
@@ -338,7 +340,7 @@ static string Decompile(ID3DBlob *pShaderByteCode, string *asmText)
 	bool errorOccurred = false;
 
 	ParseParameters p;
-	p.bytecode = pShaderByteCode->GetBufferPointer();
+	p.bytecode = bytecode;
 	p.decompiled = asmText->c_str();
 	p.decompiledSize = asmText->size();
 	p.ZeroOutput = false;
@@ -834,15 +836,14 @@ err:
 	goto out;
 }
 
-static bool WriteASM(string *asmText, string *hlslText, string *errText,
-		UINT64 hash, OriginalShaderInfo shader_info, HackerDevice *device, wstring *tagline = NULL)
+static bool WriteASMFile(string *asmText, string *hlslText, string *errText,
+		UINT64 hash, const wchar_t *shaderType, wstring *tagline, wchar_t fileName[MAX_PATH])
 {
-	wchar_t fileName[MAX_PATH];
 	wchar_t fullName[MAX_PATH];
 	std::string token;
 	FILE *f;
 
-	swprintf_s(fileName, MAX_PATH, L"%016llx-%ls.txt", hash, shader_info.shaderType.c_str());
+	swprintf_s(fileName, MAX_PATH, L"%016llx-%ls.txt", hash, shaderType);
 	swprintf_s(fullName, MAX_PATH, L"%ls\\%ls", G->SHADER_PATH, fileName);
 
 	wfopen_ensuring_access(&f, fullName, L"wb");
@@ -879,6 +880,16 @@ static bool WriteASM(string *asmText, string *hlslText, string *errText,
 	}
 
 	fclose(f);
+	return true;
+}
+
+static bool WriteASM(string *asmText, string *hlslText, string *errText,
+		UINT64 hash, OriginalShaderInfo shader_info, HackerDevice *device, wstring *tagline = NULL)
+{
+	wchar_t fileName[MAX_PATH];
+
+	if (!WriteASMFile(asmText, hlslText, errText, hash, shader_info.shaderType.c_str(), tagline, fileName))
+		return false;
 
 	// Lastly, reload the shader generated, to check for decompile errors, set it as the active
 	// shader code, in case there are visual errors, and make it the match the code in the file.
@@ -894,16 +905,13 @@ static bool WriteASM(string *asmText, string *hlslText, string *errText,
 // and thus is not different than the file on disk.
 // If a file was already extant in the ShaderFixes, it will be picked up at game launch as the master shaderByteCode.
 
-static bool WriteHLSL(string *asmText, string *hlslText, string *errText,
-		UINT64 hash, OriginalShaderInfo shader_info, HackerDevice *device, bool remove_failed)
+static bool WriteHLSLFile(string *asmText, string *hlslText, const void *bytecode,
+		UINT64 hash, const wchar_t *shaderType, wchar_t fileName[MAX_PATH], wchar_t fullName[MAX_PATH])
 {
-	wchar_t fileName[MAX_PATH];
-	wchar_t fullName[MAX_PATH];
 	FILE *fw;
-	bool ret;
 
 	// Try to decompile the current byte code into HLSL:
-	*hlslText = Decompile(shader_info.byteCode, asmText);
+	*hlslText = Decompile(bytecode, asmText);
 	if (hlslText->empty())
 		return false;
 
@@ -911,7 +919,7 @@ static bool WriteHLSL(string *asmText, string *hlslText, string *errText,
 	// this has been moved to the earlier shader_already_dumped() routine,
 	// and that no longer modifies the file when touching it.
 
-	swprintf_s(fileName, MAX_PATH, L"%016llx-%ls_replace.txt", hash, shader_info.shaderType.c_str());
+	swprintf_s(fileName, MAX_PATH, L"%016llx-%ls_replace.txt", hash, shaderType);
 	swprintf_s(fullName, MAX_PATH, L"%ls\\%ls", G->SHADER_PATH, fileName);
 	wfopen_ensuring_access(&fw, fullName, L"wb");
 	if (!fw)
@@ -929,6 +937,19 @@ static bool WriteHLSL(string *asmText, string *hlslText, string *errText,
 	fprintf_s(fw, "\n//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/\n");
 
 	fclose(fw);
+	return true;
+}
+
+static bool WriteHLSL(string *asmText, string *hlslText, string *errText,
+		UINT64 hash, OriginalShaderInfo shader_info, HackerDevice *device, bool remove_failed)
+{
+	wchar_t fileName[MAX_PATH];
+	wchar_t fullName[MAX_PATH];
+	bool ret;
+
+	if (!WriteHLSLFile(asmText, hlslText, shader_info.byteCode->GetBufferPointer(), hash,
+			shader_info.shaderType.c_str(), fileName, fullName))
+		return false;
 
 	// Lastly, reload the shader generated, to check for decompile errors, set it as the active
 	// shader code, in case there are visual errors, and make it the match the code in the file.
@@ -1090,6 +1111,41 @@ static void CopyToFixes(UINT64 hash, HackerDevice *device)
 	}
 }
 
+void CopyBytecodeToFixes(UINT64 hash, const char *type, const void *bytecode, size_t size)
+{
+	bool asm_enabled = !!(G->marking_actions & MarkingAction::ASM);
+	wstring shaderType(type, type + strlen(type));
+	wchar_t fileName[MAX_PATH], fullName[MAX_PATH];
+	string asmText, hlslText;
+	bool success = false;
+
+	// ShaderRegex patches no shaders that are not D3D11 shader objects,
+	// so there is nothing for marking_actions=regex to show
+	if (!(G->marking_actions & MarkingAction::HLSL) && !asm_enabled)
+		return;
+
+	if (G->marking_actions & MarkingAction::HLSL) {
+		asmText = BinaryToAsmText(bytecode, size, false);
+		if (!asmText.empty())
+			success = WriteHLSLFile(&asmText, &hlslText, bytecode, hash, shaderType.c_str(), fileName, fullName);
+		if (!success && asm_enabled)
+			LogOverlay(LOG_NOTICE, "> HLSL decompilation failed. Falling back to assembly\n");
+	}
+
+	if (!success && asm_enabled) {
+		asmText = BinaryToAsmText(bytecode, size, G->patch_cb_offsets);
+		if (!asmText.empty())
+			success = WriteASMFile(&asmText, &hlslText, NULL, hash, shaderType.c_str(), NULL, fileName);
+	}
+
+	if (success) {
+		LogOverlayW(LOG_INFO, L"> copied Marked shader to ShaderFixes for reference: %ls\n", fileName);
+	} else {
+		LogOverlay(LOG_WARNING, "> FAILED to copy Marked shader to ShaderFixes\n");
+		BeepFailure();
+	}
+}
+
 // If a shader no longer exists in ShaderFixes, point it back to the original
 // shader so that the replaced shaders are consistent with those in
 // ShaderFixes. Especially useful if the decompiler creates a rendering issue
@@ -1216,6 +1272,12 @@ static void EnableFix(HackerDevice *device, void *private_data)
 	G->fix_enabled = true;
 }
 
+static void ToggleDx12Mods(HackerDevice *device, void *private_data)
+{
+	if (dx12_shim)
+		Dx12ToggleMods();
+}
+
 static void _AnalyseFrameStop()
 {
 	G->analyse_frame = false;
@@ -1234,11 +1296,14 @@ static void AnalyseFrame(HackerDevice *device, void *private_data)
 	time_t ltime;
 	struct tm tm;
 
-	if (FAILED(device->GetHackerContext()->QueryInterface(IID_FrameAnalysisContext, (void**)&factx))) {
-		LogOverlay(LOG_DIRE, "Frame Analysis Context is missing: Restart the game with hunting enabled\n");
-		return;
+	// D3D12 has none: dx12/FrameDump.cpp writes what can be had of the frame
+	if (!dx12_shim) {
+		if (FAILED(device->GetHackerContext()->QueryInterface(IID_FrameAnalysisContext, (void**)&factx))) {
+			LogOverlay(LOG_DIRE, "Frame Analysis Context is missing: Restart the game with hunting enabled\n");
+			return;
+		}
+		factx->Release();
 	}
-	factx->Release();
 
 	if (G->analyse_frame) {
 		// Frame analysis key has been pressed again while FA was
@@ -1726,6 +1791,15 @@ static void MarkShaderEnd(HackerDevice *device, char *long_type, char *short_typ
 	if (G->marking_actions & MarkingAction::CLIPBOARD)
 		HashToClipboard(long_type, selected);
 
+	// No screenshots for D3D12 yet, and its shaders are not in
+	// mReloadedShaders for CopyToFixes to find
+	if (dx12_shim) {
+		if (!shader_already_dumped(selected, short_type) && (G->marking_actions & MarkingAction::DUMP_MASK))
+			Dx12DumpMarkedShader(selected, short_type);
+		LeaveCriticalSection(&G->mCriticalSection);
+		return;
+	}
+
 	MarkingScreenShots(device, selected, short_type);
 
 	// We always test if a shader is already dumped even if neither HLSL or
@@ -1989,6 +2063,10 @@ void ParseHuntingSection()
 	G->config_reloadable = RegisterIniKeyBinding(L"Hunting", L"reload_config", FlagConfigReload, NULL, noRepeat, NULL);
 	G->config_reloadable = RegisterIniKeyBinding(L"Hunting", L"wipe_user_config", FlagConfigReload, NULL, noRepeat, (void*)true);
 
+	// For comparing a D3D12 game with and without what mods do to it.
+	// Like reload_config this is not only for hunting.
+	RegisterIniKeyBinding(L"Hunting", L"disable_dx12_mods", ToggleDx12Mods, NULL, noRepeat, NULL);
+
 	// We're interested in performance measurements even in release mode
 	// (possibly even especially in release mode), particularly if we want
 	// a user to send us a screenshot of the profiling info:
@@ -2153,4 +2231,25 @@ void PurgeStaleVisitedBufferHashes(HackerDevice* device)
 	PurgeStaleBuffers(&G->mVisitedVertexBuffers, &G->mVisitedVertexBuffersLastSeenFrame, &G->mSelectedVertexBuffer, &G->mSelectedVertexBufferPos);
 	PurgeStaleBuffers(&G->mVisitedIndexBuffers, &G->mVisitedIndexBuffersLastSeenFrame, &G->mSelectedIndexBuffer, &G->mSelectedIndexBufferPos);
 	LeaveCriticalSection(&G->mCriticalSection);
+}
+
+void UpdateHuntingBufferSelection(HackerDevice* device)
+{
+	if (G->overlay_buffer_hash_lifetime >= 0)
+		PurgeStaleVisitedBufferHashes(device);
+	if (G->mSelectedIndexBufferPos == INT_MAX && !G->mVisitedIndexBuffers.empty()) {
+		G->mSelectedIndexBufferPos = G->mVisitedIndexBuffers.size() - 1;
+		G->mSelectedIndexBuffer = *std::prev(G->mVisitedIndexBuffers.end());
+	}
+	if (G->mSelectedVertexBufferPos == INT_MAX && !G->mVisitedVertexBuffers.empty()) {
+		G->mSelectedVertexBufferPos = G->mVisitedVertexBuffers.size() - 1;
+		G->mSelectedVertexBuffer = *std::prev(G->mVisitedVertexBuffers.end());
+	}
+	if (G->gResetSelectedVertexBufferSlotId) {
+		if (!G->mVisitedVertexBuffers.empty()) {
+			G->mSelectedVertexBuffer = *G->mVisitedVertexBuffers.begin();
+			G->mSelectedVertexBufferPos = 0;
+			G->gResetSelectedVertexBufferSlotId = false;
+		}
+	}
 }
