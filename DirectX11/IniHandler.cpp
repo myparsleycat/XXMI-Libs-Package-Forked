@@ -5064,10 +5064,10 @@ void LoadConfigFile()
 		CreateDirectoryEnsuringAccess(G->SHADER_CACHE_PATH);
 	}
 
-	G->CACHE_SHADERS = GetIniBool(L"Rendering", L"cache_shaders", false, NULL);
+	G->CACHE_SHADERS = GetIniBool(L"Rendering", L"cache_shaders", true, NULL);
 	set_shader_regex_background(GetIniInt(L"Rendering", L"shader_regex_background", 0, NULL));
 	G->share_duplicate_resources = GetIniBool(L"Rendering", L"share_duplicate_resources", true, NULL);
-	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", false, NULL);
+	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", true, NULL);
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
 
