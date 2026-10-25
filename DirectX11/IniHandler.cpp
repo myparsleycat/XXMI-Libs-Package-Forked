@@ -3048,6 +3048,11 @@ static void ParseShaderRegexSections()
 	hash = crc32c_hw(hash, &G->assemble_signature_comments, sizeof(G->assemble_signature_comments));
 	hash = crc32c_hw(hash, &G->disassemble_undecipherable_custom_data, sizeof(G->disassemble_undecipherable_custom_data));
 	hash = crc32c_hw(hash, &G->patch_cb_offsets, sizeof(G->patch_cb_offsets));
+	// The cached patched shaders came out of this build's disassembler,
+	// assembler and patching code, which another build may change. The
+	// company string names the commit:
+	hash = crc32c_hw(hash, VER_FILE_VERSION_STR, sizeof(VER_FILE_VERSION_STR));
+	hash = crc32c_hw(hash, VER_COMPANYNAME_STR, sizeof(VER_COMPANYNAME_STR));
 
 	lower = ini_sections.lower_bound(wstring(L"ShaderRegex"));
 	upper = prefix_upper_bound(ini_sections, wstring(L"ShaderRegex"));
