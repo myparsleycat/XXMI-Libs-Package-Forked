@@ -1055,8 +1055,10 @@ void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pin
 		// What another thread recorded since the queue proxy had our
 		// list executed was promised the value signalled next
 		Dx12ShimSubmit();
+		Dx12QueueLock(shim.queue);
 		shim.queue->Signal(fence, ++fence_signalled);
 		Dx12QueueSignalled(shim.queue, fence, fence_signalled);
+		Dx12QueueUnlock(shim.queue);
 		InterlockedIncrement64(&dx12_stats.pin_signals);
 		for (IUnknown *object : *pins)
 			retired.push_back({ object, fence_signalled });
@@ -1123,8 +1125,13 @@ void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods
 			if (!Dx12QueueCanWait(fence, needed)) {
 				ordered = false;
 			} else if (uses_mods) {
+				HRESULT hr;
+
+				Dx12QueueLock(queue);
 				Dx12QueueWaits(queue, fence, needed);
-				if (SUCCEEDED(queue->Wait(fence, needed))) {
+				hr = queue->Wait(fence, needed);
+				Dx12QueueUnlock(queue);
+				if (SUCCEEDED(hr)) {
 					foreign->waited = needed;
 					InterlockedIncrement64(&dx12_stats.queue_waits);
 				} else {
@@ -1485,8 +1492,10 @@ void Dx12ShimSubmit()
 	lists[count++] = shim_list;
 	Dx12ShimResidencyWait(shim.queue);
 	shim.queue->ExecuteCommandLists(count, lists);
+	Dx12QueueLock(shim.queue);
 	shim.queue->Signal(fence, ++fence_signalled);
 	Dx12QueueSignalled(shim.queue, fence, fence_signalled);
+	Dx12QueueUnlock(shim.queue);
 	allocators[current_allocator].fence = fence_signalled;
 	if (early_open)
 		early_allocators[current_early_allocator].fence = fence_signalled;

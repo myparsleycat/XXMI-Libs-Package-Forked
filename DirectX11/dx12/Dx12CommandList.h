@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "BufferHash.h"
 #include "CmdState.h"
 
 class Dx12Device;
@@ -101,6 +102,8 @@ public:
 	// They only become true when the list is executed, which is when the
 	// queue hands them to the resource tracker, each time it is.
 	std::vector<Dx12Transition> mTransitions;
+	// The same for what the copies it records write to buffers
+	Dx12ListBufferWrites mBufferWrites;
 
 	Dx12GraphicsCommandList(Dx12Device *device, ID3D12GraphicsCommandList *orig);
 

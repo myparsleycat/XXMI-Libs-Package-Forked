@@ -34,7 +34,21 @@ public:
 // as well (a signal after the queue has it, a wait before).
 void Dx12QueueSignalled(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value);
 void Dx12QueueWaits(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value);
+// Held from noting a signal, a wait or an execution with buffer writes until
+// the queue has it, or the other way round, so that they are noted in the
+// order the queue has them, which Dx12QueueAfter goes by. Taken after the
+// shim's lock, before any other of ours.
+void Dx12QueueLock(ID3D12CommandQueue *queue);
+void Dx12QueueUnlock(ID3D12CommandQueue *queue);
 // Whether the signal that takes the fence to the value has been handed to a
 // queue that gets to it with what the queues have been handed so far. Then a
 // wait for it handed to a queue now cannot be one of a circle.
 bool Dx12QueueCanWait(ID3D12Fence *fence, UINT64 value);
+// The place of an execution of lists among those signals and waits, taken
+// before the lists are handed to the queue, with Dx12QueueLock held
+UINT64 Dx12QueueExecutes(ID3D12CommandQueue *queue);
+// Whether the GPU gets through what writer was handed up to the execution of
+// that order before anything queue is handed now: writer is queue, or it was
+// handed a signal after the execution that the fence has got to, or queue was
+// handed a wait for one.
+bool Dx12QueueAfter(ID3D12CommandQueue *queue, ID3D12CommandQueue *writer, UINT64 order);

@@ -300,7 +300,7 @@ void Dx12DumpDraw(Dx12GraphicsCommandList *list, const char *type, UINT count, U
 	ID3D12Resource *ib = NULL, *vb = NULL;
 	UINT64 ib_offset = 0, vb_offset = 0;
 	Dx12BufferHash ib_hash = {}, vb_hash = {};
-	bool ib_hashed = false, vb_hashed = false;
+	bool ib_hashed = false, vb_hashed = false, own;
 	DrawSample counts = {};
 	std::string bindings;
 	FILE *file;
@@ -310,9 +310,9 @@ void Dx12DumpDraw(Dx12GraphicsCommandList *list, const char *type, UINT count, U
 
 	if (!dispatch) {
 		if (indexed && Dx12FindBuffer(state->index_buffer.BufferLocation, &ib, &ib_offset))
-			ib_hashed = Dx12FindBufferHash(ib, ib_offset, &ib_hash);
+			ib_hashed = Dx12FindListBufferHash(&list->mBufferWrites, ib, ib_offset, &ib_hash, &own);
 		if (Dx12FindBuffer(state->vertex_buffers[0].BufferLocation, &vb, &vb_offset))
-			vb_hashed = Dx12FindBufferHash(vb, vb_offset, &vb_hash);
+			vb_hashed = Dx12FindListBufferHash(&list->mBufferWrites, vb, vb_offset, &vb_hash, &own);
 	}
 
 	AcquireSRWLockExclusive(&lock);
@@ -407,8 +407,8 @@ void Dx12HashReport(bool info)
 		t->hashed, t->hashed_bytes / 1048576.0, t->other_subresource, t->partial, t->update_ignored, t->dynamic, t->not_2d,
 		t->unknown_format, t->untracked, t->not_mappable, t->out_of_bounds, t->copy_propagated, t->copy_partial);
 
-	REPORT("  Buffer uploads: %lld hashed (%.1f MB). Not hashed: %lld dynamic, %lld source not mappable, %lld untracked, %lld out of bounds\n",
-		b->hashed, b->hashed_bytes / 1048576.0, b->dynamic, b->not_mappable, b->untracked, b->out_of_bounds);
+	REPORT("  Buffer uploads: %lld hashed (%.1f MB). Not hashed: %lld dynamic, %lld source not mappable, %lld untracked, %lld out of bounds. Copies: %lld moved a hash\n",
+		b->hashed, b->hashed_bytes / 1048576.0, b->dynamic, b->not_mappable, b->untracked, b->out_of_bounds, b->copy_propagated);
 
 	REPORT("  TextureOverride hashes: %Iu in the configuration, %Iu distinct texture and %Iu buffer hashes seen\n",
 		G->mTextureOverrideMap.size(), texture_hashes[DEFAULT_FORMAT_RULE].size(), buffer_hashes[0].size());

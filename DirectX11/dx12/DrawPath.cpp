@@ -670,10 +670,15 @@ struct ReachLookup {
 	VertexReach *reach;
 	// How far it got with the index buffer
 	bool ib_asked, ib_found, ib_hashed;
+	// The list's own copies decided ib_hashed, see Dx12FindListBufferHash
+	bool ib_own;
 	ID3D12Resource *ib;
 	UINT64 ib_offset;
 	Dx12BufferHash ib_upload;
 };
+
+// What the list of the open scope copied to buffers so far, or NULL
+static const Dx12ListBufferWrites* scope_writes();
 
 // What is known about a vertex buffer drawn with the index buffer of the view,
 // or NULL. Sets off finding out if it is not known.
@@ -697,7 +702,7 @@ static const Dx12BufferHash* vertex_reach(ID3D12Resource *vb, UINT64 vb_offset, 
 	lookup->ib_found = true;
 	lookup->ib = key.ib;
 	lookup->ib_offset = key.ib_offset;
-	if (!Dx12FindBufferHash(key.ib, key.ib_offset, &ib_upload))
+	if (!Dx12FindListBufferHash(scope_writes(), key.ib, key.ib_offset, &ib_upload, &lookup->ib_own))
 		return NULL;
 	lookup->ib_hashed = true;
 
@@ -1193,6 +1198,14 @@ static bool buffer_cache_stamp(const BufferCacheEntry *cached, UINT64 *stamp)
 	return true;
 }
 
+// What an entry says is not for a list that copied to the buffers it went by:
+// it goes by what was recorded and executed so far by all of them
+static bool list_wrote(const Dx12ListBufferWrites *writes, const BufferCacheEntry *cached)
+{
+	return Dx12ListWroteBuffer(writes, cached->resource, cached->offset, cached->span)
+	    || (cached->ib_asked && cached->ib_found && Dx12ListWroteBuffer(writes, cached->ib, cached->ib_offset, cached->ib_span));
+}
+
 static bool same_buffer_hash(bool found, const Dx12BufferHash *hash, ID3D12Resource *resource, UINT64 offset)
 {
 	Dx12BufferHash now = {};
@@ -1218,16 +1231,17 @@ static volatile LONG64* boring_unhashed_slot(UINT kind, UINT64 bytes, LONG64 *wo
 }
 
 // Without the lock
-static bool unhashed_buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind)
+static bool unhashed_buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64 va, UINT64 bytes, UINT kind)
 {
 	ID3D12Resource *resource;
 	Dx12BufferHash hash;
 	UINT64 offset;
 	LONG64 word;
+	bool own;
 
 	if (*boring_unhashed_slot(kind, bytes, &word) != word)
 		return false;
-	return Dx12FindBuffer(va, &resource, &offset) && !Dx12FindBufferHash(resource, offset, &hash);
+	return Dx12FindBuffer(va, &resource, &offset) && !Dx12FindListBufferHash(writes, resource, offset, &hash, &own);
 }
 
 // Whether the lookups an entry was made from come to the same now. Without
@@ -1291,7 +1305,7 @@ static Published* publish_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 
 	// In this order: the pointers are only good with the generation
 	if (cached && cached->generation == buffer_cache_generation && cached->config == config_generation
-	    && cached->entry->version == cached->entry_version
+	    && cached->entry->version == cached->entry_version && !list_wrote(scope_writes(), cached)
 	    && buffer_cache_stamp(cached, &stamp) && stamp == cached->stamp) {
 		stats.buffers_remembered++;
 		cached->entry->frame = dx12_frame;
@@ -1382,7 +1396,7 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 	Published *entry, before;
 	UINT64 offset, tag;
 	uint32_t hash;
-	bool has_hash;
+	bool has_hash, own, remember;
 	LONG64 word;
 
 	bucket = buffer_cache_slot(&asked, va, bytes, kind, stride, indices, &tag);
@@ -1392,16 +1406,18 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 		stats.lookups_missing++;
 		return NULL;
 	}
-	has_hash = Dx12FindBufferHash(resource, offset, &data);
+	has_hash = Dx12FindListBufferHash(scope_writes(), resource, offset, &data, &own);
 	lookup.settled = true;
 	if (has_hash && indices)
 		reach = vertex_reach(resource, offset, bytes, stride, &data, indices, &lookup);
+	// What the list's own copies decided is not what the others' draws go by
+	remember = lookup.settled && !own && !lookup.ib_own;
 
 	entry = &published[{ resource, offset, kind }];
 	entry->frame = dx12_frame;
 	before = *entry;
 
-	if (lookup.settled) {
+	if (remember) {
 		asked.resource = resource;
 		asked.offset = offset;
 		asked.span = has_hash ? data.bytes : 1;
@@ -1418,7 +1434,7 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 	if (entry->resource && entry->bytes == bytes) {
 		if (entry->has_data_hash == has_hash && entry->data_hash == data.data_hash && entry->config == config_generation
 		    && entry->reach_bytes == (reach ? reach->bytes : 0) && entry->reach_hash == (reach ? reach->data_hash : 0)) {
-			if (lookup.settled) {
+			if (remember) {
 				asked.entry_version = entry->version;
 				remember_buffer(&asked, has_hash, &data, &lookup);
 				if (asked.generation) {
@@ -1445,7 +1461,7 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 					slot->data = asked;
 					InterlockedExchange(&slot->seq, seq + 2);
 				}
-			} else {
+			} else if (!lookup.settled) {
 				stats.lookups_unsettled++;
 			}
 			return entry;
@@ -1757,6 +1773,11 @@ struct Dx12DrawScope {
 };
 
 static Dx12DrawScope *scope;
+
+static const Dx12ListBufferWrites* scope_writes()
+{
+	return scope ? &scope->list->mBufferWrites : NULL;
+}
 
 static void log_once(bool *reported, const char *message)
 {
@@ -4958,8 +4979,8 @@ static void add_draw_stamps(DrawStamps *stamps, const BufferCacheEntry *cached, 
 	stamps->total += stamp;
 }
 
-static SlowReason buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind, UINT stride, const D3D12_INDEX_BUFFER_VIEW *indices,
-		DrawStamps *stamps = NULL)
+static SlowReason buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64 va, UINT64 bytes, UINT kind, UINT stride,
+		const D3D12_INDEX_BUFFER_VIEW *indices, DrawStamps *stamps = NULL)
 {
 	BufferCacheEntry asked = {}, cached;
 	UINT64 stamp, tag;
@@ -4983,6 +5004,8 @@ static SlowReason buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind, UINT stri
 		// away does not change what the buffer is.
 		if (!cached.generation || cached.config != config_generation)
 			break;
+		if (list_wrote(writes, &cached))
+			return unhashed_buffer_is_boring(writes, va, bytes, kind) ? SLOW_NOT : SLOW_VB_CHANGED;
 		if (!cached.boring)
 			return SLOW_VB_WANTED;
 		if (!buffer_cache_stamp(&cached, &stamp))
@@ -5013,7 +5036,7 @@ static SlowReason buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind, UINT stri
 	}
 	if (stamps)
 		stamps->whole = false;
-	return unhashed_buffer_is_boring(va, bytes, kind) ? SLOW_NOT : SLOW_VB_UNKNOWN;
+	return unhashed_buffer_is_boring(writes, va, bytes, kind) ? SLOW_NOT : SLOW_VB_UNKNOWN;
 }
 
 // The buffers of a draw all at once: most draws of a frame are of meshes drawn
@@ -5221,18 +5244,23 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 		memo_key.vb_slots |= 1u << slot;
 		memo_buffers++;
 	}
+	// The memo is of the buffers as all lists left them, which the list's
+	// own copies may not have
+	if (!list->mBufferWrites.recorded.empty())
+		stamps.whole = false;
 	if (!stamps.whole || !draw_memo_holds(&memo_key)) {
 		for (vbs = worked_out.vbs & pipeline->vb_slots; _BitScanForward(&slot, vbs); vbs &= vbs - 1) {
 			if (slot >= ARRAYSIZE(game->vertex_buffers) || !game->vertex_buffers[slot].BufferLocation)
 				continue;
-			reason = buffer_is_boring(game->vertex_buffers[slot].BufferLocation, game->vertex_buffers[slot].SizeInBytes,
-					PUBLISHED_VERTEX_BUFFER, game->vertex_buffers[slot].StrideInBytes, &game->index_buffer, &stamps);
+			reason = buffer_is_boring(&list->mBufferWrites, game->vertex_buffers[slot].BufferLocation,
+					game->vertex_buffers[slot].SizeInBytes, PUBLISHED_VERTEX_BUFFER, game->vertex_buffers[slot].StrideInBytes,
+					&game->index_buffer, &stamps);
 			if (reason != SLOW_NOT)
 				return reason;
 		}
 		if (worked_out.ib && game->index_buffer.BufferLocation
-		    && buffer_is_boring(game->index_buffer.BufferLocation, game->index_buffer.SizeInBytes, PUBLISHED_INDEX_BUFFER, 0, NULL,
-				&stamps) != SLOW_NOT)
+		    && buffer_is_boring(&list->mBufferWrites, game->index_buffer.BufferLocation, game->index_buffer.SizeInBytes,
+				PUBLISHED_INDEX_BUFFER, 0, NULL, &stamps) != SLOW_NOT)
 			return SLOW_IB;
 		if (stamps.whole)
 			remember_draw(&memo_key, &stamps);
@@ -5274,7 +5302,7 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 // skins to. The scope of such a dispatch answers for vertex buffer slots 0 and
 // SKIN_BLEND_SLOT, no index buffer and the constant buffers of the compute
 // shader, see the Dx12Scope functions.
-static SlowReason skin_is_boring(const Dx12PipelineInfo *pipeline, const SkinDispatch *skin)
+static SlowReason skin_is_boring(Dx12GraphicsCommandList *list, const Dx12PipelineInfo *pipeline, const SkinDispatch *skin)
 {
 	Dx12DrawFilter worked_out;
 	SlowReason reason;
@@ -5299,13 +5327,14 @@ static SlowReason skin_is_boring(const Dx12PipelineInfo *pipeline, const SkinDis
 		return reason;
 
 	if (worked_out.vbs & 1) {
-		reason = buffer_is_boring(skin->source_va, (UINT64)skin->count * skin->stride, PUBLISHED_SKIN_BUFFER, skin->stride, NULL);
+		reason = buffer_is_boring(&list->mBufferWrites, skin->source_va, (UINT64)skin->count * skin->stride, PUBLISHED_SKIN_BUFFER,
+				skin->stride, NULL);
 		if (reason != SLOW_NOT)
 			return reason;
 	}
 	if (worked_out.vbs & 1u << SKIN_BLEND_SLOT) {
-		reason = buffer_is_boring(skin->weights_va, (UINT64)skin->count * skin->weight_stride, PUBLISHED_SKIN_BUFFER,
-				skin->weight_stride, NULL);
+		reason = buffer_is_boring(&list->mBufferWrites, skin->weights_va, (UINT64)skin->count * skin->weight_stride,
+				PUBLISHED_SKIN_BUFFER, skin->weight_stride, NULL);
 		if (reason != SLOW_NOT)
 			return reason;
 	}
@@ -5579,7 +5608,7 @@ bool Dx12Dispatch(Dx12GraphicsCommandList *list, UINT x, UINT y, UINT z)
 			unconfirmed = true;
 		}
 		if (skinning)
-			reason = skin_is_boring(pipeline, &skin);
+			reason = skin_is_boring(list, pipeline, &skin);
 	}
 	if (skinning) {
 		if (reason == SLOW_NOT) {
