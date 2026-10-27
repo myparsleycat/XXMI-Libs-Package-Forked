@@ -1035,8 +1035,10 @@ static bool create_readback(ShimResource *resource)
 // frame, to deform its own along, so lags a frame behind; reading them where
 // the game has them would take its dispatch on the game's list. The memory is
 // the game's to hand out again once its list is done, so it is kept until
-// ours is.
-static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset)
+// ours is. available is what the resource has from the offset on, which can be
+// less than the view of it claims: the view of skinned vertices is as large as
+// what a mod had skinned, into a buffer of ours.
+static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset, UINT64 *available)
 {
 	UINT64 va = src->foreign_va ? src->foreign_va : src->game_va;
 	ID3D12Resource *resource;
@@ -1047,6 +1049,7 @@ static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset)
 	// Never a state a copy can read
 	if (!Dx12GetResourceInfo(resource, &info) || info.heap_type == D3D12_HEAP_TYPE_READBACK)
 		return NULL;
+	*available = *offset < info.desc.Width ? info.desc.Width - *offset : 0;
 	if (!Dx12ShimReadGameResource(resource))
 		return NULL;
 
@@ -1060,7 +1063,7 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	ShimResource *dst = ShimResourceOf(dst11), *src = ShimResourceOf(src11);
 	ShimResourceDesc dst_desc, src_desc;
 	ID3D12Resource *game;
-	UINT64 game_offset;
+	UINT64 game_offset, game_bytes;
 	bool src_in_shadow, whole;
 
 	// The vertices skinned for a mod are in no buffer a list of ours could
@@ -1105,7 +1108,15 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 
 	if (src_in_shadow) {
 		ShimWriteBuffer(dst, dst_offset, src->shadow.data() + src_offset, size);
-	} else if (dst->resource && (game = game_source(src, &game_offset))) {
+	} else if (dst->resource && (game = game_source(src, &game_offset, &game_bytes))) {
+		// Reading past the end of the game's buffer fails our list's
+		// Close(), and executing that removes the device
+		if (src_offset >= game_bytes)
+			return;
+		if (size > game_bytes - src_offset) {
+			size = game_bytes - src_offset;
+			whole = false;
+		}
 		if (Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole))
 			Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
 	} else if (src->resource && dst->resource && src != dst && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)

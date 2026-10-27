@@ -10,6 +10,8 @@
 # mode 9: mode 5, for skin.exe unhashed second second_at=10: weights nothing has a hash of
 # mode 10: mode 5, for skin.exe reuse_at=10: the buffer skinned to had another mesh of as many vertices first
 # mode 11: mode 5, for skin.exe replace_at=10: a mesh of another size takes over the address a mesh of the mod's size was noted at
+# mode 12: mode 0 that copies so0 after its draw and binds the copy as vb0 of its ...IB draw: so0 is as large as the mod's
+#          900 vertices, more than the game's buffer of 300 has
 import os, struct, sys
 out, mode = sys.argv[1], int(sys.argv[2])
 os.makedirs(out, exist_ok=True)
@@ -99,8 +101,18 @@ filename = ib.buf
 ''' % ('' if mode in (2, 3, 4) else '\thandling = skip\n',
       '\tResourceGameVb0 = ref vb0\n\tvb0 = ResourceSkinPosition' if mode == 3 else
       '\tResourceGameVb0 = copy vb0\n\tvb0 = ResourceSkinPosition' if mode == 4 else
-      '\tvb0 = ResourceSkinPosition' if mode in (0, 2) else '\trun = CustomShaderAnim\n\tvb0 = ResourceAnimated',
-      V, '\tvb0 = ResourceGameVb0\n' if mode in (3, 4) else '', count, (V + 63) // 64))
+      '\tvb0 = ResourceSkinPosition' if mode in (0, 2, 12) else '\trun = CustomShaderAnim\n\tvb0 = ResourceAnimated',
+      V, '\tvb0 = ResourceGameVb0\n' if mode in (3, 4) else '\tResourceSkinCopy = copy so0\n' if mode == 12 else '',
+      count, (V + 63) // 64))
+
+if mode == 12:
+    ini = open(os.path.join(out, 'skin.ini')).read()
+    ini = ini.replace('ib = ResourceSkinIB\n', 'ib = ResourceSkinIB\nvb0 = ResourceSkinCopy\n')
+    open(os.path.join(out, 'skin.ini'), 'w').write(ini + '''
+[ResourceSkinCopy]
+type = Buffer
+stride = 40
+''')
 
 if mode in (5, 6, 7, 8, 9, 10, 11):
     def crc32c(b):

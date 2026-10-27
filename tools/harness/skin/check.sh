@@ -21,7 +21,10 @@ cases="0||bar low
 8|drawfirst|low
 9|unhashed second second_at=10|bar low second
 10|reuse_at=10|bar low
-11|replace_at=10|bar low second"
+11|replace_at=10|bar low second
+12||bar low"
+# Mode 12 is a mod copying so0 where it had more vertices skinned than the
+# game's buffer holds; the copy has to stay within that buffer.
 # Mode 8's draws do not check the index buffer, so the mod's ...IB section is
 # not run: the game's draw gets the mod's skinned vertices but keeps its own
 # indices, which reach the bar's lower rows only, as on D3D11.
@@ -40,7 +43,8 @@ run_case() {
 	local mode=$1 args=$2 want=$3 out status got
 	out=$(bash try.sh $mode 60 "$args" 2>&1); status=$?
 	got=$(echo "$out" | spots)
-	if [ $status = 0 ] && [ "$got" = "$want" ]; then
+	# A list of ours that failed to close removes the device when executed
+	if [ $status = 0 ] && [ "$got" = "$want" ] && ! echo "$out" | grep -q "failed to close"; then
 		echo "mode $mode${args:+ ($args)}: OK ($got)"
 	else
 		echo "mode $mode${args:+ ($args)}: FAILED (exit $status), expected [$want], got [$got]"
