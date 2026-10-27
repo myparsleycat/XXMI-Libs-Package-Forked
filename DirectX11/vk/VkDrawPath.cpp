@@ -4339,6 +4339,66 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 	}
 }
 
+// What track_texture_updates has D3D11 and D3D12 do for a copy that replaces
+// the top mip (PropagateResourceHash, propagate_hash): the image takes the data
+// hash of the one copied from, whichever of its levels the copy read, which
+// lets match_lower_mip_textures find what a streaming copy is of
+void VkModsCopyImage(VkImage src, VkImage dst, uint32_t count, const VkImageCopy *regions)
+{
+	D3D11_TEXTURE2D_DESC desc = {};
+	uint32_t width = 0, height = 0, r;
+
+	if (G->track_texture_updates != 1 || src == dst)
+		return;
+
+	AcquireSRWLockShared(&image_lock);
+	auto to = game_images.find(dst);
+	bool known = to != game_images.end() && game_images.count(src);
+	if (known) {
+		width = to->second.width;
+		height = to->second.height;
+	}
+	ReleaseSRWLockShared(&image_lock);
+	if (!known)
+		return;
+
+	for (r = 0; r < count; r++) {
+		const VkImageCopy &region = regions[r];
+		if (!region.dstSubresource.mipLevel && !region.dstSubresource.baseArrayLayer
+		    && !region.dstOffset.x && !region.dstOffset.y && !region.dstOffset.z
+		    && !region.srcOffset.x && !region.srcOffset.y && !region.srcOffset.z
+		    && region.extent.width >= width && region.extent.height >= height)
+			break;
+	}
+	if (r == count)
+		return;
+
+	AcquireSRWLockExclusive(&image_lock);
+	to = game_images.find(dst);
+	auto from = game_images.find(src);
+	if (to != game_images.end() && from != game_images.end()
+	    && (to->second.hashed != from->second.hashed || to->second.data_hash != from->second.data_hash
+	        || to->second.level)) {
+		desc.Width = to->second.width;
+		desc.Height = to->second.height;
+		desc.MipLevels = to->second.mips;
+		desc.ArraySize = to->second.layers;
+		desc.Format = to->second.format->dxgi;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		desc.MiscFlags = to->second.cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+
+		images_changing();
+		to->second.level = 0;
+		to->second.hashed = from->second.hashed;
+		to->second.data_hash = from->second.hashed ? from->second.data_hash : 0;
+		to->second.hash = from->second.hashed ? CalcTexture2DDescHash(to->second.data_hash, &desc) : 0;
+		images_changed();
+	}
+	ReleaseSRWLockExclusive(&image_lock);
+}
+
 // -----------------------------------------------------------------------------
 // What is set on a command buffer
 

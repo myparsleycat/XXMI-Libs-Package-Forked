@@ -56,29 +56,33 @@ static DXGI_FORMAT apply_format_rule(DXGI_FORMAT format, Dx12FormatRule rule)
 	return format;
 }
 
+void Dx12TextureDesc(const Dx12ResourceInfo *info, Dx12FormatRule rule, D3D11_TEXTURE2D_DESC *desc)
+{
+	desc->Width = (UINT)info->desc.Width;
+	desc->Height = info->desc.Height;
+	desc->MipLevels = info->desc.MipLevels;
+	desc->ArraySize = info->desc.DepthOrArraySize;
+	desc->Format = apply_format_rule(info->desc.Format, rule);
+	desc->SampleDesc = info->desc.SampleDesc;
+	desc->Usage = D3D11_USAGE_DEFAULT;
+	desc->BindFlags = 0;
+	if (!(info->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+		desc->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+	if (info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+		desc->BindFlags |= D3D11_BIND_RENDER_TARGET;
+	if (info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+		desc->BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+	if (info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+		desc->BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+	desc->CPUAccessFlags = 0;
+	desc->MiscFlags = info->cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+}
+
 uint32_t Dx12TextureHash(const Dx12ResourceInfo *info, Dx12FormatRule rule)
 {
 	D3D11_TEXTURE2D_DESC desc;
 
-	desc.Width = (UINT)info->desc.Width;
-	desc.Height = info->desc.Height;
-	desc.MipLevels = info->desc.MipLevels;
-	desc.ArraySize = info->desc.DepthOrArraySize;
-	desc.Format = apply_format_rule(info->desc.Format, rule);
-	desc.SampleDesc = info->desc.SampleDesc;
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = 0;
-	if (!(info->desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
-		desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
-	if (info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-		desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
-	if (info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
-		desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
-	if (info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-		desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-	desc.CPUAccessFlags = 0;
-	desc.MiscFlags = info->cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
-
+	Dx12TextureDesc(info, rule, &desc);
 	return CalcTexture2DDescHash(info->has_data_hash ? info->data_hash : 0, &desc);
 }
 

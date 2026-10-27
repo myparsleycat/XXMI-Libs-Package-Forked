@@ -495,6 +495,70 @@ uint32_t CalcTexture3DDescHash(uint32_t initial_hash, const D3D11_TEXTURE3D_DESC
 	return hash;
 }
 
+static UINT full_mip_chain(UINT width, UINT height)
+{
+	UINT levels = 1, size = max(width, height);
+
+	while (size > 1) {
+		size >>= 1;
+		levels++;
+	}
+	return levels;
+}
+
+// A side of 1 is that of every level from where it got to 1 on, so the side
+// of the texture copied from may have been any power of two up to 1 << levels
+static UINT top_mip_sides(UINT side, UINT levels, UINT sides[LOWER_MIP_TEXTURE_LEVELS + 1])
+{
+	UINT count = 0, i;
+
+	if (side > 1) {
+		if (side <= ((UINT)D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION >> levels))
+			sides[count++] = side << levels;
+		return count;
+	}
+	for (i = 0; i <= levels; i++)
+		sides[count++] = 1u << i;
+	return count;
+}
+
+UINT LowerMipTextureOrigins(const D3D11_TEXTURE2D_DESC *desc, UINT levels,
+		D3D11_TEXTURE2D_DESC origins[LOWER_MIP_TEXTURE_ORIGINS])
+{
+	UINT widths[LOWER_MIP_TEXTURE_LEVELS + 1], heights[LOWER_MIP_TEXTURE_LEVELS + 1];
+	UINT width_count, height_count, w, h, mips, count = 0;
+
+	if (!levels || levels > LOWER_MIP_TEXTURE_LEVELS)
+		return 0;
+
+	// 0 asks for every level down to 1x1
+	mips = (desc->MipLevels ? desc->MipLevels : full_mip_chain(desc->Width, desc->Height)) + levels;
+	if (mips > (UINT)D3D11_REQ_MIP_LEVELS)
+		return 0;
+
+	width_count = top_mip_sides(desc->Width, levels, widths);
+	height_count = top_mip_sides(desc->Height, levels, heights);
+	for (w = 0; w < width_count; w++) {
+		for (h = 0; h < height_count; h++) {
+			UINT chain = full_mip_chain(widths[w], heights[h]);
+			if (mips > chain)
+				continue;
+
+			D3D11_TEXTURE2D_DESC origin = *desc;
+			origin.Width = widths[w];
+			origin.Height = heights[h];
+			origin.MipLevels = mips;
+			origins[count++] = origin;
+			// Created either way when the texture has all its levels
+			if (mips == chain) {
+				origin.MipLevels = 0;
+				origins[count++] = origin;
+			}
+		}
+	}
+	return count;
+}
+
 // -----------------------------------------------------------------------------------------------
 
 static UINT CompressedFormatBlockSize(DXGI_FORMAT Format)
@@ -2084,6 +2148,39 @@ void InvalidateTextureOverrideCandidates()
 		slot.store(nullptr);
 }
 
+// match_lower_mip_textures: a copy keeps the data hash of what it was copied
+// from, whichever of its levels the copy read (PropagateResourceHash), so the
+// copy of a texture without its top levels has the hash of that texture once
+// those levels are added back to its description. Only for a hash made from
+// its own data and description, which on D3D12 the shim may have picked
+// otherwise (pick_texture_hash), and which a texture written every frame no
+// longer has (note_top_update).
+static std::vector<TextureOverride>* find_lower_mip_texture_overrides(const ResourceHandleInfo *handle_info)
+{
+	D3D11_TEXTURE2D_DESC desc, origins[LOWER_MIP_TEXTURE_ORIGINS];
+	UINT levels, count, o;
+
+	if (handle_info->type != D3D11_RESOURCE_DIMENSION_TEXTURE2D || !handle_info->data_hash)
+		return NULL;
+	desc = handle_info->desc2D;
+	if (CalcTexture2DDescHash(handle_info->data_hash, &desc) != handle_info->hash)
+		return NULL;
+
+	for (levels = 1; levels <= LOWER_MIP_TEXTURE_LEVELS; levels++) {
+		count = LowerMipTextureOrigins(&handle_info->desc2D, levels, origins);
+		for (o = 0; o < count; o++) {
+			uint32_t hash = CalcTexture2DDescHash(handle_info->data_hash, &origins[o]);
+			TextureOverrideMap::iterator i = lookup_textureoverride(hash);
+			if (i != G->mTextureOverrideMap.end()) {
+				LogDebug("Texture hash %08x matches the TextureOverride of %08x, the texture with %u more top mip levels\n",
+					handle_info->hash, hash, levels);
+				return &i->second;
+			}
+		}
+	}
+	return NULL;
+}
+
 // Must be called with G->mCriticalSection held, and the returned candidates
 // read before releasing it: they are built and stored in ResourceHandleInfo
 // here, so concurrent draws on deferred contexts must not race on them.
@@ -2117,6 +2214,8 @@ TextureOverrideCandidates* get_texture_override_candidates(ID3D11Resource *resou
 			TextureOverrideMap::iterator i = lookup_textureoverride(handle_info->hash);
 			if (i != G->mTextureOverrideMap.end())
 				candidates->hash_matches = &i->second;
+			else if (G->match_lower_mip_textures)
+				candidates->hash_matches = find_lower_mip_texture_overrides(handle_info);
 		}
 
 		handle_info->texture_override_hash = handle_info->hash;

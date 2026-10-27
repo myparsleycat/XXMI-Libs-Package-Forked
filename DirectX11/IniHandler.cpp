@@ -5075,6 +5075,7 @@ void LoadConfigFile()
 	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", true, NULL);
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
+	G->match_lower_mip_textures = GetIniBool(L"Rendering", L"match_lower_mip_textures", false, NULL);
 
 	if (GetIniStringAndLog(L"Rendering", L"cache_resource_data", 0, setting, MAX_PATH)) {
 		if (wcscmp(setting, L"none") == 0)

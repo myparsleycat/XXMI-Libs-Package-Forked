@@ -46,6 +46,8 @@
 	X(CreateImageView) \
 	X(DestroyImageView) \
 	X(CmdCopyBufferToImage) \
+	X(CmdCopyImage) \
+	X(CmdCopyImage2) \
 	X(CmdUpdateBuffer) \
 	X(CmdFillBuffer) \
 	X(CmdBindPipeline) \
@@ -474,6 +476,30 @@ static void VKAPI_CALL Hooked_vkCmdCopyBufferToImage(VkCommandBuffer cmd, VkBuff
 	if (vk_mods_active)
 		VkModsCopyBufferToImage(src, dst, count, regions);
 	next_CmdCopyBufferToImage(cmd)(cmd, src, dst, layout, count, regions);
+}
+
+static void VKAPI_CALL Hooked_vkCmdCopyImage(VkCommandBuffer cmd, VkImage src, VkImageLayout src_layout, VkImage dst,
+		VkImageLayout dst_layout, uint32_t count, const VkImageCopy *regions)
+{
+	if (vk_mods_active)
+		VkModsCopyImage(src, dst, count, regions);
+	next_CmdCopyImage(cmd)(cmd, src, src_layout, dst, dst_layout, count, regions);
+}
+
+static void VKAPI_CALL Hooked_vkCmdCopyImage2(VkCommandBuffer cmd, const VkCopyImageInfo2 *info)
+{
+	uint32_t i;
+
+	if (vk_mods_active) {
+		std::vector<VkImageCopy> regions(info->regionCount);
+
+		for (i = 0; i < info->regionCount; i++) {
+			const VkImageCopy2 &region = info->pRegions[i];
+			regions[i] = { region.srcSubresource, region.srcOffset, region.dstSubresource, region.dstOffset, region.extent };
+		}
+		VkModsCopyImage(info->srcImage, info->dstImage, info->regionCount, regions.data());
+	}
+	next_CmdCopyImage2(cmd)(cmd, info);
 }
 
 static void VKAPI_CALL Hooked_vkCmdCopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions)
@@ -1093,6 +1119,9 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		if (exports.UnmapMemory2KHR && (void*)next.UnmapMemory2KHR == NktHookLibHelpers::GetProcedureAddress(vulkan, "vkUnmapMemory2"))
 			next.UnmapMemory2KHR = exports.UnmapMemory2KHR;
 	}
+	// And a device from before Vulkan 1.3 by the name of its extension only
+	if (!next.CmdCopyImage2)
+		next.CmdCopyImage2 = (PFN_vkCmdCopyImage2)get(device, "vkCmdCopyImage2KHR");
 
 	AcquireSRWLockExclusive(&dispatch_lock);
 
@@ -1577,6 +1606,8 @@ static PFN_vkVoidFunction VKAPI_CALL Hooked_vkGetDeviceProcAddr(VkDevice device,
 		return (PFN_vkVoidFunction)Hooked_vkBindBufferMemory2;
 	if (!strcmp(name, "vkCmdCopyBuffer2KHR") && dispatch->next.CmdCopyBuffer2)
 		return (PFN_vkVoidFunction)Hooked_vkCmdCopyBuffer2;
+	if (!strcmp(name, "vkCmdCopyImage2KHR") && dispatch->next.CmdCopyImage2)
+		return (PFN_vkVoidFunction)Hooked_vkCmdCopyImage2;
 	if (!strcmp(name, "vkCreateDescriptorUpdateTemplateKHR") && dispatch->next.CreateDescriptorUpdateTemplate)
 		return (PFN_vkVoidFunction)Hooked_vkCreateDescriptorUpdateTemplate;
 	if (!strcmp(name, "vkUpdateDescriptorSetWithTemplateKHR") && dispatch->next.UpdateDescriptorSetWithTemplate)

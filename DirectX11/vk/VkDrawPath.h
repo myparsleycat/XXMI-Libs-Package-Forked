@@ -145,6 +145,7 @@ void VkModsForgetImage(VkImage image);
 void VkModsImageView(VkImageView view, const VkImageViewCreateInfo *info);
 void VkModsForgetImageView(VkImageView view);
 void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const VkBufferImageCopy *regions);
+void VkModsCopyImage(VkImage src, VkImage dst, uint32_t count, const VkImageCopy *regions);
 void VkModsQueue(VkDevice device, VkQueue queue, uint32_t family);
 
 void VkModsShaderModule(VkShaderModule module, const VkShaderModuleCreateInfo *info);

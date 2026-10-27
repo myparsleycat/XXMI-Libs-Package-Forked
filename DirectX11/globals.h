@@ -540,6 +540,7 @@ struct Globals
 	int EXPORT_HLSL;		// 0=off, 1=HLSL only, 2=HLSL+OriginalASM, 3= HLSL+OriginalASM+recompiledASM
 	bool EXPORT_SHADERS, EXPORT_FIXED, EXPORT_BINARY, CACHE_SHADERS, SCISSOR_DISABLE;
 	int track_texture_updates;
+	bool match_lower_mip_textures;
 	bool assemble_signature_comments;
 	bool disassemble_undecipherable_custom_data;
 	bool patch_cb_offsets;
@@ -790,6 +791,7 @@ struct Globals
 		any_deny_cpu_read(false),
 		allow_buffer_resize(true),
 		texture_hash_version(0),
+		match_lower_mip_textures(false),
 		EXPORT_SHADERS(false),
 		EXPORT_HLSL(0),
 		EXPORT_FIXED(false),

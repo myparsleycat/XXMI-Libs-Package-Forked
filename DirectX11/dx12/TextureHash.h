@@ -1,5 +1,7 @@
 #pragma once
 
+#include <d3d11.h>
+
 #include "ResourceTracker.h"
 
 // Reproduces the hashes [TextureOverride] sections were written against under
@@ -29,8 +31,11 @@ enum Dx12FormatRule {
 };
 extern const char *const dx12_format_rule_names[DX12_FORMAT_RULE_COUNT];
 
-// The hash 3DMigoto would have given the D3D11 counterpart of a 2D texture
+// The hash 3DMigoto would have given the D3D11 counterpart of a 2D texture,
+// and the description of that counterpart, which the hash is of along with
+// the data hash
 uint32_t Dx12TextureHash(const Dx12ResourceInfo *info, Dx12FormatRule rule);
+void Dx12TextureDesc(const Dx12ResourceInfo *info, Dx12FormatRule rule, D3D11_TEXTURE2D_DESC *desc);
 
 // For the command list proxy, before it forwards the call
 void Dx12CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z,

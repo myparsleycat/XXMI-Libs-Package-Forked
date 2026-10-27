@@ -332,10 +332,14 @@ static ID3D11Resource* new_game_texture(const Dx12ResourceInfo *info, D3D11_TEXT
 
 // D3D12 does not record everything that went into the hash of a D3D11
 // resource, so there are a few it could have been. The one a mod asks for is
-// the one the game's D3D11 renderer would have produced.
+// the one the game's D3D11 renderer would have produced. Failing that, with
+// match_lower_mip_textures, that of the texture this is a copy of without its
+// top mip levels, which a copy has the data hash of (propagate_hash).
 static uint32_t pick_texture_hash(const Dx12ResourceInfo *info)
 {
+	D3D11_TEXTURE2D_DESC desc, origins[LOWER_MIP_TEXTURE_ORIGINS];
 	uint32_t hash, first = 0;
+	UINT levels, count, o;
 	int rule;
 
 	for (rule = 0; rule < DX12_FORMAT_RULE_COUNT; rule++) {
@@ -344,6 +348,20 @@ static uint32_t pick_texture_hash(const Dx12ResourceInfo *info)
 			return hash;
 		if (!rule)
 			first = hash;
+	}
+
+	if (!G->match_lower_mip_textures || !info->has_data_hash || G->mTextureOverrideMap.empty())
+		return first;
+	for (levels = 1; levels <= LOWER_MIP_TEXTURE_LEVELS; levels++) {
+		for (rule = 0; rule < DX12_FORMAT_RULE_COUNT; rule++) {
+			Dx12TextureDesc(info, (Dx12FormatRule)rule, &desc);
+			count = LowerMipTextureOrigins(&desc, levels, origins);
+			for (o = 0; o < count; o++) {
+				hash = CalcTexture2DDescHash(info->data_hash, &origins[o]);
+				if (G->mTextureOverrideMap.count(hash))
+					return hash;
+			}
+		}
 	}
 	return first;
 }
