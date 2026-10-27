@@ -52,6 +52,10 @@ the settings that harness needs. To change more settings, append
 - `check.sh move`: mesh A's vertices move between buffers by GPU copies,
   across lists and queues. The cases are in the comment at `move_test` in
   `harness.cpp`. The script checks frame by frame whether A stays hidden.
+- `check.sh lowmip`: a texture is filled by a GPU copy from the second mip
+  level of a texture whose hash `case/test.ini` lists. With
+  `track_texture_updates = 1` the copy has to be drawn with
+  `match_lower_mip_textures = 0` and hidden with `1`.
 - `check.sh ref`: compares the pictures of `run` and `ref` with the mod in
   `case/Mods` and with `test.ini`.
 - `bench.sh [runs] [args]`: reports the recording time per frame with no DLL,
@@ -68,6 +72,11 @@ when `harness.cpp` changes its meshes.
   with `run` and with `ref`. The pixels and the picture checksum have to match.
 - `check.sh fg`: runs every `fg_*.ini` with frame generation
   (`--generated 1`). The mod's triangle has to be on screen at the end.
+- `check.sh lowmip`: draws `case/tests/lowmip_texhash.ini` with `--lowmip`,
+  where `vkCmdCopyImage` fills the texture from the second mip level of a
+  texture whose hash the ini lists, 2x2 from 4x4 and with `--wide` 2x1 from
+  4x1. The texture has to be replaced only with
+  `track_texture_updates = 1` and `match_lower_mip_textures = 1`.
 - `try.sh <test> [args]`: runs one test ini and prints the summary from
   `vk_report.txt`.
 

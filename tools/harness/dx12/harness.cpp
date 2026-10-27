@@ -7,7 +7,7 @@
 // harness.exe [frames=3000] [nodll] [meshes=350] [passes=3] [dump=file.bmp]
 //             [key=VK] [keyframe=N] [uploads=60] [churn=1] [table=4] [heap=N]
 //             [video] [dxil] [rootconst] [threads=1] [rereach=K] [contend]
-//             [profile | profile=present] [test [move | evict [evictstop=N]]]
+//             [profile | profile=present] [test [move | evict [evictstop=N] | lowmip]]
 //             [scene=file [slot=vb0] [appear=N]]
 // Prints the average frame time of the frames after the first 300, in blocks.
 //   dump=file.bmp  the last frame as a picture and its checksum
@@ -20,6 +20,7 @@
 //   threads=1      passes after the first recorded on a thread of their own
 //   test           the meshes and textures that Mods/test.ini looks for (check.sh)
 //   move, evict    with test: see move_test and evict_test below
+//   lowmip         with test: see lowmip_test below
 //   scene=file     the parts of real mods (cpu/dx12.sh); appear=N: a mod at a time
 //                  for N frames, CYCLES=N in the environment repeats them,
 //                  STEADY profiles the steady frames in place of the first ones
@@ -134,6 +135,13 @@ static std::vector<ID3D12Pageable*> evicted_buffers;
 static ID3D12GraphicsCommandList *empty_list;
 // The meshes and textures of the test: see Mods/test.ini
 static const UINT TEST_A = 30, TEST_B = 31, TEST_C = 32, TEST_CONTROL = 33, TEST_TEXTURE = 40, TEST_TEXTURE_B = 41;
+// lowmip (with test): texture TEST_LOWMIP_FULL is twice the size of the others
+// with a second mip level, and TEST_LOWMIP_COPY the size of the others with
+// one level, filled by a copy of that second level, as texture streaming makes
+// a texture without its top level. Mods/test.ini skips the draws with the
+// first, and with match_lower_mip_textures those with the second.
+static bool lowmip_test;
+static const UINT TEST_LOWMIP_FULL = 43, TEST_LOWMIP_COPY = 44;
 static BYTE test_vb[VERTICES * 12], test_other_vb[VERTICES * 12];
 static UINT test_texels[TEXTURE_SIZE * TEXTURE_SIZE];
 static const UINT RING_VBS = 30;
@@ -400,6 +408,54 @@ static UINT rng()
 	return rng_state >> 8;
 }
 
+static void create_lowmip_texture(ID3D12GraphicsCommandList *list, ID3D12Resource *upload, BYTE *data, UINT64 *at, UINT i)
+{
+	D3D12_HEAP_PROPERTIES heap = {};
+	D3D12_RESOURCE_DESC desc = {};
+	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+	bool full = i == TEST_LOWMIP_FULL;
+	UINT level, size, v;
+
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = full ? TEXTURE_SIZE * 2 : TEXTURE_SIZE;
+	desc.Height = full ? TEXTURE_SIZE * 2 : TEXTURE_SIZE;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = full ? 2 : 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&textures[i])));
+
+	dst.pResource = textures[i];
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	if (!full) {
+		src.pResource = textures[TEST_LOWMIP_FULL];
+		src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.SubresourceIndex = 1;
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+		transition(list, textures[TEST_LOWMIP_FULL], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		transition(list, textures[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		return;
+	}
+
+	for (level = 0; level < 2; level++) {
+		UINT *texels = (UINT*)(data + *at);
+
+		size = TEXTURE_SIZE * 2 >> level;
+		for (v = 0; v < size * size; v++)
+			texels[v] = 0xff000000 | ((v * 2654435761u) >> 8 & 0xffffff) ^ (level * 0x5a5a5a);
+		dst.SubresourceIndex = level;
+		src.pResource = upload;
+		src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		src.PlacedFootprint.Offset = *at;
+		src.PlacedFootprint.Footprint = { DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, size * 4 };
+		list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+		*at += size * size * 4;
+	}
+	// Until TEST_LOWMIP_COPY is copied from it
+	transition(list, textures[i], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+}
+
 // Everything the scene is made of, uploaded the way an engine does: written
 // to an upload buffer and copied from there
 static void create_scene(UINT mesh_count)
@@ -408,7 +464,8 @@ static void create_scene(UINT mesh_count)
 	const UINT strides[3] = { 12, 8, 16 };
 	const UINT64 ib_bytes = INDICES * 2;
 	const UINT64 per_mesh = 1024;
-	UINT64 upload_bytes = mesh_count * per_mesh + (UINT64)TEXTURES * TEXTURE_SIZE * TEXTURE_SIZE * 4 + 65536;
+	// lowmip: TEST_LOWMIP_FULL is the size of five of the others
+	UINT64 upload_bytes = mesh_count * per_mesh + (UINT64)(TEXTURES + 4) * TEXTURE_SIZE * TEXTURE_SIZE * 4 + 65536;
 	ID3D12Resource *upload = create_buffer(upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
 	ID3D12CommandAllocator *allocator = frames[0].allocators[0];
 	ID3D12GraphicsCommandList *list = lists[0];
@@ -523,6 +580,13 @@ static void create_scene(UINT mesh_count)
 		D3D12_RESOURCE_DESC desc = {};
 		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
 		UINT *texels = (UINT*)(data + at);
+
+		if (lowmip_test && (i == TEST_LOWMIP_FULL || i == TEST_LOWMIP_COPY)) {
+			create_lowmip_texture(list, upload, data, &at, i);
+			device->CreateShaderResourceView(textures[i], NULL, cpu);
+			cpu.ptr += view_size;
+			continue;
+		}
 
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -660,6 +724,14 @@ static void dump_back_buffer(const char *path, ID3D12Resource *back_buffer)
 
 			printf("  mesh %3u %-28s %s\n", watched[w], names[w], hidden ? "hidden" : "drawn");
 		}
+		for (UINT w = TEST_LOWMIP_FULL; lowmip_test && w <= TEST_LOWMIP_COPY; w++) {
+			float ndc_x = -0.95f + (w % 25) * 0.078f, ndc_y = -0.9f + (w / 25) * 0.12f;
+			UINT px = (UINT)((ndc_x * 0.5f + 0.5f) * WIDTH), py = (UINT)((1.0f - (ndc_y * 0.5f + 0.5f)) * HEIGHT);
+			const BYTE *p = data + (UINT64)py * footprint.Footprint.RowPitch + px * 4;
+			bool hidden = abs(p[0] - 26) <= 1 && abs(p[1] - 26) <= 1 && abs(p[2] - 38) <= 1;
+
+			printf("  mesh %3u %-28s %s\n", w, w == TEST_LOWMIP_FULL ? "lowmip full" : "lowmip copy", hidden ? "hidden" : "drawn");
+		}
 	}
 	save_bmp(path, data, footprint.Footprint.RowPitch);
 	readback->Unmap(0, NULL);
@@ -772,6 +844,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "test")) test = true;
 		else if (!strcmp(argv[a], "evict")) evict_test = true;
 		else if (!strcmp(argv[a], "move")) move_test = true;
+		else if (!strcmp(argv[a], "lowmip")) lowmip_test = true;
 		else if (!strncmp(argv[a], "evictstop=", 10)) evict_stop = atoi(argv[a] + 10);
 		else if (!strncmp(argv[a], "appear=", 7)) appear_frames = atoi(argv[a] + 7);
 		else if (!strncmp(argv[a], "rereach=", 8)) rereach = atoi(argv[a] + 8);

@@ -8,7 +8,7 @@
 //               [--rewrite] [--bonetick] [--unmapped | --map2 | --gpufilled]
 //               [--upload late|unmapped|discard|fill|srcfill|lastfill]
 //               [--generated N [--overlay]] [--reload 1|2|3] [--profile]
-//               [--efmi file [--characters N] [--passes N] [--appear N]]
+//               [--efmi file [--characters N] [--passes N] [--appear N]] [--lowmip [--wide]]
 //
 // --instance gets the device's functions from vkGetInstanceProcAddr instead
 // of vkGetDeviceProcAddr, which are the loader's exports. --pool draws the
@@ -61,7 +61,7 @@
 	X(CreateDescriptorPool) X(DestroyDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) \
 	X(CmdBindDescriptorSets) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) X(CreateImage) X(DestroyImage) \
 	X(GetImageMemoryRequirements) X(BindImageMemory) X(CmdCopyBufferToImage) X(CreateSampler) X(DestroySampler) \
-	X(CmdFillBuffer)
+	X(CmdFillBuffer) X(CmdCopyImage)
 
 static struct {
 #define X(name) PFN_vk##name name;
@@ -158,6 +158,13 @@ int main(int argc, char **argv)
 	// --gpufilled: the GPU fills that buffer with vkCmdCopyBuffer just before
 	// the copy to the texture; the CPU never maps it
 	bool gpufilled = false;
+	// --lowmip: the texture is filled by vkCmdCopyImage from the second level
+	// of one twice its size with two levels, as texture streaming makes a
+	// texture without its top level
+	bool lowmip = false;
+	// --wide: with --lowmip, that one is 4x1 and the texture 2x1, a side of
+	// 1 being that of the level above it too
+	bool wide = false;
 	// --upload <how>: the order of the upload of vb and ib through the staging
 	// buffer, for a draw without --pool. late: the staging buffer is filled
 	// after the copies are recorded, before they are submitted. unmapped: it is
@@ -224,6 +231,10 @@ int main(int argc, char **argv)
 			map2 = true;
 		else if (!strcmp(argv[i], "--gpufilled"))
 			gpufilled = true;
+		else if (!strcmp(argv[i], "--lowmip"))
+			lowmip = true;
+		else if (!strcmp(argv[i], "--wide"))
+			wide = true;
 		else if (!strcmp(argv[i], "--upload") && i + 1 < argc && (!strcmp(argv[i + 1], "late")
 		    || !strcmp(argv[i + 1], "unmapped") || !strcmp(argv[i + 1], "discard") || !strcmp(argv[i + 1], "fill")
 		    || !strcmp(argv[i + 1], "srcfill") || !strcmp(argv[i + 1], "lastfill")))
@@ -710,7 +721,8 @@ int main(int argc, char **argv)
 	void *texels_mapped;
 	VkDeviceMemory texels_source_memory;
 	VkBuffer texels_source = VK_NULL_HANDLE;
-	VkBuffer texels = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (gpufilled ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0),
+	VkDeviceSize texel_bytes = lowmip ? 80 : 16;
+	VkBuffer texels = make_buffer(texel_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (gpufilled ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0),
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &texels_memory);
 	if (gpufilled) {
 		texels_source = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -729,7 +741,7 @@ int main(int argc, char **argv)
 	} else {
 		CHECK(vk.MapMemory(device, texels_memory, 0, VK_WHOLE_SIZE, 0, &texels_mapped));
 	}
-	memset(texels_mapped, 0xff, 16);
+	memset(texels_mapped, 0xff, (size_t)texel_bytes);
 	if (unmapped && map2) {
 		PFN_vkUnmapMemory2KHR unmap_memory2 = (PFN_vkUnmapMemory2KHR)vk.GetDeviceProcAddr(device, "vkUnmapMemory2KHR");
 		VkMemoryUnmapInfoKHR unmap_info = { VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR };
@@ -740,7 +752,7 @@ int main(int argc, char **argv)
 	}
 	texture_info.imageType = VK_IMAGE_TYPE_2D;
 	texture_info.format = VK_FORMAT_R8G8B8A8_UNORM;
-	texture_info.extent = { 2, 2, 1 };
+	texture_info.extent = { 2, lowmip && wide ? 1u : 2u, 1 };
 	texture_info.mipLevels = 1;
 	texture_info.arrayLayers = 1;
 	texture_info.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -760,6 +772,26 @@ int main(int argc, char **argv)
 	sampler_info.maxLod = 16;
 	CHECK(vk.CreateSampler(device, &sampler_info, NULL, &sampler));
 
+	VkImage full = VK_NULL_HANDLE;
+	VkDeviceMemory full_memory;
+	UINT full_height = wide ? 1 : 4;
+	if (lowmip) {
+		VkImageCreateInfo full_info = texture_info;
+		VkMemoryRequirements full_needs;
+		VkMemoryAllocateInfo full_allocate = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+
+		full_info.extent = { 4, full_height, 1 };
+		full_info.mipLevels = 2;
+		full_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		CHECK(vk.CreateImage(device, &full_info, NULL, &full));
+		vk.GetImageMemoryRequirements(device, full, &full_needs);
+		full_allocate.allocationSize = full_needs.size;
+		for (full_allocate.memoryTypeIndex = 0; !(full_needs.memoryTypeBits & (1u << full_allocate.memoryTypeIndex));
+		     full_allocate.memoryTypeIndex++);
+		CHECK(vk.AllocateMemory(device, &full_allocate, NULL, &full_memory));
+		CHECK(vk.BindImageMemory(device, full, full_memory, 0));
+	}
+
 	texture_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 	texture_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 	texture_barrier.srcQueueFamilyIndex = texture_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -777,7 +809,32 @@ int main(int argc, char **argv)
 		vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &filled, 0, NULL, 0, NULL);
 	}
 	vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &texture_barrier);
-	vk.CmdCopyBufferToImage(cmd, texels, texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &texture_copy);
+	if (lowmip) {
+		VkImageMemoryBarrier full_barrier = texture_barrier;
+		VkBufferImageCopy levels[2] = {};
+		VkImageCopy copy = {};
+
+		full_barrier.image = full;
+		full_barrier.subresourceRange.levelCount = 2;
+		vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &full_barrier);
+		levels[0].imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		levels[0].imageExtent = { 4, full_height, 1 };
+		levels[1].bufferOffset = 4 * full_height * 4;
+		levels[1].imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1 };
+		levels[1].imageExtent = texture_info.extent;
+		vk.CmdCopyBufferToImage(cmd, texels, full, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, levels);
+		full_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		full_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		full_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		full_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &full_barrier);
+		copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1 };
+		copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		copy.extent = texture_info.extent;
+		vk.CmdCopyImage(cmd, full, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	} else {
+		vk.CmdCopyBufferToImage(cmd, texels, texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &texture_copy);
+	}
 	texture_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 	texture_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	texture_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;

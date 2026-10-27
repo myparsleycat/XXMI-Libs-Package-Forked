@@ -1,6 +1,6 @@
 #!/bin/bash
-# check.sh [tests] [fg]: the checks of the Vulkan side, in the run folder
-# setup.sh makes (default: both). Exits with 1 when one fails.
+# check.sh [tests] [fg] [upload] [lowmip]: the checks of the Vulkan side, in the
+# run folder setup.sh makes (default: all). Exits with 1 when one fails.
 #   tests  every case/tests/test_*.ini and bench_*.ini drawn with the DLL of run
 #          and with that of ref (setup.sh ref <older d3d11.dll>): the pixels
 #          and the checksum of the picture have to be the same
@@ -13,6 +13,12 @@
 #          pixels have to be those of --pool; with --upload fill, srcfill and
 #          lastfill those of a run without the DLL, as the indices the mod is
 #          for are gone
+#   lowmip lowmip_texhash with the texture copied from the second level of one
+#          with two (--lowmip), whose hash the ini has, also 2x1 from 4x1
+#          (--wide): with
+#          track_texture_updates = 1 and match_lower_mip_textures = 1 the
+#          pixels have to be those of test_texhash, which matches the texture
+#          itself; with either at 0 those of the texture not replaced
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here/run" 2>/dev/null || { echo "no run folder: run setup.sh first"; exit 1; }
 ok=1
@@ -99,12 +105,52 @@ run_upload() {
 	cp ../case/tests/test_texture.ini Mods/test.ini
 }
 
-for what in ${@:-tests fg upload}; do
+lowmip_at() {
+	# the picture of lowmip_texhash with track_texture_updates = $1 and
+	# match_lower_mip_textures = $2, with the further harness arguments
+	local track=$1 match=$2
+	shift 2
+	cp d3dx.ini d3dx.ini.keep
+	sed -i "s/^track_texture_updates *=.*/track_texture_updates = $track/; s/^match_lower_mip_textures *=.*/match_lower_mip_textures = $match/" d3dx.ini
+	picture 2 --pool --lowmip "$@" | sed 's/picture checksum [0-9a-f]* //'
+	mv d3dx.ini.keep d3dx.ini
+}
+
+run_lowmip() {
+	local replaced kept got want settings shape
+	grep -q "^match_lower_mip_textures *=" d3dx.ini || { echo "lowmip: FAILED, d3dx.ini has no match_lower_mip_textures: run setup.sh again"; ok=0; return; }
+	for shape in "" --wide; do
+		cp ../case/tests/test_texhash.ini Mods/test.ini
+		replaced=$(picture 2 --pool | sed 's/picture checksum [0-9a-f]* //')
+		# Its hash is that of the texture of a run without --lowmip
+		kept=$(picture 2 --pool --lowmip $shape | sed 's/picture checksum [0-9a-f]* //')
+		cp ../case/tests/lowmip_texhash.ini Mods/test.ini
+		if [ "$replaced" = "$kept" ] || ! echo "$replaced" | grep -q "^middle.*exit 0$"; then
+			echo "lowmip$shape: FAILED, no difference to tell: replaced [$replaced] kept [$kept]"; ok=0
+			continue
+		fi
+		for settings in "1 1 replaced" "1 0 kept" "0 1 kept"; do
+			set -- $settings
+			got=$(lowmip_at $1 $2 $shape)
+			[ $3 = replaced ] && want=$replaced || want=$kept
+			if [ "$got" = "$want" ]; then
+				echo "same  lowmip$shape track_texture_updates=$1 match_lower_mip_textures=$2: $3"
+			else
+				echo "DIFF  lowmip$shape track_texture_updates=$1 match_lower_mip_textures=$2: want $3 [$want], got [$got]"
+				ok=0
+			fi
+		done
+	done
+	cp ../case/tests/test_texture.ini Mods/test.ini
+}
+
+for what in ${@:-tests fg upload lowmip}; do
 	case $what in
 	tests) run_tests ;;
 	fg) run_fg ;;
 	upload) run_upload ;;
-	*) sed -n '2,12p' "$0"; exit 1 ;;
+	lowmip) run_lowmip ;;
+	*) sed -n '2,20p' "$0"; exit 1 ;;
 	esac
 done
 [ $ok = 1 ] && echo "CHECK OK" || { echo "CHECK FAILED"; exit 1; }
