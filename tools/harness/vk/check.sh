@@ -7,6 +7,12 @@
 #   fg     the fg_*.ini with frame generation (--generated 1): the triangle of
 #          the mod has to be there at the end, which a corner pixel unlike
 #          that of a run without the DLL tells
+#   upload test_plain with the indices copied from a staging buffer into
+#          memory that is not mapped (no --pool), as a game does without
+#          resizable BAR, also with --upload late, unmapped and discard: the
+#          pixels have to be those of --pool; with --upload fill, srcfill and
+#          lastfill those of a run without the DLL, as the indices the mod is
+#          for are gone
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here/run" 2>/dev/null || { echo "no run folder: run setup.sh first"; exit 1; }
 ok=1
@@ -71,11 +77,34 @@ run_fg() {
 	cp ../case/tests/test_texture.ini Mods/test.ini
 }
 
-for what in ${@:-tests fg}; do
+run_upload() {
+	local want got how
+	cp ../case/tests/test_plain.ini Mods/test.ini
+	for how in plain late unmapped discard fill srcfill lastfill; do
+		local args=()
+		[ $how = plain ] || args=(--upload $how)
+		if [ $how = fill ] || [ $how = srcfill ] || [ $how = lastfill ]; then
+			want=$(picture 2 "${args[@]}" --nodll | sed 's/picture checksum [0-9a-f]* //')
+		else
+			want=$(picture 2 --pool | sed 's/picture checksum [0-9a-f]* //')
+		fi
+		got=$(picture 2 "${args[@]}" | sed 's/picture checksum [0-9a-f]* //')
+		if [ "$want" = "$got" ] && echo "$got" | grep -q "^middle.*exit 0$"; then
+			echo "same  upload $how: $got"
+		else
+			echo "DIFF  upload $how: want [$want] got [$got]"
+			ok=0
+		fi
+	done
+	cp ../case/tests/test_texture.ini Mods/test.ini
+}
+
+for what in ${@:-tests fg upload}; do
 	case $what in
 	tests) run_tests ;;
 	fg) run_fg ;;
-	*) sed -n '2,9p' "$0"; exit 1 ;;
+	upload) run_upload ;;
+	*) sed -n '2,12p' "$0"; exit 1 ;;
 	esac
 done
 [ $ok = 1 ] && echo "CHECK OK" || { echo "CHECK FAILED"; exit 1; }

@@ -6,6 +6,7 @@
 //
 //   harness.exe [seconds] [--instance] [--pool] [--nodll] [--noext] [--draws N]
 //               [--rewrite] [--bonetick] [--unmapped | --map2 | --gpufilled]
+//               [--upload late|unmapped|discard|fill|srcfill|lastfill]
 //               [--generated N [--overlay]] [--reload 1|2|3] [--profile]
 //               [--efmi file [--characters N] [--passes N] [--appear N]]
 //
@@ -59,7 +60,8 @@
 	X(DestroySemaphore) X(ResetCommandBuffer) X(CreateDescriptorSetLayout) X(DestroyDescriptorSetLayout) \
 	X(CreateDescriptorPool) X(DestroyDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) \
 	X(CmdBindDescriptorSets) X(CmdPipelineBarrier) X(CmdCopyImageToBuffer) X(CreateImage) X(DestroyImage) \
-	X(GetImageMemoryRequirements) X(BindImageMemory) X(CmdCopyBufferToImage) X(CreateSampler) X(DestroySampler)
+	X(GetImageMemoryRequirements) X(BindImageMemory) X(CmdCopyBufferToImage) X(CreateSampler) X(DestroySampler) \
+	X(CmdFillBuffer)
 
 static struct {
 #define X(name) PFN_vk##name name;
@@ -156,6 +158,17 @@ int main(int argc, char **argv)
 	// --gpufilled: the GPU fills that buffer with vkCmdCopyBuffer just before
 	// the copy to the texture; the CPU never maps it
 	bool gpufilled = false;
+	// --upload <how>: the order of the upload of vb and ib through the staging
+	// buffer, for a draw without --pool. late: the staging buffer is filled
+	// after the copies are recorded, before they are submitted. unmapped: it is
+	// unmapped before they are recorded. discard: after the upload, a copy of
+	// other indices to ib is recorded and the command buffer reset unsubmitted.
+	// fill: after the upload, ib is filled with zeroes on the GPU. srcfill:
+	// after the upload, the indices in the staging buffer are filled with
+	// zeroes on the GPU and copied to ib again, in one submission. lastfill:
+	// the command buffer of the last frame fills ib with zeroes before its
+	// draw.
+	const char *upload = "";
 	// --rewrite: halfway through, the indices in the pool are written in
 	// another order, which is other indices with another hash for the same draw
 	bool rewrite = false;
@@ -211,6 +224,10 @@ int main(int argc, char **argv)
 			map2 = true;
 		else if (!strcmp(argv[i], "--gpufilled"))
 			gpufilled = true;
+		else if (!strcmp(argv[i], "--upload") && i + 1 < argc && (!strcmp(argv[i + 1], "late")
+		    || !strcmp(argv[i + 1], "unmapped") || !strcmp(argv[i + 1], "discard") || !strcmp(argv[i + 1], "fill")
+		    || !strcmp(argv[i + 1], "srcfill") || !strcmp(argv[i + 1], "lastfill")))
+			upload = argv[++i];
 		else if (!strcmp(argv[i], "--generated") && i + 1 < argc)
 			generated = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--reload") && i + 1 < argc)
@@ -590,16 +607,24 @@ int main(int argc, char **argv)
 
 	// One staging buffer for both, as an allocator would hand out
 	VkDeviceMemory staging_memory, vb_memory, ib_memory;
-	VkBuffer staging = make_buffer(4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	VkBuffer staging = make_buffer(4096, VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+		| (!strcmp(upload, "srcfill") ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0),
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &staging_memory);
 	VkBuffer vb = make_buffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &vb_memory);
 	VkBuffer ib = make_buffer(sizeof(indices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ib_memory);
 	void *mapped;
+	bool late = !strcmp(upload, "late"), staging_mapped = true;
 	CHECK(vk.MapMemory(device, staging_memory, 0, VK_WHOLE_SIZE, 0, &mapped));
-	memcpy((char*)mapped + 256, vertices, sizeof(vertices));
-	memcpy((char*)mapped + 1024, indices, sizeof(indices));
+	if (!late) {
+		memcpy((char*)mapped + 256, vertices, sizeof(vertices));
+		memcpy((char*)mapped + 1024, indices, sizeof(indices));
+	}
+	if (!strcmp(upload, "unmapped")) {
+		vk.UnmapMemory(device, staging_memory);
+		staging_mapped = false;
+	}
 
 	VkCommandPoolCreateInfo pool_info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 	VkCommandBufferAllocateInfo cmd_info = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
@@ -622,8 +647,43 @@ int main(int argc, char **argv)
 	vk.CmdCopyBuffer(cmd, staging, vb, 1, &vb_copy);
 	vk.CmdCopyBuffer(cmd, staging, ib, 1, &ib_copy);
 	CHECK(vk.EndCommandBuffer(cmd));
+	if (late) {
+		memcpy((char*)mapped + 256, vertices, sizeof(vertices));
+		memcpy((char*)mapped + 1024, indices, sizeof(indices));
+	}
 	CHECK(vk.QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
 	CHECK(vk.QueueWaitIdle(queue));
+	if (!strcmp(upload, "discard")) {
+		static const uint16_t other[6] = { 0, 2, 3, 0, 1, 2 };
+		VkBufferCopy other_copy = { 2048, 0, sizeof(other) };
+
+		memcpy((char*)mapped + 2048, other, sizeof(other));
+		CHECK(vk.BeginCommandBuffer(cmd, &begin));
+		vk.CmdCopyBuffer(cmd, staging, ib, 1, &other_copy);
+		CHECK(vk.EndCommandBuffer(cmd));
+		CHECK(vk.ResetCommandBuffer(cmd, 0));
+	} else if (!strcmp(upload, "fill")) {
+		CHECK(vk.BeginCommandBuffer(cmd, &begin));
+		vk.CmdFillBuffer(cmd, ib, 0, VK_WHOLE_SIZE, 0);
+		CHECK(vk.EndCommandBuffer(cmd));
+		CHECK(vk.QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+		CHECK(vk.QueueWaitIdle(queue));
+	} else if (!strcmp(upload, "srcfill")) {
+		VkBufferMemoryBarrier filled = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+		filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		filled.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		filled.srcQueueFamilyIndex = filled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		filled.buffer = staging;
+		filled.offset = 1024;
+		filled.size = sizeof(indices);
+		CHECK(vk.BeginCommandBuffer(cmd, &begin));
+		vk.CmdFillBuffer(cmd, staging, 1024, sizeof(indices), 0);
+		vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &filled, 0, NULL);
+		vk.CmdCopyBuffer(cmd, staging, ib, 1, &ib_copy);
+		CHECK(vk.EndCommandBuffer(cmd));
+		CHECK(vk.QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+		CHECK(vk.QueueWaitIdle(queue));
+	}
 
 	// Or the way of an engine that keeps its meshes in one buffer it has
 	// mapped: no copy for Vulkan to see, and the index buffer followed by
@@ -1049,6 +1109,16 @@ int main(int argc, char **argv)
 		if (appear)
 			profiling = profile && (getenv("STEADY") ? in_window == 5 || in_window == 6 : in_window == 0 || in_window == 1);
 		CHECK(vk.BeginCommandBuffer(cmd, &begin));
+		if (last && !strcmp(upload, "lastfill")) {
+			VkBufferMemoryBarrier filled = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+			filled.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			filled.dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+			filled.srcQueueFamilyIndex = filled.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			filled.buffer = ib;
+			filled.size = VK_WHOLE_SIZE;
+			vk.CmdFillBuffer(cmd, ib, 0, VK_WHOLE_SIZE, 0);
+			vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, NULL, 1, &filled, 0, NULL);
+		}
 		vk.CmdBeginRenderPass(cmd, &pass_begin, VK_SUBPASS_CONTENTS_INLINE);
 		if (efmi) {
 			VkBuffer streams[5] = { efmi_buffer, efmi_buffer, efmi_buffer, efmi_buffer, efmi_buffer };
@@ -1228,7 +1298,8 @@ int main(int argc, char **argv)
 	vk.DestroyBuffer(device, staging, NULL);
 	vk.DestroyBuffer(device, vb, NULL);
 	vk.DestroyBuffer(device, ib, NULL);
-	vk.UnmapMemory(device, staging_memory);
+	if (staging_mapped)
+		vk.UnmapMemory(device, staging_memory);
 	vk.FreeMemory(device, staging_memory, NULL);
 	vk.FreeMemory(device, vb_memory, NULL);
 	vk.FreeMemory(device, ib_memory, NULL);
