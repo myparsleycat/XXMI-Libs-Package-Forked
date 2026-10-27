@@ -65,7 +65,7 @@ enum TimedPart {
 static struct {
 	unsigned draws, skipped, mod_draws, mod_draws_failed;
 	unsigned slow[SLOW_REASONS];
-	unsigned regions_hashed, regions_checked, regions_unmapped;
+	unsigned regions_hashed, regions_checked, regions_unmapped, regions_uploaded;
 	unsigned mirrored, mirrored_from_gpu;
 	UINT64 mirrored_bytes;
 	unsigned constants_shown, constants_read, constants_unmapped, constants_unbound;
@@ -927,6 +927,40 @@ const UINT REGION_SAMPLES = 4;
 const UINT REGION_SAMPLE_BYTES = 16;
 const UINT REGION_REHASH_FRAMES = 600;
 
+// A write to an index buffer a command buffer records, see VkModsCopyBuffer
+enum IndexWriteKind { INDEX_COPY, INDEX_UPDATE, INDEX_FILL };
+
+struct IndexWrite {
+	IndexWriteKind kind;
+	VkBuffer dst;
+	VkDeviceSize offset, bytes;
+	VkBuffer src;
+	VkDeviceSize src_offset;
+	// Of an update, whose data the command buffer keeps from when it is
+	// recorded
+	uint32_t hash;
+};
+
+// Whether the writes a command buffer recorded before a draw touch a region
+// of its indices, which they have not written yet when the draw is recorded:
+// what the region holds then is not what the draw reads. With the hash the
+// last of them leaves, where that is an update of exactly the region, else 0.
+static bool written_before(const std::vector<IndexWrite> *writes, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes,
+		uint32_t *hash)
+{
+	bool touched = false;
+
+	if (!writes)
+		return false;
+	for (const IndexWrite &write : *writes) {
+		if (write.dst != buffer || write.offset >= offset + bytes || write.offset + write.bytes <= offset)
+			continue;
+		touched = true;
+		*hash = write.kind == INDEX_UPDATE && write.offset == offset && write.bytes == bytes ? write.hash : 0;
+	}
+	return touched;
+}
+
 struct Region {
 	uint32_t hash;
 	bool hashed;
@@ -950,6 +984,8 @@ static std::vector<VkBuffer> dead_buffers;
 static SRWLOCK dead_lock = SRWLOCK_INIT;
 static volatile bool any_published;
 
+static void forget_uploads(VkBuffer buffer);
+
 void VkModsBufferCreated(VkBuffer buffer, const VkBufferCreateInfo *info)
 {
 	Buffer created = {};
@@ -957,6 +993,7 @@ void VkModsBufferCreated(VkBuffer buffer, const VkBufferCreateInfo *info)
 	created.size = info->size;
 	created.usage = info->usage;
 
+	forget_uploads(buffer);
 	AcquireSRWLockExclusive(&memory_lock);
 	buffers[buffer] = created;
 	ReleaseSRWLockExclusive(&memory_lock);
@@ -985,6 +1022,7 @@ void VkModsForgetBuffer(VkBuffer buffer)
 	AcquireSRWLockExclusive(&memory_lock);
 	buffers.erase(buffer);
 	ReleaseSRWLockExclusive(&memory_lock);
+	forget_uploads(buffer);
 }
 
 void VkModsMemoryMapped(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, void *data)
@@ -1030,6 +1068,7 @@ SRWLOCK* VkModsMapLock(VkDeviceMemory memory)
 // published: the handle of a buffer that is gone may be another's by now
 static void forget_dead_constants(VkBuffer buffer);
 static void forget_region_memos(const std::vector<VkBuffer> &gone);
+static bool uploaded_hash(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, uint32_t *hash);
 
 static void forget_dead_buffers()
 {
@@ -1150,14 +1189,21 @@ static void forget_region_memos(const std::vector<VkBuffer> &gone)
 	}
 }
 
-// 0 if there is no telling
-static uint32_t region_hash(VkBuffer buffer, PublishedBuffer *entry, VkDeviceSize offset, UINT bytes)
+// 0 if there is no telling. writes: what the command buffer of the draw
+// recorded before it.
+static uint32_t region_hash(VkBuffer buffer, PublishedBuffer *entry, VkDeviceSize offset, UINT bytes,
+		const std::vector<IndexWrite> *writes)
 {
-	Region *region = &entry->regions[std::make_pair(offset, bytes)];
+	Region *region;
 	BYTE samples[sizeof(region->samples)];
 	UINT frame = mods_frame;
 	const BYTE *data;
+	uint32_t hash;
 
+	if (written_before(writes, buffer, offset, bytes, &hash))
+		return hash;
+
+	region = &entry->regions[std::make_pair(offset, bytes)];
 	if (region->hashed && region->checked_frame == frame) {
 		remember_region(buffer, offset, bytes, region);
 		return region->hash;
@@ -1168,6 +1214,10 @@ static uint32_t region_hash(VkBuffer buffer, PublishedBuffer *entry, VkDeviceSiz
 	data = mapped_bytes(buffer, offset, bytes);
 	if (!data) {
 		ReleaseSRWLockShared(&memory_lock);
+		if (uploaded_hash(buffer, offset, bytes, &hash)) {
+			stats.regions_uploaded++;
+			return hash;
+		}
 		stats.regions_unmapped++;
 		return 0;
 	}
@@ -3972,8 +4022,11 @@ static std::unordered_map<VkImageView, VkImage> game_views;
 static std::vector<IUnknown*> retired_images;
 static volatile LONG images_hashed, images_not_mapped;
 // Of the uploads hashed through a mapping of ours, see hash_unmapped
-static volatile LONG images_mapped_here, images_map_refused;
-static volatile LONG64 mapped_here_bytes, mapped_here_ticks, mapped_here_longest;
+struct MappedHere {
+	volatile LONG done, refused;
+	volatile LONG64 bytes, ticks, longest;
+};
+static MappedHere images_mapped_here;
 // Odd while game_images or game_views is being changed, and one more each
 // time after, see shown_textures:
 static volatile LONG image_epoch;
@@ -4083,7 +4136,8 @@ static bool upload_note_wanted(VkImage image, uint32_t level, int outcome)
 // buffer the GPU does not write (GPU_READ_ONLY_USAGE) in memory the game has
 // mapped before: what it holds is what the CPU wrote, which the CPU reads
 // without anything to wait for.
-static bool hash_unmapped(VkDeviceMemory memory, VkDeviceSize start, VkDeviceSize bytes, uint32_t *data_hash, const char **why)
+static bool hash_unmapped(VkDeviceMemory memory, VkDeviceSize start, VkDeviceSize bytes, uint32_t *data_hash, const char **why,
+		MappedHere *counted)
 {
 	SRWLOCK *lock = VkModsMapLock(memory);
 	UINT64 started, took, longest;
@@ -4119,14 +4173,14 @@ static bool hash_unmapped(VkDeviceMemory memory, VkDeviceSize start, VkDeviceSiz
 		if (!ok)
 			*why = "the memory of the buffer is not mapped, and mapping it here failed";
 		took = ticks() - started;
-		InterlockedAdd64(&mapped_here_ticks, took);
-		InterlockedAdd64(&mapped_here_bytes, bytes);
-		for (longest = mapped_here_longest; took > longest; longest = mapped_here_longest)
-			InterlockedCompareExchange64(&mapped_here_longest, took, longest);
+		InterlockedAdd64(&counted->ticks, took);
+		InterlockedAdd64(&counted->bytes, bytes);
+		for (longest = counted->longest; took > longest; longest = counted->longest)
+			InterlockedCompareExchange64(&counted->longest, took, longest);
 	}
 	ReleaseSRWLockExclusive(lock);
 
-	InterlockedIncrement(ok ? &images_mapped_here : &images_map_refused);
+	InterlockedIncrement(ok ? &counted->done : &counted->refused);
 	return ok;
 }
 
@@ -4236,7 +4290,7 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 	}
 	ReleaseSRWLockShared(&memory_lock);
 	if (unmapped)
-		known = mapped_here = hash_unmapped(unmapped, start, bytes, &data_hash, &why);
+		known = mapped_here = hash_unmapped(unmapped, start, bytes, &data_hash, &why, &images_mapped_here);
 	if (!known) {
 		if (update)
 			InterlockedIncrement(&images_not_mapped);
@@ -4316,6 +4370,9 @@ struct CmdState {
 	bool resubmitted;
 	// Of the fence after the submission it was last in, none before that
 	UINT64 serial;
+	// In the order recorded, those of the secondaries it executes included.
+	// Made once and kept by the handle: the state is copied for every scope.
+	std::vector<IndexWrite> *index_writes;
 };
 
 // One for every handle there has been, which is what lets a thread remember
@@ -4357,6 +4414,7 @@ static void forget_pending(CmdState *state);
 void VkModsBeginCommands(VkCommandBuffer cmd)
 {
 	CmdState *state = cmd_state(cmd);
+	std::vector<IndexWrite> *index_writes = state->index_writes;
 
 	// Which the game may only do once the GPU is done with it. pending is
 	// only set on this thread, while it records.
@@ -4366,6 +4424,10 @@ void VkModsBeginCommands(VkCommandBuffer cmd)
 		Dx12ShimUnlock();
 	}
 	*state = {};
+	// What was recorded before and never submitted is not written
+	if (index_writes)
+		index_writes->clear();
+	state->index_writes = index_writes;
 }
 
 static CmdState* known_cmd_state(VkCommandBuffer cmd)
@@ -4399,6 +4461,12 @@ void VkModsExecuteCommands(VkCommandBuffer cmd, uint32_t count, const VkCommandB
 		if (!secondary)
 			continue;
 		primary->shown += secondary->shown;
+		if (secondary->index_writes && !secondary->index_writes->empty()) {
+			if (!primary->index_writes)
+				primary->index_writes = new std::vector<IndexWrite>();
+			primary->index_writes->insert(primary->index_writes->end(),
+				secondary->index_writes->begin(), secondary->index_writes->end());
+		}
 		// What the secondary was given is read when the primary is
 		// executed, which is the one submitted
 		if (secondary->has_mods) {
@@ -5223,27 +5291,298 @@ static void collect_index_counts()
 	wanted_index_counts = bits;
 }
 
+// A game whose meshes are in memory it does not have mapped, as on a GPU the
+// CPU can reach only a little memory of (no resizable BAR), copies them there
+// from a staging buffer. What region_hash cannot read is then known by the
+// copy that wrote it. The copies a command buffer records are only noted with
+// it; their sources are hashed when it is handed to a queue, by when the game
+// has to have written them, and what they wrote is known once the queue took
+// it. Only a region that is exactly what a copy wrote is known this way, which
+// is how the game draws them.
+//
+// The engine looks at a draw when it is recorded: one recorded before the
+// upload of its indices was submitted, as with both in one submission, is
+// matched from the next frame on. Writes are known in the order they were
+// submitted in, not the one the GPU runs them in.
+struct IndexUpload {
+	VkDeviceSize bytes;
+	uint32_t hash;
+};
+
+// By buffer and offset. Not with memory_lock, which is held for as long as the
+// bones take to read while the game records its copies.
+static std::unordered_map<VkBuffer, std::map<VkDeviceSize, IndexUpload>> index_uploads;
+static SRWLOCK upload_lock = SRWLOCK_INIT;
+// Since the last report
+static volatile LONG uploads_hashed;
+static volatile LONG64 uploads_hashed_bytes, upload_ticks;
+// Of those, read by mapping the memory of the source here
+static MappedHere uploads_mapped_here;
+// What the command buffers being handed to a queue on this thread write, with
+// the hashes of their sources as they are now
+static thread_local std::vector<IndexWrite> submitting;
+
+// Whether a section can be for this many bytes of indices. Hashing every copy
+// would read all the game uploads, hundreds of MB, from write-combined memory.
+// A section added by a reload is not found for meshes uploaded before it.
+static bool upload_wanted(VkDeviceSize bytes)
+{
+	volatile LONG64 *bits = wanted_index_counts;
+	UINT bit;
+
+	if (!G->track_region_hashes || !bytes || bytes > UINT_MAX)
+		return false;
+	// The sections are not known before the first frame
+	if (!bits || fuzzy_sections)
+		return true;
+	if (bytes % 2 == 0) {
+		bit = index_count_bit((UINT)(bytes / 2));
+		if (bits[bit / 64] & 1ll << (bit % 64))
+			return true;
+	}
+	if (bytes % 4 == 0) {
+		bit = index_count_bit((UINT)(bytes / 4));
+		if (bits[bit / 64] & 1ll << (bit % 64))
+			return true;
+	}
+	return false;
+}
+
+// With upload_lock held. What the write overlaps is no longer what was hashed.
+static void note_upload(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, uint32_t hash)
+{
+	auto found = index_uploads.find(buffer);
+
+	if (found == index_uploads.end()) {
+		if (!hash)
+			return;
+		found = index_uploads.emplace(buffer, std::map<VkDeviceSize, IndexUpload>()).first;
+	}
+	std::map<VkDeviceSize, IndexUpload> &map = found->second;
+	auto i = map.lower_bound(offset);
+	if (i != map.begin() && std::prev(i)->first + std::prev(i)->second.bytes > offset)
+		--i;
+	while (i != map.end() && i->first < offset + bytes)
+		i = map.erase(i);
+	if (hash)
+		map[offset] = { bytes, hash };
+}
+
+static bool index_buffer(VkBuffer buffer, VkDeviceSize *size)
+{
+	auto found = buffers.find(buffer);
+
+	if (found == buffers.end() || !(found->second.usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
+		return false;
+	*size = found->second.size;
+	return true;
+}
+
+// On the thread recording to it
+static void note_index_write(VkCommandBuffer cmd, const IndexWrite &write)
+{
+	CmdState *state = cmd_state(cmd);
+
+	if (!state->index_writes)
+		state->index_writes = new std::vector<IndexWrite>();
+	state->index_writes->push_back(write);
+}
+
+void VkModsCopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions)
+{
+	VkDeviceSize size;
+	uint32_t r;
+
+	AcquireSRWLockShared(&memory_lock);
+	bool known = index_buffer(dst, &size);
+	ReleaseSRWLockShared(&memory_lock);
+	if (!known)
+		return;
+
+	for (r = 0; r < count; r++)
+		note_index_write(cmd, { INDEX_COPY, dst, regions[r].dstOffset, regions[r].size, src, regions[r].srcOffset, 0 });
+}
+
+void VkModsUpdateBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes, const void *data)
+{
+	VkDeviceSize size;
+
+	AcquireSRWLockShared(&memory_lock);
+	bool known = index_buffer(dst, &size);
+	ReleaseSRWLockShared(&memory_lock);
+	if (!known)
+		return;
+
+	note_index_write(cmd, { INDEX_UPDATE, dst, offset, bytes, VK_NULL_HANDLE, 0, crc32c_hw(0, data, (size_t)bytes) });
+}
+
+void VkModsFillBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes)
+{
+	VkDeviceSize size;
+
+	AcquireSRWLockShared(&memory_lock);
+	bool known = index_buffer(dst, &size);
+	ReleaseSRWLockShared(&memory_lock);
+	if (!known || offset >= size)
+		return;
+
+	if (bytes == VK_WHOLE_SIZE)
+		bytes = (size - offset) & ~(VkDeviceSize)3;
+	note_index_write(cmd, { INDEX_FILL, dst, offset, bytes, VK_NULL_HANDLE, 0, 0 });
+}
+
+// The hash of what a copy reads now, 0 if there is no telling. Only of a source
+// the GPU does not write: the commands before the copy may have, mapped or not.
+static uint32_t copy_source_hash(const IndexWrite &write)
+{
+	VkDeviceMemory unmapped = VK_NULL_HANDLE;
+	VkDeviceSize start = 0;
+	uint32_t hash = 0;
+	const char *why;
+	const BYTE *data;
+
+	AcquireSRWLockShared(&memory_lock);
+	auto from = buffers.find(write.src);
+	if (from != buffers.end() && !(from->second.usage & ~GPU_READ_ONLY_USAGE)) {
+		data = mapped_bytes(write.src, write.src_offset, write.bytes);
+		if (data) {
+			hash = Dx12Crc32cWriteCombined(0, data, (size_t)write.bytes);
+		} else if (from->second.memory && write.src_offset + write.bytes <= from->second.size) {
+			// As VkModsCopyBufferToImage has it: the game may have
+			// unmapped the memory it filled the source through
+			unmapped = from->second.memory;
+			start = from->second.memory_offset + write.src_offset;
+		}
+	}
+	ReleaseSRWLockShared(&memory_lock);
+
+	if (unmapped && !hash_unmapped(unmapped, start, write.bytes, &hash, &why, &uploads_mapped_here))
+		hash = 0;
+	return hash;
+}
+
+void VkModsIndexWritesSubmitting(VkCommandBuffer cmd)
+{
+	CmdState *state = known_cmd_state(cmd);
+	UINT64 start;
+	VkDeviceSize size;
+	bool fits;
+
+	if (!state || !state->index_writes || state->index_writes->empty())
+		return;
+
+	start = G->vk_dump_hashes ? ticks() : 0;
+	for (IndexWrite write : *state->index_writes) {
+		AcquireSRWLockShared(&memory_lock);
+		fits = index_buffer(write.dst, &size) && write.offset + write.bytes <= size;
+		ReleaseSRWLockShared(&memory_lock);
+
+		// Written all the same where the hash is 0, which only forgets
+		if (!fits || !upload_wanted(write.bytes))
+			write.hash = 0;
+		else if (write.kind == INDEX_COPY)
+			write.hash = copy_source_hash(write);
+		if (write.hash && write.kind != INDEX_FILL) {
+			InterlockedIncrement(&uploads_hashed);
+			InterlockedAdd64(&uploads_hashed_bytes, write.bytes);
+		}
+		submitting.push_back(write);
+	}
+	if (start)
+		InterlockedAdd64(&upload_ticks, ticks() - start);
+}
+
+void VkModsIndexWritesSubmitted(bool taken)
+{
+	if (submitting.empty())
+		return;
+
+	if (taken) {
+		AcquireSRWLockExclusive(&upload_lock);
+		for (const IndexWrite &write : submitting)
+			note_upload(write.dst, write.offset, write.bytes, write.hash);
+		ReleaseSRWLockExclusive(&upload_lock);
+	}
+	submitting.clear();
+}
+
+static void forget_uploads(VkBuffer buffer)
+{
+	AcquireSRWLockExclusive(&upload_lock);
+	index_uploads.erase(buffer);
+	ReleaseSRWLockExclusive(&upload_lock);
+}
+
+static bool uploaded_hash(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, uint32_t *hash)
+{
+	bool found = false;
+
+	AcquireSRWLockShared(&upload_lock);
+	auto in = index_uploads.find(buffer);
+	if (in != index_uploads.end()) {
+		auto at = in->second.find(offset);
+		if (at != in->second.end() && at->second.bytes == bytes) {
+			*hash = at->second.hash;
+			found = true;
+		}
+	}
+	ReleaseSRWLockShared(&upload_lock);
+	return found;
+}
+
 static volatile LONG fast_draws, quiet_draws;
+
+// As the engine works out the region of the indices it asks about
+static bool draw_indices(const CmdState *state, uint32_t count, uint32_t first, VkDeviceSize *offset, UINT *bytes)
+{
+	UINT index_bytes = state->index_type == VK_INDEX_TYPE_UINT16 ? 2 : state->index_type == VK_INDEX_TYPE_UINT32 ? 4 : 0;
+
+	if (!index_bytes || !state->ib || (UINT64)count * index_bytes > UINT_MAX || (UINT64)first * index_bytes > UINT_MAX)
+		return false;
+	*offset = state->ib_offset + (VkDeviceSize)first * index_bytes;
+	*bytes = count * index_bytes;
+	return true;
+}
+
+// Without the lock. True if the indices of the draw are not mapped, a copy
+// had their hash, and no section is for that.
+static bool upload_is_quiet(const CmdState *state, uint32_t count, uint32_t first, const volatile LONG64 *hashes)
+{
+	VkDeviceSize offset;
+	uint32_t hash;
+	bool mapped;
+	UINT bytes, bit;
+
+	if (!draw_indices(state, count, first, &offset, &bytes) || written_before(state->index_writes, state->ib, offset, bytes, &hash))
+		return false;
+	// region_hash goes by what is mapped first
+	AcquireSRWLockShared(&memory_lock);
+	mapped = !!mapped_bytes(state->ib, offset, bytes);
+	ReleaseSRWLockShared(&memory_lock);
+	if (mapped || !uploaded_hash(state->ib, offset, bytes, &hash))
+		return false;
+	bit = index_count_bit(hash);
+	return !(hashes[bit / 64] & 1ll << (bit % 64));
+}
 
 // Without the lock. True if the indices of the draw are known to be what they
 // were when region_hash had their hash, and no section is for that.
 static bool region_is_quiet(const CmdState *state, uint32_t count, uint32_t first, const volatile LONG64 *hashes)
 {
-	UINT index_bytes = state->index_type == VK_INDEX_TYPE_UINT16 ? 2 : state->index_type == VK_INDEX_TYPE_UINT32 ? 4 : 0;
 	BYTE samples[REGION_SAMPLES * REGION_SAMPLE_BYTES];
 	VkDeviceSize offset;
 	const BYTE *data;
 	RegionMemo *memo;
 	RegionMemo was;
 	LONG sequence;
-	UINT bit;
+	uint32_t hash;
+	UINT bytes, bit;
 
-	// As the engine works out the region it asks about
-	if (!index_bytes || !state->ib || (UINT64)count * index_bytes > UINT_MAX || (UINT64)first * index_bytes > UINT_MAX)
+	// What region_hash would say of it then is not what the memo has
+	if (!draw_indices(state, count, first, &offset, &bytes) || written_before(state->index_writes, state->ib, offset, bytes, &hash))
 		return false;
-	offset = state->ib_offset + (VkDeviceSize)first * index_bytes;
 
-	memo = region_memo(state->ib, offset, count * index_bytes);
+	memo = region_memo(state->ib, offset, bytes);
 	sequence = memo->sequence;
 	if (sequence & 1)
 		return false;
@@ -5259,7 +5598,7 @@ static bool region_is_quiet(const CmdState *state, uint32_t count, uint32_t firs
 
 	// Without a hash the engine goes by that of the buffer instead, and it
 	// is region_hash that has the indices hashed again every so often
-	if (was.buffer != state->ib || was.offset != offset || was.bytes != count * index_bytes || !was.hash
+	if (was.buffer != state->ib || was.offset != offset || was.bytes != bytes || !was.hash
 	    || mods_frame - was.hashed_frame >= REGION_REHASH_FRAMES)
 		return false;
 	bit = index_count_bit(was.hash);
@@ -5315,7 +5654,8 @@ static bool draw_is_boring(Pipeline *pipeline, const CmdState *state, bool index
 	bit = index_count_bit(count);
 	if (!(bits[bit / 64] & 1ll << (bit % 64)))
 		return true;
-	if (!region_is_quiet(state, count, first, region_hash_bits[bits == index_count_bits[1]]))
+	volatile LONG64 *hashes = region_hash_bits[bits == index_count_bits[1]];
+	if (!region_is_quiet(state, count, first, hashes) && !upload_is_quiet(state, count, first, hashes))
 		return false;
 	if (G->vk_dump_hashes)
 		InterlockedIncrement(&quiet_draws);
@@ -7524,7 +7864,7 @@ bool VkScopeRegionHash(ID3D11Buffer *buffer, UINT offset, UINT size, uint32_t *h
 		return false;
 	Timed timed(TIMED_ANSWERS);
 
-	*hash = region_hash(scope->state.ib, scope->ib, scope->state.ib_offset + offset, size);
+	*hash = region_hash(scope->state.ib, scope->ib, scope->state.ib_offset + offset, size, scope->state.index_writes);
 	return true;
 }
 
@@ -7734,12 +8074,19 @@ static void report()
 	// A note is cut off past a thousand characters
 	VkDumpNote("Mods, frame %u (D3D12 frame %u), since the last of these lines: the engine saw %u draws and skipped %u, mods drew %u times "
 		"of which %u could not be made, %u buffers of mods copied (%llu KB, %u from the GPU), %Iu held; "
-		"index regions hashed %u, found as they were %u, not mapped %u; per frame the draws took %.2f ms waiting for the lock "
-		"and %.2f ms in the engine, %.2f us a draw; %Iu shaders linked to ShaderRegex (%Iu by what they declare), %Iu ShaderOverride hashes, %Iu buffers published\n",
+		"index regions hashed %u, found as they were %u, by the copy that uploaded them %u, not mapped %u; per frame the draws took %.2f ms "
+		"waiting for the lock and %.2f ms in the engine, %.2f us a draw; %Iu shaders linked to ShaderRegex (%Iu by what they declare), "
+		"%Iu ShaderOverride hashes, %Iu buffers published\n",
 		vk_frame, dx12_frame, stats.draws, stats.skipped, stats.mod_draws, stats.mod_draws_failed, stats.mirrored,
 		stats.mirrored_bytes >> 10, stats.mirrored_from_gpu, mirrors.size(), stats.regions_hashed, stats.regions_checked,
-		stats.regions_unmapped, stats.wait_ticks * per_frame, stats.engine_ticks * per_frame, stats.engine_ticks * per_draw,
-		linked_shaders, matched_shaders, G->mShaderOverrideMap.size(), published.size());
+		stats.regions_uploaded, stats.regions_unmapped, stats.wait_ticks * per_frame, stats.engine_ticks * per_frame,
+		stats.engine_ticks * per_draw, linked_shaders, matched_shaders, G->mShaderOverrideMap.size(), published.size());
+	VkDumpNote("  Uploads to index buffers hashed when submitted: %ld (%lld KB, %.2f ms per frame); since the start %d of them read "
+		"by mapping the memory of their source here (%lld MB, %.1f ms in all, the longest %.2f ms), %d that could not be\n",
+		InterlockedExchange(&uploads_hashed, 0), InterlockedExchange64(&uploads_hashed_bytes, 0) >> 10,
+		InterlockedExchange64(&upload_ticks, 0) * per_frame, (int)uploads_mapped_here.done, (long long)(uploads_mapped_here.bytes >> 20),
+		uploads_mapped_here.ticks * 1000.0 / frequency.QuadPart, uploads_mapped_here.longest * 1000.0 / frequency.QuadPart,
+		(int)uploads_mapped_here.refused);
 	VkDumpNote("  Constant buffers of the game: shown %u times, read %u times (%llu KB, %.2f ms per frame), not mapped %u, no buffer seen set at the "
 		"binding %u; %Iu held. Descriptor sets: %u allocated, buffers written %u times by vkUpdateDescriptorSets and %u times "
 		"by a template; %u layouts of sets the game destroyed kept since the start\n",
@@ -7783,8 +8130,8 @@ static void report()
 		"memory here (%lld MB, %.1f ms in all, the longest %.2f ms), %d that could not be\n",
 		stats.textures_set, stats.textures_made, stats.textures_bytes >> 10, stats.textures_failed, mod_textures.size(),
 		image_blocks.size(), stats.apart_draws, stats.textures_shown, (int)images_hashed, (int)images_not_mapped,
-		(int)images_mapped_here, (long long)(mapped_here_bytes >> 20), mapped_here_ticks * 1000.0 / frequency.QuadPart,
-		mapped_here_longest * 1000.0 / frequency.QuadPart, (int)images_map_refused);
+		(int)images_mapped_here.done, (long long)(images_mapped_here.bytes >> 20), images_mapped_here.ticks * 1000.0 / frequency.QuadPart,
+		images_mapped_here.longest * 1000.0 / frequency.QuadPart, (int)images_mapped_here.refused);
 	VkDeviceSize buffer_bytes = 0, buffer_taken = 0, image_bytes = 0, image_taken = 0, transient_bytes = 0;
 	for (const MirrorBlock *block : mirror_blocks) {
 		buffer_bytes += block->size;

@@ -47,6 +47,7 @@
 	X(DestroyImageView) \
 	X(CmdCopyBufferToImage) \
 	X(CmdUpdateBuffer) \
+	X(CmdFillBuffer) \
 	X(CmdBindPipeline) \
 	X(CmdBindVertexBuffers) \
 	X(CmdBindIndexBuffer) \
@@ -479,6 +480,8 @@ static void VKAPI_CALL Hooked_vkCmdCopyBuffer(VkCommandBuffer cmd, VkBuffer src,
 {
 	if (vk_dump_active)
 		VkDumpCopyBuffer(src, dst, count, regions);
+	if (vk_mods_active)
+		VkModsCopyBuffer(cmd, src, dst, count, regions);
 	next_CmdCopyBuffer(cmd)(cmd, src, dst, count, regions);
 }
 
@@ -486,12 +489,15 @@ static void VKAPI_CALL Hooked_vkCmdCopyBuffer2(VkCommandBuffer cmd, const VkCopy
 {
 	uint32_t i;
 
-	if (vk_dump_active) {
+	if (vk_dump_active || vk_mods_active) {
 		std::vector<VkBufferCopy> regions(info->regionCount);
 
 		for (i = 0; i < info->regionCount; i++)
 			regions[i] = { info->pRegions[i].srcOffset, info->pRegions[i].dstOffset, info->pRegions[i].size };
-		VkDumpCopyBuffer(info->srcBuffer, info->dstBuffer, info->regionCount, regions.data());
+		if (vk_dump_active)
+			VkDumpCopyBuffer(info->srcBuffer, info->dstBuffer, info->regionCount, regions.data());
+		if (vk_mods_active)
+			VkModsCopyBuffer(cmd, info->srcBuffer, info->dstBuffer, info->regionCount, regions.data());
 	}
 	next_CmdCopyBuffer2(cmd)(cmd, info);
 }
@@ -500,7 +506,16 @@ static void VKAPI_CALL Hooked_vkCmdUpdateBuffer(VkCommandBuffer cmd, VkBuffer ds
 {
 	if (vk_dump_active)
 		VkDumpUpdateBuffer(dst, bytes);
+	if (vk_mods_active)
+		VkModsUpdateBuffer(cmd, dst, offset, bytes, data);
 	next_CmdUpdateBuffer(cmd)(cmd, dst, offset, bytes, data);
+}
+
+static void VKAPI_CALL Hooked_vkCmdFillBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes, uint32_t data)
+{
+	if (vk_mods_active)
+		VkModsFillBuffer(cmd, dst, offset, bytes);
+	next_CmdFillBuffer(cmd)(cmd, dst, offset, bytes, data);
 }
 
 static VkResult VKAPI_CALL Hooked_vkFlushMappedMemoryRanges(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges)
@@ -697,6 +712,8 @@ static inline VkResult check_lost(VkQueue queue, VkResult result)
 // What the submission had of draws the engine was shown, once the queue took it
 static VkResult submitted(VkQueue queue, VkResult result, const std::vector<VkCommandBuffer> &shown_cmds)
 {
+	if (vk_mods_active)
+		VkModsIndexWritesSubmitted(result == VK_SUCCESS);
 	if (result == VK_SUCCESS && !shown_cmds.empty())
 		VkModsSubmitted(queue, shown_cmds.data(), shown_cmds.size());
 	return check_lost(queue, result);
@@ -720,6 +737,7 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit(VkQueue queue, uint32_t count, c
 	if (vk_mods_active) {
 		for (i = 0; i < count; i++) {
 			for (j = 0; j < submits[i].commandBufferCount; j++) {
+				VkModsIndexWritesSubmitting(submits[i].pCommandBuffers[j]);
 				draws = VkModsCommandsShown(submits[i].pCommandBuffers[j]);
 				if (draws)
 					shown_cmds.push_back(submits[i].pCommandBuffers[j]);
@@ -770,6 +788,7 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit2(VkQueue queue, uint32_t count, 
 	if (vk_mods_active) {
 		for (i = 0; i < count; i++) {
 			for (j = 0; j < submits[i].commandBufferInfoCount; j++) {
+				VkModsIndexWritesSubmitting(submits[i].pCommandBufferInfos[j].commandBuffer);
 				draws = VkModsCommandsShown(submits[i].pCommandBufferInfos[j].commandBuffer);
 				if (draws)
 					shown_cmds.push_back(submits[i].pCommandBufferInfos[j].commandBuffer);

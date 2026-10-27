@@ -164,6 +164,16 @@ void VkModsRetirePipelineObject(VkObjectType type, uint64_t handle);
 void VkModsBufferCreated(VkBuffer buffer, const VkBufferCreateInfo *info);
 void VkModsBufferBound(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset);
 void VkModsForgetBuffer(VkBuffer buffer);
+// The game writing a buffer on the GPU, which is how it fills its meshes when
+// it does not have their memory mapped. Noted with the command buffer, and
+// known once it is submitted: VkModsIndexWritesSubmitting for each command
+// buffer of a submission before it is handed to the queue, then
+// VkModsIndexWritesSubmitted with whether the queue took it.
+void VkModsCopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions);
+void VkModsUpdateBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes, const void *data);
+void VkModsFillBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes);
+void VkModsIndexWritesSubmitting(VkCommandBuffer cmd);
+void VkModsIndexWritesSubmitted(bool taken);
 void VkModsMemoryAllocated(VkDevice device, VkDeviceMemory memory, const VkMemoryAllocateInfo *info);
 void VkModsMemoryMapped(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, void *data);
 void VkModsMemoryUnmapped(VkDeviceMemory memory);
