@@ -32,6 +32,7 @@
 volatile bool dx12_draw_path_active;
 volatile UINT dx12_draw_generation = 1;
 bool dx12_mods_disabled;
+static bool mods_faulted;
 
 // What the engine did with the game's draws since the last report
 static struct {
@@ -900,7 +901,9 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 
 	reach->state = REACH_FAILED;
 	stats.reaches_failed++;
-	if (reach->in_ring)
+	if (Dx12ShimSubmissionDiscarded(reach->fence))
+		data = NULL;
+	else if (reach->in_ring)
 		data = reach_ring_data + reach->readback_offset;
 	else if (FAILED(reach->readback->Map(0, &range, (void**)&data)))
 		data = NULL;
@@ -3786,7 +3789,8 @@ static void finish_skin_dumps()
 
 		data = NULL;
 		file = NULL;
-		if (SUCCEEDED(dump->readback->Map(0, &range, (void**)&data)) && data) {
+		if (!Dx12ShimSubmissionDiscarded(dump->fence)
+		    && SUCCEEDED(dump->readback->Map(0, &range, (void**)&data)) && data) {
 			if (GetModuleFileName(migoto_handle, path, MAX_PATH)) {
 				wcsrchr(path, L'\\')[1] = 0;
 				if (!wcscat_s(path, L"dx12_reach")) {
@@ -5717,8 +5721,26 @@ bool Dx12Dispatch(Dx12GraphicsCommandList *list, UINT x, UINT y, UINT z)
 
 void Dx12ToggleMods()
 {
+	if (mods_faulted) {
+		Dx12LogInfo("disable_dx12_mods pressed - mods stay off: a command list of theirs failed to close\n");
+		return;
+	}
 	dx12_mods_disabled = !dx12_mods_disabled;
 	Dx12LogInfo("disable_dx12_mods pressed - mods %s\n", dx12_mods_disabled ? "disabled" : "enabled");
+}
+
+void Dx12ModsFaulted(HRESULT hr)
+{
+	if (mods_faulted)
+		return;
+	mods_faulted = true;
+	dx12_mods_disabled = true;
+	dx12_draw_path_active = false;
+
+	Dx12DumpNote("*** Frame %u: a command list of the mods failed to close (0x%x) and was not executed. "
+		"Mods are off until the game restarts.\n", dx12_frame, hr);
+	LogOverlay(LOG_WARNING, "Mods are off until the game restarts: a command list of the mods failed to close (0x%x). "
+		"Details are in the log.\n", hr);
 }
 
 void Dx12DumpMarkedShader(UINT64 hash, const char *type)

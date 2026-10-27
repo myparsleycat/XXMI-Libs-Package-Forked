@@ -892,7 +892,7 @@ static HRESULT fetch_readback(ShimResource *resource, UINT byte_width, bool wait
 	void *data;
 
 	if (!resource->readback_pending)
-		return S_OK;
+		return resource->readback_lost ? E_FAIL : S_OK;
 
 	if (!Dx12ShimFenceReached(resource->readback_fence)) {
 		if (!wait)
@@ -901,6 +901,10 @@ static HRESULT fetch_readback(ShimResource *resource, UINT byte_width, bool wait
 	}
 
 	resource->readback_pending = false;
+	if (Dx12ShimSubmissionDiscarded(resource->readback_fence))
+		resource->readback_lost = true;
+	if (resource->readback_lost)
+		return E_FAIL;
 	if (FAILED(resource->readback->Map(0, &range, &data)))
 		return E_FAIL;
 	memcpy(resource->shadow.data(), data, byte_width);
@@ -1080,7 +1084,7 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	whole = !dst_offset && size == dst_desc.byte_width;
 
 	ShimUploadShadow(src);
-	src_in_shadow = src->cpu_only && !src->readback_pending;
+	src_in_shadow = src->cpu_only && !src->readback_pending && !src->readback_lost;
 	ShimReadShadow(src, src_offset, size);
 	if (src->cpu_only && !src_in_shadow) {
 		// Possible once the GPU is done, but nothing asks for it
@@ -1098,10 +1102,20 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 			VkScopeFinishRefresh(dst);
 			memcpy(dst->shadow.data() + dst_offset, src->shadow.data() + src_offset, (size_t)size);
 			dst->version++;
+			// A copy the GPU has yet to finish would land over this one
+			if (whole) {
+				dst->readback_pending = false;
+				dst->readback_lost = false;
+			}
 		} else if (src->resource && create_readback(dst) && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)) {
 			Dx12ShimList()->CopyBufferRegion(dst->readback, dst_offset, src->resource, src_offset, size);
+			// The fence of a copy not read yet is about to be forgotten
+			if (dst->readback_pending && Dx12ShimSubmissionDiscarded(dst->readback_fence))
+				dst->readback_lost = true;
 			dst->readback_fence = Dx12ShimPendingFence();
 			dst->readback_pending = true;
+			if (whole)
+				dst->readback_lost = false;
 		}
 		return;
 	}

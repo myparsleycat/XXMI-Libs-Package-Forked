@@ -122,6 +122,9 @@ void Dx12DrawPathEngineRan();
 // nor at present
 extern bool dx12_mods_disabled;
 void Dx12ToggleMods();
+// A list of ours failed to close: mods stay off until the game restarts, as
+// what failed would fail again
+void Dx12ModsFaulted(HRESULT hr);
 
 // What marking a shader does while hunting: writes the shader as the game
 // gave it to ShaderFixes, for dxc or a disassembler to take from there

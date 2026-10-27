@@ -193,6 +193,9 @@ struct ShimResource {
 	ID3D12Resource *readback;
 	UINT64 readback_fence;
 	bool readback_pending;
+	// A copy into it was in a submission that failed to close: until a
+	// copy fills all of it again, what it holds is not what was copied
+	bool readback_lost = false;
 
 	// Not 0 for a vertex buffer that stands for vertices DrawPath had
 	// skinned for a mod, which are in a buffer only it knows: the buffer

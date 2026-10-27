@@ -110,6 +110,7 @@ struct VkModsApi {
 	PFN_vkEndCommandBuffer EndCommandBuffer;
 	PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
 	PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+	PFN_vkCmdFillBuffer CmdFillBuffer;
 	PFN_vkQueueSubmit QueueSubmit;
 	PFN_vkCreateSemaphore CreateSemaphore;
 	PFN_vkDestroySemaphore DestroySemaphore;

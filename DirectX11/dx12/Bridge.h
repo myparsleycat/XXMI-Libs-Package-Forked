@@ -141,6 +141,9 @@ void Dx12ShimFlush();
 // have been executed
 UINT64 Dx12ShimPendingFence();
 bool Dx12ShimFenceReached(UINT64 value);
+// The fence reaches the value of a submission that failed to close too, but
+// nothing of it was executed: what it was to copy is not there
+bool Dx12ShimSubmissionDiscarded(UINT64 value);
 // Counts submissions. Memory from Dx12ShimUpload and descriptors from
 // Dx12ShimAllocViews are gone when it changes.
 extern UINT dx12_shim_epoch;

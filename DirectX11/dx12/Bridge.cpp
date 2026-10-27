@@ -64,6 +64,8 @@ static void (*before_submit)();
 static ID3D12Fence *fence;
 static UINT64 fence_signalled;
 static HANDLE fence_event;
+// Mods are off after the first, so there are few
+static std::vector<UINT64> discarded;
 
 struct Retired {
 	IUnknown *object;
@@ -1443,6 +1445,11 @@ bool Dx12ShimFenceReached(UINT64 value)
 	return fence->GetCompletedValue() >= value;
 }
 
+bool Dx12ShimSubmissionDiscarded(UINT64 value)
+{
+	return std::find(discarded.begin(), discarded.end(), value) != discarded.end();
+}
+
 // An allocator of the pool the GPU is done with, reset
 static size_t free_allocator(std::vector<Allocator> *pool)
 {
@@ -1503,6 +1510,22 @@ ID3D12GraphicsCommandList* Dx12ShimEarlyList()
 	return early_list;
 }
 
+// A list that failed to close cannot be reset either. If no new one can be
+// made, the old one keeps failing to close and is never executed.
+static void replace_list(ID3D12GraphicsCommandList **list, ID3D12CommandAllocator *allocator, const wchar_t *name)
+{
+	ID3D12GraphicsCommandList *replacement;
+
+	if (FAILED(shim.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, IID_PPV_ARGS(&replacement)))) {
+		Dx12LogInfo("*** Failed to create a command list to replace '%S'\n", name);
+		return;
+	}
+	replacement->Close();
+	replacement->SetName(name);
+	(*list)->Release();
+	*list = replacement;
+}
+
 void Dx12ShimBeforeSubmit(void (*callback)())
 {
 	before_submit = callback;
@@ -1512,6 +1535,7 @@ void Dx12ShimSubmit()
 {
 	ID3D12CommandList *lists[2];
 	UINT count = 0;
+	HRESULT hr = S_OK, shim_hr;
 
 	if (before_submit)
 		before_submit();
@@ -1536,15 +1560,28 @@ void Dx12ShimSubmit()
 		Dx12ShimTransition(touched[i], D3D12_RESOURCE_STATE_COMMON);
 	touched.clear();
 
-	// Executing a list that failed to close removes the device
 	if (early_open) {
-		Dx12LogCloseFailure(early_list, early_list->Close());
+		hr = early_list->Close();
+		Dx12LogCloseFailure(early_list, hr);
 		lists[count++] = early_list;
 	}
-	Dx12LogCloseFailure(shim_list, shim_list->Close());
+	shim_hr = shim_list->Close();
+	Dx12LogCloseFailure(shim_list, shim_hr);
 	lists[count++] = shim_list;
-	Dx12ShimResidencyWait(shim.queue);
-	shim.queue->ExecuteCommandLists(count, lists);
+	if (FAILED(hr) || FAILED(shim_hr)) {
+		// Executing a list that failed to close removes the device. The
+		// shim list was recorded after the early one, so neither runs;
+		// the fence is still signalled for what waits on it.
+		Dx12ModsFaulted(FAILED(hr) ? hr : shim_hr);
+		discarded.push_back(fence_signalled + 1);
+		if (FAILED(hr))
+			replace_list(&early_list, early_allocators[current_early_allocator].allocator, L"3DMigoto mods, early");
+		if (FAILED(shim_hr))
+			replace_list(&shim_list, allocators[current_allocator].allocator, L"3DMigoto mods");
+	} else {
+		Dx12ShimResidencyWait(shim.queue);
+		shim.queue->ExecuteCommandLists(count, lists);
+	}
 	Dx12QueueLock(shim.queue);
 	shim.queue->Signal(fence, ++fence_signalled);
 	Dx12QueueSignalled(shim.queue, fence, fence_signalled);

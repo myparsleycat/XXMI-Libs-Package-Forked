@@ -1181,6 +1181,7 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		api.EndCommandBuffer = (PFN_vkEndCommandBuffer)get(device, "vkEndCommandBuffer");
 		api.CmdPipelineBarrier = (PFN_vkCmdPipelineBarrier)get(device, "vkCmdPipelineBarrier");
 		api.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)get(device, "vkCmdCopyBufferToImage");
+		api.CmdFillBuffer = (PFN_vkCmdFillBuffer)get(device, "vkCmdFillBuffer");
 		api.QueueSubmit = next.QueueSubmit;
 		api.CreateSemaphore = (PFN_vkCreateSemaphore)get(device, "vkCreateSemaphore");
 		api.DestroySemaphore = (PFN_vkDestroySemaphore)get(device, "vkDestroySemaphore");

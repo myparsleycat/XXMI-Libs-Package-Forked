@@ -2236,7 +2236,7 @@ static void destroy_retired_mirrors(bool all)
 static const BYTE* buffer_contents(const ShimResource *resource)
 {
 	finish_refresh_of(resource);
-	if (resource->shadow.empty() || resource->readback_pending)
+	if (resource->shadow.empty() || resource->readback_pending || resource->readback_lost)
 		return NULL;
 	if (!resource->cpu_only && resource->shadow_version != resource->version)
 		return NULL;
@@ -2483,6 +2483,8 @@ struct Transfer {
 	const BYTE *src;
 	BYTE *dst;
 	size_t bytes;
+	// Of the submission of the shim that copies to src
+	UINT64 fence;
 };
 
 const UINT64 READBACK_BYTES = 1 << 20;
@@ -2572,7 +2574,7 @@ static bool transfer_from_gpu(ShimResource *resource, UINT64 offset, UINT64 byte
 	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE))
 		return false;
 	Dx12ShimList()->CopyBufferRegion(readback->resource, start, resource->resource, offset, bytes);
-	transfers.push_back({ readback->data + start, dst, (size_t)bytes });
+	transfers.push_back({ readback->data + start, dst, (size_t)bytes, Dx12ShimPendingFence() });
 	transfers_pending = true;
 	return true;
 }
@@ -2634,6 +2636,17 @@ struct SharedBuffer {
 };
 
 static std::vector<SharedBuffer> shared_buffers;
+
+// A copy of the shim to a shared buffer, for the draws of the game's next
+// submission
+struct SharedCopy {
+	VkBuffer buffer;
+	VkDeviceSize at, fill_bytes;
+	UINT64 fence;
+};
+static std::vector<SharedCopy> shared_copies;
+// Those whose submission failed to close, see finish_transfers
+static std::vector<SharedCopy> zero_fills;
 static PFN_vkGetMemoryWin32HandlePropertiesKHR handle_properties;
 // Once making one did not work, as when the GPU's memory ran out, no other
 // is tried until sharing_retry_frame, which is SHARING_RETRY_FRAMES later and
@@ -2695,8 +2708,9 @@ static SharedBuffer* new_shared_buffer(VkDeviceSize size)
 	external.handleTypes = type;
 	info.pNext = &external;
 	info.size = desc.Width;
+	// Filled with zeros where a copy to it was discarded, see finish_transfers
 	info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-		| VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+		| VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	if (api.CreateBuffer(mods_device, &info, NULL, &shared.buffer) == VK_SUCCESS) {
 		api.GetBufferMemoryRequirements(mods_device, shared.buffer, &needed);
@@ -2816,6 +2830,9 @@ static bool share_from_gpu(ShimResource *resource, UINT64 offset, UINT64 bytes, 
 	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE))
 		return false;
 	Dx12ShimList()->CopyBufferRegion(shared->resource, *at, resource->resource, offset, bytes);
+	// A fill is of whole words, or to the end
+	shared_copies.push_back({ shared->buffer, *at,
+		*at + ShimAlign(bytes, 4) <= shared->size ? ShimAlign(bytes, 4) : VK_WHOLE_SIZE, Dx12ShimPendingFence() });
 	*buffer = shared->buffer;
 	copies_pending = true;
 	transfers_pending = true;
@@ -2939,9 +2956,26 @@ static VkSemaphore finish_transfers(VkQueue queue, UINT64 *value)
 		// A GPU that has stopped, which a lost device follows
 		if (waited >= 500)
 			VkDumpNote("*** Frame %u: the D3D12 device took %llu ms to get through the copies for mods\n", vk_frame, waited);
-		for (const Transfer &transfer : transfers)
-			memcpy(transfer.dst, transfer.src, transfer.bytes);
+		// What a submission that failed to close was to copy is not
+		// there, and the draws of the game reading it have been recorded:
+		// zeros keep their indices within the vertices
+		for (const Transfer &transfer : transfers) {
+			if (Dx12ShimSubmissionDiscarded(transfer.fence))
+				memset(transfer.dst, 0, transfer.bytes);
+			else
+				memcpy(transfer.dst, transfer.src, transfer.bytes);
+		}
 	}
+	for (const SharedCopy &copy : shared_copies) {
+		if (dx12_shim && Dx12ShimSubmissionDiscarded(copy.fence))
+			zero_fills.push_back(copy);
+	}
+	shared_copies.clear();
+	// The fence the game's submission was chained to does not order the
+	// fills, which go to a queue before it: copies of earlier submissions to
+	// the same buffers, chained for other queues, may still be running
+	if (semaphore && !zero_fills.empty())
+		Dx12ShimSubmitAndWait();
 	transfers.clear();
 	copies_pending = false;
 	for (Readback &readback : readbacks)
@@ -3379,11 +3413,11 @@ static bool fill_image(ModTexture *texture, ShimResource *resource, const D3D12_
 
 		bytes = ShimAlign(bytes, 16);
 		if (layouts[i].Footprint.RowPitch == row_sizes[i]) {
-			transfers.push_back({ from, staging + bytes, (size_t)(row_sizes[i] * rows[i]) });
+			transfers.push_back({ from, staging + bytes, (size_t)(row_sizes[i] * rows[i]), Dx12ShimPendingFence() });
 		} else {
 			for (y = 0; y < rows[i]; y++) {
 				transfers.push_back({ from + (size_t)y * layouts[i].Footprint.RowPitch,
-					staging + bytes + y * row_sizes[i], (size_t)row_sizes[i] });
+					staging + bytes + y * row_sizes[i], (size_t)row_sizes[i], Dx12ShimPendingFence() });
 			}
 		}
 
@@ -3473,7 +3507,7 @@ static void submit_uploads(VkQueue queue)
 	VkCommandBuffer cmd;
 	VkCommandPool *pool;
 
-	if (uploads.empty() || !mods_device)
+	if ((uploads.empty() && zero_fills.empty()) || !mods_device)
 		return;
 
 	auto family = queue_families.find(queue);
@@ -3481,6 +3515,7 @@ static void submit_uploads(VkQueue queue)
 		// Nothing can be done for them later either: the buffers they
 		// are in are given out again
 		uploads.clear();
+		zero_fills.clear();
 		return;
 	}
 
@@ -3492,13 +3527,26 @@ static void submit_uploads(VkQueue queue)
 	if ((!*pool && api.CreateCommandPool(mods_device, &pool_info, NULL, pool) != VK_SUCCESS)
 	    || (cmd_info.commandPool = *pool, api.AllocateCommandBuffers(mods_device, &cmd_info, &cmd) != VK_SUCCESS)) {
 		uploads.clear();
+		zero_fills.clear();
 		return;
 	}
 	upload_commands.push_back({ *pool, cmd, mods_frame });
 
 	if (api.BeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
 		uploads.clear();
+		zero_fills.clear();
 		return;
+	}
+	if (!zero_fills.empty()) {
+		VkMemoryBarrier barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+
+		for (const SharedCopy &fill : zero_fills)
+			api.CmdFillBuffer(cmd, fill.buffer, fill.at, fill.fill_bytes, 0);
+		zero_fills.clear();
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+		api.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+			1, &barrier, 0, NULL, 0, NULL);
 	}
 	for (const Upload &upload : uploads) {
 		VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
