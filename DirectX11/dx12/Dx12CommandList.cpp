@@ -128,7 +128,9 @@ HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Close()
 	mDraws = mDispatches = 0;
 	Dx12FlushFastDraws(this);
 
-	return mOrig->Close();
+	HRESULT hr = mOrig->Close();
+	Dx12LogCloseFailure(mOrig, hr);
+	return hr;
 }
 
 void Dx12GraphicsCommandList::ForgetInfo()

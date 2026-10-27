@@ -171,17 +171,69 @@ void Dx12ShimNotImplemented(const char *method, bool *reported)
 	Dx12LogInfo("*** %s is not implemented on D3D12\n", method);
 }
 
-void Dx12LogDebugMessages()
+void Dx12LogCloseFailure(ID3D12GraphicsCommandList *list, HRESULT hr)
+{
+	static std::atomic<unsigned> logged;
+	wchar_t name[128] = {};
+	UINT size = sizeof(name) - sizeof(wchar_t);
+
+	if (SUCCEEDED(hr) || logged++ >= 100)
+		return;
+	list->GetPrivateData(WKPDID_D3DDebugObjectNameW, &size, name);
+	Dx12DumpNote("*** Command list %p '%S' failed to close: 0x%x, executing it removes the device\n", list, name, hr);
+}
+
+static void log_debug_message(D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID id, const char *description)
 {
 	static const char *const severities[] = { "corruption", "error", "warning", "info", "message" };
+	static SRWLOCK lock = SRWLOCK_INIT;
 	static unsigned logged;
-	static bool said;
 	static std::unordered_map<int, unsigned> noted;
+	char line[2048];
+	bool wanted;
+
+	// A warning repeated every frame would fill the disk, and one kind of
+	// them is not to keep the others out. Errors are all kept: the one that
+	// removes the device may be of a kind seen many times before it.
+	AcquireSRWLockExclusive(&lock);
+	if (severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+		wanted = true;
+	else if (severity == D3D12_MESSAGE_SEVERITY_WARNING)
+		wanted = noted[id]++ < 8;
+	else
+		wanted = logged++ < 1000;
+	ReleaseSRWLockExclusive(&lock);
+	if (!wanted)
+		return;
+
+	if (severity > D3D12_MESSAGE_SEVERITY_WARNING) {
+		Dx12LogInfo("debug layer %s %d: %s\n", severities[min(severity, 4)], id, description);
+		return;
+	}
+	if (_snprintf_s(line, _TRUNCATE, "*** debug layer %s %d: %s\n", severities[min(severity, 4)], id, description) < 0)
+		line[sizeof(line) - 2] = '\n';
+	Dx12LogInfo("%s", line);
+	// The log may be off where the report is on. The thread may be one
+	// writing the report, which takes the call to the debug layer.
+	Dx12DumpReportLineIfFree(line);
+}
+
+static void __stdcall debug_message_callback(D3D12_MESSAGE_CATEGORY category, D3D12_MESSAGE_SEVERITY severity,
+		D3D12_MESSAGE_ID id, LPCSTR description, void *context)
+{
+	log_debug_message(severity, id, description);
+}
+
+void Dx12LogDebugMessages()
+{
+	static bool said, callback;
 	ID3D12InfoQueue *queue;
+	ID3D12InfoQueue1 *queue1;
 	D3D12_MESSAGE *message;
 	std::vector<BYTE> storage;
 	UINT64 count, i;
 	SIZE_T length;
+	DWORD cookie;
 
 	if (!G->dx12_debug_layer)
 		return;
@@ -191,29 +243,29 @@ void Dx12LogDebugMessages()
 		said = true;
 		return;
 	}
-	if (!said)
-		Dx12DumpNote("dx12_debug_layer: the debug layer is on, its errors and warnings follow as they come\n");
-	said = true;
 
 	count = queue->GetNumStoredMessages();
+	if (!said) {
+		said = true;
+		// What the queue holds from before is still taken from it below
+		if (SUCCEEDED(queue->QueryInterface(IID_PPV_ARGS(&queue1)))) {
+			callback = SUCCEEDED(queue1->RegisterMessageCallback(debug_message_callback,
+					D3D12_MESSAGE_CALLBACK_FLAG_NONE, NULL, &cookie));
+			queue1->Release();
+		}
+		Dx12DumpNote("dx12_debug_layer: the debug layer is on, its errors and warnings follow %s\n",
+				callback ? "as each call is made" : "at each present");
+	} else if (callback) {
+		count = 0;
+	}
+
 	for (i = 0; i < count; i++) {
 		length = 0;
 		queue->GetMessage(i, NULL, &length);
 		storage.resize(length);
 		message = (D3D12_MESSAGE*)storage.data();
-		if (FAILED(queue->GetMessage(i, message, &length)))
-			continue;
-		// A mistake repeated every frame would fill the disk, and one
-		// kind of them is not to keep the others out
-		if (message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
-			if (noted[message->ID]++ >= 8)
-				continue;
-			// The log may be off where the report is on
-			Dx12DumpNote("*** debug layer %s %d: %s\n", severities[min(message->Severity, 4)], message->ID, message->pDescription);
-		} else if (logged++ >= 1000) {
-			continue;
-		}
-		Dx12LogInfo("debug layer %s %d: %s\n", severities[min(message->Severity, 4)], message->ID, message->pDescription);
+		if (SUCCEEDED(queue->GetMessage(i, message, &length)))
+			log_debug_message(message->Severity, message->ID, message->pDescription);
 	}
 	queue->ClearStoredMessages();
 	queue->Release();
@@ -1484,11 +1536,12 @@ void Dx12ShimSubmit()
 		Dx12ShimTransition(touched[i], D3D12_RESOURCE_STATE_COMMON);
 	touched.clear();
 
+	// Executing a list that failed to close removes the device
 	if (early_open) {
-		early_list->Close();
+		Dx12LogCloseFailure(early_list, early_list->Close());
 		lists[count++] = early_list;
 	}
-	shim_list->Close();
+	Dx12LogCloseFailure(shim_list, shim_list->Close());
 	lists[count++] = shim_list;
 	Dx12ShimResidencyWait(shim.queue);
 	shim.queue->ExecuteCommandLists(count, lists);

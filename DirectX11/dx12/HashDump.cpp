@@ -131,6 +131,20 @@ void Dx12DumpNote(const char *format, ...)
 	ReleaseSRWLockExclusive(&lock);
 }
 
+void Dx12DumpReportLineIfFree(const char *line)
+{
+	FILE *report;
+
+	if (!TryAcquireSRWLockExclusive(&lock))
+		return;
+	report = csv(CSV_REPORT);
+	if (report) {
+		fputs(line, report);
+		fflush(report);
+	}
+	ReleaseSRWLockExclusive(&lock);
+}
+
 void Dx12DumpShader(Dx12ShaderStage stage, const Dx12ShaderInfo *info)
 {
 	FILE *file;

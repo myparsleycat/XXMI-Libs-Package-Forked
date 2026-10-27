@@ -31,6 +31,9 @@ void Dx12DumpDraw(Dx12GraphicsCommandList *list, const char *type, UINT count, U
 // A line for the log that also goes to dx12_report.txt, as what the draw path
 // has to say is needed most from sessions of a game run without a log
 void Dx12DumpNote(const char *format, ...);
+// Only to dx12_report.txt, from any thread, also one that is in the middle of
+// writing the report: the line is left out while another holds it
+void Dx12DumpReportLineIfFree(const char *line);
 
 void Dx12DumpFramePresented();
 void Dx12HashReport(bool info);

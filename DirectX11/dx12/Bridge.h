@@ -106,8 +106,14 @@ void Dx12ShimUnlock();
 // By the calling thread
 bool Dx12ShimLockHeld();
 
+// The result of a list's Close(), of the game's or ours
+void Dx12LogCloseFailure(ID3D12GraphicsCommandList *list, HRESULT hr);
+
 // Moves what the debug layer has said since the last call to our log. Does
-// nothing unless the device was created with dx12_debug_layer.
+// nothing unless the device was created with dx12_debug_layer. Where the
+// debug layer takes a callback, the first call registers one, which logs each
+// message in the thread of the call it is about, as the message that removes
+// the device would otherwise be lost with the process.
 void Dx12LogDebugMessages();
 
 // The command list to record to. Stays valid until the next submission.
