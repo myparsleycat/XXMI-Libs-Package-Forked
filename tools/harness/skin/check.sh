@@ -1,0 +1,66 @@
+#!/bin/bash
+# check.sh: every mode of make_mod.py with the skin.exe arguments it is for,
+# against what each has to show, then queuelife, queuegone and devicelife,
+# in the run folder setup.sh makes. Exits with 1 when one fails.
+cd "$(dirname "$0")" || exit 1
+[ -x run/skin.exe ] || { echo "no run folder: run setup.sh first"; exit 1; }
+ok=1
+
+# mode|skin.exe arguments|the spots that have to be drawn, all others empty:
+# square (the game's mesh), bar (the mod's, as in its file), low (the lower
+# rows of the mod's bar), moved (the mod's, moved by its compute shader), second
+# (the second game mesh)
+cases="0||bar low
+1||moved
+2||bar low
+3||square
+4||square
+5||bar low
+6||bar low
+7|second|bar low second
+8|drawfirst|low
+9|unhashed second second_at=10|bar low second
+10|reuse_at=10|bar low
+11|replace_at=10|bar low second"
+# Mode 8's draws do not check the index buffer, so the mod's ...IB section is
+# not run: the game's draw gets the mod's skinned vertices but keeps its own
+# indices, which reach the bar's lower rows only, as on D3D11.
+# Mode 9's weights are copied from GPU buffers whose data has a hash, which a
+# copy carries since the D3D12 shim follows them, so the square is the mod's;
+# the second mesh, of as many vertices, must stay the game's.
+
+spots() {
+	# skin.exe output -> the names of the spots drawn
+	sed -n 's/^ *\(.*[^ ]\) *DRAWN .*/\1/p' | sed 's/^game square$/square/; s/^mod bar where it is in its file$/bar/; s/^mod bar, its lower rows$/low/;
+		s/^mod bar where its compute shader moves it$/moved/; s/^second game square$/second/; s/^\.\.\. with the game.s vertices: \(.*\) wrong$/\1-wrong/' |
+		tr '\n' ' ' | sed 's/ $//'
+}
+
+run_case() {
+	local mode=$1 args=$2 want=$3 out status got
+	out=$(bash try.sh $mode 60 "$args" 2>&1); status=$?
+	got=$(echo "$out" | spots)
+	if [ $status = 0 ] && [ "$got" = "$want" ]; then
+		echo "mode $mode${args:+ ($args)}: OK ($got)"
+	else
+		echo "mode $mode${args:+ ($args)}: FAILED (exit $status), expected [$want], got [$got]"
+		echo "$out" | grep "FAILED\|\*\*\*" | head -3 | sed 's/^/  /'
+		ok=0
+	fi
+}
+
+while IFS='|' read -r mode args want; do
+	run_case "$mode" "$args" "$want"
+done <<< "$cases"
+
+rm -rf run/Mods/skin
+for life in queuelife queuegone devicelife; do
+	out=$(cd run && ./skin.exe frames=30 $life 2>&1); status=$?
+	if [ $status = 0 ] && echo "$out" | grep -q "^frame"; then
+		echo "$life: OK ($(echo "$out" | grep "^$life" | head -1))"
+	else
+		echo "$life: FAILED (exit $status)"; echo "$out" | grep "^$life\|FAILED" | head -3 | sed 's/^/  /'
+		ok=0
+	fi
+done
+[ $ok = 1 ] && echo "CHECK OK" || { echo "CHECK FAILED"; exit 1; }

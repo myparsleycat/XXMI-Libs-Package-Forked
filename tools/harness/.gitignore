@@ -1,0 +1,11 @@
+# What build.bat, setup.sh and the runs make
+*/bin/
+*/run/
+*/ref/
+*/old/
+*.bmp
+*.png
+prof*.txt
+__pycache__/
+# Made by xh.sh setup from the mods installed; they name the user's mods
+cpu/scenes/
