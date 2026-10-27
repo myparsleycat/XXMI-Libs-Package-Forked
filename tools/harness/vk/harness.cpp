@@ -1108,6 +1108,8 @@ int main(int argc, char **argv)
 	unsigned frames = 0;
 	LARGE_INTEGER frequency, before, after;
 	double recording = 0;
+	// The CPU time of the thread, which leaves out its waits for the GPU
+	ULONG64 cycles_before, cycles_after, cycles = 0;
 	QueryPerformanceFrequency(&frequency);
 	HANDLE pacer_go = CreateEvent(NULL, FALSE, FALSE, NULL), pacer_done = CreateEvent(NULL, FALSE, FALSE, NULL);
 	std::function<void()> pacer_job;
@@ -1162,6 +1164,7 @@ int main(int argc, char **argv)
 		for (size_t n = 0; efmi && n < 65536; n++)
 			((float*)efmi_mapped)[(1 << 18) + n] = (float)(frames + n);
 		QueryPerformanceCounter(&before);
+		QueryThreadCycleTime(GetCurrentThread(), &cycles_before);
 		profiling = profile && frames >= 120;
 		if (appear)
 			profiling = profile && (getenv("STEADY") ? in_window == 5 || in_window == 6 : in_window == 0 || in_window == 1);
@@ -1246,9 +1249,12 @@ int main(int argc, char **argv)
 		CHECK(vk.QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
 		profiling = false;
 		QueryPerformanceCounter(&after);
+		QueryThreadCycleTime(GetCurrentThread(), &cycles_after);
 		// Not the first frames, which have everything made
-		if (frames >= 30)
+		if (frames >= 30) {
 			recording += (double)(after.QuadPart - before.QuadPart) * 1000 / frequency.QuadPart;
+			cycles += cycles_after - cycles_before;
+		}
 
 		present.waitSemaphoreCount = 1;
 		present.pWaitSemaphores = &rendered;
@@ -1332,8 +1338,10 @@ int main(int argc, char **argv)
 	printf("frames: %u\n", frames);
 	if (bonetick)
 		printf("last bone: %u\n", (frames - 1) % 200 + 20);
-	if (frames > 30)
+	if (frames > 30) {
 		printf("recording and submitting: %.3f ms a frame\n", recording / (frames - 30));
+		printf("recording and submitting: %.3f million cycles of the thread a frame\n", cycles / 1e6 / (frames - 30));
+	}
 
 	// The middle is within the game's square and the triangle of the test
 	// mods, the other only within the triangle
