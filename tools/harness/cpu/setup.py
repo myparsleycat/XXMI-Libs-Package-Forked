@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 
+import ini
 from condition import ini_int
 from paths import HERE, REPO, RUNS, importers_root
 
@@ -34,49 +35,11 @@ def junction(link, target):
     subprocess.check_call(['cmd', '/c', 'mklink', '/J', windows(link), windows(target)], stdout=subprocess.DEVNULL)
 
 
-def ini_lines(text):
-    # The lines of d3dx.ini as the DLL's ParseIniStream reads them: past a
-    # UTF-8 BOM, blanks around lines, section names, keys and values left out,
-    # names lowercased. Yields (section, key, start, end): section is None in a
-    # repeated section, which the DLL skips; key is None on a section line,
-    # end being the end of that line, else start and end span the value.
-    seen = set()
-    section = None
-    for line in re.finditer(r'[^\n]+', text):
-        start, end = line.span()
-        if start == 0 and text.startswith('\ufeff'):
-            start = 1
-        if text[end - 1] == '\r' and end < len(text):
-            end -= 1
-        line_end = end
-        while start < end and text[start] in ' \t':
-            start += 1
-        while end > start and text[end - 1] in ' \t':
-            end -= 1
-        if start == end or text[start] == ';':
-            continue
-        if text[start] == '[':
-            close = text.find(']', start, end)
-            name = text[start + 1:close if close >= 0 else end].strip(' \t').lower()
-            section = None if name in seen else name
-            seen.add(name)
-            yield section, None, start, line_end
-            continue
-        delim = text.find('=', start, end)
-        if section is None or delim < 0:
-            continue
-        first = delim + 1
-        while first < end and text[first] in ' \t':
-            first += 1
-        if first < end:
-            yield section, text[start:delim].rstrip(' \t').lower(), first, end
-
-
 def ini_value(text, section, key):
     # The span of the value the DLL takes: the first one in the first [section]
-    for name, k, start, end in ini_lines(text):
-        if name == section and k == key:
-            return start, end
+    for line in ini.lines(text):
+        if line.kind == 'value' and line.section.lower() == section and line.key.lower() == key:
+            return line.start, line.end
     return None
 
 
@@ -87,7 +50,8 @@ def set_value(text, section, key, value):
     if found:
         return text[:found[0]] + value + text[found[1]:]
     newline = '\r\n' if '\r\n' in text else '\n'
-    header = [end for name, k, start, end in ini_lines(text) if name == section.lower() and k is None]
+    header = [line.end for line in ini.lines(text)
+              if line.kind == 'section' and line.section and line.section.lower() == section.lower()]
     if header:
         return text[:header[0]] + newline + key + ' = ' + value + text[header[0]:]
     if text and not text.endswith('\n'):
@@ -163,14 +127,7 @@ def main():
     user = os.path.join(source, 'd3dx_user.ini')
     found = ini_value(text, 'include', 'user_config')
     if found:
-        value = text[found[0]:found[1]]
-        # UNC (\\server\share) and \\?\ paths are complete as they are
-        if value[1:2] == ':' or value.startswith('\\\\'):
-            user = value
-        elif value.startswith('\\'):
-            user = os.path.splitdrive(source)[0] + value
-        else:
-            user = os.path.normpath(source + '\\' + value)
+        user = ini.user_config_path(source, text[found[0]:found[1]])
         text = text[:found[0]] + 'd3dx_user.ini' + text[found[1]:]
     # A check compares frames call for call. With shader_regex_background = 1
     # a ShaderRegex takes effect whenever its background job ends, which

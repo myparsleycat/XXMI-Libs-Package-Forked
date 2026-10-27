@@ -4,83 +4,70 @@
 # TextureOverride sections of the active mods to match: one object per mod ini,
 # with the buffers and textures whose hashes its sections look for.
 import fnmatch
+import math
 import os
 import re
 import sys
 
+import ini
 from condition import ini_int, static_condition, static_value
-from paths import importers_root
+from ini import fold
+from paths import RUNS, importers_root
 
 ROOT = importers_root()
 
-SECTION = re.compile(r'^\[(.+)\]\s*$')
-ASSIGN = re.compile(r'^\s*(?:(?:pre|post|global|local|persist)\s+)*([^=;]+?)\s*=\s*(.*?)\s*$')
-
-
 MAX_PATH = 260
-ASCII_LOWER = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
 
 
-def fold(text):
-    # The order of _wcsicmp, which the DLL sorts section and file names by
-    return text.translate(ASCII_LOWER)
-
-
-def include_entries(path, hunting_static=False):
+def include_entries(path, hunting_static=False, included=True):
     # (namespace = of the preamble or None, [(name, [(key, value)])] of the
     # [Include...] sections of an ini with their lines in order); None when a
     # condition in its preamble makes the DLL skip the whole file
     sections = []
     namespace = None
-    preamble = True
-    entries = None
-    try:
-        with open(path, encoding='utf-8-sig', errors='replace') as f:
-            lines = f.read().splitlines()
-    except OSError:
+    text = ini.read_text(path)
+    if text is None:
         return namespace, sections
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith(';'):
-            continue
-        m = SECTION.match(line)
-        if m:
-            preamble = False
-            name = m.group(1).strip()
-            entries = [] if name.lower().startswith('include') else None
-            if entries is not None:
-                sections.append((name, entries))
-            continue
-        m = ASSIGN.match(line)
-        if not m:
-            continue
-        if preamble:
-            if m.group(1).lower() == 'condition' and not static_condition(m.group(2), hunting_static):
+    entries = None
+    for line in ini.lines(text, included):
+        if line.kind == 'preamble':
+            if line.key.lower() == 'condition' and not static_condition(line.value, hunting_static):
                 return None
-            if m.group(1).lower() == 'namespace':
-                namespace = m.group(2)
-        elif entries is not None:
-            entries.append((m.group(1), m.group(2)))
+            if line.key.lower() == 'namespace':
+                namespace = line.value
+        elif line.kind == 'section':
+            entries = [] if line.section and line.section.lower().startswith('include') else None
+            if entries is not None:
+                sections.append((line.section, entries))
+        elif line.kind == 'value' and entries is not None:
+            entries.append((line.key, line.value))
     return namespace, sections
 
 
 def ini_value(path, section, key):
-    for name, lines in read_ini(path):
+    # What GetIniString gives as d3dx.ini is parsed: the first value in the
+    # first [section]
+    for name, entries in read_ini(path, False):
         if name.lower() == section:
-            for line in lines:
-                m = ASSIGN.match(line)
-                if m and m.group(1).lower() == key:
-                    return m.group(2)
+            for k, value, text in entries:
+                if k is not None and k.lower() == key:
+                    return value
     return None
+
+
+def reload_delay(importer):
+    # config_initialization_delay: the DLL loads the mods again at the first
+    # Present past it, unless it is negative. Read as the DLL loads, when
+    # hunting is still disabled.
+    delay = ini_value(os.path.join(ROOT, importer, 'd3dx.ini'), 'system', 'config_initialization_delay')
+    return ini_int(delay, 0, True)
 
 
 def includes_hunting_static(importer):
     # With config_initialization_delay < 0 the includes are parsed only as the
     # DLL loads, before [Hunting] is read: hunting is still disabled then. At
     # the delayed reload it is not, as [Hunting] turns 0 into soft disabled.
-    # The setting is read as the DLL loads, when hunting is still disabled too.
-    delay = ini_value(os.path.join(ROOT, importer, 'd3dx.ini'), 'system', 'config_initialization_delay')
-    return ini_int(delay, 0, True) < 0
+    return reload_delay(importer) < 0
 
 
 def mod_inis(importer):
@@ -90,8 +77,16 @@ def mod_inis(importer):
     # lines in order. A path is relative to the folder of the ini that names
     # it; exclude_recursive is d3dx.ini's [Include] only.
     top = os.path.join(ROOT, importer)
+    # The DLL under test sits in the cur (or ref) folder of setup.py, with
+    # junctions to the deployed folders: a path opens there when it fits in
+    # MAX_PATH after that folder.
+    dll_dir = len(os.path.join(RUNS, importer, 'cur') + '\\')
+
+    def fits(rel):
+        return dll_dir + len(rel) < MAX_PATH
+
     hunting_static = includes_hunting_static(importer)
-    parsed = include_entries(os.path.join(top, 'd3dx.ini'), hunting_static)
+    parsed = include_entries(os.path.join(top, 'd3dx.ini'), hunting_static, False)
     first = parsed[1] if parsed else []
     excluded = [value.lower() for name, entries in first if name.lower() == 'include'
                 for key, value in entries if key.lower() == 'exclude_recursive']
@@ -102,7 +97,7 @@ def mod_inis(importer):
     def recursive(rel):
         # ParseIniFilesRecursive: the .ini files of a folder (the extension
         # compared case sensitively), then its folders, each sorted by name
-        if len(os.path.join(top, rel, '*')) >= MAX_PATH:
+        if not fits(rel + '\\*'):
             return
         try:
             names = os.listdir(os.path.join(top, rel))
@@ -110,7 +105,7 @@ def mod_inis(importer):
             return
         names = sorted((name for name in names if not skip(name)), key=fold)
         for name in names:
-            if name.endswith('.ini') and os.path.isfile(os.path.join(top, rel, name)):
+            if name.endswith('.ini') and os.path.isfile(os.path.join(top, rel, name)) and fits(rel + '\\' + name):
                 yield os.path.join(top, rel, name), rel + '\\' + name
         for name in names:
             if os.path.isdir(os.path.join(top, rel, name)):
@@ -137,7 +132,7 @@ def mod_inis(importer):
                 seen.add(rel)
                 if key == 'include':
                     path = os.path.join(top, rel)
-                    paths = [(path, rel)] if os.path.isfile(path) and len(path) < MAX_PATH else []
+                    paths = [(path, rel)] if os.path.isfile(path) and fits(rel) else []
                 elif key == 'include_recursive':
                     paths = recursive(rel)
                 else:
@@ -161,25 +156,24 @@ def mod_inis(importer):
     return found, order
 
 
-def read_ini(path):
-    try:
-        with open(path, encoding='utf-8-sig', errors='replace') as f:
-            lines = f.read().splitlines()
-    except OSError:
+def read_ini(path, included=True):
+    # [(name, [(key, value, line)])]: the sections the DLL keeps of an ini,
+    # with their lines in order; key and value are None on a line without '='
+    text = ini.read_text(path)
+    if text is None:
         return []
     sections = []
-    current = None
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(';'):
-            continue
-        m = SECTION.match(stripped)
-        if m:
-            current = (m.group(1), [])
-            sections.append(current)
-        elif current is not None:
-            current[1].append(stripped)
+    for line in ini.lines(text, included):
+        if line.kind == 'section':
+            if line.section is not None:
+                sections.append((line.section, []))
+        elif line.kind != 'preamble':
+            sections[-1][1].append((line.key, line.value, line.text))
     return sections
+
+
+def texts(entries):
+    return [text for key, value, text in entries]
 
 
 MATCH_KEYS = ('match_type', 'match_usage', 'match_bind_flags', 'match_cpu_access_flags', 'match_misc_flags',
@@ -189,16 +183,15 @@ MATCH_KEYS = ('match_type', 'match_usage', 'match_bind_flags', 'match_cpu_access
 
 def overrides(path):
     out = []
-    for name, body in read_ini(path):
+    for name, entries in read_ini(path):
         if not name.lower().startswith('textureoverride'):
             continue
         o = {'name': name[len('TextureOverride'):], 'hash': None, 'first': None, 'count': None, 'fuzzy': {},
-             'body': body, 'vertex_count': None}
-        for line in body:
-            m = ASSIGN.match(line)
-            if not m:
+             'body': texts(entries), 'vertex_count': None}
+        for key, value, text in entries:
+            if key is None:
                 continue
-            key, value = m.group(1).lower(), m.group(2)
+            key = key.lower()
             if key == 'hash':
                 try:
                     o['hash'] = int(value, 16)
@@ -258,13 +251,12 @@ def key_combo(text):
 
 def keys_of(path):
     out = []
-    for name, body in read_ini(path):
+    for name, entries in read_ini(path):
         if not name.lower().startswith('key'):
             continue
-        for line in body:
-            m = ASSIGN.match(line)
-            if m and m.group(1).lower() == 'key':
-                combo = key_combo(m.group(2))
+        for key, value, text in entries:
+            if key is not None and key.lower() == 'key':
+                combo = key_combo(value)
                 if combo:
                     out.append(combo)
                 break
@@ -275,35 +267,29 @@ def reserved_keys(importer):
     # What d3dx.ini and the Core bind: reloading, frame analysis, switching
     # the mods off. The harness leaves those alone.
     keys = set()
-    paths = [os.path.join(ROOT, importer, 'd3dx.ini')]
+    d3dx = os.path.join(ROOT, importer, 'd3dx.ini')
+    paths = [d3dx]
     for base, dirs, files in os.walk(os.path.join(ROOT, importer, 'Core')):
         paths += [os.path.join(base, n) for n in files if n.lower().endswith('.ini')]
     for path in paths:
-        for name, body in read_ini(path):
-            for line in body:
-                m = ASSIGN.match(line)
-                if not m:
+        for name, entries in read_ini(path, path != d3dx):
+            for key, value, text in entries:
+                if key is None:
                     continue
-                if name.lower().startswith('key') and m.group(1).lower() != 'key':
+                if name.lower().startswith('key') and key.lower() != 'key':
                     continue
                 if not name.lower().startswith('key') and name.lower() != 'hunting':
                     continue
-                combo = key_combo(m.group(2))
+                combo = key_combo(value)
                 if combo:
                     keys.add(combo[-1])
     return keys
 
 
 def user_config(importer):
-    # [Include] user_config of d3dx.ini, relative to the importer folder
-    # unless it starts with a drive or a backslash
     top = os.path.join(ROOT, importer)
     value = ini_value(os.path.join(top, 'd3dx.ini'), 'include', 'user_config') or 'd3dx_user.ini'
-    if value[1:2] == ':' or value.startswith('\\\\'):
-        return value
-    if value.startswith('\\'):
-        return os.path.splitdrive(top)[0] + value
-    return os.path.normpath(top + '\\' + value)
+    return ini.user_config_path(top, value)
 
 
 def rendering(importer, order, key):
@@ -317,26 +303,26 @@ def rendering(importer, order, key):
     if include_entries(user, includes_hunting_static(importer)) is not None:
         order = order + [user]
     for path in order:
-        for name, lines in read_ini(path):
+        for name, entries in read_ini(path):
             if name.lower() == 'rendering':
-                for line in lines:
-                    m = ASSIGN.match(line)
-                    if m and m.group(1).lower() == key:
-                        value = m.group(2)
+                for k, v, text in entries:
+                    if k is not None and k.lower() == key:
+                        value = v
     return value
 
 
 def ini_bool(text, default):
-    # GetIniBool: the words ParseBoolValue knows, anything else as an expression
+    # GetIniBool: the words ParseBoolValue knows, anything else as an
+    # expression, where NaN is false
     if not text:
         return default
-    word = text.strip().lower()
+    word = text.lower()
     if word in ('1', 'true', 'yes', 'on'):
         return True
     if word in ('0', 'false', 'no', 'off'):
         return False
     value = static_value(word, False)
-    return default if value is None else value != 0
+    return default if value is None else not math.isnan(value) and value != 0
 
 
 # Where the mesh a section with match_first_index is for sits in a draw, and
@@ -419,7 +405,7 @@ def main():
     fuzzy_keys = {}
     for path in inis:
         found = overrides(path)
-        lists = {name.lower(): body for name, body in read_ini(path)}
+        lists = {name.lower(): texts(entries) for name, entries in read_ini(path)}
         parts = []
         for o in found:
             if o['hash'] is None:
@@ -458,6 +444,10 @@ def main():
     lines = ['importer %s' % importer, 'mesh_slot %s' % slot, 'draw %s' % draw,
              'region %d' % ini_bool(rendering(importer, order, 'track_region_hashes'), False),
              'texture_hash %d' % ini_int(rendering(importer, order, 'texture_hash'), 0, False)]
+    # Until the reload these settings are those of d3dx.ini alone, so the
+    # harness makes the mods' objects after it
+    if reload_delay(importer) >= 0:
+        lines.append('config_reload %d' % reload_delay(importer))
     for path, parts in objects:
         relative = os.path.relpath(path, os.path.join(ROOT, importer)).replace('\\', '/')
         lines.append('object %s' % relative)

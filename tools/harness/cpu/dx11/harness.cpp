@@ -207,6 +207,7 @@ struct Object {
 static std::vector<Object> objects, scenery;
 static bool mesh_on_vb0, region_hashes, instanced;
 static int texture_hash_version;
+static int config_reload = -1;
 
 static uint64_t rng_state;
 static uint32_t rnd()
@@ -246,6 +247,8 @@ static bool load_scene(const char *path)
 			region_hashes = atoi(p) != 0;
 		} else if (!strcmp(word, "texture_hash")) {
 			texture_hash_version = atoi(p);
+		} else if (!strcmp(word, "config_reload")) {
+			config_reload = atoi(p);
 		} else if (!strcmp(word, "draw")) {
 			instanced = strstr(p, "instanced") != NULL;
 		} else if (!strcmp(word, "object")) {
@@ -987,6 +990,7 @@ int main(int argc, char **argv)
 		redirect_export(system_d3d11, "D3D11CreateDevice", traced_create_device, (void**)&real_create_device);
 	}
 	HMODULE lib = system_d3d11;
+	uint64_t dll_loaded_us = virtual_us;
 	if (!nodll) {
 		GetModuleFileNameW(NULL, own_path, MAX_PATH);
 		*wcsrchr(own_path, L'\\') = 0;
@@ -1023,6 +1027,32 @@ int main(int argc, char **argv)
 	if (check)
 		trace_enable(true);
 	make_game(material_count, scenery_count);
+
+	// The DLL loads the mods again at the first Present past
+	// config_initialization_delay seconds of its `time`, and only then takes
+	// the [Rendering] settings of the includes: what it hashes before that is
+	// hashed with those of d3dx.ini alone. The objects of the mods, made from
+	// the first frame on, come after it.
+	if (config_reload >= 0 && !nodll) {
+		LARGE_INTEGER start, now;
+		QueryPerformanceCounter(&start);
+		trace_note_frame(~0u);
+		for (;;) {
+			if (check)
+				virtual_us += 16667;
+			QueryPerformanceCounter(&now);
+			double since = check ? (virtual_us - dll_loaded_us) / 1e6 : (now.QuadPart - start.QuadPart) / (double)qpf.QuadPart;
+			swap->Present(0, 0);
+			if (since > config_reload)
+				break;
+			Sleep(1);
+		}
+		if (check) {
+			trace_frame_end();
+			// As after the first frames below
+			Sleep(700);
+		}
+	}
 
 	FILE *frames_file = NULL, *text_file = NULL;
 	if (check) {
@@ -1106,7 +1136,7 @@ int main(int argc, char **argv)
 		virtual_us += 16667;
 		InterlockedIncrement(&frames_done);
 		// The DLL looks at the shaders it has met on threads of its own once
-		// its configuration is loaded (the first Present), and a shader's
+		// its configuration is loaded (at a Present), and a shader's
 		// draws run their lists from whenever that is done: for a check, it
 		// has to be done before the next frame, not some frame later.
 		if (check && f < 3)
