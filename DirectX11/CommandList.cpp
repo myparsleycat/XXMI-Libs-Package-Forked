@@ -6297,6 +6297,7 @@ bool CommandListExpression::parse(const wstring *expression, const wstring *ini_
 
 		evaluatable = tree.finalise();
 		log_syntax_tree(evaluatable, "Final syntax tree:\n");
+		compile();
 		return true;
 	} catch (const CommandListSyntaxError &e) {
 		LogOverlay(LOG_WARNING_MONOSPACE,
@@ -6324,9 +6325,149 @@ static inline float evaluate_operand_or_call(CommandListEvaluatable *evaluatable
 	return evaluatable->evaluate(state, device);
 }
 
+// The operators evaluate() applies by name rather than through the virtual
+// call, each with the very function of its class:
+enum FastOp : uint8_t {
+	FAST_OP_NONE,
+	FAST_OP_NOT,
+	FAST_OP_NEGATE,
+	FAST_OP_MULTIPLY,
+	FAST_OP_DIVIDE,
+	FAST_OP_MODULUS,
+	FAST_OP_ADD,
+	FAST_OP_SUBTRACT,
+	FAST_OP_LESS,
+	FAST_OP_LESS_EQUAL,
+	FAST_OP_GREATER,
+	FAST_OP_GREATER_EQUAL,
+	FAST_OP_EQUAL,
+	FAST_OP_NOT_EQUAL,
+	FAST_OP_AND,
+	FAST_OP_OR,
+};
+
+#define FAST_OPS(X) \
+	X(FAST_OP_NOT, unary_not_operatorT) \
+	X(FAST_OP_NEGATE, unary_negate_operatorT) \
+	X(FAST_OP_MULTIPLY, multiplication_operatorT) \
+	X(FAST_OP_DIVIDE, division_operatorT) \
+	X(FAST_OP_MODULUS, modulus_operatorT) \
+	X(FAST_OP_ADD, addition_operatorT) \
+	X(FAST_OP_SUBTRACT, subtraction_operatorT) \
+	X(FAST_OP_LESS, less_operatorT) \
+	X(FAST_OP_LESS_EQUAL, less_equal_operatorT) \
+	X(FAST_OP_GREATER, greater_operatorT) \
+	X(FAST_OP_GREATER_EQUAL, greater_equal_operatorT) \
+	X(FAST_OP_EQUAL, equality_operatorT) \
+	X(FAST_OP_NOT_EQUAL, inequality_operatorT) \
+	X(FAST_OP_AND, and_operatorT) \
+	X(FAST_OP_OR, or_operatorT)
+
+static uint8_t fast_op_of(CommandListOperator *op)
+{
+#define FAST_OP_OF(fast_op, type) if (typeid(*op) == typeid(type)) return fast_op;
+	FAST_OPS(FAST_OP_OF)
+#undef FAST_OP_OF
+	return FAST_OP_NONE;
+}
+
+static inline float apply_operator(const ExpressionStep &step, float lhs, float rhs)
+{
+	switch (step.fast_op) {
+#define FAST_OP_CASE(fast_op, type) case fast_op: return static_cast<type*>(step.op)->type::evaluate(lhs, rhs);
+		FAST_OPS(FAST_OP_CASE)
+#undef FAST_OP_CASE
+	}
+	return step.op->evaluate(lhs, rhs);
+}
+
+// Deep enough for any expression written by hand; a deeper one is evaluated
+// as a tree
+const size_t MAX_EXPRESSION_STACK = 32;
+
+// Appends the steps of the node, returns how deep the stack gets. The order is
+// that of CommandListOperator::evaluate(), which evaluates the right hand
+// side before the left as compiled.
+static size_t compile_node(CommandListEvaluatable *node, std::vector<ExpressionStep> *steps)
+{
+	ExpressionStep step = {};
+	size_t depth, lhs_depth;
+
+	CommandListOperator *op = dynamic_cast<CommandListOperator*>(node);
+	if (op && op->rhs) {
+		depth = compile_node(op->rhs.get(), steps);
+		if (op->lhs) {
+			lhs_depth = compile_node(op->lhs.get(), steps);
+			depth = max(depth, lhs_depth + 1);
+		}
+		step.kind = op->lhs ? ExpressionStep::Kind::BINARY : ExpressionStep::Kind::UNARY;
+		step.fast_op = fast_op_of(op);
+		step.op = op;
+		steps->push_back(step);
+		return depth;
+	}
+
+	// As evaluate_operand_or_call() does with a state or a device
+	CommandListOperand *operand = node->as_operand;
+	if (operand && operand->type == ParamOverrideType::VALUE) {
+		step.kind = ExpressionStep::Kind::VALUE;
+		step.value = operand->val;
+	} else if (operand && operand->type == ParamOverrideType::VARIABLE) {
+		step.kind = ExpressionStep::Kind::VARIABLE;
+		step.variable = operand->var_ftarget;
+	} else {
+		step.kind = ExpressionStep::Kind::CALL;
+		step.evaluatable = node;
+	}
+	steps->push_back(step);
+	return 1;
+}
+
+void CommandListExpression::compile()
+{
+	steps.clear();
+	if (!evaluatable)
+		return;
+	// A lone operand gains nothing from it
+	if (evaluatable->as_operand)
+		return;
+	if (compile_node(evaluatable.get(), &steps) > MAX_EXPRESSION_STACK)
+		steps.clear();
+	steps.shrink_to_fit();
+}
+
 float CommandListExpression::evaluate(CommandListState *state, HackerDevice *device)
 {
-	return evaluate_operand_or_call(evaluatable.get(), state, device);
+	float stack[MAX_EXPRESSION_STACK], lhs, rhs;
+	size_t top = 0;
+
+	// Without either, the operands complain the way they always have
+	if (steps.empty() || !(state || device))
+		return evaluate_operand_or_call(evaluatable.get(), state, device);
+
+	for (const ExpressionStep &step : steps) {
+		switch (step.kind) {
+		case ExpressionStep::Kind::VALUE:
+			stack[top++] = step.value;
+			break;
+		case ExpressionStep::Kind::VARIABLE:
+			stack[top++] = *step.variable;
+			break;
+		case ExpressionStep::Kind::CALL:
+			stack[top++] = step.evaluatable->evaluate(state, device);
+			break;
+		case ExpressionStep::Kind::UNARY:
+			rhs = stack[--top];
+			stack[top++] = apply_operator(step, std::numeric_limits<float>::quiet_NaN(), rhs);
+			break;
+		case ExpressionStep::Kind::BINARY:
+			lhs = stack[--top];
+			rhs = stack[--top];
+			stack[top++] = apply_operator(step, lhs, rhs);
+			break;
+		}
+	}
+	return stack[0];
 }
 
 bool CommandListExpression::static_evaluate(float *ret, HackerDevice *device, bool evaluate_variables)
@@ -6342,6 +6483,7 @@ bool CommandListExpression::optimise(HackerDevice *device)
 	if (!evaluatable) {
 		LogOverlay(LOG_DIRE, "BUG: Non-evaluatable expression, please report this and provide your d3dx.ini\n");
 		evaluatable = std::make_shared<CommandListOperand>(0, L"<BUG>");
+		compile();
 		return false;
 	}
 
@@ -6350,6 +6492,7 @@ bool CommandListExpression::optimise(HackerDevice *device)
 	if (replacement)
 		evaluatable = replacement;
 
+	compile();
 	return ret;
 }
 
