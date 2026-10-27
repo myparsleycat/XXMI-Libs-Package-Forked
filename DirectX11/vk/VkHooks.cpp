@@ -1119,7 +1119,9 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		if (exports.UnmapMemory2KHR && (void*)next.UnmapMemory2KHR == NktHookLibHelpers::GetProcedureAddress(vulkan, "vkUnmapMemory2"))
 			next.UnmapMemory2KHR = exports.UnmapMemory2KHR;
 	}
-	// And a device from before Vulkan 1.3 by the name of its extension only
+	// And a device from before Vulkan 1.3 by the name of their extension only
+	if (!next.CmdCopyBuffer2)
+		next.CmdCopyBuffer2 = (PFN_vkCmdCopyBuffer2)get(device, "vkCmdCopyBuffer2KHR");
 	if (!next.CmdCopyImage2)
 		next.CmdCopyImage2 = (PFN_vkCmdCopyImage2)get(device, "vkCmdCopyImage2KHR");
 
