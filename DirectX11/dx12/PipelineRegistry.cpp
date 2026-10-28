@@ -104,29 +104,40 @@ static UINT32 count_targets(Blob part, bool wide)
 
 // The elements of the signature parts in full: name, index, system value,
 // component type, register, mask, read/write mask. The *SG1 form has a
-// stream number in front and a minimum precision after.
+// stream number in front and a minimum precision after. OSG5, the output of
+// a DXBC geometry shader with streams, has only the stream number in front.
+// Of an output with stream numbers only the elements of stream 0, the one
+// rasterized, are read.
 bool Dx12ReadSignature(const void *bytecode, size_t size, bool output, std::vector<Dx12SignatureElement> *elements)
 {
 	Blob container = { (const BYTE*)bytecode, size }, part;
-	UINT32 count, offset, value, i;
+	UINT32 count, offset, value, stream, i;
 	size_t entry, base;
-	bool wide;
+	bool stream_first, stream_zero_only = false;
 
 	elements->clear();
-	if (find_part(container, output ? "OSG1" : "ISG1", &part))
-		wide = true;
-	else if (find_part(container, output ? "OSGN" : "ISGN", &part))
-		wide = false;
-	else
+	if (find_part(container, output ? "OSG1" : "ISG1", &part)) {
+		entry = 32;
+		stream_first = true;
+		stream_zero_only = output;
+	} else if (find_part(container, output ? "OSGN" : "ISGN", &part)) {
+		entry = 24;
+		stream_first = false;
+	} else if (output && find_part(container, "OSG5", &part)) {
+		entry = 28;
+		stream_first = stream_zero_only = true;
+	} else {
 		return false;
-	entry = wide ? 32 : 24;
+	}
 
 	if (!read32(part, 0, &count) || count > 64)
 		return false;
 	for (i = 0; i < count; i++) {
 		Dx12SignatureElement element = {};
 
-		base = 8 + i * entry + (wide ? 4 : 0);
+		base = 8 + i * entry + (stream_first ? 4 : 0);
+		if (stream_zero_only && (!read32(part, base - 4, &stream) || stream != 0))
+			continue;
 		if (!read32(part, base, &offset) || offset >= part.size)
 			return false;
 		strncpy_s(element.name, (const char*)part.data + offset, min(sizeof(element.name) - 1, part.size - offset));
