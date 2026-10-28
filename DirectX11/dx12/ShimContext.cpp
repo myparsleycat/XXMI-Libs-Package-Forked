@@ -110,6 +110,7 @@ void STDMETHODCALLTYPE ShimContext::ClearState()
 				assign(stage.srvs[i + bit], (ID3D11ShaderResourceView*)NULL);
 			}
 		}
+		memset(stage.srv_unbound, 0, sizeof(stage.srv_unbound));
 		for (i = 0; mState->samplers_set && i < SHIM_SAMPLER_SLOTS; i++)
 			assign(stage.samplers[i], (ID3D11SamplerState*)NULL);
 	}
@@ -255,6 +256,7 @@ void ShimContext::UnbindInput(ShimResource *resource)
 					continue;
 				assign(stage.srvs[slot], (ID3D11ShaderResourceView*)NULL);
 				stage.srv_mask[word] &= ~(1u << bit);
+				stage.srv_unbound[word] |= 1u << bit;
 			}
 		}
 	}
@@ -272,10 +274,13 @@ void ShimContext::SetShaderResources(Dx12ShaderStage stage, UINT start, UINT cou
 		if (view && IsOutput(ShimViewOf(view)->resource))
 			view = NULL;
 		assign(state->srvs[start + i], view);
-		if (view)
+		if (view) {
 			state->srv_mask[(start + i) / 32] |= 1u << ((start + i) & 31);
-		else
+			state->srv_unbound[(start + i) / 32] &= ~(1u << ((start + i) & 31));
+		} else {
 			state->srv_mask[(start + i) / 32] &= ~(1u << ((start + i) & 31));
+			state->srv_unbound[(start + i) / 32] |= 1u << ((start + i) & 31);
+		}
 	}
 	mChanged = true;
 }
@@ -288,7 +293,8 @@ void ShimContext::GetShaderResources(Dx12ShaderStage stage, UINT start, UINT cou
 	for (i = 0; i < count; i++) {
 		view = start + i < SHIM_SRV_SLOTS ? mState->stages[stage].srvs[start + i] : NULL;
 		// What a mod has not bound over is still the game's
-		if (!view && start + i < SHIM_SRV_SLOTS && Dx12InDrawScope())
+		if (!view && start + i < SHIM_SRV_SLOTS
+		    && !(mState->stages[stage].srv_unbound[(start + i) / 32] & (1u << ((start + i) & 31))) && Dx12InDrawScope())
 			view = Dx12ScopeShaderResource(stage, start + i);
 		get(view, &views[i]);
 	}

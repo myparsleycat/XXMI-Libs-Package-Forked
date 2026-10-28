@@ -3,6 +3,7 @@
 #include <unordered_map>
 
 #include "util.h"
+#include "CmdState.h"
 #include "../globals.h"
 
 #include "DxilMetadata.h"
@@ -486,6 +487,8 @@ void Dx12RegisterRootSignature(void **ppvRootSignature, const void *blob, SIZE_T
 	if (!find_part(container, "RTS0", &rts) || !parse_root_signature(rts, info)) {
 		Dx12LogInfo("*** Failed to parse the %Iu bytes ID3D12RootSignature %p was created from\n", size, signature);
 		info->parameters.clear();
+	} else {
+		info->blob.assign((const BYTE*)blob, (const BYTE*)blob + size);
 	}
 
 	AcquireSRWLockExclusive(&signature_lock);
@@ -511,6 +514,186 @@ const Dx12RootSignatureInfo* Dx12FindRootSignature(ID3D12RootSignature *signatur
 	ReleaseSRWLockShared(&signature_lock);
 
 	return info;
+}
+
+Dx12RootSignatureInfo::~Dx12RootSignatureInfo()
+{
+	for (Dx12ExtendedSignature &made : extended) {
+		if (made.signature)
+			made.signature->Release();
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Root signatures of the game extended for the shaders of mods
+//
+// A shader of a mod may read registers the game's shaders do not, like t120
+// for IniParams, which the game's root signature has nothing for and D3D12
+// then refuses a pipeline with. The root signature it gets instead is the
+// game's as the game created it, with a descriptor table appended for each
+// stage that reads such registers.
+
+static const D3D12_SHADER_VISIBILITY extra_visibility[DX12_STAGE_COUNT] = {
+	D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_GEOMETRY,
+	D3D12_SHADER_VISIBILITY_HULL, D3D12_SHADER_VISIBILITY_DOMAIN, D3D12_SHADER_VISIBILITY_ALL,
+};
+static const D3D12_ROOT_SIGNATURE_FLAGS extra_denied[DX12_STAGE_COUNT] = {
+	D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS, D3D12_ROOT_SIGNATURE_FLAG_DENY_PIXEL_SHADER_ROOT_ACCESS,
+	D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS, D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS,
+	D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS, D3D12_ROOT_SIGNATURE_FLAG_NONE,
+};
+
+static void volatile_range(D3D12_DESCRIPTOR_RANGE *range)
+{
+}
+
+// What mods bind changes from draw to draw, as with root signature 1.0
+static void volatile_range(D3D12_DESCRIPTOR_RANGE1 *range)
+{
+	range->Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+}
+
+static void set_versioned(D3D12_VERSIONED_ROOT_SIGNATURE_DESC *versioned, const D3D12_ROOT_SIGNATURE_DESC *desc)
+{
+	versioned->Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+	versioned->Desc_1_0 = *desc;
+}
+
+static void set_versioned(D3D12_VERSIONED_ROOT_SIGNATURE_DESC *versioned, const D3D12_ROOT_SIGNATURE_DESC1 *desc)
+{
+	versioned->Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+	versioned->Desc_1_1 = *desc;
+}
+
+static void set_versioned(D3D12_VERSIONED_ROOT_SIGNATURE_DESC *versioned, const D3D12_ROOT_SIGNATURE_DESC2 *desc)
+{
+	versioned->Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+	versioned->Desc_1_2 = *desc;
+}
+
+typedef HRESULT (WINAPI *VersionedSerializer)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob**, ID3DBlob**);
+
+// Ranges of consecutive registers, so that the descriptors of the table are
+// in the order of Dx12ExtendedSignature
+template <class Desc, class Parameter, class Range>
+static HRESULT serialize_extended(const Desc *game, VersionedSerializer serialize, Dx12ExtendedSignature *extended,
+		ID3DBlob **blob, ID3DBlob **errors)
+{
+	std::vector<Parameter> parameters(game->pParameters, game->pParameters + game->NumParameters);
+	std::vector<Range> ranges[DX12_STAGE_COUNT];
+	D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};
+	Desc desc = *game;
+	UINT stage, kind, reg;
+	bool extra;
+
+	for (stage = 0; stage < DX12_STAGE_CS; stage++) {
+		for (kind = 0; kind < 2; kind++) {
+			D3D12_DESCRIPTOR_RANGE_TYPE type = kind ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+
+			for (reg = 0; reg < (kind ? 128u : 64u); reg++) {
+				extra = kind ? !!(extended->extra.srv[stage][reg / 64] & (1ull << (reg % 64)))
+					: !!(extended->extra.cbv[stage] & (1ull << reg));
+				if (!extra)
+					continue;
+				if (!ranges[stage].empty() && ranges[stage].back().RangeType == type
+				    && ranges[stage].back().BaseShaderRegister + ranges[stage].back().NumDescriptors == reg) {
+					ranges[stage].back().NumDescriptors++;
+					continue;
+				}
+				Range range = {};
+				range.RangeType = type;
+				range.NumDescriptors = 1;
+				range.BaseShaderRegister = reg;
+				range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+				volatile_range(&range);
+				ranges[stage].push_back(range);
+			}
+		}
+		if (ranges[stage].empty())
+			continue;
+
+		Parameter table = {};
+		table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		table.DescriptorTable.NumDescriptorRanges = (UINT)ranges[stage].size();
+		table.DescriptorTable.pDescriptorRanges = ranges[stage].data();
+		table.ShaderVisibility = extra_visibility[stage];
+		extended->parameters[stage] = (int)parameters.size();
+		parameters.push_back(table);
+		desc.Flags &= ~extra_denied[stage];
+	}
+	if (parameters.size() > DX12_MAX_ROOT_ARGUMENTS)
+		return E_INVALIDARG;
+
+	desc.NumParameters = (UINT)parameters.size();
+	desc.pParameters = parameters.data();
+	set_versioned(&versioned, &desc);
+	return serialize(&versioned, blob, errors);
+}
+
+bool Dx12ExtendRootSignature(const Dx12RootSignatureInfo *info, ID3D12Device *device, Dx12ExtendedSignature *extended)
+{
+	static HRESULT (WINAPI *deserialize)(LPCVOID, SIZE_T, REFIID, void**);
+	static VersionedSerializer serialize;
+	static bool loaded;
+	ID3D12VersionedRootSignatureDeserializer *deserializer = NULL;
+	const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *game = NULL;
+	ID3DBlob *blob = NULL, *errors = NULL;
+	HRESULT hr = E_NOTIMPL;
+	int stage;
+
+	extended->signature = NULL;
+	for (stage = 0; stage < DX12_STAGE_COUNT; stage++)
+		extended->parameters[stage] = -1;
+	if (info->blob.empty())
+		return false;
+	for (const Dx12RootParameter &parameter : info->parameters) {
+		if (parameter.type == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+			return false;
+	}
+
+	if (!loaded) {
+		// Not linked against, see Dx12ShimPipelineInit
+		HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+
+		*(FARPROC*)&deserialize = d3d12 ? GetProcAddress(d3d12, "D3D12CreateVersionedRootSignatureDeserializer") : NULL;
+		*(FARPROC*)&serialize = d3d12 ? GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature") : NULL;
+		loaded = true;
+	}
+	if (!deserialize || !serialize)
+		return false;
+
+	if (SUCCEEDED(deserialize(info->blob.data(), info->blob.size(), IID_PPV_ARGS(&deserializer)))
+	    && (game = deserializer->GetUnconvertedRootSignatureDesc()) != NULL) {
+		switch (game->Version) {
+		case D3D_ROOT_SIGNATURE_VERSION_1_0:
+			hr = serialize_extended<D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_PARAMETER, D3D12_DESCRIPTOR_RANGE>(
+				&game->Desc_1_0, serialize, extended, &blob, &errors);
+			break;
+		case D3D_ROOT_SIGNATURE_VERSION_1_1:
+			hr = serialize_extended<D3D12_ROOT_SIGNATURE_DESC1, D3D12_ROOT_PARAMETER1, D3D12_DESCRIPTOR_RANGE1>(
+				&game->Desc_1_1, serialize, extended, &blob, &errors);
+			break;
+		case D3D_ROOT_SIGNATURE_VERSION_1_2:
+			hr = serialize_extended<D3D12_ROOT_SIGNATURE_DESC2, D3D12_ROOT_PARAMETER1, D3D12_DESCRIPTOR_RANGE1>(
+				&game->Desc_1_2, serialize, extended, &blob, &errors);
+			break;
+		}
+	}
+	if (SUCCEEDED(hr))
+		hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&extended->signature));
+	if (FAILED(hr)) {
+		Dx12LogInfo("*** A root signature of the game could not be extended for registers of a mod's shaders: 0x%x %s\n", hr,
+			errors ? (const char*)errors->GetBufferPointer() : "");
+		extended->signature = NULL;
+	}
+
+	if (deserializer)
+		deserializer->Release();
+	if (blob)
+		blob->Release();
+	if (errors)
+		errors->Release();
+	return extended->signature != NULL;
 }
 
 // -----------------------------------------------------------------------------
@@ -795,6 +978,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 	Dx12ShaderStage stage;
 	char stages[32];
 	size_t pos, size;
+	bool has_signature = false;
 	HRESULT hr = S_OK;
 
 	for (stage = DX12_STAGE_VS; stage < DX12_STAGE_COUNT; stage = (Dx12ShaderStage)(stage + 1)) {
@@ -804,6 +988,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		key = key * 0x9e3779b97f4a7c15ull ^ (variant->shaders[stage] ? variant->shaders[stage]->hash : 0);
 	}
 	key = key * 0x9e3779b97f4a7c15ull ^ variant->removed_stages;
+	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)(uintptr_t)variant->root_signature;
 	changed_stages = mod_stages | variant->removed_stages;
 
 	for (const auto &made : info->variants) {
@@ -838,6 +1023,8 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		if (!failed && (desc->StreamOutput.NumEntries || desc->StreamOutput.NumStrides))
 			failed = "it has a stream output";
 		desc->StreamOutput = {};
+		if (variant->root_signature)
+			desc->pRootSignature = variant->root_signature;
 		desc->InputLayout.pInputElementDescs = elements;
 		desc->InputLayout.NumElements = count;
 		desc->CachedPSO = {};
@@ -860,6 +1047,10 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
 				((D3D12_INPUT_LAYOUT_DESC*)value)->pInputElementDescs = elements;
 				((D3D12_INPUT_LAYOUT_DESC*)value)->NumElements = count;
+			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+				if (variant->root_signature)
+					*(ID3D12RootSignature**)value = variant->root_signature;
+				has_signature = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) {
 				*(D3D12_CACHED_PIPELINE_STATE*)value = {};
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
@@ -877,6 +1068,8 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		// none for: the stream would have to be put together again
 		if (!failed && (mod_stages & ~patched))
 			failed = "the game's pipeline state stream has no subobject for a shader of the mod's";
+		if (!failed && variant->root_signature && !has_signature)
+			failed = "the game's pipeline state stream has no root signature to extend";
 		if (!failed && FAILED(device->QueryInterface(IID_PPV_ARGS(&device2))))
 			failed = "the device takes no pipeline state streams";
 		if (!failed) {

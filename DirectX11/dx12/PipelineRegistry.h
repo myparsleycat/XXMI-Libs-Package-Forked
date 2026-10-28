@@ -80,13 +80,45 @@ struct Dx12RootParameter {
 	std::vector<Dx12RootRange> ranges;
 };
 
+// Registers of space 0 that shaders of a mod read and a root signature of the
+// game has nothing for, by stage
+struct Dx12ExtraRegisters {
+	UINT64 srv[DX12_STAGE_COUNT][2];
+	UINT64 cbv[DX12_STAGE_COUNT];
+};
+
+// The game's root signature with a descriptor table more for each stage that
+// has extra registers: the b registers of the stage in ascending order, then
+// its t registers, one descriptor each
+struct Dx12ExtendedSignature {
+	UINT64 key;
+	Dx12ExtraRegisters extra;
+	// NULL where none is needed or it could not be made. Referenced.
+	ID3D12RootSignature *signature;
+	// The root parameter of the table of each stage, -1 for none
+	int parameters[DX12_STAGE_COUNT];
+};
+
 struct Dx12RootSignatureInfo {
 	std::vector<Dx12RootParameter> parameters;
+	// What it was created from, for Dx12ExtendRootSignature
+	std::vector<BYTE> blob;
 	// For DrawPath: whether a register is one its shaders can be given
 	// something for, with the register it was worked out for. 0 if it
 	// has not been.
 	mutable volatile LONG ini_params = 0;
+	// For DrawPath, with its lock held: what Dx12ExtendRootSignature made
+	// of it, by the key DrawPath makes of the shaders of the mod
+	mutable std::vector<Dx12ExtendedSignature> extended;
+
+	~Dx12RootSignatureInfo();
 };
+
+// Makes extended->signature from info and extended->extra, and sets
+// extended->parameters. Not where info has root constants, which a command
+// list does not record and so cannot be set again after the root signature
+// is changed, or where D3D12 refuses it.
+bool Dx12ExtendRootSignature(const Dx12RootSignatureInfo *info, ID3D12Device *device, Dx12ExtendedSignature *extended);
 
 struct Dx12InputElement {
 	std::string semantic;
@@ -174,6 +206,9 @@ struct Dx12PipelineVariantDesc {
 	const Dx12ShaderInfo *shaders[DX12_STAGE_COUNT];
 	// Bit per stage a mod wants no shader for, where the game has one
 	UINT removed_stages;
+	// In place of the game's root signature, for registers of the mod's
+	// shaders the game's has nothing for (Dx12ExtendRootSignature)
+	ID3D12RootSignature *root_signature;
 };
 
 // The game's pipeline made again with that. Not referenced: it lives as long

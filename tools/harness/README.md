@@ -105,7 +105,8 @@ and `--appear`. They are described in `harness.cpp`.
 ### skin
 
 - `check.sh`: runs each mode of `make_mod.py` with its `skin.exe` arguments
-  and compares which spots are drawn with a fixed list. It then runs
+  and compares which spots are drawn, and for mode 13 their colour, with a
+  fixed list. A D3D12 debug layer error also fails the mode. It then runs
   `queuelife`, `queuegone` and `devicelife`.
 - `try.sh <mode> [frames] [args]`: runs one mode.
 - `skin.exe fault_at=N` in a run folder made with
@@ -119,6 +120,23 @@ Mode 8 (`drawfirst`, with the draws checking only vb0 and vb2) does not run
 the mod's `...IB` section. The game's draw gets the mod's skinned vertices
 with the game's indices, which cover only the lower rows of the bar. This is
 the same as on D3D11.
+
+Mode 13 draws the bar with the mod's own shaders, which read IniParams (t120)
+and a buffer of the mod at b13. The game's root signature has no slot for
+either, so the DLL extends it for that draw. The bar is green when both
+values arrive, magenta when one is wrong, and orange when the draw fell back
+to the game's shaders. `rs11` makes the root signatures version 1.1, as Unreal
+does. `place` adds a root constant buffer that the game's vertex shader reads,
+which has to be set again after the root signature changes.
+`noheap` unbinds descriptor heaps before the game's draws, so the mod's
+extra tables need a side heap created on their first allocation. The checks
+also combine it with `second place rs11` to verify state restoration.
+
+Modes 14 and 15 use `bindings`, which adds a vertex constant buffer with
+distinct values in its 256-byte regions and a pixel SRV at t0. Mode 14 checks
+the offset and length of `ref vs-cb0->Region(256, 256)` bound through an
+extended table. Mode 15 checks that saving and rebinding `ps-t0` after
+`ps-t0 = null` preserves the null binding. Both modes must draw green.
 
 ### sampler
 

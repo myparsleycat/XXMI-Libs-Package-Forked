@@ -12,6 +12,10 @@
 # mode 11: mode 5, for skin.exe replace_at=10: a mesh of another size takes over the address a mesh of the mod's size was noted at
 # mode 12: mode 0 that copies so0 after its draw and binds the copy as vb0 of its ...IB draw: so0 is as large as the mod's
 #          900 vertices, more than the game's buffer of 300 has
+# mode 13: mode 0 whose ...IB draw is made with shaders of its own that read IniParams (t120) and a buffer
+#          of its own at b13, which the game's root signature has nothing for: green if both came through
+# mode 14: mode 13 with a region of the game's constant buffer at b13; requires skin.exe bindings
+# mode 15: mode 13 with a null SRV saved and rebound at t0; requires skin.exe bindings
 import os, struct, sys
 out, mode = sys.argv[1], int(sys.argv[2])
 os.makedirs(out, exist_ok=True)
@@ -101,7 +105,7 @@ filename = ib.buf
 ''' % ('' if mode in (2, 3, 4) else '\thandling = skip\n',
       '\tResourceGameVb0 = ref vb0\n\tvb0 = ResourceSkinPosition' if mode == 3 else
       '\tResourceGameVb0 = copy vb0\n\tvb0 = ResourceSkinPosition' if mode == 4 else
-      '\tvb0 = ResourceSkinPosition' if mode in (0, 2, 12) else '\trun = CustomShaderAnim\n\tvb0 = ResourceAnimated',
+      '\tvb0 = ResourceSkinPosition' if mode in (0, 2, 12, 13, 14, 15) else '\trun = CustomShaderAnim\n\tvb0 = ResourceAnimated',
       V, '\tvb0 = ResourceGameVb0\n' if mode in (3, 4) else '\tResourceSkinCopy = copy so0\n' if mode == 12 else '',
       count, (V + 63) // 64))
 
@@ -149,3 +153,50 @@ handling = skip
 [TextureOverrideOtherVertexLimitRaise]
 hash = %08x
 ''' % vlr)
+
+if mode in (13, 14, 15):
+    open(os.path.join(out, 'tint.hlsl'), 'w').write('''Texture1D<float4> IniParams : register(t120);
+cbuffer Tint : register(b13) { float4 tint; };
+#ifdef VERTEX_SHADER
+float4 main(float3 p : POSITION) : SV_Position { return float4(p, 1); }
+#else
+float4 main() : SV_Target0 {
+	bool ok = abs(IniParams.Load(int2(150, 0)).x - 0.25) < 0.01 && abs(tint.y - 0.75) < 0.01;
+	return ok ? float4(0.1, 0.9, 0.1, 1) : float4(0.9, 0.1, 0.9, 1);
+}
+#endif
+''')
+    ini = open(os.path.join(out, 'skin.ini')).read()
+    ini = ini.replace('drawindexed = %d, 0, 0\n' % count, 'x150 = 0.25\nrun = CustomShaderTint\n')
+    open(os.path.join(out, 'skin.ini'), 'w').write(ini + '''
+[CustomShaderTint]
+vs = tint.hlsl
+ps = tint.hlsl
+ps-cb13 = ResourceTint
+drawindexed = %d, 0, 0
+
+[ResourceTint]
+type = Buffer
+format = R32G32B32A32_FLOAT
+data = 0 0.75 0 0
+''' % count)
+
+    if mode == 14:
+        path = os.path.join(out, 'tint.hlsl')
+        shader = open(path).read().replace('float4 tint;', 'float4 tint[32];')
+        shader = shader.replace('abs(tint.y - 0.75) < 0.01', 'abs(tint[0].y - 0.75) < 0.01 && tint[16].y == 0')
+        open(path, 'w').write(shader)
+        path = os.path.join(out, 'skin.ini')
+        ini = open(path).read().replace('ps-cb13 = ResourceTint', 'ps-cb13 = ref vs-cb0->Region(256, 256)')
+        open(path, 'w').write(ini)
+    elif mode == 15:
+        path = os.path.join(out, 'tint.hlsl')
+        shader = open(path).read().replace('cbuffer Tint', 'StructuredBuffer<float4> Missing : register(t0);\ncbuffer Tint')
+        shader = shader.replace('bool ok = ', 'bool ok = all(Missing[0] == 0) && ')
+        open(path, 'w').write(shader)
+        path = os.path.join(out, 'skin.ini')
+        ini = open(path).read().replace('ps-cb13 = ResourceTint', '''ps-cb13 = ResourceTint
+ps-t0 = null
+ResourceSaved = ref ps-t0
+ps-t0 = ref ResourceSaved''')
+        open(path, 'w').write(ini + '\n[ResourceSaved]\n')

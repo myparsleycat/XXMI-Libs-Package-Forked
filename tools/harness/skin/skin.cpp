@@ -7,7 +7,7 @@
 // skinned there: the game mesh is a small square on the left, the mod's a
 // wide bar on the right.
 //
-// skin.exe [frames=120] [nodll] [deform] [dump=file.bmp] [queuelife] [queuegone] [devicelife] [second] [others=N] [second_at=N] [drawfirst] [unhashed] [reuse_at=N] [replace_at=N] [reupload_at=N] [fault_at=N] [stall_at=N]
+// skin.exe [frames=120] [nodll] [deform] [dump=file.bmp] [queuelife] [queuegone] [devicelife] [second] [others=N] [second_at=N] [drawfirst] [unhashed] [reuse_at=N] [replace_at=N] [reupload_at=N] [fault_at=N] [stall_at=N] [rs11] [place] [noheap] [bindings]
 // Prints what is drawn where the game's and the mod's meshes go. Exits with 1
 // when D3D12 fails, an argument is unknown or a lifetime case goes wrong.
 // queuelife: before that, does what RTSS did to ZZZ: holds a queue by an
@@ -40,6 +40,13 @@
 // it is removed, after giving dx12_dred time to write its report.
 // stall_at=N: after frame N, with the window in front, presents nothing for
 // 4 s, for dx12_stall_dump_seconds.
+// rs11: root signatures of version 1.1, as Unreal makes them, in place of 1.0.
+// place: the draws' vertex shader adds a vector it reads from a root constant
+// buffer (b0) to the positions, which is all zeros.
+// noheap: unbinds descriptor heaps before drawing; the game's draw shaders
+// use no descriptor tables, so only a mod's shaders can need a view heap.
+// bindings: adds a 768-byte vertex constant buffer with distinct values in
+// its 256-byte regions, and a pixel SRV at t0 for binding checks.
 
 #include <windows.h>
 #include "../common/window.h"
@@ -180,12 +187,42 @@ static ID3D12Resource* upload_unhashed(ID3D12GraphicsCommandList *list, std::vec
 	return buffer;
 }
 
+static bool signature_1_1;
+
 static ID3D12RootSignature* root_signature(const D3D12_ROOT_SIGNATURE_DESC *desc)
 {
 	ID3DBlob *blob = NULL, *errors = NULL;
 	ID3D12RootSignature *signature;
+	D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};
+	std::vector<D3D12_ROOT_PARAMETER1> parameters(desc->NumParameters);
+	std::vector<std::vector<D3D12_DESCRIPTOR_RANGE1>> ranges(desc->NumParameters);
+	HRESULT hr;
 
-	if (FAILED(D3D12SerializeRootSignature(desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors))) {
+	for (UINT i = 0; i < desc->NumParameters; i++) {
+		const D3D12_ROOT_PARAMETER &from = desc->pParameters[i];
+
+		parameters[i].ParameterType = from.ParameterType;
+		parameters[i].ShaderVisibility = from.ShaderVisibility;
+		if (from.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS) {
+			parameters[i].Constants = from.Constants;
+		} else if (from.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+			for (UINT j = 0; j < from.DescriptorTable.NumDescriptorRanges; j++) {
+				const D3D12_DESCRIPTOR_RANGE &range = from.DescriptorTable.pDescriptorRanges[j];
+
+				ranges[i].push_back({ range.RangeType, range.NumDescriptors, range.BaseShaderRegister, range.RegisterSpace,
+					D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE, range.OffsetInDescriptorsFromTableStart });
+			}
+			parameters[i].DescriptorTable = { (UINT)ranges[i].size(), ranges[i].data() };
+		} else {
+			parameters[i].Descriptor = { from.Descriptor.ShaderRegister, from.Descriptor.RegisterSpace,
+				D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE };
+		}
+	}
+	versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+	versioned.Desc_1_1 = { desc->NumParameters, parameters.data(), desc->NumStaticSamplers, desc->pStaticSamplers, desc->Flags };
+	hr = signature_1_1 ? D3D12SerializeVersionedRootSignature(&versioned, &blob, &errors)
+		: D3D12SerializeRootSignature(desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors);
+	if (FAILED(hr)) {
 		printf("root signature: %s\n", errors ? (const char*)errors->GetBufferPointer() : "?");
 		ExitProcess(1);
 	}
@@ -278,7 +315,7 @@ int main(int argc, char **argv)
 	UINT frame_count = 120, i, f;
 	bool load_dll = true, deform = false, queue_life = false, queue_gone = false, device_life = false, second = false;
 	UINT others = 0, second_at = 0, reuse_at = 0, replace_at = 0, reupload_at = 0, fault_at = 0, stall_at = 0;
-	bool draw_first = false, unhashed = false;
+	bool draw_first = false, unhashed = false, place_vector = false, no_heap = false, bindings = false;
 	const char *dump = NULL;
 	HMODULE dll = NULL;
 
@@ -300,6 +337,10 @@ int main(int argc, char **argv)
 		else if (!strncmp(argv[a], "reupload_at=", 12)) reupload_at = atoi(argv[a] + 12);
 		else if (!strncmp(argv[a], "fault_at=", 9)) fault_at = atoi(argv[a] + 9);
 		else if (!strncmp(argv[a], "stall_at=", 9)) stall_at = atoi(argv[a] + 9);
+		else if (!strcmp(argv[a], "rs11")) signature_1_1 = true;
+		else if (!strcmp(argv[a], "place")) place_vector = true;
+		else if (!strcmp(argv[a], "noheap")) no_heap = true;
+		else if (!strcmp(argv[a], "bindings")) bindings = place_vector = true;
 		else {
 			printf("unknown argument %s\n", argv[a]);
 			return 1;
@@ -498,11 +539,32 @@ int main(int argc, char **argv)
 	ID3D12PipelineState *skin_pso;
 	CHECK(device->CreateComputePipelineState(&skin_pso_desc, IID_PPV_ARGS(&skin_pso)));
 
-	// The drawing pipeline: positions from vb0 only
+	// The drawing pipeline: positions from vb0 only, and with place the
+	// vector at b0
+	D3D12_ROOT_PARAMETER draw_parameters[2] = {};
+	draw_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+	draw_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+	D3D12_DESCRIPTOR_RANGE draw_srv = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 };
+	draw_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	draw_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	draw_parameters[1].DescriptorTable = { 1, &draw_srv };
 	D3D12_ROOT_SIGNATURE_DESC draw_signature_desc = {};
 	draw_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+	draw_signature_desc.NumParameters = bindings ? 2 : place_vector ? 1 : 0;
+	draw_signature_desc.pParameters = draw_parameters;
 	ID3D12RootSignature *draw_signature = root_signature(&draw_signature_desc);
-	std::vector<char> vs = read_file("draw_vs.cso"), ps = read_file("draw_ps.cso");
+	std::vector<char> vs = read_file(bindings ? "draw_vs_bindings.cso" : place_vector ? "draw_vs_place.cso" : "draw_vs.cso");
+	std::vector<char> ps = read_file(bindings ? "draw_ps_bindings.cso" : "draw_ps.cso");
+	UINT place_bytes = bindings ? 768 : 256;
+	ID3D12Resource *place_buffer = create_buffer(place_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+	void *place_data;
+	CHECK(place_buffer->Map(0, NULL, &place_data));
+	memset(place_data, 0, place_bytes);
+	if (bindings) {
+		static_cast<float*>(place_data)[65] = 0.75f;
+		static_cast<float*>(place_data)[129] = 0.5f;
+	}
+	place_buffer->Unmap(0, NULL);
 	static const D3D12_INPUT_ELEMENT_DESC layout[] = {
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 	};
@@ -776,6 +838,8 @@ int main(int argc, char **argv)
 			}
 		};
 		auto draw_meshes = [&]() {
+			if (no_heap)
+				list->SetDescriptorHeaps(0, &gpu_heap);
 			transition(list, back_buffers[back], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			D3D12_CPU_DESCRIPTOR_HANDLE target = { rtv.ptr + back * rtv_size };
 			list->OMSetRenderTargets(1, &target, FALSE, NULL);
@@ -783,6 +847,10 @@ int main(int argc, char **argv)
 			list->RSSetViewports(1, &viewport);
 			list->RSSetScissorRects(1, &scissor);
 			list->SetGraphicsRootSignature(draw_signature);
+			if (place_vector)
+				list->SetGraphicsRootConstantBufferView(0, place_buffer->GetGPUVirtualAddress());
+			if (bindings)
+				list->SetGraphicsRootDescriptorTable(1, gpu_heap->GetGPUDescriptorHandleForHeapStart());
 			list->SetPipelineState(draw_pso);
 			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 			list->IASetVertexBuffers(0, 1, &vb_square);
