@@ -61,6 +61,7 @@
     <ClCompile Include="vk\Spirv.cpp" />
     <ClCompile Include="vk\SpirvConvert.cpp" />
     <ClCompile Include="vk\SpirvPatch.cpp" />
+    <ClCompile Include="vk\SpirvPatchCache.cpp" />
     <ClCompile Include="vk\SpirvTools.cpp" />
     <ClCompile Include="vk\VkDrawPath.cpp" />
     <ClCompile Include="vk\VkDump.cpp" />
@@ -131,6 +132,7 @@
     <ClInclude Include="vk\Spirv.h" />
     <ClInclude Include="vk\SpirvConvert.h" />
     <ClInclude Include="vk\SpirvPatch.h" />
+    <ClInclude Include="vk\SpirvPatchCache.h" />
     <ClInclude Include="vk\SpirvTools.h" />
     <ClInclude Include="vk\VkCommon.h" />
     <ClInclude Include="vk\VkDrawPath.h" />

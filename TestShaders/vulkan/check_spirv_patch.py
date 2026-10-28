@@ -64,13 +64,14 @@ def d3d11_patch_ini():
     return (HERE / "spirv_patch_d3d11.ini").read_text(encoding="utf-8")
 
 
-def run_case(folder, mod, group=None, alpha=0, draws=1, system=""):
+def run_case(folder, mod, group=None, alpha=0, draws=1, system="", cache=False, dump=False):
     (folder / "d3dx.ini").write_text(
         "[Loader]\ntarget = harness.exe\n"
         + (f"[System]\n{system}\n" if system else "") +
         "[Include]\ninclude_recursive = Mods\n"
         "[Rendering]\nextended_rendering = 1\ntrack_region_hashes = 1\n"
-        "[Hunting]\nhunting = 0\n"
+        + ("cache_directory = ShaderCache\nvk_cache_patched_shaders = 1\n" if cache else "")
+        + f"[Hunting]\nhunting = 0\nvk_dump_hashes = {int(dump)}\n"
         "[Logging]\nlog_level = info\nshow_warnings = 0\nunbuffered = 1\n",
         encoding="utf-8",
     )
@@ -134,6 +135,25 @@ def main():
         if not re.search(r"is patched by \[[^\]]*HarnessCut\]", log, re.I):
             raise AssertionError("The log must say which section patched the shader")
         print("PASS: a transparent mask with the guid discards the mod's triangle")
+
+        for label in ("cold", "cached"):
+            pixels, log = run_case(folder, mod_ini(), group_ini(), cache=True,
+                                   system="config_initialization_delay = -1")
+            if pixels != hidden:
+                raise AssertionError(f"The {label} cached patch must discard: expected {hidden}, got {pixels}")
+            if ("as kept in the cache" in log) != (label == "cached"):
+                raise AssertionError(f"Expected a cache miss for cold and a cache hit for cached: {label}")
+        print("PASS: a cached shader renders the same pixels as a fresh patch")
+
+        pixels, _ = run_case(folder, mod_ini(), group_ini(), cache=True, dump=True,
+                             system="config_initialization_delay = -1")
+        if pixels != hidden:
+            raise AssertionError(f"Dumping a cached patch must preserve its pixels: expected {hidden}, got {pixels}")
+        for part in ("before", "after"):
+            files = list((folder / "vk_patched").glob(f"*-ps.{part}.spvasm"))
+            if len(files) != 1 or not files[0].read_text(encoding="utf-8").strip():
+                raise AssertionError(f"Enabling vk_dump_hashes with a warm cache must write the {part} text")
+        print("PASS: enabling vk_dump_hashes with a warm cache writes both patch texts")
 
         # Then the configuration read when the DLL is loaded is all there is
         unreloaded, _ = run_case(folder, mod_ini(), group_ini(), system="config_initialization_delay = -1")

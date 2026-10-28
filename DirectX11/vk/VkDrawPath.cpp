@@ -15,6 +15,7 @@
 #include "Spirv.h"
 #include "SpirvConvert.h"
 #include "SpirvPatch.h"
+#include "SpirvPatchCache.h"
 #include "SpirvTools.h"
 #include "VkDump.h"
 #include "VkScope.h"
@@ -6986,6 +6987,9 @@ struct PatchedShader {
 	volatile LONG state;
 	// Written before the state is
 	SpirvPatched patched;
+	// If it came from the cache, which is patched again when no pipeline can
+	// be made of it
+	std::unique_ptr<SpirvPatchCacheKey> cached;
 };
 
 // Of the ShaderRegex sections as they are, which what is made for older ones
@@ -7067,7 +7071,7 @@ static std::deque<PatchJob> patch_jobs;
 static HANDLE patch_wake;
 static bool patch_thread_started;
 // For the report, from either thread
-static volatile LONG shaders_patched, shaders_unmatched, shaders_unpatched, patch_pipelines_made, patch_pipelines_failed;
+static volatile LONG shaders_patched, shaders_unmatched, shaders_unpatched, shaders_cached, patch_pipelines_made, patch_pipelines_failed;
 static volatile LONG64 patch_ticks;
 
 // The texts the patterns were applied to and what they made of them, next to
@@ -7101,6 +7105,9 @@ static void patch_shader_job(PatchJob &job)
 	SpirvPatchOutcome outcome;
 	SpirvPatched patched;
 	std::string why, groups;
+	SpirvPatchCacheKey key;
+	bool keep = SpirvPatchCacheEnabled(), cached = false;
+	UINT64 start = ticks();
 
 	{
 		ShaderRegexConfigRead config;
@@ -7108,23 +7115,45 @@ static void patch_shader_job(PatchJob &job)
 		// The sections it was for are gone, and so is whoever waited
 		if (job.generation != patch_generation)
 			return;
-		outcome = SpirvPatchShader(job.code->data(), job.code->size(), dx12_stage_names[job.stage],
-			job.entry.empty() ? NULL : job.entry.c_str(), &job.declarations, job.ini_params,
-			G->vk_dump_hashes, &patched, &why);
-		for (const ShaderRegexGroup *group : patched.groups)
-			groups += (groups.empty() ? "[" : ", [") + std::string(group->ini_section.begin(), group->ini_section.end()) + "]";
-		// Gone with the sections
-		patched.groups.clear();
+		if (keep) {
+			key.shader = job.hash;
+			key.code = SpirvPatchCacheHash(job.code->data(), job.code->size() * sizeof(uint32_t));
+			key.stage = job.stage;
+			key.entry = job.entry;
+			key.groups = SpirvPatchGroupsKey(dx12_stage_names[job.stage], &job.declarations);
+			key.declarations = SpirvPatchCacheHash(job.declarations.data(), job.declarations.size());
+			key.ini_params = job.ini_params;
+			// Cached shaders omit the text needed for vk_dump_hashes.
+			keep = key.groups != 0;
+			cached = keep && !G->vk_dump_hashes && SpirvPatchCacheLoad(key, &outcome, &patched, &groups);
+		}
+		if (!cached) {
+			outcome = SpirvPatchShader(job.code->data(), job.code->size(), dx12_stage_names[job.stage],
+				job.entry.empty() ? NULL : job.entry.c_str(), &job.declarations, job.ini_params,
+				G->vk_dump_hashes, &patched, &why);
+			for (const ShaderRegexGroup *group : patched.groups)
+				groups += (groups.empty() ? "[" : ", [") + std::string(group->ini_section.begin(), group->ini_section.end()) + "]";
+			// Gone with the sections
+			patched.groups.clear();
+		}
 	}
 	if (G->vk_dump_hashes)
 		write_patched_text(job.hash, job.stage, patched);
 	patched.before.clear();
 	patched.after.clear();
+	if (keep && !cached)
+		SpirvPatchCacheSave(key, outcome, patched, groups);
+	if (cached) {
+		InterlockedIncrement(&shaders_cached);
+		job.shader->cached = std::make_unique<SpirvPatchCacheKey>(std::move(key));
+	}
+	InterlockedAdd64(&patch_ticks, ticks() - start);
 
 	switch (outcome) {
 		case SpirvPatchOutcome::PATCHED:
 			InterlockedIncrement(&shaders_patched);
-			VkDumpNote("ShaderRegex: the %s shader %016llx is patched by %s\n", kind, job.hash, groups.c_str());
+			VkDumpNote("ShaderRegex: the %s shader %016llx is patched by %s%s\n", kind, job.hash, groups.c_str(),
+				cached ? ", as kept in the cache" : "");
 			break;
 		case SpirvPatchOutcome::NO_MATCH:
 			InterlockedIncrement(&shaders_unmatched);
@@ -7145,7 +7174,7 @@ static void patch_pipeline_job(PatchJob &job)
 	const std::shared_ptr<PatchedShader> *shaders[] = { &job.vertex, &job.fragment };
 	VkShaderModule modules[ARRAYSIZE(shaders)] = {};
 	VkPipeline made = VK_NULL_HANDLE;
-	bool alive, placed = false, ready = true;
+	bool alive, placed = false, ready = true, retry = false;
 	UINT64 start = ticks();
 	size_t i;
 
@@ -7184,14 +7213,40 @@ static void patch_pipeline_job(PatchJob &job)
 		VkDumpNote("*** ShaderRegex: no pipeline could be made with the patched %s shader %016llx\n",
 			job.vertex ? "vertex" : "pixel", job.hash);
 
+	// What was kept may not be what patching makes now: the shaders are
+	// patched again, and the next draw that wants them makes this again
+	if (!made) {
+		for (const std::shared_ptr<PatchedShader> *shader : shaders) {
+			const SpirvPatchCacheKey *cached = *shader ? (*shader)->cached.get() : NULL;
+
+			if (!cached)
+				continue;
+			VkDumpNote("*** ShaderRegex: the %s shader %016llx is patched again for what is kept in the cache\n",
+				cached->stage == DX12_STAGE_VS ? "vertex" : "pixel", cached->shader);
+			SpirvPatchCacheDrop(*cached);
+			AcquireSRWLockExclusive(&patch_lock);
+			auto found = patched_shaders.find({ cached->shader, cached->stage, cached->entry });
+			if (found != patched_shaders.end() && found->second == *shader)
+				patched_shaders.erase(found);
+			ReleaseSRWLockExclusive(&patch_lock);
+			retry = true;
+		}
+	}
+
 	AcquireSRWLockExclusive(&registry_lock);
 	if (job.pipeline->recipe == job.recipe) {
-		for (PipelineVariant &variant : job.pipeline->variants) {
-			if (variant.patched == job.patched && variant.pending && variant.generation == job.generation && variant.layout == job.layout_id
-			    && !memcmp(variant.strides, job.strides, sizeof(variant.strides))) {
-				variant.pipeline = made;
-				variant.pending = false;
-				placed = true;
+		auto &variants = job.pipeline->variants;
+
+		for (auto variant = variants.begin(); variant != variants.end(); variant++) {
+			if (variant->patched == job.patched && variant->pending && variant->generation == job.generation && variant->layout == job.layout_id
+			    && !memcmp(variant->strides, job.strides, sizeof(variant->strides))) {
+				if (retry) {
+					variants.erase(variant);
+				} else {
+					variant->pipeline = made;
+					variant->pending = false;
+					placed = true;
+				}
 				break;
 			}
 		}
@@ -8226,10 +8281,10 @@ static void report()
 		(int)recipe_unknown_structure);
 	if (patching.any) {
 		VkDumpNote("  ShaderRegex sections with SpirvPattern, since the start: %d shaders patched, %d matched by none, %d could "
-			"not be; %d pipelines made with them, %d could not be, %.1f ms on their thread. Draws of mods that want one, "
-			"since the last of these lines: %u, %u drawn with it; drawn with the game's while its shader was being patched %u, its "
-			"pipeline made %u, a texture brought %u, and as it cannot be %u\n",
-			(int)shaders_patched, (int)shaders_unmatched, (int)shaders_unpatched, (int)patch_pipelines_made,
+			"not be, %d of these as kept in the cache; %d pipelines made with them, %d could not be, %.1f ms on their thread. "
+			"Draws of mods that want one, since the last of these lines: %u, %u drawn with it; drawn with the game's while its "
+			"shader was being patched %u, its pipeline made %u, a texture brought %u, and as it cannot be %u\n",
+			(int)shaders_patched, (int)shaders_unmatched, (int)shaders_unpatched, (int)shaders_cached, (int)patch_pipelines_made,
 			(int)patch_pipelines_failed, patch_ticks * 1000.0 / frequency.QuadPart, stats.patch_wanted, stats.patch_drawn,
 			stats.patch_shader_pending, stats.patch_pipeline_pending, stats.patch_texture_pending, stats.patch_impossible);
 	}

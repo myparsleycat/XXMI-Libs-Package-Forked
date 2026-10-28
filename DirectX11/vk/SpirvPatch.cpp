@@ -695,9 +695,7 @@ uint32_t SpirvPatchBinding(const SpirvDeclaration &declaration)
 	return 1 + D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT + declaration.reg;
 }
 
-SpirvPatchOutcome SpirvPatchShader(const uint32_t *code, size_t words, const char *stage, const char *entry,
-		const std::string *declarations, unsigned ini_params, bool keep_text,
-		SpirvPatched *patched, std::string *why)
+static std::vector<Candidate> candidates_for(const char *stage, const std::string *declarations)
 {
 	std::vector<Candidate> candidates;
 	unsigned ordinal = 0;
@@ -711,6 +709,35 @@ SpirvPatchOutcome SpirvPatchShader(const uint32_t *code, size_t words, const cha
 			ordinal++;
 		}
 	}
+	return candidates;
+}
+
+uint64_t SpirvPatchGroupsKey(const char *stage, const std::string *declarations)
+{
+	uint64_t key = 0xcbf29ce484222325;
+
+	auto add = [&](const void *data, size_t bytes) {
+		for (size_t i = 0; i < bytes; i++)
+			key = (key ^ ((const uint8_t*)data)[i]) * 0x100000001b3;
+	};
+
+	std::vector<Candidate> candidates = candidates_for(stage, declarations);
+	if (candidates.empty())
+		return 0;
+	for (const Candidate &candidate : candidates) {
+		add(&candidate.ordinal, sizeof(candidate.ordinal));
+		add(&candidate.group->text_hash, sizeof(candidate.group->text_hash));
+		add(candidate.group->ini_section.data(), (candidate.group->ini_section.size() + 1) * sizeof(wchar_t));
+	}
+	return key ? key : 1;
+}
+
+SpirvPatchOutcome SpirvPatchShader(const uint32_t *code, size_t words, const char *stage, const char *entry,
+		const std::string *declarations, unsigned ini_params, bool keep_text,
+		SpirvPatched *patched, std::string *why)
+{
+	std::vector<Candidate> candidates = candidates_for(stage, declarations);
+
 	if (candidates.empty()) {
 		*patched = SpirvPatched();
 		*why = "no group is for it";

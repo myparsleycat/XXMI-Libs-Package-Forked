@@ -194,6 +194,10 @@ public:
 	FuzzyMatch dx12_targets;
 	FuzzyMatch dx12_cb_bytes[16];
 
+	// Of the lines it was made of: what a Vulkan shader it patched and that
+	// is kept on disk was patched by (vk/SpirvPatchCache.h)
+	uint32_t text_hash;
+
 	CommandList command_list;
 	CommandList post_command_list;
 	std::shared_ptr<RunLinkedCommandList> link;
@@ -209,7 +213,8 @@ public:
 		dx12_match(false),
 		dx12_srv(),
 		dx12_cbv(0),
-		dx12_uav(0)
+		dx12_uav(0),
+		text_hash(0)
 	{}
 };
 

@@ -82,5 +82,10 @@ SpirvPatchOutcome SpirvPatchShader(const uint32_t *code, size_t words, const cha
 		const std::string *declarations, unsigned ini_params, bool keep_text,
 		SpirvPatched *patched, std::string *why);
 
+// Of the groups SpirvPatchShader would try on a shader of that stage and
+// declarations, as they are and in the order it would: 0 if there are none.
+// Call with the ShaderRegex sections kept from changing.
+uint64_t SpirvPatchGroupsKey(const char *stage, const std::string *declarations);
+
 // The code of a patched shader with its set at that number
 std::vector<uint32_t> SpirvPatchedCode(const SpirvPatched &patched, uint32_t set);

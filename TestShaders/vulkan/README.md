@@ -62,6 +62,25 @@ An opaque mask, another `x245` value or no mask must draw it as without the
 group. The same cut is checked with a declared sampler, and with `--draws 2` the
 game's draw after the patched one must render as the game's.
 
+The cache checks compare a fresh patch with a disk cache hit, then enable
+`vk_dump_hashes` with that cache present. The rendered pixels must remain the
+same and both patch text files must be written.
+
+The native cache regression needs only MSVC and the Windows SDK:
+
+```powershell
+./TestShaders/vulkan/check_spirv_patch_cache.ps1 `
+  -VcVars 'C:/path/to/VC/Auxiliary/Build/vcvars64.bat' `
+  -Output build/vk-spirv-patch-cache
+```
+
+It uses isolated settings and cache files to check that a rejected cache cannot
+be loaded again when Windows denies deletion or the file is recreated. Other
+cache entries must remain usable. It also checks that oversized final and
+temporary cache paths do not terminate the process, and that skipping a save
+preserves an existing cache file. `-CacheSource` accepts a saved cache `.cpp`
+implementation for verifying the same assertions before a fix.
+
 The group `spirv_patch_vs_group.ini` patches the harness's vertex shader to move
 the triangle off the screen where `x246 = 246001`. It declares no texture, so
 the mod's draw uses it without one: with `x246` set the triangle must be gone,

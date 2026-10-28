@@ -2765,11 +2765,13 @@ static uint32_t hash_ini_section(uint32_t hash, const wstring *sname)
 	IniSectionVector *svec = NULL;
 	IniSectionVector::iterator entry;
 
-	hash = crc32c_hw(hash, sname->c_str(), sname->size());
+	// In bytes, with the terminator that keeps one line from running into
+	// the next
+	hash = crc32c_hw(hash, sname->c_str(), (sname->size() + 1) * sizeof(wchar_t));
 
 	GetIniSection(&svec, sname->c_str());
 	for (entry = svec->begin(); entry < svec->end(); entry++) {
-		hash = crc32c_hw(hash, entry->raw_line.c_str(), entry->raw_line.size());
+		hash = crc32c_hw(hash, entry->raw_line.c_str(), (entry->raw_line.size() + 1) * sizeof(wchar_t));
 	}
 
 	return hash;
@@ -3076,6 +3078,7 @@ static void ParseShaderRegexSections()
 		regex_group = get_regex_group(&subsection_names[0], subsection_names.size() == 1);
 		if (!regex_group)
 			continue;
+		regex_group->text_hash = hash_ini_section(regex_group->text_hash, section_id);
 
 		switch (subsection_names.size()) {
 			case 1:
@@ -5036,6 +5039,7 @@ void LoadConfigFile()
 	G->dx12_dump_hashes = GetIniBool(L"Hunting", L"dx12_dump_hashes", false, NULL);
 	G->vk_dump_hashes = GetIniBool(L"Hunting", L"vk_dump_hashes", false, NULL);
 	G->vk_buffers_first = GetIniBool(L"Rendering", L"vk_buffers_first", false, NULL);
+	G->vk_cache_patched_shaders = GetIniBool(L"Rendering", L"vk_cache_patched_shaders", true, NULL);
 	G->dx12_debug_layer = GetIniBool(L"Rendering", L"dx12_debug_layer", false, NULL);
 	G->dx12_dred = GetIniBool(L"Rendering", L"dx12_dred", false, NULL);
 	G->dx12_stall_dump_seconds = max(0, GetIniInt(L"Rendering", L"dx12_stall_dump_seconds", 0, NULL));

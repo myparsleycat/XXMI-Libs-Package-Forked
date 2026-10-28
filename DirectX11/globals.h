@@ -525,6 +525,7 @@ struct Globals
 	UINT dx12_evict_budget_percent;
 	bool vk_dump_hashes;
 	bool vk_buffers_first;
+	bool vk_cache_patched_shaders;
 	bool track_region_hashes;
 	DataCacheBindFlags cache_resource_data = (DataCacheBindFlags)0;
 	bool track_implicit_index_buffers;
@@ -787,6 +788,7 @@ struct Globals
 		dx12_evict_budget_percent(75),
 		vk_dump_hashes(false),
 		vk_buffers_first(false),
+		vk_cache_patched_shaders(true),
 		track_region_hashes(false),
 		track_implicit_index_buffers(false),
 		any_override_byte_width(false),
