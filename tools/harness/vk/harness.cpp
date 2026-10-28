@@ -9,6 +9,7 @@
 //               [--upload late|unmapped|discard|fill|srcfill|lastfill]
 //               [--generated N [--overlay]] [--reload 1|2|3] [--profile]
 //               [--efmi file [--characters N] [--passes N] [--appear N]] [--lowmip [--wide]]
+//               [--frames N [--min-seconds N]]
 //
 // --instance gets the device's functions from vkGetInstanceProcAddr instead
 // of vkGetDeviceProcAddr, which are the loader's exports. --pool draws the
@@ -31,9 +32,12 @@
 #include <map>
 #include <string>
 #include <algorithm>
+#include <cmath>
+#include <limits.h>
 #include <thread>
 #include <functional>
 #include <dbghelp.h>
+#include "../common/window.h"
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -194,6 +198,8 @@ int main(int argc, char **argv)
 	int efmi_passes = 5, efmi_characters = 4;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	double seconds = 8;
+	unsigned frame_limit = 0;
+	double min_seconds = 0;
 	int reload = 0;
 	HMODULE loader;
 	PFN_vkGetInstanceProcAddr get_instance;
@@ -245,6 +251,24 @@ int main(int argc, char **argv)
 			reload = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--draws") && i + 1 < argc)
 			draws = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--frames") && i + 1 < argc) {
+			const char *value = argv[++i];
+			char *end;
+			unsigned long long count = strtoull(value, &end, 10);
+			if (*value < '0' || *value > '9' || *end || !count || count > UINT_MAX) {
+				printf("invalid frame count: %s\n", value);
+				return 1;
+			}
+			frame_limit = (unsigned)count;
+		}
+		else if (!strcmp(argv[i], "--min-seconds") && i + 1 < argc) {
+			char *end;
+			min_seconds = strtod(argv[++i], &end);
+			if (end == argv[i] || *end || !std::isfinite(min_seconds) || min_seconds < 0) {
+				printf("invalid minimum duration: %s\n", argv[i]);
+				return 1;
+			}
+		}
 		else {
 			char *end;
 			seconds = strtod(argv[i], &end);
@@ -253,6 +277,11 @@ int main(int argc, char **argv)
 				return 1;
 			}
 		}
+	}
+
+	if ((frame_limit && appear) || (min_seconds && !frame_limit)) {
+		printf("--frames cannot be combined with --appear; --min-seconds requires --frames\n");
+		return 1;
 	}
 
 	if (load_dll && !LoadLibraryA("d3d11.dll")) {
@@ -349,7 +378,7 @@ int main(int argc, char **argv)
 	RegisterClassA(&window_class);
 	HWND window = CreateWindowA("VkHarness", "VkHarness", WS_OVERLAPPEDWINDOW, 100, 100, 640, 480,
 		NULL, NULL, window_class.hInstance, NULL);
-	ShowWindow(window, SW_SHOWNOACTIVATE);
+	show_harness_window(window);
 
 	VkWin32SurfaceCreateInfoKHR surface_info = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
 	VkSurfaceKHR surface;
@@ -1125,7 +1154,8 @@ int main(int argc, char **argv)
 	LARGE_INTEGER frame_start;
 	QueryPerformanceCounter(&frame_start);
 	for (bool last = false; !last;) {
-		last = GetTickCount64() - start >= seconds * 1000;
+		ULONGLONG elapsed = GetTickCount64() - start;
+		last = frame_limit ? frames + 1 >= frame_limit && elapsed >= min_seconds * 1000 : elapsed >= seconds * 1000;
 		int in_window = appear && frames >= 120 ? (int)((frames - 120) % appear) : -1;
 		int visible = appear && frames >= 120 ? (int)((frames - 120) / appear) : -1;
 		if (appear)
@@ -1152,7 +1182,7 @@ int main(int argc, char **argv)
 		pass_begin.clearValueCount = 1;
 		pass_begin.pClearValues = &clear;
 
-		if (rewrite && GetTickCount64() - start >= seconds * 500) {
+		if (rewrite && (frame_limit ? frames >= frame_limit / 2 : GetTickCount64() - start >= seconds * 500)) {
 			static const uint16_t other[6] = { 0, 2, 1, 0, 3, 2 };
 			memcpy((char*)pool_mapped + pool_ib, other, sizeof(other));
 			rewrite = false;

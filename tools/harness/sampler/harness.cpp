@@ -12,6 +12,7 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
+#include "../common/window.h"
 #include <d3d11.h>
 #include <stdio.h>
 #include <float.h>
@@ -115,7 +116,7 @@ int main(int argc, char **argv)
 	wc.lpszClassName = L"sampler-harness";
 	RegisterClassW(&wc);
 	HWND window = CreateWindowW(wc.lpszClassName, L"sampler-harness", WS_OVERLAPPEDWINDOW, 40, 40, 320, 120, NULL, NULL, wc.hInstance, NULL);
-	ShowWindow(window, SW_SHOWNOACTIVATE);
+	show_harness_window(window);
 
 	DXGI_SWAP_CHAIN_DESC scd = {};
 	scd.BufferDesc.Width = 64;

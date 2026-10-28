@@ -42,6 +42,7 @@
 // 4 s, for dx12_stall_dump_seconds.
 
 #include <windows.h>
+#include "../common/window.h"
 #include <d3d12.h>
 #include <d3d11on12.h>
 #include <dxgi1_6.h>
@@ -325,7 +326,7 @@ int main(int argc, char **argv)
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 	HWND hwnd = CreateWindowW(L"SkinHarness", L"SkinHarness", WS_OVERLAPPEDWINDOW, 50, 50, rect.right - rect.left,
 		rect.bottom - rect.top, NULL, NULL, window_class.hInstance, NULL);
-	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	show_harness_window(hwnd, stall_at != 0);
 
 	IDXGIFactory4 *factory;
 	IDXGISwapChain1 *swap_chain1;

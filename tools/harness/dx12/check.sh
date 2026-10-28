@@ -50,28 +50,31 @@ run_test() {
 	fi
 }
 
-move_at() {
-	# state of mesh A at frame $1 with the extra arguments $2; returns the exit
-	# code of the harness, which can still fail after it printed the state
-	local out status
-	out=$(cd run && ./harness.exe test move frames=$(( $1 + 1 )) dump=move.bmp $2 2>&1); status=$?
-	echo "$out" | sed -n 's/^  mesh *[0-9]* A (vb matches) *\(hidden\|drawn\)$/\1/p'
-	return $status
+check_move_frames() {
+	local expected=$1 args=$2 pair frame captures= last=0 out status got
+	for pair in $expected; do
+		frame=${pair%%:*}
+		captures=${captures:+$captures,}$frame
+		[ "$frame" -le "$last" ] || last=$frame
+	done
+	out=$(cd run && ./harness.exe test move frames=$((last + 1)) capture="$captures" $args 2>&1); status=$?
+	got=$(echo "$out" | awk '/^capture [0-9]+:$/ { frame=$2; sub(/:$/, "", frame) }
+		/^  mesh *[0-9]+ A \(vb matches\) *(hidden|drawn)$/ { print frame ":" $NF }')
+	if [ "$status" = 0 ] && [ "$(echo $got)" = "$(echo $expected)" ]; then
+		return 0
+	fi
+	echo "  move${args:+ ($args)}: exit $status"
+	echo "  expected: $(echo $expected)"
+	echo "  got:      $(echo $got)"
+	echo "$out" | grep 'FAILED\|unknown argument\|invalid capture' | head -5 | sed 's/^/  /'
+	return 1
 }
 
 run_move() {
-	local bad=0 pair frame want got status
+	local bad=0
 	cp case/test.ini run/Mods/test.ini
-	for pair in $expect_move; do
-		frame=${pair%%:*}; want=${pair#*:}
-		got=$(move_at $frame ""); status=$?
-		[ $status = 0 ] && [ "$got" = "$want" ] || { echo "  frame $frame: A ${got:-not reported}, expected $want (exit $status)"; bad=1; }
-	done
-	for pair in $expect_move_one_pass; do
-		frame=${pair%%:*}; want=${pair#*:}
-		got=$(move_at $frame passes=1); status=$?
-		[ $status = 0 ] && [ "$got" = "$want" ] || { echo "  frame $frame (passes=1): A ${got:-not reported}, expected $want (exit $status)"; bad=1; }
-	done
+	check_move_frames "$expect_move" "" || bad=1
+	check_move_frames "$expect_move_one_pass" passes=1 || bad=1
 	rm -f run/Mods/test.ini
 	[ $bad = 0 ] && echo "move: OK" || { echo "move: FAILED"; ok=0; }
 }

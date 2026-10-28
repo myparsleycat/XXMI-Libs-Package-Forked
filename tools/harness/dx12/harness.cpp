@@ -11,6 +11,7 @@
 //             [scene=file [slot=vb0] [appear=N]]
 // Prints the average frame time of the frames after the first 300, in blocks.
 //   dump=file.bmp  the last frame as a picture and its checksum
+//   capture=N,...  report pictures at these zero-based frames without BMP files
 //   key=VK         a key press the shim sees at frame keyframe
 //   uploads, churn the buffers handed out from the upload ring each frame
 //   table=N        SRVs in the pixel shaders' table; heap=N its shader visible heap
@@ -42,7 +43,9 @@
 #include <atomic>
 #include <thread>
 #include <algorithm>
+#include <limits.h>
 #include "../common/crc.h"
+#include "../common/window.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -733,7 +736,8 @@ static void dump_back_buffer(const char *path, ID3D12Resource *back_buffer)
 			printf("  mesh %3u %-28s %s\n", w, w == TEST_LOWMIP_FULL ? "lowmip full" : "lowmip copy", hidden ? "hidden" : "drawn");
 		}
 	}
-	save_bmp(path, data, footprint.Footprint.RowPitch);
+	if (path)
+		save_bmp(path, data, footprint.Footprint.RowPitch);
 	readback->Unmap(0, NULL);
 	readback->Release();
 	list->Release();
@@ -788,6 +792,7 @@ int main(int argc, char **argv)
 	UINT frame_count = 3000, mesh_count = 350, passes = 3, key = 0, key_frame = 0;
 	bool load_dll = true, profile = false, profile_present = false, threaded = false;
 	const char *dump = NULL;
+	std::vector<UINT> capture_frames;
 	WNDCLASSW window_class = {};
 	DXGI_SWAP_CHAIN_DESC1 swap_desc = {};
 	D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
@@ -828,6 +833,21 @@ int main(int argc, char **argv)
 		}
 		else if (!strncmp(argv[a], "passes=", 7)) passes = atoi(argv[a] + 7);
 		else if (!strncmp(argv[a], "dump=", 5)) dump = argv[a] + 5;
+		else if (!strncmp(argv[a], "capture=", 8)) {
+			const char *at = argv[a] + 8;
+			for (;;) {
+				char *end;
+				unsigned long long frame = strtoull(at, &end, 10);
+				if (*at < '0' || *at > '9' || frame > UINT_MAX || (*end && *end != ',')) {
+					printf("invalid capture frames: %s\n", argv[a] + 8);
+					return 1;
+				}
+				capture_frames.push_back((UINT)frame);
+				if (!*end)
+					break;
+				at = end + 1;
+			}
+		}
 		else if (!strncmp(argv[a], "key=", 4)) key = strtoul(argv[a] + 4, NULL, 0);
 		else if (!strncmp(argv[a], "keyframe=", 9)) key_frame = atoi(argv[a] + 9);
 		else if (!strncmp(argv[a], "uploads=", 8)) DYNAMIC_UPLOADS = min(MAX_DYNAMIC_UPLOADS, (UINT)atoi(argv[a] + 8));
@@ -855,6 +875,12 @@ int main(int argc, char **argv)
 		}
 	}
 
+	std::sort(capture_frames.begin(), capture_frames.end());
+	if (!capture_frames.empty() && capture_frames.back() >= frame_count) {
+		printf("capture frames must be less than frames=%u\n", frame_count);
+		return 1;
+	}
+
 	if (load_dll) {
 		wchar_t path[MAX_PATH];
 
@@ -874,7 +900,7 @@ int main(int argc, char **argv)
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 	hwnd = CreateWindowW(L"Dx12Harness", L"Dx12Harness", WS_OVERLAPPEDWINDOW, 50, 50, rect.right - rect.left, rect.bottom - rect.top,
 			NULL, NULL, window_class.hInstance, NULL);
-	ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+	show_harness_window(hwnd);
 
 	CHECK(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
 	CHECK(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
@@ -1534,9 +1560,12 @@ int main(int argc, char **argv)
 		if (move_test && f == 1980)
 			queue->ExecuteCommandLists(1, (ID3D12CommandList**)&race_lists[3]);
 
-		if (dump && f == frame_count - 1) {
+		bool capture = std::binary_search(capture_frames.begin(), capture_frames.end(), f);
+		if (capture || (dump && f == frame_count - 1)) {
 			wait_for(signal());
-			dump_back_buffer(dump, back_buffers[index]);
+			if (capture)
+				printf("capture %u:\n", f);
+			dump_back_buffer(f == frame_count - 1 ? dump : NULL, back_buffers[index]);
 		}
 
 		QueryPerformanceCounter(&t1);

@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "../../common/crc.h"
+#include "../../common/window.h"
 #include "trace.h"
 #include "../../common/profile.inc"
 
@@ -977,7 +978,7 @@ int main(int argc, char **argv)
 	RECT rect = { 0, 0, (LONG)WIDTH, (LONG)HEIGHT };
 	AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 	window = CreateWindowW(wc.lpszClassName, L"cpu-harness", WS_OVERLAPPEDWINDOW, 40, 40, rect.right - rect.left, rect.bottom - rect.top, NULL, NULL, wc.hInstance, NULL);
-	ShowWindow(window, SW_SHOWNOACTIVATE);
+	show_harness_window(window);
 
 	wchar_t system_path[MAX_PATH], own_path[MAX_PATH];
 	GetSystemDirectoryW(system_path, MAX_PATH);

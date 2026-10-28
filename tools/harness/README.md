@@ -5,6 +5,13 @@ does, without a game. Each folder builds its own program, makes a run folder
 with the DLL to test, and has a check script that exits with 1 when a check
 fails.
 
+The harness windows are hidden by default. Set `XH_VISIBLE=1` to show them,
+for example `XH_VISIBLE=1 bash tools/harness/dx12/check.sh`. Rendering, GPU
+copies and presents still run with a hidden window. The `skin` stall
+diagnostic shows its window because it checks foreground-window behavior.
+Rebuild each harness and copy the new executable into existing run folders
+to apply this behavior there; the DLL does not need rebuilding.
+
 | Folder | What it checks |
 |---|---|
 | `dx12` | The D3D12 shim: matching by hash, hashes carried along GPU copies, the picture against an older DLL, frame time |
@@ -51,7 +58,9 @@ the settings that harness needs. To change more settings, append
   hashes it lists. The script compares which ones are hidden with a fixed list.
 - `check.sh move`: mesh A's vertices move between buffers by GPU copies,
   across lists and queues. The cases are in the comment at `move_test` in
-  `harness.cpp`. The script checks frame by frame whether A stays hidden.
+  `harness.cpp`. The script captures every watched frame in one run per
+  pass setting (two processes), without replaying the earlier frames for
+  each capture. `capture=N,...` reports zero-based frames without BMP files.
 - `check.sh lowmip`: a texture is filled by a GPU copy from the second mip
   level of a texture whose hash `case/test.ini` lists. With
   `track_texture_updates = 1` the copy has to be drawn with
@@ -67,6 +76,15 @@ fails the checks instead of matching itself. Run `make_mod.py` again only
 when `harness.cpp` changes its meshes.
 
 ### vk
+
+`check.sh` runs at least `CHECK_FRAMES` frames (default 60) and at least
+`CHECK_SECONDS` seconds (default 0.5) per process. The frame minimum covers
+the frame-generation checks after frame 20; the time minimum allows
+background shader work to finish. Increase `CHECK_SECONDS` on slower
+machines, for example `CHECK_SECONDS=2 bash check.sh`. The harness accepts
+`--frames N` to replace its normal duration limit and `--min-seconds N`
+to require a minimum duration as well. Timing and profiling runs retain
+their existing duration defaults.
 
 - `check.sh tests`: draws every `case/tests/test_*.ini` and `bench_*.ini`
   with `run` and with `ref`. The pixels and the picture checksum have to match.

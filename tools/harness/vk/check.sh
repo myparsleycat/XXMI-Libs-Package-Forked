@@ -33,10 +33,14 @@ restore_dll || { echo "cannot put d3d11.dll.new back as d3d11.dll"; exit 1; }
 trap restore_dll EXIT
 trap 'exit 1' INT TERM HUP
 
+harness() {
+	./harness.exe --frames "${CHECK_FRAMES:-60}" --min-seconds "${CHECK_SECONDS:-0.5}" "$@"
+}
+
 picture() {
 	# the lines of a run that tell its picture, and its exit code
 	local out status
-	out=$(./harness.exe "$@" 2>&1); status=$?
+	out=$(harness "$@" 2>&1); status=$?
 	echo "$out" | grep "^middle\|^corner\|^picture checksum\|^FAILED" | tr '\n' ' '
 	echo "exit $status"
 }
@@ -50,9 +54,9 @@ run_tests() {
 		name=$(basename "$ini" .ini)
 		cp "$ini" Mods/test.ini
 		cp ../ref/d3d11.dll d3d11.dll || { echo "tests: FAILED, cannot put the DLL of ref in place"; ok=0; break; }
-		want=$(picture 2 --pool)
+		want=$(picture --pool)
 		cp d3d11.dll.new d3d11.dll || { echo "tests: FAILED, cannot put the DLL of run back"; ok=0; break; }
-		got=$(picture 2 --pool)
+		got=$(picture --pool)
 		if [ "$want" = "$got" ] && echo "$got" | grep -q "^middle.*checksum.*exit 0$" &&! echo "$got" | grep -q FAILED; then
 			echo "same  $name: $got"
 		else
@@ -66,12 +70,12 @@ run_tests() {
 
 run_fg() {
 	local ini name background got out status
-	background=$(./harness.exe 3 --pool --generated 1 --nodll 2>&1) && background=$(echo "$background" | sed -n 's/^corner: //p') || background=
+	background=$(harness --pool --generated 1 --nodll 2>&1) && background=$(echo "$background" | sed -n 's/^corner: //p') || background=
 	[ -n "$background" ] || { echo "fg: FAILED, no picture without the DLL"; ok=0; return; }
 	for ini in ../case/tests/fg_*.ini; do
 		name=$(basename "$ini" .ini)
 		cp "$ini" Mods/test.ini
-		out=$(./harness.exe 3 --pool --generated 1 2>&1); status=$?
+		out=$(harness --pool --generated 1 2>&1); status=$?
 		got=$(echo "$out" | sed -n 's/^corner: //p')
 		if [ $status = 0 ] && [ -n "$got" ] && [ "$got" != "$background" ]; then
 			echo "kept  $name: corner $got"
@@ -84,17 +88,18 @@ run_fg() {
 }
 
 run_upload() {
-	local want got how
+	local want got how pooled
 	cp ../case/tests/test_plain.ini Mods/test.ini
+	pooled=$(picture --pool | sed 's/picture checksum [0-9a-f]* //')
 	for how in plain late unmapped discard fill srcfill lastfill; do
 		local args=()
 		[ $how = plain ] || args=(--upload $how)
 		if [ $how = fill ] || [ $how = srcfill ] || [ $how = lastfill ]; then
-			want=$(picture 2 "${args[@]}" --nodll | sed 's/picture checksum [0-9a-f]* //')
+			want=$(picture "${args[@]}" --nodll | sed 's/picture checksum [0-9a-f]* //')
 		else
-			want=$(picture 2 --pool | sed 's/picture checksum [0-9a-f]* //')
+			want=$pooled
 		fi
-		got=$(picture 2 "${args[@]}" | sed 's/picture checksum [0-9a-f]* //')
+		got=$(picture "${args[@]}" | sed 's/picture checksum [0-9a-f]* //')
 		if [ "$want" = "$got" ] && echo "$got" | grep -q "^middle.*exit 0$"; then
 			echo "same  upload $how: $got"
 		else
@@ -112,18 +117,19 @@ lowmip_at() {
 	shift 2
 	cp d3dx.ini d3dx.ini.keep
 	sed -i "s/^track_texture_updates *=.*/track_texture_updates = $track/; s/^match_lower_mip_textures *=.*/match_lower_mip_textures = $match/" d3dx.ini
-	picture 2 --pool --lowmip "$@" | sed 's/picture checksum [0-9a-f]* //'
+	picture --pool --lowmip "$@" | sed 's/picture checksum [0-9a-f]* //'
 	mv d3dx.ini.keep d3dx.ini
 }
 
 run_lowmip() {
 	local replaced kept got want settings shape
 	grep -q "^match_lower_mip_textures *=" d3dx.ini || { echo "lowmip: FAILED, d3dx.ini has no match_lower_mip_textures: run setup.sh again"; ok=0; return; }
+	cp ../case/tests/test_texhash.ini Mods/test.ini
+	replaced=$(picture --pool | sed 's/picture checksum [0-9a-f]* //')
 	for shape in "" --wide; do
 		cp ../case/tests/test_texhash.ini Mods/test.ini
-		replaced=$(picture 2 --pool | sed 's/picture checksum [0-9a-f]* //')
 		# Its hash is that of the texture of a run without --lowmip
-		kept=$(picture 2 --pool --lowmip $shape | sed 's/picture checksum [0-9a-f]* //')
+		kept=$(picture --pool --lowmip $shape | sed 's/picture checksum [0-9a-f]* //')
 		cp ../case/tests/lowmip_texhash.ini Mods/test.ini
 		if [ "$replaced" = "$kept" ] || ! echo "$replaced" | grep -q "^middle.*exit 0$"; then
 			echo "lowmip$shape: FAILED, no difference to tell: replaced [$replaced] kept [$kept]"; ok=0
