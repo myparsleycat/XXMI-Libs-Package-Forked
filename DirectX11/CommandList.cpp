@@ -12362,8 +12362,10 @@ static ID3D11Buffer *RecreateCompatibleBuffer(
 
 	// If the size of the new resource doesn't match the old or
 	// there is an offset we will have to perform a region copy
-	// instead of a regular copy:
-	if (offset || dst_size != new_desc.ByteWidth)
+	// instead of a regular copy. A Region() size larger than the source
+	// was clamped into dst_size, so the region copy size must be updated
+	// too, or it would be larger than the new resource:
+	if (offset || dst_size != new_desc.ByteWidth || *buf_dst_size)
 	{
 		// It might be temping to take the offset into account
 		// here and make the buffer only as large as it need to
@@ -13315,26 +13317,32 @@ static void ResolveMSAA(ID3D11Resource *dst_resource, ID3D11Resource *src_resour
 }
 
 static void SpecialCopyBufferRegion(ID3D11Resource *dst_resource,ID3D11Resource *src_resource,
-		CommandListState *state, UINT src_stride, UINT *src_offset,
+		CommandListState *state, UINT *src_offset,
 		UINT buf_src_size, UINT buf_dst_size)
 {
 	// Copy a byte range from the source buffer into the destination, starting
 	// at destination offset 0. This also handles buffer conversions that require
 	// a region copy, including constant-buffer size and alignment constraints.
 	D3D11_BOX src_box;
+	D3D11_BUFFER_DESC dst_desc;
 
 	// D3D11_BOX::right is an exclusive end offset, whereas buf_dst_size is a
 	// byte count. Calculate the requested end and clamp it to the source buffer's
 	// total size so the copy does not extend beyond the source.
-	UINT available_size = buf_src_size - *src_offset;
+	UINT available_size = *src_offset < buf_src_size ? buf_src_size - *src_offset : 0;
 	UINT copy_size = min(buf_dst_size, available_size);
 	src_box.left = *src_offset;
 	src_box.right = *src_offset + copy_size;
 
-	if (src_stride) {
-		// The copied byte range must contain whole elements when copying into
-		// a structured buffer. Round the end down to the nearest stride boundary.
-		src_box.right = (src_box.right - src_box.left) / src_stride * src_stride + src_box.left;
+	// The copied byte range must contain whole elements when copying into
+	// a structured buffer. Round the end down to the nearest stride boundary.
+	// The stride of the copy is not used for this: for a buffer with neither
+	// a format nor a structure, such as a constant buffer, it is the size of
+	// the whole buffer, which would round a part of it down to nothing.
+	static_cast<ID3D11Buffer*>(dst_resource)->GetDesc(&dst_desc);
+	if ((dst_desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && dst_desc.StructureByteStride) {
+		UINT stride = dst_desc.StructureByteStride;
+		src_box.right = (src_box.right - src_box.left) / stride * stride + src_box.left;
 	}
 
 	src_box.top = 0;
@@ -13342,7 +13350,11 @@ static void SpecialCopyBufferRegion(ID3D11Resource *dst_resource,ID3D11Resource 
 	src_box.front = 0;
 	src_box.back = 1;
 
-	state->mOrigContext1->CopySubresourceRegion(dst_resource, 0, 0, 0, 0, src_resource, 0, &src_box);
+	// An offset past the end of the source leaves nothing to copy. The
+	// D3D12 shim takes right - left as the size, so an empty box is not
+	// passed on:
+	if (src_box.right > src_box.left)
+		state->mOrigContext1->CopySubresourceRegion(dst_resource, 0, 0, 0, 0, src_resource, 0, &src_box);
 
 	// We have effectively removed the offset during the region copy, so
 	// set it to 0 to make sure nothing will try to use it again elsewhere:
@@ -13724,7 +13736,12 @@ void ResourceCopyOperation::CopyResourceToResource(
 	// Region(offset, size) specifies a byte offset and a byte count.
 	// Keep size as the requested destination copy size.
 	// The copy helper calculates the exclusive source end offset from both values.
-	if (src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION) {
+	// A region of a texture means nothing, and the region copy only takes buffers.
+	D3D11_RESOURCE_DIMENSION src_dimension;
+	src_resource->GetType(&src_dimension);
+	bool src_region = src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION
+		&& src_dimension == D3D11_RESOURCE_DIMENSION_BUFFER;
+	if (src_region) {
 		offset = (UINT)src.member_args[0].GetValue(state);
 		buf_dst_size = (UINT)src.member_args[1].GetValue(state);
 	}
@@ -13754,7 +13771,10 @@ void ResourceCopyOperation::CopyResourceToResource(
 			Profiling::buffer_region_copies++;
 			if (G->cache_resource_data != DataCacheBindFlags::INVALID && dst_custom_resource)
 				dst_custom_resource->SetHandleInfo(src_resource, offset, buf_dst_size);
-			SpecialCopyBufferRegion(dst_resource, src_resource, state, stride, &offset, buf_src_size, buf_dst_size);
+			SpecialCopyBufferRegion(dst_resource, src_resource, state, &offset, buf_src_size, buf_dst_size);
+			// The destination only holds the copied range, so a view of
+			// it must not be sized by the source:
+			buf_src_size = buf_dst_size;
 		} else {
 			COMMAND_LIST_LOG(state, "  performing full copy (src_stride=%d src_offset=%d src_size=%d)\n", stride, offset, buf_src_size);
 			Profiling::resource_full_copies++;
@@ -13768,7 +13788,28 @@ void ResourceCopyOperation::CopyResourceToResource(
 		if (G->cache_resource_data != DataCacheBindFlags::INVALID && dst_custom_resource)
 			dst_custom_resource->SetHandleInfo(src_resource, offset, buf_dst_size ? buf_dst_size : buf_src_size);
 		dst_resource = src_resource;
-		dst_view = UsableRefView(&dst, state, src_view, dst_resource);
+
+		// A Region() bound to a view slot needs a view of that range. The
+		// source's view and the view cache, which is only matched by
+		// resource, are of other ranges. Views take the end of the range:
+		ResourceCopyTargetType dst_type = dst.type;
+		if (dst_type == ResourceCopyTargetType::THIS_RESOURCE && state->this_target)
+			dst_type = state->this_target->type;
+		bool region_view = src_region && buf_dst_size
+			&& (dst_type == ResourceCopyTargetType::SHADER_RESOURCE
+				|| dst_type == ResourceCopyTargetType::UNORDERED_ACCESS_VIEW
+				|| dst_type == ResourceCopyTargetType::RENDER_TARGET);
+		if (region_view) {
+			D3D11_BUFFER_DESC src_desc;
+			static_cast<ID3D11Buffer*>(src_resource)->GetDesc(&src_desc);
+			buf_src_size = (UINT)min((UINT64)src_desc.ByteWidth, (UINT64)offset + buf_dst_size);
+			if (*pp_cached_view) {
+				(*pp_cached_view)->Release();
+				*pp_cached_view = NULL;
+			}
+		} else {
+			dst_view = UsableRefView(&dst, state, src_view, dst_resource);
+		}
 		if (!dst_view && *pp_cached_view) {
 			if (ViewMatchesResource(*pp_cached_view, dst_resource)) {
 				dst_view = *pp_cached_view;

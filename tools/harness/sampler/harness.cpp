@@ -5,6 +5,7 @@
 // an 8 element RWBuffer), presents (which runs the ini's [Present]) and prints
 // what the custom shaders sampled and which samplers are bound afterwards,
 // then checks those of the last frame against what case/d3dx.ini asks for.
+// It also checks the views of two ->Region() buffer copies.
 //
 //   harness.exe <run folder> [frames]
 //
@@ -172,6 +173,18 @@ int main(int argc, char **argv)
 	ID3D11UnorderedAccessView *uav;
 	CHECK(dev->CreateUnorderedAccessView(buf, &ud, &uav));
 
+	// The game's constant buffer at cs-cb1 for CustomShaderRegion: float4 i
+	// holds i, so byte 256 starts the value 16
+	float constants[32][4];
+	for (int i = 0; i < 32; i++)
+		constants[i][0] = constants[i][1] = constants[i][2] = constants[i][3] = (float)i;
+	bd = {};
+	bd.ByteWidth = sizeof(constants);
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	D3D11_SUBRESOURCE_DATA cb_init = { constants, 0, 0 };
+	ID3D11Buffer *cb;
+	CHECK(dev->CreateBuffer(&bd, &cb_init, &cb));
+
 	D3D11_SAMPLER_DESC sd = {};
 	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
 	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
@@ -198,6 +211,7 @@ int main(int argc, char **argv)
 		ctx->PSSetShaderResources(0, 1, &srv);
 		ctx->CSSetShaderResources(0, 1, &srv);
 		ctx->CSSetUnorderedAccessViews(0, 1, &uav, NULL);
+		ctx->CSSetConstantBuffers(1, 1, &cb);
 
 		CHECK(swap->Present(0, 0));
 
@@ -236,6 +250,18 @@ int main(int argc, char **argv)
 			expect("border colour 0.25 at u = 1.5", close_to(px[5][0], 0.25f));
 			expect("ps-s0 = null in a custom shader samples with the default sampler (0.7)", close_to(px[6][0], 0.7f));
 			expect("cs-s0 linear clamp samples 0.7", close_to(cs[0][0], 0.7f));
+			// Bytes 16..31 of data = 1 2 3 4 5 6 7 8 are 5 6 7 8
+			printf("  region: %g %g %g %g of %g, clamped: %g %g %g %g of %g\n", cs[1][0], cs[1][1], cs[1][2], cs[1][3], cs[2][0],
+				cs[3][0], cs[3][1], cs[3][2], cs[3][3], cs[4][0]);
+			expect("copy Region(16, 16) gives a view of 4 elements 5..8", cs[2][0] == 4
+				&& cs[1][0] == 5 && cs[1][1] == 6 && cs[1][2] == 7 && cs[1][3] == 8);
+			expect("copy Region(0, 1024) gives a view of the 8 elements of the source", cs[4][0] == 8
+				&& cs[3][0] == 1 && cs[3][1] == 2 && cs[3][2] == 3 && cs[3][3] == 4);
+			printf("  ref start: %g elements %g..%g, ref middle: %g elements %g %g, cb: %g\n", cs[5][0], cs[5][1], cs[5][2],
+				cs[6][0], cs[6][1], cs[6][2], cs[7][0]);
+			expect("ref Region(0, 16) gives a view of 4 elements 1..4", cs[5][0] == 4 && cs[5][1] == 1 && cs[5][2] == 4);
+			expect("ref Region(8, 8) gives a view of 2 elements 3 4", cs[6][0] == 2 && cs[6][1] == 3 && cs[6][2] == 4);
+			expect("copy cs-cb1->Region(256, 256) of a 512 byte constant buffer starts with 16", cs[7][0] == 16);
 			expect("ps-s0..s2 restored after the custom shaders", bound(4, 0) == game && bound(4, 1) == game && bound(4, 2) == game);
 			expect("cs-s0 restored after the compute custom shader", bound(5, 0) == game);
 			expect("ps-s3 = null in [Present] leaves the slot empty", bound(4, 3) == NULL);

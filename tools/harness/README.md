@@ -142,6 +142,9 @@ extended table. Mode 15 checks that saving and rebinding `ps-t0` after
 
 `bash run.sh` makes `run/new` from `case/` and the DLL just built, then checks
 the last frame and the warnings for the invalid sections in `d3d11_log.txt`.
+It also checks the views of `cs-t1 = copy ResourceRegionSource->Region(16, 16)`,
+of a `Region()` size past the end of the source and of `ref ...->Region()`,
+and `copy cs-cb1->Region(256, 256)` of a constant buffer.
 
 To compare with a package DLL from before sampler slots, or with the upstream
 DLL, run `run.sh old` or `run.sh stock` with `XXMI_PACKAGES` set to the
