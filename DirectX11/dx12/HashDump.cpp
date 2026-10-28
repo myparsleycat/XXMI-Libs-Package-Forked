@@ -83,11 +83,11 @@ static DrawSample sample;
 static bool sample_requested, sample_finished;
 
 // With the lock held
-static FILE* csv(int which)
+static FILE* csv(int which, bool always = false)
 {
 	wchar_t path[MAX_PATH];
 
-	if (!G->dx12_dump_hashes || csv_failed[which])
+	if (!(G->dx12_dump_hashes || always) || csv_failed[which])
 		return NULL;
 	if (csv_files[which])
 		return csv_files[which];
@@ -110,25 +110,40 @@ static FILE* csv(int which)
 	return csv_files[which];
 }
 
-void Dx12DumpNote(const char *format, ...)
+static void note(bool always, const char *format, va_list args)
 {
 	char line[1024];
-	va_list args;
 	FILE *report;
 
-	va_start(args, format);
 	vsnprintf_s(line, _TRUNCATE, format, args);
-	va_end(args);
 
 	Dx12LogInfo("%s", line);
 
 	AcquireSRWLockExclusive(&lock);
-	report = csv(CSV_REPORT);
+	report = csv(CSV_REPORT, always);
 	if (report) {
 		fputs(line, report);
 		fflush(report);
 	}
 	ReleaseSRWLockExclusive(&lock);
+}
+
+void Dx12DumpNote(const char *format, ...)
+{
+	va_list args;
+
+	va_start(args, format);
+	note(false, format, args);
+	va_end(args);
+}
+
+void Dx12ReportNote(const char *format, ...)
+{
+	va_list args;
+
+	va_start(args, format);
+	note(true, format, args);
+	va_end(args);
 }
 
 void Dx12DumpReportLineIfFree(const char *line)

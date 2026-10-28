@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "DeviceRemoved.h"
 #include "Dx12CommandList.h"
 #include "Dx12CommandQueue.h"
 #include "Dx12Device.h"
@@ -808,6 +809,77 @@ bool Dx12ShimProcessMemory(DXGI_QUERY_VIDEO_MEMORY_INFO *info)
 		}
 	}
 	return adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, info));
+}
+
+static void describe_resource(char *text, size_t size, const ShimResource *resource)
+{
+	if (resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+		sprintf_s(text, size, "a buffer of the mods, %llu bytes%s", resource->desc.Width,
+			resource->evicted ? ", evicted" : "");
+	else
+		sprintf_s(text, size, "a texture of the mods, %llu x %u, %u mips, format %d%s", resource->desc.Width,
+			resource->desc.Height, resource->desc.MipLevels, resource->desc.Format,
+			resource->evicted ? ", evicted" : "");
+}
+
+static bool buffer_at(ID3D12Resource *buffer, UINT64 va)
+{
+	UINT64 start = buffer->GetGPUVirtualAddress();
+
+	return start && va >= start && va < start + buffer->GetDesc().Width;
+}
+
+void Dx12ShimNoteFault(UINT64 va, const std::vector<const void*> &objects, void (*note)(const char *format, ...))
+{
+	const std::vector<UploadPage> *pages[] = { &upload_active, &upload_idle, &upload_big_active, &upload_big_idle };
+	char text[256];
+	UINT found = 0;
+	bool locked = false;
+
+	// Called on a thread of its own once the device is gone. Whoever has
+	// the lock may be waiting for the GPU, which the removal ends.
+	InitOnceExecuteOnce(&shim_lock_once, init_shim_lock, NULL, NULL);
+	for (int waited = 0; waited < 2000 && !(locked = TryEnterCriticalSection(&shim_lock)); waited += 10)
+		Sleep(10);
+	if (!locked) {
+		note("    what of the mods is there is not known: the lock of the D3D12 shim stayed taken\n");
+		return;
+	}
+
+	for (const ShimResource *resource : residents) {
+		if (!resource->resource)
+			continue;
+		if (std::find(objects.begin(), objects.end(), resource->resource) != objects.end()) {
+			describe_resource(text, sizeof(text), resource);
+			note("    among the allocations there: %p, %s\n", resource->resource, text);
+			found++;
+		}
+		if (resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+			continue;
+		if (buffer_at(resource->resource, va)) {
+			describe_resource(text, sizeof(text), resource);
+			note("    at the address: %p, %s\n", resource->resource, text);
+			found++;
+		}
+		for (const ShimResource::Spare &spare : resource->spares) {
+			if (buffer_at(spare.resource, va)) {
+				describe_resource(text, sizeof(text), resource);
+				note("    at the address: %p, a resource kept for renaming %s\n", spare.resource, text);
+				found++;
+			}
+		}
+	}
+	for (const std::vector<UploadPage> *list : pages) {
+		for (const UploadPage &page : *list) {
+			if (buffer_at(page.buffer, va)) {
+				note("    at the address: %p, an upload buffer of the mods\n", page.buffer);
+				found++;
+			}
+		}
+	}
+	if (!found)
+		note("    nothing of the mods there\n");
+	LeaveCriticalSection(&shim_lock);
 }
 
 // Nothing recorded or executed, or yet to be, uses it: none of our
@@ -1730,6 +1802,7 @@ bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue)
 	Dx12LogInfo("HackerDevice %p and HackerContext %p created on the D3D11 shim of ID3D12Device %p, commands go to ID3D12CommandQueue %p\n",
 		shim.hacker_device, shim.hacker_context, shim.device, shim.queue);
 	shim_created = true;
+	Dx12WatchDevice(shim.device);
 
 	// The shader overrides were read before the game was known to be
 	// D3D12, and are not read again at the first present when

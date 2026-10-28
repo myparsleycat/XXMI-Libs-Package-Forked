@@ -206,6 +206,9 @@ bool Dx12ShimReadGameResource(ID3D12Resource *resource);
 // What the process uses of the GPU's local memory and the budget it has, as
 // the system counts them
 bool Dx12ShimProcessMemory(DXGI_QUERY_VIDEO_MEMORY_INFO *info);
+// For a report of a removed device: which resources of the mods are at the
+// address of a page fault or among the allocations DRED found there
+void Dx12ShimNoteFault(UINT64 va, const std::vector<const void*> &objects, void (*note)(const char *format, ...));
 
 // Keeps the object alive until the game's list has been executed, as often
 // as it is, or has been reset without being executed. False if the list had

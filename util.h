@@ -1593,6 +1593,9 @@ static UINT DrawPrimitiveCountToVerticesCount(UINT pCount, D3DPRIMITIVETYPE pTyp
 extern IDXGISwapChain *last_fullscreen_swap_chain;
 #endif // MIGOTO_DX == 11
 void install_crash_handler(int level);
+// 3DM-<time>.dmp in the working directory, of the threads as they are when
+// ExceptionInfo is NULL
+void write_minidump(struct _EXCEPTION_POINTERS *ExceptionInfo);
 float get_effective_dpi();
 uint32_t popcount(uint32_t x);
 float random(float max);

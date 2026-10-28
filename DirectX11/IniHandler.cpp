@@ -5037,6 +5037,8 @@ void LoadConfigFile()
 	G->vk_dump_hashes = GetIniBool(L"Hunting", L"vk_dump_hashes", false, NULL);
 	G->vk_buffers_first = GetIniBool(L"Rendering", L"vk_buffers_first", false, NULL);
 	G->dx12_debug_layer = GetIniBool(L"Rendering", L"dx12_debug_layer", false, NULL);
+	G->dx12_dred = GetIniBool(L"Rendering", L"dx12_dred", false, NULL);
+	G->dx12_stall_dump_seconds = max(0, GetIniInt(L"Rendering", L"dx12_stall_dump_seconds", 0, NULL));
 	G->dx12_evict_idle = GetIniBool(L"Rendering", L"dx12_evict_idle", true, NULL);
 	G->dx12_evict_idle_seconds = max(0, GetIniInt(L"Rendering", L"dx12_evict_idle_seconds", 10, NULL));
 	G->dx12_evict_budget_percent = min(max(0, GetIniInt(L"Rendering", L"dx12_evict_budget_percent", 75, NULL)), 1000);

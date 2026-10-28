@@ -20,6 +20,7 @@
 #include "VkScope.h"
 
 #include "../dx12/Bridge.h"
+#include "../dx12/DeviceRemoved.h"
 #include "../dx12/DrawPath.h"
 #include "../dx12/ShimContext.h"
 #include "../dx12/ShimDevice.h"
@@ -8619,33 +8620,11 @@ static void note_fault()
 		VkDumpNote("    %s: code 0x%llx, data 0x%llx\n", entry.description, entry.vendorFaultCode, entry.vendorFaultData);
 }
 
-static const char* breadcrumb_op(D3D12_AUTO_BREADCRUMB_OP op)
-{
-	static const char *names[] = {
-		"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect", "Dispatch",
-		"CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource",
-		"ClearRenderTargetView", "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle",
-		"Present", "ResolveQueryData", "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames",
-		"AtomicCopyBufferUINT", "AtomicCopyBufferUINT64", "ResolveSubresourceRegion", "WriteBufferImmediate",
-		"DecodeFrame1", "SetProtectedResourceSession", "DecodeFrame2", "ProcessFrames1",
-		"BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
-		"CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand",
-		"EstimateMotion", "ResolveMotionVectorHeap", "SetPipelineState1", "InitializeExtensionCommand",
-		"ExecuteExtensionCommand", "DispatchMesh",
-	};
-
-	return (unsigned)op < ARRAYSIZE(names) ? names[op] : "another operation";
-}
-
-// What DRED (enable_dred in dx12/Dx12Hooks.cpp) kept of the D3D12 device. The
-// driver removes it some time after the Vulkan device is lost, if at all.
+// What DRED kept of the D3D12 device. The driver removes it some time after
+// the Vulkan device is lost, if at all.
 static void note_dred()
 {
-	ID3D12DeviceRemovedExtendedData1 *dred = NULL;
-	D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = {};
-	D3D12_DRED_PAGE_FAULT_OUTPUT1 page_fault = {};
 	HRESULT reason = S_OK;
-	unsigned complete = 0, shown;
 
 	for (int waited = 0; waited < 5000; waited += 50) {
 		reason = dx12_shim->device->GetDeviceRemovedReason();
@@ -8654,42 +8633,8 @@ static void note_dred()
 		Sleep(50);
 	}
 	VkDumpNote("  The D3D12 device: removed reason 0x%x%s\n", reason, reason == S_OK ? " 5 s after the Vulkan device was lost" : "");
-	if (reason == S_OK || FAILED(dx12_shim->device->QueryInterface(IID_PPV_ARGS(&dred))))
-		return;
-
-	if (FAILED(dred->GetAutoBreadcrumbsOutput1(&breadcrumbs))) {
-		VkDumpNote("  DRED has no breadcrumbs\n");
-	} else {
-		VkDumpNote("  Command lists of the D3D12 device the GPU had not got through (our queue is %p):\n", dx12_shim->queue);
-		for (const D3D12_AUTO_BREADCRUMB_NODE1 *node = breadcrumbs.pHeadAutoBreadcrumbNode; node; node = node->pNext) {
-			UINT32 last = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
-
-			if (last >= node->BreadcrumbCount) {
-				complete++;
-				continue;
-			}
-			VkDumpNote("    list %p \"%ls\" on queue %p \"%ls\"%s: %u of %u operations done\n",
-				node->pCommandList, node->pCommandListDebugNameW ? node->pCommandListDebugNameW : L"",
-				node->pCommandQueue, node->pCommandQueueDebugNameW ? node->pCommandQueueDebugNameW : L"",
-				node->pCommandQueue == dx12_shim->queue ? " (ours)" : "", last, node->BreadcrumbCount);
-			for (UINT32 i = last >= 3 ? last - 3 : 0; i < node->BreadcrumbCount && i < last + 4; i++)
-				VkDumpNote("      %s%u %s\n", i == last ? "-> " : "   ", i, breadcrumb_op(node->pCommandHistory[i]));
-		}
-		VkDumpNote("    and %u it had got through\n", complete);
-	}
-
-	if (FAILED(dred->GetPageFaultAllocationOutput1(&page_fault))) {
-		VkDumpNote("  DRED has no page fault\n");
-	} else {
-		VkDumpNote("  Page fault at 0x%llx\n", page_fault.PageFaultVA);
-		shown = 0;
-		for (const D3D12_DRED_ALLOCATION_NODE1 *node = page_fault.pHeadExistingAllocationNode; node && shown < 8; node = node->pNext, shown++)
-			VkDumpNote("    there now: %p \"%ls\", type %u\n", node->pObject, node->ObjectNameW ? node->ObjectNameW : L"", node->AllocationType);
-		shown = 0;
-		for (const D3D12_DRED_ALLOCATION_NODE1 *node = page_fault.pHeadRecentFreedAllocationNode; node && shown < 8; node = node->pNext, shown++)
-			VkDumpNote("    freed recently: %p \"%ls\", type %u\n", node->pObject, node->ObjectNameW ? node->ObjectNameW : L"", node->AllocationType);
-	}
-	dred->Release();
+	if (reason != S_OK)
+		Dx12NoteDred(dx12_shim->device, VkDumpNote);
 }
 
 void VkModsDeviceLost(VkQueue queue)

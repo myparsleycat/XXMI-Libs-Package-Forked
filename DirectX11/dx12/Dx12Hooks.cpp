@@ -48,16 +48,18 @@ static void enable_debug_layer()
 	Dx12LogInfo("dx12_debug_layer: debug layer enabled\n");
 }
 
-// For a Vulkan game with vk_dump_hashes: the D3D12 device of the driver that
-// presents its frames then keeps a record of where its queues were, for
-// VkModsDeviceLost. Like the debug layer, only before the device is created.
+// With dx12_dred, or for a Vulkan game with vk_dump_hashes: the device then
+// keeps a record of where its queues were and of the memory a page fault was
+// in, for Dx12NoteDred. Like the debug layer, only before the device is
+// created.
 static void enable_dred()
 {
 	static bool enabled;
 	HRESULT (WINAPI *get_debug_interface)(REFIID, void**);
 	ID3D12DeviceRemovedExtendedDataSettings *settings = NULL;
+	ID3D12DeviceRemovedExtendedDataSettings1 *settings1;
 
-	if (enabled || !dx12_enabled() || !G->vk_dump_hashes)
+	if (enabled || !dx12_enabled() || (!G->dx12_dred && !G->vk_dump_hashes))
 		return;
 	enabled = true;
 
@@ -68,6 +70,10 @@ static void enable_dred()
 	}
 	settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 	settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+	if (SUCCEEDED(settings->QueryInterface(IID_PPV_ARGS(&settings1)))) {
+		settings1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+		settings1->Release();
+	}
 	settings->Release();
 	Dx12LogInfo("DRED enabled\n");
 }

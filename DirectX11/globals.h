@@ -518,6 +518,8 @@ struct Globals
 	bool extended_rendering;
 	bool dx12_dump_hashes;
 	bool dx12_debug_layer;
+	bool dx12_dred;
+	UINT dx12_stall_dump_seconds;
 	bool dx12_evict_idle;
 	UINT dx12_evict_idle_seconds;
 	UINT dx12_evict_budget_percent;
@@ -778,6 +780,8 @@ struct Globals
 		extended_rendering(true),
 		dx12_dump_hashes(false),
 		dx12_debug_layer(false),
+		dx12_dred(false),
+		dx12_stall_dump_seconds(0),
 		dx12_evict_idle(true),
 		dx12_evict_idle_seconds(10),
 		dx12_evict_budget_percent(75),

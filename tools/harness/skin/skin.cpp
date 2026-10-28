@@ -7,7 +7,7 @@
 // skinned there: the game mesh is a small square on the left, the mod's a
 // wide bar on the right.
 //
-// skin.exe [frames=120] [nodll] [deform] [dump=file.bmp] [queuelife] [queuegone] [devicelife] [second] [others=N] [second_at=N] [drawfirst] [unhashed] [reuse_at=N] [replace_at=N] [reupload_at=N]
+// skin.exe [frames=120] [nodll] [deform] [dump=file.bmp] [queuelife] [queuegone] [devicelife] [second] [others=N] [second_at=N] [drawfirst] [unhashed] [reuse_at=N] [replace_at=N] [reupload_at=N] [fault_at=N] [stall_at=N]
 // Prints what is drawn where the game's and the mod's meshes go. Exits with 1
 // when D3D12 fails, an argument is unknown or a lifetime case goes wrong.
 // queuelife: before that, does what RTSS did to ZZZ: holds a queue by an
@@ -35,6 +35,11 @@
 // reupload_at=N: at frame N the square's index buffer is written again by a copy
 // from another GPU buffer, which nothing can hash, and at frame 2N by one from
 // upload memory again, as a game that moves or streams in a mesh would.
+// fault_at=N: at frame N the square is drawn from the address of a buffer that
+// has been released, a page fault that removes the device; exits with 0 once
+// it is removed, after giving dx12_dred time to write its report.
+// stall_at=N: after frame N, with the window in front, presents nothing for
+// 4 s, for dx12_stall_dump_seconds.
 
 #include <windows.h>
 #include <d3d12.h>
@@ -271,7 +276,7 @@ int main(int argc, char **argv)
 {
 	UINT frame_count = 120, i, f;
 	bool load_dll = true, deform = false, queue_life = false, queue_gone = false, device_life = false, second = false;
-	UINT others = 0, second_at = 0, reuse_at = 0, replace_at = 0, reupload_at = 0;
+	UINT others = 0, second_at = 0, reuse_at = 0, replace_at = 0, reupload_at = 0, fault_at = 0, stall_at = 0;
 	bool draw_first = false, unhashed = false;
 	const char *dump = NULL;
 	HMODULE dll = NULL;
@@ -292,6 +297,8 @@ int main(int argc, char **argv)
 		else if (!strncmp(argv[a], "reuse_at=", 9)) reuse_at = atoi(argv[a] + 9);
 		else if (!strncmp(argv[a], "replace_at=", 11)) replace_at = atoi(argv[a] + 11);
 		else if (!strncmp(argv[a], "reupload_at=", 12)) reupload_at = atoi(argv[a] + 12);
+		else if (!strncmp(argv[a], "fault_at=", 9)) fault_at = atoi(argv[a] + 9);
+		else if (!strncmp(argv[a], "stall_at=", 9)) stall_at = atoi(argv[a] + 9);
 		else {
 			printf("unknown argument %s\n", argv[a]);
 			return 1;
@@ -716,6 +723,14 @@ int main(int argc, char **argv)
 			placed = place(REPLACE_VERTICES * sizeof(Vertex));
 			write_table(1008, vertex_buffer3, weight_buffer3, REPLACE_VERTICES, placed);
 		}
+		D3D12_VERTEX_BUFFER_VIEW vb_square = vb_view;
+		if (fault_at && f == fault_at) {
+			wait_for(signal());
+			ID3D12Resource *gone = create_buffer(GAME_VERTICES * sizeof(Vertex), D3D12_HEAP_TYPE_DEFAULT,
+				D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+			vb_square.BufferLocation = gone->GetGPUVirtualAddress();
+			gone->Release();
+		}
 		UINT phase = f < replace_at ? 0 : f < 2 * replace_at ? 1 : 2;
 		ID3D12Resource *replace_output = phase == 2 ? own2 : placed;
 		UINT replace_count = phase == 1 ? REPLACE_VERTICES : GAME_VERTICES;
@@ -769,7 +784,7 @@ int main(int argc, char **argv)
 			list->SetGraphicsRootSignature(draw_signature);
 			list->SetPipelineState(draw_pso);
 			list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			list->IASetVertexBuffers(0, 1, &vb_view);
+			list->IASetVertexBuffers(0, 1, &vb_square);
 			list->IASetIndexBuffer(f < reuse_at ? &ib_view_reuse : &ib_view);
 			list->DrawIndexedInstanced(GAME_INDICES, 1, 0, 0, 0);
 			if (replace_at) {
@@ -796,6 +811,18 @@ int main(int argc, char **argv)
 		}
 		CHECK(list->Close());
 		queue->ExecuteCommandLists(1, (ID3D12CommandList**)&list);
+		if (fault_at && f == fault_at) {
+			HRESULT reason = S_OK;
+
+			for (int waited = 0; waited < 10000 && reason == S_OK; waited += 50) {
+				Sleep(50);
+				reason = device->GetDeviceRemovedReason();
+			}
+			printf("fault_at: removed reason 0x%08x\n", (unsigned)reason);
+			fflush(stdout);
+			Sleep(3000);
+			ExitProcess(reason == S_OK ? 1 : 0);
+		}
 		QueryPerformanceCounter(&after);
 		if (f >= 60) {
 			recording += (double)(after.QuadPart - before.QuadPart) / frequency.QuadPart;
@@ -809,6 +836,11 @@ int main(int argc, char **argv)
 		}
 		CHECK(swap_chain->Present(0, 0));
 		frame_fences[back] = signal();
+		if (stall_at && f == stall_at) {
+			SetForegroundWindow(hwnd);
+			Sleep(4000);
+			printf("stall_at: the window was %sin front\n", GetForegroundWindow() == hwnd ? "" : "not ");
+		}
 	}
 	wait_for(signal());
 	if (timed_frames)

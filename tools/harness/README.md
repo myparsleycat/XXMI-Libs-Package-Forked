@@ -90,6 +90,12 @@ and `--appear`. They are described in `harness.cpp`.
   and compares which spots are drawn with a fixed list. It then runs
   `queuelife`, `queuegone` and `devicelife`.
 - `try.sh <mode> [frames] [args]`: runs one mode.
+- `skin.exe fault_at=N` in a run folder made with
+  `Rendering.dx12_debug_layer=0 Rendering.dx12_dred=1`: a page fault at frame
+  N. The log has the `dx12_dred` report. The debug layer stops the program
+  before the fault, so it has to be off.
+- `skin.exe stall_at=N` with `Rendering.dx12_stall_dump_seconds=2`: presents
+  stop for 4 s, and a `3DM-<time>.dmp` is written in the run folder.
 
 Mode 8 (`drawfirst`, with the draws checking only vb0 and vb2) does not run
 the mod's `...IB` section. The game's draw gets the mod's skinned vertices
