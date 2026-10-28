@@ -15,7 +15,8 @@
 // proxy to D3D11On12CreateDevice (needs dx12_debug_layer for the interface).
 // queuegone: what RTSS did to ZZZ after the game made its swap chain again:
 // hands D3D11On12CreateDevice a queue that has been destroyed, which is to be
-// refused without being touched.
+// refused without being touched, and once the swap chain presented, to be
+// taken as the queue it presents on.
 // devicelife: the same with the device, before the one the frames use is made.
 // second: another game mesh above the square, of as many vertices but with
 // weights and indices of its own, which no mod is for.
@@ -428,14 +429,15 @@ int main(int argc, char **argv)
 		fflush(stdout);
 	}
 
+	PFN_D3D11ON12_CREATE_DEVICE create_on12 = NULL;
+	ID3D12CommandQueue *gone = NULL;
 	if (queue_gone) {
-		PFN_D3D11ON12_CREATE_DEVICE create_on12 = (PFN_D3D11ON12_CREATE_DEVICE)GetProcAddress(
-			dll ? dll : LoadLibraryW(L"d3d11.dll"), "D3D11On12CreateDevice");
-		ID3D12CommandQueue *gone;
 		ID3D11Device *on12 = NULL;
 		IUnknown *queues[1];
 		HRESULT hr;
 
+		create_on12 = (PFN_D3D11ON12_CREATE_DEVICE)GetProcAddress(
+			dll ? dll : LoadLibraryW(L"d3d11.dll"), "D3D11On12CreateDevice");
 		CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&gone)));
 		gone->Release();
 
@@ -914,5 +916,18 @@ int main(int argc, char **argv)
 	wait_for(signal());
 	if (timed_frames)
 		printf("recording and executing %.4f ms a frame (%u skinned meshes)\n", recording * 1000 / timed_frames, 1 + (UINT)skinned2.size());
+
+	if (queue_gone) {
+		IUnknown *queues[] = { gone };
+		ID3D11Device *on12 = NULL;
+		HRESULT hr = create_on12(device, 0, NULL, 0, queues, 1, 0, &on12, NULL, NULL);
+
+		printf("queuegone: after the swap chain presented, D3D11On12CreateDevice with the destroyed queue returned 0x%x%s\n",
+			hr, SUCCEEDED(hr) && on12 ? "" : " (expected a device on the presenting queue)");
+		fflush(stdout);
+		if (FAILED(hr) || !on12)
+			return 1;
+		on12->Release();
+	}
 	return 0;
 }
