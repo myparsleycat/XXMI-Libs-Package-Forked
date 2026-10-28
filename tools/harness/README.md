@@ -19,6 +19,7 @@ to apply this behavior there; the DLL does not need rebuilding.
 | `skin` | D3D12 GPU skinning with character mods (`make_mod.py` modes), queue and device lifetimes with D3D11On12 |
 | `sampler` | `type = SamplerState` resources and `ps-s0` bindings on D3D11 |
 | `cpu` | The CPU work of the DLL on the configuration of an installed importer: call-for-call equality and frame time against a reference DLL |
+| `cpu/dx11/desktop` | The Nahida Desktop channel: the codec against the shared vectors, the pipe server, and picking on D3D11 |
 
 ## Requirements
 
@@ -128,6 +129,61 @@ the last frame and the warnings for the invalid sections in `d3d11_log.txt`.
 To compare with a package DLL from before sampler slots, or with the upstream
 DLL, run `run.sh old` or `run.sh stock` with `XXMI_PACKAGES` set to the
 launcher's packages folder. The checks are expected to fail with those DLLs.
+
+### cpu/dx11/desktop
+
+Run `cpu/dx11/build.bat`, then `bash cpu/dx11/desktop/check.sh`. It checks
+the codec of `DirectX11/desktop/Protocol.h` against
+`testdata/desktop-channel/v1`, then runs `pick.exe` in `cpu/dx11/bin/pick-run`
+with `[Desktop] channel = 1`. `pick.exe` draws a scene with a hidden mesh, a
+vertex shader that writes `SV_Position` to `o3`, a mod with `handling = skip`
+and two `drawindexed` parts, and a cached deferred command list. A client thread checks
+the handshake, INI variables, refusals and the PickResults. After every draw
+it checks that the pick left the game's state and picture unchanged. It also checks
+that overlapping occlusion and pipeline statistics queries retain their results
+and that a timestamp disjoint query spanning the scene allows picking.
+
+The script also runs `pick.exe <run folder> uav`, `region` and `devices` with
+WARP. These check that UAV slots above 7 are restored, that vertex and index
+buffer region hashes retain the data used by a draw when the buffers are
+updated afterward, and that picking works on a second device after the first
+device has completed a pick. The `region` run enables
+`[Rendering] track_region_hashes = 1`.
+
+The `cbzero` run checks that picking preserves a zero-length `b13` constant
+buffer range and the rendered image. The `indirect` run checks hits, draw types
+and command origins for both `drawinstancedindirect` and
+`drawindexedinstancedindirect` in a mod. Both runs use WARP.
+
+The `shader-uav` run uses WARP with vertex shaders that read and write `u12`,
+with reflection data stripped. It checks that picking skips these draws and
+preserves the UAV data, vertex invocation counts, bindings and image. The
+`limits` run checks variable responses at exactly 4 MiB and one byte over the
+limit, error request IDs, connection reuse and that a rejected SetVars changes
+no variables. Both runs use WARP.
+
+The `coplanar` run checks that a later mesh rejected by `LESS` at the same depth
+does not receive a depth-tested hit. The `stencil` run also enables stencil
+comparisons and writes to check that probing preserves the rendered image.
+The `reconnect` run disconnects during large variable requests and checks that
+their responses cannot reach the next connection. These runs use WARP.
+
+The `multiswap` run presents a secondary swap chain after every scene frame,
+first on the same device and then on another device. It checks that picking
+uses the primary swap chain's frame and window, and that releasing the primary
+allows the next scene to drive the channel. The `predication` run leaves a
+false predicate bound during Present and checks that picking still returns the
+scene's hits, restores the predicate and skips predicated draws. Both runs use WARP.
+
+The `backpressure` run uses WARP and sends 512 GetVars and SetVars requests
+interleaved with unknown frames to keep pipe reads ready. It checks that each
+request receives one matching reply or `BUSY`, rejected SetVars requests change
+no variables, and requests succeed again after the reply queue drains.
+
+`bin/client.exe [pid]` is a console client for checking a game by hand. It
+connects to the game's pipe, prints every frame as JSON to the console and
+`bin/client.log`, and sends a pick when Enter is pressed. `pick.exe <run folder> idle
+<seconds>` draws the scene without its own client, so that `client.exe` can connect.
 
 ### cpu
 

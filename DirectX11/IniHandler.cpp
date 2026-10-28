@@ -18,6 +18,7 @@
 #include "cursor.h"
 #include "dx12/Bridge.h"
 #include "dx12/PipelineRegistry.h"
+#include "desktop/Channel.h"
 #include <chrono>
 #include <mutex>
 #include <atomic>
@@ -72,6 +73,7 @@ static Section RegularSections[] = {
 	{L"Include", true}, // Prefix so that it may be namespaced to allow included files to include more files with relative paths
 	{L"Preset", true},
 	{L"Hunting", false},
+	{L"Desktop", false},
 	{L"Logging", false},
 	{L"System", false},
 	{L"Input", false},
@@ -371,6 +373,28 @@ static bool _get_namespaced_section_path(IniSections *custom_ini_sections, const
 static bool get_namespaced_section_path(const wchar_t *section, wstring *ret)
 {
 	return _get_namespaced_section_path(&ini_sections, section, ret);
+}
+
+void GetSectionOrigin(const wchar_t *section, wstring *name, wstring *ini_path)
+{
+	const wchar_t *prefix = SectionPrefix(section);
+	wchar_t migoto_path[MAX_PATH];
+
+	*name = section;
+	ini_path->clear();
+
+	IniSections::iterator entry = ini_sections.find(section);
+	if (entry == ini_sections.end())
+		return;
+	if (prefix)
+		*name = wstring(prefix) + (section + get_section_namespace_endpos(section));
+
+	// A section without a prefix may have lines from any file
+	if (!prefix || !GetModuleFileName(migoto_handle, migoto_path, MAX_PATH))
+		return;
+	wcsrchr(migoto_path, L'\\')[1] = 0;
+	const wstring &rel_path = entry->second.ini_path.empty() ? entry->second.ini_namespace : entry->second.ini_path;
+	*ini_path = wstring(migoto_path) + (rel_path.empty() ? wstring(INI_FILENAME) : rel_path);
 }
 
 // Returns the section name re-namespaced with the path of the ini file that
@@ -5215,6 +5239,8 @@ void LoadConfigFile()
 	// [Hunting]
 	ParseHuntingSection();
 
+	ParseDesktopSection();
+
 	// Must be done prior to parsing any command list sections, as every
 	// section registered in this set will be a candidate for optimisation:
 	registered_command_lists.clear();
@@ -5797,6 +5823,8 @@ void ReloadConfig(HackerDevice *device)
 	std::chrono::duration<float> duration = stop - start;
 
 	LogOverlayW(LOG_INFO, L"> Reloaded config in %.3fs\n", duration.count());
+
+	DesktopChannelReloaded();
 }
 
 // With skip_early_includes_load the mods are only loaded by the reload at the

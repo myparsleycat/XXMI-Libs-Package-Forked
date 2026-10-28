@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <Dbghelp.h>
 #include <shellscalingapi.h>
+#include <algorithm>
 #include <chrono>
 
 // FIXME: Move any dependencies from these headers into common:
@@ -521,10 +522,15 @@ void save_om_state(ID3D11DeviceContext *context, struct OMState *state)
 	}
 
 	state->UAVStartSlot = state->NumRTVs;
+	ID3D11Device *device;
+	context->GetDevice(&device);
+	UINT uav_slots = device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1
+		? D3D11_1_UAV_SLOT_COUNT : D3D11_PS_CS_UAV_REGISTER_COUNT;
+	device->Release();
 	// Set NumUAVs to the max to retrieve them all now, and so that later
 	// when rebinding them we will unbind any others that the command list
 	// bound in the meantime
-	state->NumUAVs = D3D11_PS_CS_UAV_REGISTER_COUNT - state->UAVStartSlot;
+	state->NumUAVs = uav_slots - state->UAVStartSlot;
 
 	// Finally get all the UAVs. Since we already retrieved the RTVs and
 	// DSV we can skip getting them:
@@ -533,8 +539,9 @@ void save_om_state(ID3D11DeviceContext *context, struct OMState *state)
 
 void restore_om_state(ID3D11DeviceContext *context, struct OMState *state)
 {
-	static const UINT uav_counts[D3D11_PS_CS_UAV_REGISTER_COUNT] = {(UINT)-1, (UINT)-1, (UINT)-1, (UINT)-1, (UINT)-1, (UINT)-1, (UINT)-1, (UINT)-1};
+	UINT uav_counts[D3D11_1_UAV_SLOT_COUNT];
 	UINT i;
+	std::fill_n(uav_counts, state->NumUAVs, (UINT)-1);
 
 	context->OMSetRenderTargetsAndUnorderedAccessViews(state->NumRTVs, state->rtvs, state->dsv,
 			state->UAVStartSlot, state->NumUAVs, state->uavs, uav_counts);

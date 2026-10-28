@@ -28,8 +28,9 @@ static uint32_t read_u32(const uint8_t* ptr)
 	return value;
 }
 
-bool get_shader_bindings_from_bytecode(const void* data, size_t size, ShaderBindings* out)
+bool get_shader_bindings_from_bytecode(const void* data, size_t size, ShaderBindings* out, bool* uses_uav)
 {
+	bool has_uav = false;
 	if (!data || !out || size < 32)
 		return false;
 
@@ -108,6 +109,12 @@ bool get_shader_bindings_from_bytecode(const void* data, size_t size, ShaderBind
 
 			switch (op)
 			{
+			case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
+			case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW:
+			case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED:
+				has_uav = true;
+				break;
+
 			case D3D10_SB_OPCODE_DCL_RESOURCE:
 			{
 				// dcl_resource_texture2d t0
@@ -246,6 +253,8 @@ bool get_shader_bindings_from_bytecode(const void* data, size_t size, ShaderBind
 			remaining -= length;
 		}
 
+		if (uses_uav)
+			*uses_uav = has_uav;
 		return true;
 	}
 

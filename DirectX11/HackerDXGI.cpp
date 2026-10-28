@@ -74,6 +74,7 @@
 #include "cursor.h" // For InstallHookLate
 #include "dx12/Bridge.h"
 #include "vk/VkHooks.h"
+#include "desktop/Channel.h"
 
 
 // -----------------------------------------------------------------------------
@@ -333,6 +334,11 @@ void HackerSwapChain::RunFrameActions()
 		}
 	}
 
+	// After the [Present] command list, whose draws belong to the frame a
+	// pick started at the last Present covers
+	if (desktop_channel_enabled)
+		DesktopChannelFrame(mHackerDevice, mHackerContext, DesktopProtocol::RENDER_D3D11, this);
+
 	// Draw the on-screen overlay text with hunting and informational
 	// messages, before final Present. We now do this after the shader and
 	// config reloads, so if they have any notices we will see them this
@@ -475,6 +481,8 @@ STDMETHODIMP_(ULONG) HackerSwapChain::Release(THIS)
 
 	if (ulRef <= 0)
 	{
+		if (desktop_channel_enabled)
+			DesktopChannelSwapChainReleased(this);
 		if (mHackerDevice) {
 			if (mHackerDevice->GetHackerSwapChain() == this) {
 				LogInfo("  Clearing mHackerDevice->mHackerSwapChain\n");

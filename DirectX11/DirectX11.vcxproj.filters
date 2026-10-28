@@ -32,6 +32,9 @@
     <ClCompile Include="Override.cpp" />
     <ClCompile Include="HackerInputLayout.cpp" />
     <ClCompile Include="ByteCodeReader.cpp" />
+    <ClCompile Include="desktop\Channel.cpp" />
+    <ClCompile Include="desktop\Pick.cpp" />
+    <ClCompile Include="desktop\Protocol.cpp" />
     <ClCompile Include="dx12\Dx12Hooks.cpp" />
     <ClCompile Include="dx12\Dx12CommandList.cpp" />
     <ClCompile Include="dx12\Dx12CommandQueue.cpp" />
@@ -113,6 +116,9 @@
     <ClInclude Include="dx12\PipelineRegistry.h" />
     <ClInclude Include="dx12\ResourceTracker.h" />
     <ClInclude Include="dx12\TextureHash.h" />
+    <ClInclude Include="desktop\Channel.h" />
+    <ClInclude Include="desktop\Pick.h" />
+    <ClInclude Include="desktop\Protocol.h" />
     <ClInclude Include="dx12\Dx12Hooks.h" />
     <ClInclude Include="dx12\Dx12CommandList.h" />
     <ClInclude Include="dx12\Dx12CommandQueue.h" />

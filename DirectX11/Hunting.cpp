@@ -21,6 +21,7 @@
 #include "ShaderRegex.h"
 #include "dx12/Bridge.h"
 #include "dx12/DrawPath.h"
+#include "desktop/Pick.h"
 
 // bo3b: For this routine, we have a lot of warnings in x64, from converting a size_t result into the needed
 //  DWORD type for the Write calls.  These are writing 256 byte strings, so there is never a chance that it 
@@ -805,6 +806,7 @@ static bool ReloadShader(wchar_t *shaderPath, wchar_t *fileName, HackerDevice *d
 			}
 			if (FAILED(hr))
 				goto err;
+			DesktopNoteShader(replacement, pShaderBytecode->GetBufferPointer(), pShaderBytecode->GetBufferSize(), true);
 
 
 			// If we have an older reloaded shader, let's release it to avoid a memory leak.  This only happens after 1st reload.

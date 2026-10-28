@@ -4,6 +4,7 @@
 #include "log.h"
 #include "Overlay.h"
 #include "dx12/PipelineRegistry.h"
+#include "desktop/Pick.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -1224,6 +1225,8 @@ static ID3D11DeviceChild* create_patched_shader(ID3D11Device *device, const wstr
 		shader->Release();
 		shader = NULL;
 	}
+	if (shader)
+		DesktopNoteShader(shader, bytecode, size, true);
 
 	return shader;
 }

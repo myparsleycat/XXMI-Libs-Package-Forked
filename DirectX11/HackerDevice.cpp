@@ -37,6 +37,7 @@
 #include "CommandList.h"
 #include "Hunting.h"
 #include "ByteCodeReader.h"
+#include "desktop/Pick.h"
 
 // A map to look up the HackerDevice from an IUnknown. The reason for using an
 // IUnknown as the key is that an ID3D11Device and IDXGIDevice are actually two
@@ -1338,6 +1339,7 @@ HRESULT HackerDevice::ReplaceShaderFromShaderFixes(UINT64 hash,
 	}
 
 	CleanupShaderMaps(*ppShader);
+	DesktopNoteShader(*ppShader, replaceShader, replaceShaderSize, true);
 
 	LogInfo("    shader successfully replaced.\n");
 
@@ -1400,6 +1402,7 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 		return hr;
 
 	CleanupShaderMaps(*ppShader);
+	DesktopNoteShader(*ppShader, pShaderBytecode, BytecodeLength, false);
 
 	// When in hunting mode, make a copy of the original binary, regardless.  This can be replaced, but we'll at least
 	// have a copy for every shader seen. If we are performing any sort of deferred shader replacement, such as pipline
@@ -1545,8 +1548,10 @@ void HackerDevice::KeepOriginalShader(UINT64 hash, wchar_t *shaderType,
 
 		hr = (mOrigDevice1->*OrigCreateShader)(pShaderBytecode, BytecodeLength, pClassLinkage, &originalShader);
 		CleanupShaderMaps(originalShader);
-		if (SUCCEEDED(hr))
+		if (SUCCEEDED(hr)) {
 			G->mOriginalShaders[pShader] = originalShader;
+			DesktopNoteShader(originalShader, pShaderBytecode, BytecodeLength, false);
+		}
 
 		// Unlike the *other* code path in CreateShader that can also
 		// fill out this structure, we do *not* bump the refcount on
@@ -2812,6 +2817,8 @@ STDMETHODIMP HackerDevice::CreateGeometryShaderWithStreamOutput(THIS_
 	HRESULT hr = mOrigDevice1->CreateGeometryShaderWithStreamOutput(pShaderBytecode, BytecodeLength, pSODeclaration,
 		NumEntries, pBufferStrides, NumStrides, RasterizedStream, pClassLinkage, ppGeometryShader);
 	LogInfo("  returns result = %x, handle = %p\n", hr, (ppGeometryShader ? *ppGeometryShader : NULL));
+	if (SUCCEEDED(hr) && ppGeometryShader)
+		DesktopNoteShader(*ppGeometryShader, pShaderBytecode, BytecodeLength, false);
 
 	return hr;
 }

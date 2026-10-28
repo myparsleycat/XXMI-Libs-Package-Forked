@@ -167,8 +167,16 @@ $shortCommit = Invoke-Git @(
 
 $commitDisplay = $shortCommit
 
+# The tag as git describe would print it, without the leading v
+$versionTag = $Tag -replace '^v', ''
+
+if (-not $isRelease) {
+    $versionTag += "-$commitsSinceTag-g$shortCommit"
+}
+
 if ($isDirty) {
     $commitDisplay += "-dirty"
+    $versionTag += "-dirty"
 }
 
 # ---------------------------------------------------------------------------
@@ -225,6 +233,7 @@ $comments = $repoUrl
 # Escape characters which could break the generated C/C++ string.
 $companyName = $companyName.Replace('\', '\\').Replace('"', '\"')
 $comments = $comments.Replace('\', '\\').Replace('"', '\"')
+$versionTag = $versionTag.Replace('\', '\\').Replace('"', '\"')
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +248,7 @@ $content = @"
 
 #define VER_COMPANYNAME_STR         "$companyName"
 #define VER_COMMENTS_STR            "$comments"
+#define VERSION_TAG_STR             "$versionTag"
 
 "@
 

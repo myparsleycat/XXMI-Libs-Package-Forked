@@ -172,6 +172,7 @@ private:
 
 	unsigned draw_number;
 	unsigned dispatch_number;
+	std::vector<ID3D11Asynchronous*> mDesktopActiveQueries;
 
 	// Whether the shader the game bound to each stage may still be waiting
 	// for deferred ShaderRegex analysis. This is worked out from the lookup
@@ -379,6 +380,7 @@ public:
 		const wchar_t *target, DXGI_FORMAT format, UINT stride, UINT offset) {};
 
 	unsigned GetDrawNumber() const { return draw_number; };
+	bool HasActiveDesktopQueries() const { return !mDesktopActiveQueries.empty(); }
 	unsigned GetDispatchNumber() const { return dispatch_number; };
 	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
 
