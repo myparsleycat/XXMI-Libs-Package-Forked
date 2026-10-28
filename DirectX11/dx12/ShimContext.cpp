@@ -1041,8 +1041,11 @@ static bool create_readback(ShimResource *resource)
 // the game's to hand out again once its list is done, so it is kept until
 // ours is. available is what the resource has from the offset on, which can be
 // less than the view of it claims: the view of skinned vertices is as large as
-// what a mod had skinned, into a buffer of ours.
-static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset, UINT64 *available)
+// what a mod had skinned, into a buffer of ours. barrier is to be recorded
+// before the copy where needed, and with its states swapped after it, to leave
+// the buffer in the state the game's lists expect.
+static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset, UINT64 *available,
+		D3D12_RESOURCE_BARRIER *barrier, bool *needed)
 {
 	UINT64 va = src->foreign_va ? src->foreign_va : src->game_va;
 	ID3D12Resource *resource;
@@ -1057,6 +1060,16 @@ static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset, UINT64 *av
 	if (!Dx12ShimReadGameResource(resource))
 		return NULL;
 
+	// From the common state D3D12 promotes a buffer by itself. One with no
+	// known state is left without a barrier, as there is no state to give it.
+	*needed = info.state != DX12_STATE_UNKNOWN && info.state && !(info.state & D3D12_RESOURCE_STATE_COPY_SOURCE);
+	*barrier = {};
+	barrier->Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier->Transition.pResource = resource;
+	barrier->Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier->Transition.StateBefore = (D3D12_RESOURCE_STATES)info.state;
+	barrier->Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
 	Dx12ShimDeferRelease(resource);
 	return resource;
 }
@@ -1068,7 +1081,8 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	ShimResourceDesc dst_desc, src_desc;
 	ID3D12Resource *game;
 	UINT64 game_offset, game_bytes;
-	bool src_in_shadow, whole;
+	D3D12_RESOURCE_BARRIER game_barrier;
+	bool src_in_shadow, whole, game_barrier_needed;
 
 	// The vertices skinned for a mod are in no buffer a list of ours could
 	// copy from, and are not there before the game's list is executed. A
@@ -1122,7 +1136,7 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 
 	if (src_in_shadow) {
 		ShimWriteBuffer(dst, dst_offset, src->shadow.data() + src_offset, size);
-	} else if (dst->resource && (game = game_source(src, &game_offset, &game_bytes))) {
+	} else if (dst->resource && (game = game_source(src, &game_offset, &game_bytes, &game_barrier, &game_barrier_needed))) {
 		// Reading past the end of the game's buffer fails our list's
 		// Close(), and executing that removes the device
 		if (src_offset >= game_bytes)
@@ -1131,8 +1145,15 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 			size = game_bytes - src_offset;
 			whole = false;
 		}
-		if (Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole))
-			Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
+		if (!Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole))
+			return;
+		if (game_barrier_needed)
+			Dx12ShimList()->ResourceBarrier(1, &game_barrier);
+		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
+		if (game_barrier_needed) {
+			std::swap(game_barrier.Transition.StateBefore, game_barrier.Transition.StateAfter);
+			Dx12ShimList()->ResourceBarrier(1, &game_barrier);
+		}
 	} else if (src->resource && dst->resource && src != dst && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
 		   && Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole)) {
 		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, src->resource, src_offset, size);
