@@ -230,7 +230,7 @@ static ID3D12RootSignature* get_root_signature(const RootKey *key, bool input_as
 // -----------------------------------------------------------------------------
 // Descriptors
 
-static void null_srv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
 
@@ -309,7 +309,7 @@ static bool write_srv(const ShimShader *shader, ID3D11ShaderResourceView *srv, U
 	if (view && view->resource->resource)
 		ShimUploadShadow(view->resource);
 	if (!view || !Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
-		null_srv(shader->srv_dimension[slot], handle);
+		Dx12ShimNullSrv(shader->srv_dimension[slot], handle);
 		return !view || !ShimNotReady(view->resource);
 	}
 

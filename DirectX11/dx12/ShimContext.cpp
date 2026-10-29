@@ -110,6 +110,7 @@ void STDMETHODCALLTYPE ShimContext::ClearState()
 				assign(stage.srvs[i + bit], (ID3D11ShaderResourceView*)NULL);
 			}
 		}
+		memset(stage.srv_unbound, 0, sizeof(stage.srv_unbound));
 		for (i = 0; mState->samplers_set && i < SHIM_SAMPLER_SLOTS; i++)
 			assign(stage.samplers[i], (ID3D11SamplerState*)NULL);
 	}
@@ -255,6 +256,7 @@ void ShimContext::UnbindInput(ShimResource *resource)
 					continue;
 				assign(stage.srvs[slot], (ID3D11ShaderResourceView*)NULL);
 				stage.srv_mask[word] &= ~(1u << bit);
+				stage.srv_unbound[word] |= 1u << bit;
 			}
 		}
 	}
@@ -272,10 +274,13 @@ void ShimContext::SetShaderResources(Dx12ShaderStage stage, UINT start, UINT cou
 		if (view && IsOutput(ShimViewOf(view)->resource))
 			view = NULL;
 		assign(state->srvs[start + i], view);
-		if (view)
+		if (view) {
 			state->srv_mask[(start + i) / 32] |= 1u << ((start + i) & 31);
-		else
+			state->srv_unbound[(start + i) / 32] &= ~(1u << ((start + i) & 31));
+		} else {
 			state->srv_mask[(start + i) / 32] &= ~(1u << ((start + i) & 31));
+			state->srv_unbound[(start + i) / 32] |= 1u << ((start + i) & 31);
+		}
 	}
 	mChanged = true;
 }
@@ -288,7 +293,8 @@ void ShimContext::GetShaderResources(Dx12ShaderStage stage, UINT start, UINT cou
 	for (i = 0; i < count; i++) {
 		view = start + i < SHIM_SRV_SLOTS ? mState->stages[stage].srvs[start + i] : NULL;
 		// What a mod has not bound over is still the game's
-		if (!view && start + i < SHIM_SRV_SLOTS && Dx12InDrawScope())
+		if (!view && start + i < SHIM_SRV_SLOTS
+		    && !(mState->stages[stage].srv_unbound[(start + i) / 32] & (1u << ((start + i) & 31))) && Dx12InDrawScope())
 			view = Dx12ScopeShaderResource(stage, start + i);
 		get(view, &views[i]);
 	}
@@ -892,7 +898,7 @@ static HRESULT fetch_readback(ShimResource *resource, UINT byte_width, bool wait
 	void *data;
 
 	if (!resource->readback_pending)
-		return S_OK;
+		return resource->readback_lost ? E_FAIL : S_OK;
 
 	if (!Dx12ShimFenceReached(resource->readback_fence)) {
 		if (!wait)
@@ -901,6 +907,10 @@ static HRESULT fetch_readback(ShimResource *resource, UINT byte_width, bool wait
 	}
 
 	resource->readback_pending = false;
+	if (Dx12ShimSubmissionDiscarded(resource->readback_fence))
+		resource->readback_lost = true;
+	if (resource->readback_lost)
+		return E_FAIL;
 	if (FAILED(resource->readback->Map(0, &range, &data)))
 		return E_FAIL;
 	memcpy(resource->shadow.data(), data, byte_width);
@@ -1035,8 +1045,13 @@ static bool create_readback(ShimResource *resource)
 // frame, to deform its own along, so lags a frame behind; reading them where
 // the game has them would take its dispatch on the game's list. The memory is
 // the game's to hand out again once its list is done, so it is kept until
-// ours is.
-static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset)
+// ours is. available is what the resource has from the offset on, which can be
+// less than the view of it claims: the view of skinned vertices is as large as
+// what a mod had skinned, into a buffer of ours. barrier is to be recorded
+// before the copy where needed, and with its states swapped after it, to leave
+// the buffer in the state the game's lists expect.
+static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset, UINT64 *available,
+		D3D12_RESOURCE_BARRIER *barrier, bool *needed)
 {
 	UINT64 va = src->foreign_va ? src->foreign_va : src->game_va;
 	ID3D12Resource *resource;
@@ -1047,8 +1062,19 @@ static ID3D12Resource* game_source(ShimResource *src, UINT64 *offset)
 	// Never a state a copy can read
 	if (!Dx12GetResourceInfo(resource, &info) || info.heap_type == D3D12_HEAP_TYPE_READBACK)
 		return NULL;
+	*available = *offset < info.desc.Width ? info.desc.Width - *offset : 0;
 	if (!Dx12ShimReadGameResource(resource))
 		return NULL;
+
+	// From the common state D3D12 promotes a buffer by itself. One with no
+	// known state is left without a barrier, as there is no state to give it.
+	*needed = info.state != DX12_STATE_UNKNOWN && info.state && !(info.state & D3D12_RESOURCE_STATE_COPY_SOURCE);
+	*barrier = {};
+	barrier->Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier->Transition.pResource = resource;
+	barrier->Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier->Transition.StateBefore = (D3D12_RESOURCE_STATES)info.state;
+	barrier->Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
 
 	Dx12ShimDeferRelease(resource);
 	return resource;
@@ -1060,8 +1086,9 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	ShimResource *dst = ShimResourceOf(dst11), *src = ShimResourceOf(src11);
 	ShimResourceDesc dst_desc, src_desc;
 	ID3D12Resource *game;
-	UINT64 game_offset;
-	bool src_in_shadow;
+	UINT64 game_offset, game_bytes;
+	D3D12_RESOURCE_BARRIER game_barrier;
+	bool src_in_shadow, whole, game_barrier_needed;
 
 	// The vertices skinned for a mod are in no buffer a list of ours could
 	// copy from, and are not there before the game's list is executed. A
@@ -1074,9 +1101,10 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 	if (src_offset >= src_desc.byte_width || dst_offset >= dst_desc.byte_width)
 		return;
 	size = min(size, min(src_desc.byte_width - src_offset, dst_desc.byte_width - dst_offset));
+	whole = !dst_offset && size == dst_desc.byte_width;
 
 	ShimUploadShadow(src);
-	src_in_shadow = src->cpu_only && !src->readback_pending;
+	src_in_shadow = src->cpu_only && !src->readback_pending && !src->readback_lost;
 	ShimReadShadow(src, src_offset, size);
 	if (src->cpu_only && !src_in_shadow) {
 		// Possible once the GPU is done, but nothing asks for it
@@ -1094,21 +1122,46 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 			VkScopeFinishRefresh(dst);
 			memcpy(dst->shadow.data() + dst_offset, src->shadow.data() + src_offset, (size_t)size);
 			dst->version++;
+			// A copy the GPU has yet to finish would land over this one
+			if (whole) {
+				dst->readback_pending = false;
+				dst->readback_lost = false;
+			}
 		} else if (src->resource && create_readback(dst) && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)) {
 			Dx12ShimList()->CopyBufferRegion(dst->readback, dst_offset, src->resource, src_offset, size);
+			// The fence of a copy not read yet is about to be forgotten
+			if (dst->readback_pending && Dx12ShimSubmissionDiscarded(dst->readback_fence))
+				dst->readback_lost = true;
 			dst->readback_fence = Dx12ShimPendingFence();
 			dst->readback_pending = true;
+			if (whole)
+				dst->readback_lost = false;
 		}
 		return;
 	}
 
 	if (src_in_shadow) {
 		ShimWriteBuffer(dst, dst_offset, src->shadow.data() + src_offset, size);
-	} else if (dst->resource && (game = game_source(src, &game_offset))) {
-		if (Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST))
-			Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
+	} else if (dst->resource && (game = game_source(src, &game_offset, &game_bytes, &game_barrier, &game_barrier_needed))) {
+		// Reading past the end of the game's buffer fails our list's
+		// Close(), and executing that removes the device
+		if (src_offset >= game_bytes)
+			return;
+		if (size > game_bytes - src_offset) {
+			size = game_bytes - src_offset;
+			whole = false;
+		}
+		if (!Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole))
+			return;
+		if (game_barrier_needed)
+			Dx12ShimList()->ResourceBarrier(1, &game_barrier);
+		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
+		if (game_barrier_needed) {
+			std::swap(game_barrier.Transition.StateBefore, game_barrier.Transition.StateAfter);
+			Dx12ShimList()->ResourceBarrier(1, &game_barrier);
+		}
 	} else if (src->resource && dst->resource && src != dst && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
-		   && Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST)) {
+		   && Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole)) {
 		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, src->resource, src_offset, size);
 	}
 }
@@ -1161,7 +1214,7 @@ void STDMETHODCALLTYPE ShimContext::CopyResource(ID3D11Resource *pDstResource, I
 	}
 
 	if (dst == src || !Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
-	    || !Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST))
+	    || !Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, true))
 		return;
 
 	Dx12ShimList()->CopyResource(dst->resource, src->resource);

@@ -30,6 +30,7 @@ static struct {
 
 static SRWLOCK lock = SRWLOCK_INIT;
 static bool tried, loaded;
+static uint64_t identity;
 // By spv_target_env, made when first needed and kept
 static spv_context contexts[SPV_ENV_MAX];
 static spv_validator_options validator_options[SPIRV_LAYOUT_COUNT];
@@ -67,6 +68,12 @@ static bool load()
 	api.spvValidatorOptionsSetScalarBlockLayout(validator_options[SPIRV_LAYOUT_SCALAR], true);
 	api.spvValidatorOptionsSetSkipBlockLayout(validator_options[SPIRV_LAYOUT_SKIP], true);
 
+	WIN32_FILE_ATTRIBUTE_DATA file;
+	if (GetFileAttributesExW(path, GetFileExInfoStandard, &file)) {
+		identity = ((uint64_t)file.ftLastWriteTime.dwHighDateTime << 32 | file.ftLastWriteTime.dwLowDateTime)
+			^ ((uint64_t)file.nFileSizeHigh << 32 | file.nFileSizeLow);
+	}
+
 	LogInfo("Loaded %S\n", path);
 	VkDumpNote("Loaded %S\n", path);
 	loaded = true;
@@ -86,6 +93,16 @@ bool SpirvToolsAvailable()
 	available = load();
 	ReleaseSRWLockExclusive(&lock);
 	return available;
+}
+
+uint64_t SpirvToolsIdentity()
+{
+	uint64_t found;
+
+	AcquireSRWLockExclusive(&lock);
+	found = load() ? identity : 0;
+	ReleaseSRWLockExclusive(&lock);
+	return found;
 }
 
 static spv_context context(spv_target_env env)

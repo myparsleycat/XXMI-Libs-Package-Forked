@@ -32,6 +32,7 @@
 volatile bool dx12_draw_path_active;
 volatile UINT dx12_draw_generation = 1;
 bool dx12_mods_disabled;
+static bool mods_faulted;
 
 // What the engine did with the game's draws since the last report
 static struct {
@@ -55,6 +56,9 @@ static struct {
 	// Draws of mods with shaders of their own: made with those, and made
 	// with the game's for want of a pipeline with them
 	unsigned custom_draws, custom_failed;
+	// Of those made with them, how many with the game's root signature
+	// extended for registers it has nothing for
+	unsigned custom_extended;
 	// Only counted with dx12_dump_hashes, in QueryPerformanceCounter ticks
 	UINT64 wait_ticks, before_ticks, buffer_ticks, draw_ticks, after_ticks;
 } stats;
@@ -332,10 +336,14 @@ static ID3D11Resource* new_game_texture(const Dx12ResourceInfo *info, D3D11_TEXT
 
 // D3D12 does not record everything that went into the hash of a D3D11
 // resource, so there are a few it could have been. The one a mod asks for is
-// the one the game's D3D11 renderer would have produced.
+// the one the game's D3D11 renderer would have produced. Failing that, with
+// match_lower_mip_textures, that of the texture this is a copy of without its
+// top mip levels, which a copy has the data hash of (propagate_hash).
 static uint32_t pick_texture_hash(const Dx12ResourceInfo *info)
 {
+	D3D11_TEXTURE2D_DESC desc, origins[LOWER_MIP_TEXTURE_ORIGINS];
 	uint32_t hash, first = 0;
+	UINT levels, count, o;
 	int rule;
 
 	for (rule = 0; rule < DX12_FORMAT_RULE_COUNT; rule++) {
@@ -344,6 +352,20 @@ static uint32_t pick_texture_hash(const Dx12ResourceInfo *info)
 			return hash;
 		if (!rule)
 			first = hash;
+	}
+
+	if (!G->match_lower_mip_textures || !info->has_data_hash || G->mTextureOverrideMap.empty())
+		return first;
+	for (levels = 1; levels <= LOWER_MIP_TEXTURE_LEVELS; levels++) {
+		for (rule = 0; rule < DX12_FORMAT_RULE_COUNT; rule++) {
+			Dx12TextureDesc(info, (Dx12FormatRule)rule, &desc);
+			count = LowerMipTextureOrigins(&desc, levels, origins);
+			for (o = 0; o < count; o++) {
+				hash = CalcTexture2DDescHash(info->data_hash, &origins[o]);
+				if (G->mTextureOverrideMap.count(hash))
+					return hash;
+			}
+		}
 	}
 	return first;
 }
@@ -670,10 +692,15 @@ struct ReachLookup {
 	VertexReach *reach;
 	// How far it got with the index buffer
 	bool ib_asked, ib_found, ib_hashed;
+	// The list's own copies decided ib_hashed, see Dx12FindListBufferHash
+	bool ib_own;
 	ID3D12Resource *ib;
 	UINT64 ib_offset;
 	Dx12BufferHash ib_upload;
 };
+
+// What the list of the open scope copied to buffers so far, or NULL
+static const Dx12ListBufferWrites* scope_writes();
 
 // What is known about a vertex buffer drawn with the index buffer of the view,
 // or NULL. Sets off finding out if it is not known.
@@ -697,7 +724,7 @@ static const Dx12BufferHash* vertex_reach(ID3D12Resource *vb, UINT64 vb_offset, 
 	lookup->ib_found = true;
 	lookup->ib = key.ib;
 	lookup->ib_offset = key.ib_offset;
-	if (!Dx12FindBufferHash(key.ib, key.ib_offset, &ib_upload))
+	if (!Dx12FindListBufferHash(scope_writes(), key.ib, key.ib_offset, &ib_upload, &lookup->ib_own))
 		return NULL;
 	lookup->ib_hashed = true;
 
@@ -877,7 +904,9 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 
 	reach->state = REACH_FAILED;
 	stats.reaches_failed++;
-	if (reach->in_ring)
+	if (Dx12ShimSubmissionDiscarded(reach->fence))
+		data = NULL;
+	else if (reach->in_ring)
 		data = reach_ring_data + reach->readback_offset;
 	else if (FAILED(reach->readback->Map(0, &range, (void**)&data)))
 		data = NULL;
@@ -1193,6 +1222,14 @@ static bool buffer_cache_stamp(const BufferCacheEntry *cached, UINT64 *stamp)
 	return true;
 }
 
+// What an entry says is not for a list that copied to the buffers it went by:
+// it goes by what was recorded and executed so far by all of them
+static bool list_wrote(const Dx12ListBufferWrites *writes, const BufferCacheEntry *cached)
+{
+	return Dx12ListWroteBuffer(writes, cached->resource, cached->offset, cached->span)
+	    || (cached->ib_asked && cached->ib_found && Dx12ListWroteBuffer(writes, cached->ib, cached->ib_offset, cached->ib_span));
+}
+
 static bool same_buffer_hash(bool found, const Dx12BufferHash *hash, ID3D12Resource *resource, UINT64 offset)
 {
 	Dx12BufferHash now = {};
@@ -1218,16 +1255,17 @@ static volatile LONG64* boring_unhashed_slot(UINT kind, UINT64 bytes, LONG64 *wo
 }
 
 // Without the lock
-static bool unhashed_buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind)
+static bool unhashed_buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64 va, UINT64 bytes, UINT kind)
 {
 	ID3D12Resource *resource;
 	Dx12BufferHash hash;
 	UINT64 offset;
 	LONG64 word;
+	bool own;
 
 	if (*boring_unhashed_slot(kind, bytes, &word) != word)
 		return false;
-	return Dx12FindBuffer(va, &resource, &offset) && !Dx12FindBufferHash(resource, offset, &hash);
+	return Dx12FindBuffer(va, &resource, &offset) && !Dx12FindListBufferHash(writes, resource, offset, &hash, &own);
 }
 
 // Whether the lookups an entry was made from come to the same now. Without
@@ -1291,7 +1329,7 @@ static Published* publish_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 
 	// In this order: the pointers are only good with the generation
 	if (cached && cached->generation == buffer_cache_generation && cached->config == config_generation
-	    && cached->entry->version == cached->entry_version
+	    && cached->entry->version == cached->entry_version && !list_wrote(scope_writes(), cached)
 	    && buffer_cache_stamp(cached, &stamp) && stamp == cached->stamp) {
 		stats.buffers_remembered++;
 		cached->entry->frame = dx12_frame;
@@ -1382,7 +1420,7 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 	Published *entry, before;
 	UINT64 offset, tag;
 	uint32_t hash;
-	bool has_hash;
+	bool has_hash, own, remember;
 	LONG64 word;
 
 	bucket = buffer_cache_slot(&asked, va, bytes, kind, stride, indices, &tag);
@@ -1392,16 +1430,18 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 		stats.lookups_missing++;
 		return NULL;
 	}
-	has_hash = Dx12FindBufferHash(resource, offset, &data);
+	has_hash = Dx12FindListBufferHash(scope_writes(), resource, offset, &data, &own);
 	lookup.settled = true;
 	if (has_hash && indices)
 		reach = vertex_reach(resource, offset, bytes, stride, &data, indices, &lookup);
+	// What the list's own copies decided is not what the others' draws go by
+	remember = lookup.settled && !own && !lookup.ib_own;
 
 	entry = &published[{ resource, offset, kind }];
 	entry->frame = dx12_frame;
 	before = *entry;
 
-	if (lookup.settled) {
+	if (remember) {
 		asked.resource = resource;
 		asked.offset = offset;
 		asked.span = has_hash ? data.bytes : 1;
@@ -1418,7 +1458,7 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 	if (entry->resource && entry->bytes == bytes) {
 		if (entry->has_data_hash == has_hash && entry->data_hash == data.data_hash && entry->config == config_generation
 		    && entry->reach_bytes == (reach ? reach->bytes : 0) && entry->reach_hash == (reach ? reach->data_hash : 0)) {
-			if (lookup.settled) {
+			if (remember) {
 				asked.entry_version = entry->version;
 				remember_buffer(&asked, has_hash, &data, &lookup);
 				if (asked.generation) {
@@ -1445,7 +1485,7 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 					slot->data = asked;
 					InterlockedExchange(&slot->seq, seq + 2);
 				}
-			} else {
+			} else if (!lookup.settled) {
 				stats.lookups_unsettled++;
 			}
 			return entry;
@@ -1730,6 +1770,12 @@ struct Dx12DrawScope {
 	UINT custom_stages;
 	// A mod's shaders could not be given to the draw being applied
 	bool custom_failed;
+	// The game's root signature extended for the registers of those that it
+	// has nothing for, which the pipeline of the draw being applied was
+	// made with: signature NULL if it was made with the game's. And the
+	// extended one set on the list, NULL while the game's is.
+	Dx12ExtendedSignature extension;
+	ID3D12RootSignature *root_signature;
 
 	// What has been changed on the list and is to be put back
 	UINT vbs_changed;
@@ -1757,6 +1803,11 @@ struct Dx12DrawScope {
 };
 
 static Dx12DrawScope *scope;
+
+static const Dx12ListBufferWrites* scope_writes()
+{
+	return scope ? &scope->list->mBufferWrites : NULL;
+}
 
 static void log_once(bool *reported, const char *message)
 {
@@ -2249,6 +2300,26 @@ static void set_root_argument(ID3D12GraphicsCommandList *list, bool compute, D3D
 
 static bool is_sampler_table(const Dx12RootSignatureInfo *signature, size_t parameter);
 static bool prepare_side_tables();
+static void use_root_signature(ID3D12RootSignature *signature);
+
+// Whether a table the game set can be set again as it was: not with no heap
+// of its type set, which D3D12 refuses, nor outside a heap we know, which the
+// game set while another heap was set. A heap that is not ours, which leaves
+// view_heap or sampler_heap NULL, may still be among the game's.
+static bool game_table_settable(const Dx12CmdState *game, bool sampler, UINT64 value)
+{
+	const Dx12DescriptorHeap *heap = sampler ? game->sampler_heap : game->view_heap;
+	D3D12_DESCRIPTOR_HEAP_TYPE type = sampler ? D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER : D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	UINT i;
+
+	if (heap)
+		return value >= heap->mGpuStart && value - heap->mGpuStart < (UINT64)heap->mCount * heap->mIncrement;
+	for (i = 0; i < game->heap_count; i++) {
+		if (game->heaps[i]->GetDesc().Type == type)
+			return true;
+	}
+	return false;
+}
 
 // Puts back what the last draw of a mod changed, for the next one: the side
 // heap stays set, with a table the mod changed set back to the copy of the
@@ -2296,14 +2367,8 @@ static void restore_heaps()
 		const Dx12RootArguments *set = side ? &game->compute : &game->graphics;
 
 		for (i = 0; signature && i < signature->parameters.size() && i < DX12_MAX_ROOT_ARGUMENTS; i++) {
-			const Dx12DescriptorHeap *heap;
-
-			if (signature->parameters[i].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE || !(set->set & (1ull << i)))
-				continue;
-			// One set while the game had another heap set is one it
-			// has no use for any more
-			heap = is_sampler_table(signature, i) ? game->sampler_heap : game->view_heap;
-			if (heap && (set->values[i] < heap->mGpuStart || set->values[i] - heap->mGpuStart >= (UINT64)heap->mCount * heap->mIncrement))
+			if (signature->parameters[i].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE || !(set->set & (1ull << i))
+			    || !game_table_settable(game, is_sampler_table(signature, i), set->values[i]))
 				continue;
 			set_root_argument(list, !!side, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, (UINT)i, set->values[i]);
 		}
@@ -2322,6 +2387,9 @@ static void restore_list()
 	const Dx12CmdState *game = &scope->list->mState;
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
 
+	// First: the tables it sets again are then set again with the game's
+	// heaps by restore_heaps
+	use_root_signature(NULL);
 	if (scope->heaps_changed)
 		restore_heaps();
 
@@ -2425,13 +2493,19 @@ static bool table_size(UINT parameter, UINT *size)
 static ID3D12DescriptorHeap *side_heap;
 static Dx12DescriptorArena side_arena(DX12_HEAP_RESERVE);
 
-static bool side_alloc(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE *cpu, D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+static bool prepare_side_heap()
 {
 	D3D12_DESCRIPTOR_HEAP_DESC desc = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, DX12_HEAP_RESERVE, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE };
-	UINT start, increment = scope->list->mState.view_heap->mIncrement;
+
+	return side_heap || SUCCEEDED(dx12_shim->device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&side_heap)));
+}
+
+static bool side_alloc(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE *cpu, D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+{
+	UINT start, increment = dx12_shim_view_increment;
 	Dx12DescriptorSpan *span;
 
-	if (!side_heap && FAILED(dx12_shim->device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&side_heap))))
+	if (!prepare_side_heap())
 		return false;
 	if (!side_arena.Alloc(count, &start, &span))
 		return false;
@@ -2443,17 +2517,52 @@ static bool side_alloc(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE *cpu, D3D12_GPU_D
 	return true;
 }
 
+// Room for a table of size descriptors for root parameter parameter in the
+// heap the draw reads views from: the reserve of the game's, or the side heap
+// where the game's has none
+static bool table_room(UINT size, UINT parameter, D3D12_CPU_DESCRIPTOR_HANDLE *cpu, D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
+{
+	static bool no_room, no_side_room;
+	Dx12DescriptorHeap *heap = scope->list->mState.view_heap;
+	Dx12DescriptorSpan *span;
+
+	if (!heap || !heap->mReserve && heap->mMirror) {
+		if (!scope->heaps_changed && (scope->side_impossible || !prepare_side_tables()))
+			return false;
+		if (!side_alloc(size, cpu, gpu)) {
+			stats.table_no_room++;
+			log_once(&no_side_room, "Out of descriptors of our own for what mods replace on the game's draws. Some were ignored.");
+			return false;
+		}
+		stats.side_copies++;
+	} else if (!heap->AllocReserved(size, cpu, gpu, &span)) {
+		stats.table_no_room++;
+		if (!no_room) {
+			no_room = true;
+			Dx12DumpNote("*** Out of descriptors for what mods replace on the game's draws. Some were ignored. "
+				"(A table of %u for %s parameter %u of a heap of %u with %u more to spare, of which %u are taken by lists not done with them)\n",
+				size, scope->compute ? "compute" : "graphics", parameter, heap->mCount, heap->mReserve,
+				heap->mArena.mLive);
+		}
+		return false;
+	} else {
+		Dx12ShimPin(scope->list, span);
+		stats.table_copies++;
+	}
+	stats.table_descriptors += size;
+	return true;
+}
+
 // Where to write a descriptor for the register so that the next draw reads
 // it: in a copy of the table the game set, made the first time the table is
 // asked about. NULL if there is no such place.
 static D3D12_CPU_DESCRIPTOR_HANDLE* table_descriptor(const Dx12RegisterLocation *location, D3D12_CPU_DESCRIPTOR_HANDLE *descriptor)
 {
-	static bool no_heap, unbounded, no_room, no_side_room;
+	static bool no_heap, unbounded;
 	const Dx12CmdState *game = &scope->list->mState;
 	const Dx12RootArguments *arguments = scope->compute ? &game->compute : &game->graphics;
 	Dx12DescriptorHeap *heap = game->view_heap;
 	ChangedParameter changed = {};
-	Dx12DescriptorSpan *span;
 	UINT64 base, first;
 	UINT size;
 
@@ -2482,31 +2591,8 @@ static D3D12_CPU_DESCRIPTOR_HANDLE* table_descriptor(const Dx12RegisterLocation 
 		return NULL;
 	size = (UINT)min((UINT64)size, heap->mCount - first);
 
-	if (!heap->mReserve && heap->mMirror) {
-		if (!scope->heaps_changed && (scope->side_impossible || !prepare_side_tables()))
-			return NULL;
-		if (!side_alloc(size, &changed.cpu, &changed.gpu)) {
-			stats.table_no_room++;
-			log_once(&no_side_room, "Out of descriptors of our own for what mods replace on the game's draws. Some were ignored.");
-			return NULL;
-		}
-		stats.side_copies++;
-	} else if (!heap->AllocReserved(size, &changed.cpu, &changed.gpu, &span)) {
-		stats.table_no_room++;
-		if (!no_room) {
-			no_room = true;
-			Dx12DumpNote("*** Out of descriptors for what mods replace on the game's draws. Some were ignored. "
-				"(A table of %u for %s parameter %u of a heap of %u with %u more to spare, of which %u are taken by lists not done with them)\n",
-				size, scope->compute ? "compute" : "graphics", location->parameter, heap->mCount, heap->mReserve,
-				heap->mArena.mLive);
-		}
+	if (!table_room(size, location->parameter, &changed.cpu, &changed.gpu))
 		return NULL;
-	} else {
-		Dx12ShimPin(scope->list, span);
-	}
-	if (heap->mReserve)
-		stats.table_copies++;
-	stats.table_descriptors += size;
 	dx12_shim->device->CopyDescriptorsSimple(size, changed.cpu, heap->MirrorCpuHandle(base), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
 	changed.parameter = location->parameter;
@@ -2541,8 +2627,9 @@ static bool prepare_side_tables()
 	ID3D12DescriptorHeap *heaps[ARRAYSIZE(game->heaps)];
 	UINT sizes[DX12_MAX_ROOT_ARGUMENTS];
 	UINT64 base, first;
-	bool found = false;
-	size_t i, count = 0;
+	// An untracked heap cannot be replaced without its tables.
+	bool found = !heap && game->heap_count == (game->sampler_heap ? 1u : 0u);
+	size_t i, count = 0, heap_count = game->heap_count;
 
 	if (signature)
 		count = min(signature->parameters.size(), (size_t)DX12_MAX_ROOT_ARGUMENTS);
@@ -2553,26 +2640,33 @@ static bool prepare_side_tables()
 		    || is_sampler_table(signature, i))
 			continue;
 		base = arguments->values[i];
-		first = base >= heap->mGpuStart ? (base - heap->mGpuStart) / heap->mIncrement : heap->mCount;
+		first = 0;
+		if (heap)
+			first = base >= heap->mGpuStart ? (base - heap->mGpuStart) / heap->mIncrement : heap->mCount;
 		// A table none of the shaders read has nothing to copy
-		if (!table_size((UINT)i, &sizes[i]) || (sizes[i] && first >= heap->mCount)) {
+		if (!table_size((UINT)i, &sizes[i]) || (sizes[i] && (!heap || first >= heap->mCount))) {
 			if (!no_switch) {
 				Dx12DumpNote("  (%s parameter %zu of %u descriptors is set to %llu descriptors into a heap of %u)\n",
-					scope->compute ? "compute" : "graphics", i, sizes[i], first, heap->mCount);
+					scope->compute ? "compute" : "graphics", i, sizes[i], first, heap ? heap->mCount : 0);
 			}
 			stats.table_unbounded++;
 			break;
 		}
-		sizes[i] = (UINT)min((UINT64)sizes[i], heap->mCount - first);
+		if (heap)
+			sizes[i] = (UINT)min((UINT64)sizes[i], heap->mCount - first);
 	}
 	for (size_t j = 0; j < game->heap_count; j++)
-		found |= game->heaps[j] == heap->mOrig;
+		found |= heap && game->heaps[j] == heap->mOrig;
 	if (i < count || !found) {
 		log_once(&no_switch, "The tables of a draw could not all be copied to a heap of ours for what a mod replaces. Ignored.");
 		scope->side_impossible = true;
 		return false;
 	}
 
+	if (!prepare_side_heap()) {
+		scope->side_impossible = true;
+		return false;
+	}
 	for (i = 0; i < count; i++) {
 		D3D12_CPU_DESCRIPTOR_HANDLE cpu;
 
@@ -2590,15 +2684,11 @@ static bool prepare_side_tables()
 		dx12_shim->device->CopyDescriptorsSimple(sizes[i], cpu, heap->MirrorCpuHandle(arguments->values[i]), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	}
 
-	// After the allocations: side_alloc makes the side heap, which is not
-	// there if no table had anything to copy
-	if (!side_heap) {
-		scope->side_impossible = true;
-		return false;
-	}
 	for (i = 0; i < game->heap_count; i++)
-		heaps[i] = game->heaps[i] == heap->mOrig ? side_heap : game->heaps[i];
-	list->SetDescriptorHeaps(game->heap_count, heaps);
+		heaps[i] = heap && game->heaps[i] == heap->mOrig ? side_heap : game->heaps[i];
+	if (!heap)
+		heaps[heap_count++] = side_heap;
+	list->SetDescriptorHeaps((UINT)heap_count, heaps);
 	scope->heaps_changed = true;
 	stats.side_switches++;
 	// Tables are to be set after the heaps, the sampler ones as they were
@@ -2607,9 +2697,11 @@ static bool prepare_side_tables()
 
 		if (signature->parameters[i].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE || !(arguments->set & (1ull << i)))
 			continue;
-		if (is_sampler_table(signature, i))
+		if (is_sampler_table(signature, i)) {
+			if (!game_table_settable(game, true, arguments->values[i]))
+				continue;
 			value = arguments->values[i];
-		else if (sizes[i])
+		} else if (sizes[i])
 			value = scope->side_base[i].ptr;
 		else
 			// Read by none of the shaders, so anywhere in the heap
@@ -2647,6 +2739,8 @@ static bool grow_side_tables()
 		}
 		if (!size)
 			continue;
+		if (!heap)
+			return false;
 		first = arguments->values[i] >= heap->mGpuStart ? (arguments->values[i] - heap->mGpuStart) / heap->mIncrement : heap->mCount;
 		// Not in the heap that is known, so nothing to copy it from
 		if (first >= heap->mCount)
@@ -2676,6 +2770,45 @@ static void bind_changed_tables()
 	for (const ChangedParameter &table : scope->parameters) {
 		if (table.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
 			set_root_argument(list, scope->compute, table.type, table.parameter, table.gpu.ptr);
+	}
+}
+
+// Sets the graphics root signature, an extended one of the game's or NULL for
+// the game's own, with what the game had set for its parameters: changing the
+// root signature leaves none of them set. Not what a mod changed: called with
+// none changed, or before they are set back. Root constants are not recorded,
+// but no root signature that has any is extended (Dx12ExtendRootSignature).
+static void use_root_signature(ID3D12RootSignature *signature)
+{
+	const Dx12CmdState *game = &scope->list->mState;
+	const Dx12RootArguments *arguments = &game->graphics;
+	const Dx12RootSignatureInfo *info = scope->signature;
+	ID3D12GraphicsCommandList *list = scope->list->mOrig;
+	size_t i;
+
+	if (signature == scope->root_signature)
+		return;
+	list->SetGraphicsRootSignature(signature ? signature : arguments->signature);
+	if (signature)
+		Dx12ShimPin(scope->list, signature);
+	scope->root_signature = signature;
+
+	for (i = 0; i < info->parameters.size() && i < DX12_MAX_ROOT_ARGUMENTS; i++) {
+		D3D12_ROOT_PARAMETER_TYPE type = info->parameters[i].type;
+		UINT64 value = arguments->values[i];
+
+		if (!(arguments->set & (1ull << i)))
+			continue;
+		if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+			bool sampler = is_sampler_table(info, i);
+
+			// As prepare_side_tables and restore_heaps set them
+			if (scope->heaps_changed && !sampler)
+				value = scope->side_size[i] ? scope->side_base[i].ptr : side_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+			else if (!game_table_settable(game, sampler, value))
+				continue;
+		}
+		set_root_argument(list, false, type, (UINT)i, value);
 	}
 }
 
@@ -2758,33 +2891,167 @@ static void apply_shader_resource(Dx12ShaderStage stage, UINT slot, ID3D11Shader
 	dx12_shim->device->CopyDescriptorsSimple(1, descriptor, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
+// The form of the mod's shader of the stage that a pipeline of the game is
+// made with: a pipeline state is all DXBC or all DXIL. NULL for none.
+static const ShimShader* mod_shader_form(const ShimState *mod, Dx12ShaderStage stage)
+{
+	const ShimShader *shader = ShimShaderOf(mod->stages[stage].shader);
+
+	if (!shader || !shader->dxil_form)
+		return shader;
+	for (Dx12ShaderStage game_stage : graphics_stages) {
+		if (scope->pipeline->shaders[game_stage])
+			return scope->pipeline->shaders[game_stage]->dxil ? shader->dxil_form : shader;
+	}
+	return shader;
+}
+
+// A shader of the mod's reads zeros where the mod set none, as under D3D11,
+// and not the game's texture the table has there. Only for those: the game's
+// shaders keep their own textures where a mod sets none.
+static void apply_unbound_shader_resources(const ShimState *mod)
+{
+	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
+	Dx12RegisterLocation location;
+	const ShimShader *shader;
+	UINT word, mask, slot;
+	unsigned long bit;
+
+	for (Dx12ShaderStage stage : graphics_stages) {
+		if (!(scope->custom_stages & 1u << stage))
+			continue;
+		shader = mod_shader_form(mod, stage);
+
+		for (word = 0; word < ARRAYSIZE(mod->stages[stage].srv_unbound); word++) {
+			mask = mod->stages[stage].srv_unbound[word] & (UINT)(shader->srv_used[word / 2] >> (word % 2 * 32));
+			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
+				slot = word * 32 + bit;
+				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
+				    && table_descriptor(&location, &descriptor))
+					Dx12ShimNullSrv(shader->srv_dimension[slot], descriptor);
+			}
+		}
+	}
+}
+
+// What the mod has bound to the slot, as a view of the game's list. False for
+// nothing, or the game's own buffer put back.
+static bool constant_buffer_view(UINT slot, const ShimStageState *bound, D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+{
+	UINT size, first;
+
+	if (!(bound->cb_mask & 1u << slot) || ShimResourceOf(bound->cbs[slot])->foreign)
+		return false;
+	desc->BufferLocation = Dx12ShimGameBufferAddress(bound->cbs[slot], scope->list, &size);
+	first = bound->cb_first[slot] * 16;
+	if (!desc->BufferLocation || first >= size)
+		return false;
+	desc->BufferLocation += first;
+	// Buffers are padded to what a view needs when they are created
+	desc->SizeInBytes = bound->cb_count[slot] ? min((bound->cb_count[slot] * 16 + 255) & ~255u, size - first) : size - first;
+	desc->SizeInBytes &= ~255u;
+	return desc->SizeInBytes != 0;
+}
+
+// The game's own buffer the mod has bound to the slot, as a view of the game's
+// list: only where it is in upload memory (Dx12ScopeConstantBuffer), which is
+// still what the game wrote for its draw
+static bool game_constant_buffer_view(UINT slot, const ShimStageState *bound, D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+{
+	const ShimBuffer *buffer = static_cast<const ShimBuffer*>(bound->cbs[slot]);
+	ID3D12Resource *resource;
+	Dx12ResourceInfo info;
+	UINT64 offset, first, size;
+
+	if (!(bound->cb_mask & 1u << slot) || !buffer->r.foreign || !buffer->r.foreign_va
+	    || !Dx12FindBuffer(buffer->r.foreign_va, &resource, &offset) || !Dx12GetResourceInfo(resource, &info))
+		return false;
+	first = (UINT64)bound->cb_first[slot] * 16;
+	size = min(((UINT64)buffer->mDesc.ByteWidth + 255) & ~255ull, info.desc.Width - offset);
+	if (first >= size)
+		return false;
+	size -= first;
+	if (bound->cb_count[slot])
+		size = min(((UINT64)bound->cb_count[slot] * 16 + 255) & ~255ull, size);
+	desc->BufferLocation = buffer->r.foreign_va + first;
+	desc->SizeInBytes = (UINT)(size & ~255ull);
+	return desc->SizeInBytes != 0;
+}
+
 static void apply_constant_buffer(Dx12ShaderStage stage, UINT slot, const ShimStageState *bound)
 {
 	D3D12_CONSTANT_BUFFER_VIEW_DESC desc;
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
 	Dx12RegisterLocation location;
-	UINT size, first;
 
 	if (ShimResourceOf(bound->cbs[slot])->foreign)
 		return;
 	if (!locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, slot, &location))
 		return;
-
-	desc.BufferLocation = Dx12ShimGameBufferAddress(bound->cbs[slot], scope->list, &size);
-	first = bound->cb_first[slot] * 16;
-	if (!desc.BufferLocation || first >= size)
-		return;
-	desc.BufferLocation += first;
-	// Buffers are padded to what a view needs when they are created
-	desc.SizeInBytes = bound->cb_count[slot] ? min((bound->cb_count[slot] * 16 + 255) & ~255u, size - first) : size - first;
-	desc.SizeInBytes &= ~255u;
-	if (!desc.SizeInBytes)
+	if (!constant_buffer_view(slot, bound, &desc))
 		return;
 
 	if (!location.table)
 		root_descriptor(&location, D3D12_ROOT_PARAMETER_TYPE_CBV, desc.BufferLocation);
 	else if (table_descriptor(&location, &descriptor))
 		dx12_shim->device->CreateConstantBufferView(&desc, descriptor);
+}
+
+static UINT count_bits(UINT64 bits)
+{
+	return popcount((uint32_t)bits) + popcount((uint32_t)(bits >> 32));
+}
+
+// Writes the tables the extended root signature of the draw has for the
+// registers of the mod's shaders the game's has nothing for, in the order of
+// Dx12ExtendedSignature, with what the mod has bound there and null views for
+// the rest. False if there is no room for them.
+static bool write_extra_tables(const ShimState *mod, D3D12_GPU_DESCRIPTOR_HANDLE *tables)
+{
+	const Dx12ExtendedSignature *extension = &scope->extension;
+	D3D12_CONSTANT_BUFFER_VIEW_DESC desc;
+	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+	UINT size, reg;
+
+	for (Dx12ShaderStage stage : graphics_stages) {
+		const ShimStageState *bound = &mod->stages[stage];
+		const ShimShader *shader;
+
+		if (extension->parameters[stage] < 0)
+			continue;
+		shader = mod_shader_form(mod, stage);
+
+		size = count_bits(extension->extra.cbv[stage]) + count_bits(extension->extra.srv[stage][0])
+			+ count_bits(extension->extra.srv[stage][1]);
+		if (!table_room(size, extension->parameters[stage], &cpu, &tables[stage]))
+			return false;
+
+		for (reg = 0; reg < 64; reg++) {
+			if (!(extension->extra.cbv[stage] & 1ull << reg))
+				continue;
+			// The game's binds nothing there for a buffer of its own to be
+			// left in place, as apply_constant_buffer leaves it
+			if (reg < SHIM_CBV_SLOTS && (constant_buffer_view(reg, bound, &desc) || game_constant_buffer_view(reg, bound, &desc)))
+				dx12_shim->device->CreateConstantBufferView(&desc, cpu);
+			else
+				dx12_shim->device->CreateConstantBufferView(NULL, cpu);
+			cpu.ptr += dx12_shim_view_increment;
+		}
+		for (reg = 0; reg < SHIM_SRV_SLOTS; reg++) {
+			const ShimView *view = NULL;
+
+			if (!(extension->extra.srv[stage][reg / 64] & 1ull << reg % 64))
+				continue;
+			if (bound->srv_mask[reg / 32] & 1u << reg % 32)
+				view = ShimViewOf(bound->srvs[reg]);
+			if (view && !view->resource->foreign && view->handle.ptr && Dx12ShimUseOnGameList(view->resource, scope->list))
+				dx12_shim->device->CopyDescriptorsSimple(1, cpu, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			else
+				Dx12ShimNullSrv(shader->srv_dimension[reg], cpu);
+			cpu.ptr += dx12_shim_view_increment;
+		}
+	}
+	return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -3511,6 +3778,46 @@ static bool skin_bind_count(const SkinDispatch *skin, UINT vertices)
 	return true;
 }
 
+// Keeps the buffer the output has if it holds that many bytes of the stride,
+// or makes another. False if none could be made.
+static bool skin_output_buffer(SkinOutput *output, UINT64 bytes, UINT stride)
+{
+	D3D12_RESOURCE_DESC desc = {};
+
+	if (output->buffer && output->bytes >= bytes && output->stride == stride)
+		return true;
+
+	// The lists that use it have it pinned
+	if (output->buffer)
+		output->buffer->Release();
+	if (output->stride != stride) {
+		if (output->spare)
+			output->spare->Release();
+		output->spare = NULL;
+		output->spare_bytes = 0;
+		output->vertices = 0;
+	}
+	output->buffer = NULL;
+	output->bytes = 0;
+	output->list = NULL;
+
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc.Width = bytes;
+	desc.Height = 1;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.SampleDesc.Count = 1;
+	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer))) {
+		output->buffer = NULL;
+		return false;
+	}
+	output->bytes = bytes;
+	output->stride = stride;
+	return true;
+}
+
 // A draw of a mod in the scope of a dispatch that skins: skins that many
 // vertices of what the mod has bound
 static void skin_draw(UINT vertices)
@@ -3521,9 +3828,7 @@ static void skin_draw(UINT vertices)
 	const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 	const SkinDispatch *skin = scope->skin;
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
-	D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
 	D3D12_RESOURCE_BARRIER barrier = {};
-	D3D12_RESOURCE_DESC desc = {};
 	UINT64 bytes = (UINT64)vertices * skin->stride;
 	SkinOutput *output;
 
@@ -3536,53 +3841,27 @@ static void skin_draw(UINT vertices)
 		std::swap(output->bytes, output->spare_bytes);
 		output->list = NULL;
 	}
-	if (!output->buffer || output->bytes < bytes || output->stride != skin->stride) {
-		// The lists that use it have it pinned
-		if (output->buffer)
-			output->buffer->Release();
-		if (output->stride != skin->stride) {
-			if (output->spare)
-				output->spare->Release();
-			output->spare = NULL;
-			output->spare_bytes = 0;
-			output->vertices = 0;
-		}
-		output->buffer = NULL;
-		output->bytes = 0;
-		output->list = NULL;
 
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc.Width = bytes;
-		desc.Height = 1;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-		if (FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-				D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&output->buffer)))) {
-			log_once(&no_buffer, "Unable to create a buffer for the vertices of a mod to be skinned to. Not skinned.");
-			forget_skin_output(skin->output_va);
-			return;
-		}
-		output->bytes = bytes;
-		output->stride = skin->stride;
-	}
-
+	// What the mod has bound goes first: a mod whose buffers the game's
+	// shader cannot be given fails that way every frame, and a buffer made
+	// to skin to would be let go of again every time
 	restore_overrides();
 	if (!skin_bind_mod_buffer(0, 0, skin->stride, vertices))
 		failed = "the mod's vertices";
 	else if (!skin_bind_mod_buffer(1, SKIN_BLEND_SLOT, skin->weight_stride, vertices))
 		failed = "the mod's bone weights";
-	else if (!skin_bind_buffer(0, true, output->buffer, 0, vertices, skin->stride))
-		failed = "the buffer to skin to";
 	else if (!skin_bind_count(skin, vertices))
 		failed = "the number of vertices";
-	if (failed) {
+	else if (!skin_output_buffer(output, bytes, skin->stride))
+		log_once(&no_buffer, "Unable to create a buffer for the vertices of a mod to be skinned to. Not skinned.");
+	else if (!skin_bind_buffer(0, true, output->buffer, 0, vertices, skin->stride))
+		failed = "the buffer to skin to";
+	if (failed || !output->buffer) {
 		const ShimState *mod = dx12_shim->shim_context->mState;
 
-		stats.skin_failed++;
-		if (reported.insert(failed).second) {
+		if (failed)
+			stats.skin_failed++;
+		if (failed && reported.insert(failed).second) {
 			Dx12DumpNote("*** A mod's mesh was not skinned, as the game's shader could not be given %s. (%u vertices where the game "
 				"has %u of %u bytes with weights of %u; the mod's buffers have strides %u and %u at offsets %u and %u)\n",
 				failed, vertices, skin->count, skin->stride, skin->weight_stride, mod->vb_strides[0],
@@ -3735,7 +4014,8 @@ static void finish_skin_dumps()
 
 		data = NULL;
 		file = NULL;
-		if (SUCCEEDED(dump->readback->Map(0, &range, (void**)&data)) && data) {
+		if (!Dx12ShimSubmissionDiscarded(dump->fence)
+		    && SUCCEEDED(dump->readback->Map(0, &range, (void**)&data)) && data) {
 			if (GetModuleFileName(migoto_handle, path, MAX_PATH)) {
 				wcsrchr(path, L'\\')[1] = 0;
 				if (!wcscat_s(path, L"dx12_reach")) {
@@ -4143,18 +4423,74 @@ static void note_custom_shader_failure(UINT stages, const char *why)
 	Dx12DumpNote("%s\n", text);
 }
 
+// The game's root signature extended for the registers of the mod's shaders of
+// the stages that it has nothing for, made once for each set of shaders. NULL
+// if it has something for all of them, or it cannot be extended for them.
+static const Dx12ExtendedSignature* extension_for(const ShimState *mod, UINT stages)
+{
+	static bool too_many;
+	std::vector<Dx12ExtendedSignature> *extended = &scope->signature->extended;
+	Dx12ExtendedSignature entry = {};
+	Dx12RegisterLocation location;
+	bool missing = false;
+	UINT64 key = 0;
+	UINT reg;
+
+	for (Dx12ShaderStage stage : graphics_stages) {
+		if (stages & 1u << stage)
+			key = (key ^ stage) * 0x9e3779b97f4a7c15ull ^ scope->mod_shaders[stage].hash;
+	}
+	for (const Dx12ExtendedSignature &existing : *extended) {
+		if (existing.key == key)
+			return existing.signature ? &existing : NULL;
+	}
+	if (extended->size() >= 64) {
+		log_once(&too_many, "Too many sets of shaders of mods to extend a root signature of the game for. Not extended for more.");
+		return NULL;
+	}
+
+	entry.key = key;
+	for (Dx12ShaderStage stage : graphics_stages) {
+		const ShimShader *shader = stages & 1u << stage ? mod_shader_form(mod, stage) : NULL;
+
+		if (!shader)
+			continue;
+		if (!shader->reflected)
+			goto unextended;
+		for (reg = 0; reg < 64; reg++) {
+			// UAVs are not given a table of their own
+			if (shader->uav_used & 1ull << reg && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, reg, &location))
+				goto unextended;
+			if (reg < 32 && shader->cbv_used & 1u << reg && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, reg, &location))
+				entry.extra.cbv[stage] |= 1ull << reg;
+		}
+		for (reg = 0; reg < 128; reg++) {
+			if (shader->srv_used[reg / 64] & 1ull << reg % 64 && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, reg, &location))
+				entry.extra.srv[stage][reg / 64] |= 1ull << reg % 64;
+		}
+		missing |= entry.extra.cbv[stage] || entry.extra.srv[stage][0] || entry.extra.srv[stage][1];
+	}
+	if (missing)
+		Dx12ExtendRootSignature(scope->signature, dx12_shim->device, &entry);
+unextended:
+	extended->push_back(entry);
+	return extended->back().signature ? &extended->back() : NULL;
+}
+
 // An input layout of a mod is what the engine set that is not the game's, and
 // shaders of a mod are what it set for a draw of its own. On D3D12 either
 // takes the game's pipeline state made again with them, which is set on the
 // list until the next draw wants another or the scope closes. The game's own
-// draw is never made with a mod's shaders.
-static void apply_pipeline(const ShimState *mod, bool mod_draw)
+// draw is never made with a mod's shaders. With extend, a pipeline with those
+// that the game's root signature has nothing for some registers of is made
+// with that extended for them, see scope->extension.
+static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 {
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
+	const Dx12ExtendedSignature *extension = NULL;
 	ID3D12PipelineState *variant = NULL;
 	Dx12PipelineVariantDesc wanted = {};
 	const char *why = NULL;
-	bool game_dxil = false;
 	UINT stages = 0;
 
 	if (scope->game_layout && mod->input_layout && mod->input_layout != scope->game_layout) {
@@ -4171,23 +4507,14 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw)
 		wanted.element_count = (UINT)layout->mElements.size();
 	}
 	if (mod_draw && !scope->compute && !scope->skin) {
-		// A pipeline state is all DXBC or all DXIL
 		for (Dx12ShaderStage stage : graphics_stages) {
-			if (scope->pipeline->shaders[stage]) {
-				game_dxil = scope->pipeline->shaders[stage]->dxil;
-				break;
-			}
-		}
-		for (Dx12ShaderStage stage : graphics_stages) {
-			const ShimShader *shader = ShimShaderOf(mod->stages[stage].shader);
+			const ShimShader *shader = mod_shader_form(mod, stage);
 
 			if (!shader) {
 				if (mod->stages[stage].shader_unbound && scope->pipeline->shaders[stage])
 					wanted.removed_stages |= 1u << stage;
 				continue;
 			}
-			if (game_dxil && shader->dxil_form)
-				shader = shader->dxil_form;
 			shader_info_of_mod(shader, &scope->mod_shaders[stage]);
 			wanted.shaders[stage] = &scope->mod_shaders[stage];
 			stages |= 1u << stage;
@@ -4219,8 +4546,17 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw)
 		}
 	}
 
+	if (stages && extend && scope->signature)
+		extension = extension_for(mod, stages);
+	if (extension)
+		wanted.root_signature = extension->signature;
+
 	if (wanted.elements || stages || wanted.removed_stages)
 		variant = Dx12PipelineVariant(scope->pipeline, dx12_shim->device, &wanted, &why);
+	if (variant && extension)
+		scope->extension = *extension;
+	else
+		scope->extension.signature = NULL;
 
 	for (Dx12ShaderStage stage : graphics_stages) {
 		if (variant && (wanted.removed_stages & 1u << stage))
@@ -4231,6 +4567,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw)
 	scope->custom_stages = variant ? stages : 0;
 	if (stages && variant) {
 		stats.custom_draws++;
+		stats.custom_extended += scope->extension.signature != NULL;
 	} else if (stages || wanted.removed_stages && !variant) {
 		stats.custom_failed++;
 		scope->custom_failed = true;
@@ -4259,6 +4596,7 @@ static void apply_overrides(bool mod_draw)
 	const Dx12ShaderStage *stages = scope->compute ? compute_stages : graphics_stages;
 	size_t stage_count = scope->compute ? ARRAYSIZE(compute_stages) : ARRAYSIZE(graphics_stages);
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
+	D3D12_GPU_DESCRIPTOR_HANDLE extra_tables[DX12_STAGE_COUNT];
 	D3D12_VERTEX_BUFFER_VIEW vb;
 	D3D12_INDEX_BUFFER_VIEW ib;
 	SkinOutput *first_output = NULL;
@@ -4269,7 +4607,15 @@ static void apply_overrides(bool mod_draw)
 	restore_overrides();
 	// Before the bindings, which go by the shaders of the draw
 	scope->custom_failed = false;
-	apply_pipeline(mod, mod_draw);
+	apply_pipeline(mod, mod_draw, true);
+	if (scope->extension.signature && !write_extra_tables(mod, extra_tables)) {
+		static bool no_room;
+
+		log_once(&no_room, "No room for the descriptors of registers of a mod's shaders the game's root signature has nothing for. The draw was made with the game's shaders.");
+		stats.custom_draws--;
+		stats.custom_extended--;
+		apply_pipeline(mod, mod_draw, false);
+	}
 	// With the game's heaps and tables the draw reads all it would have,
 	// but for what a mod binds through a table
 	if (scope->heaps_changed && !grow_side_tables()) {
@@ -4278,6 +4624,17 @@ static void apply_overrides(bool mod_draw)
 		log_once(&no_growth, "The tables of a draw could not be copied again to a heap of ours for shaders that read further. What a mod replaces in them was ignored.");
 		restore_heaps();
 		scope->side_impossible = true;
+		// Those are in the side heap as well
+		if (scope->extension.signature) {
+			stats.custom_draws--;
+			stats.custom_extended--;
+			apply_pipeline(mod, mod_draw, false);
+		}
+	}
+	use_root_signature(scope->extension.signature);
+	for (Dx12ShaderStage stage : graphics_stages) {
+		if (scope->extension.signature && scope->extension.parameters[stage] >= 0)
+			list->SetGraphicsRootDescriptorTable(scope->extension.parameters[stage], extra_tables[stage]);
 	}
 
 	for (i = 0; i < stage_count; i++) {
@@ -4290,6 +4647,8 @@ static void apply_overrides(bool mod_draw)
 		for (mask = bound->cb_mask; _BitScanForward(&bit, mask); mask &= mask - 1)
 			apply_constant_buffer(stages[i], bit, bound);
 	}
+	if (scope->custom_stages)
+		apply_unbound_shader_resources(mod);
 	bind_changed_tables();
 
 	if (scope->compute)
@@ -4585,6 +4944,8 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	memcpy(opened->shaders, pipeline->shaders, sizeof(opened->shaders));
 	opened->custom_stages = 0;
 	opened->custom_failed = false;
+	opened->extension.signature = NULL;
+	opened->root_signature = NULL;
 	opened->vbs_changed = 0;
 	opened->ib_changed = false;
 	opened->topology_changed = false;
@@ -4946,8 +5307,8 @@ static void add_draw_stamps(DrawStamps *stamps, const BufferCacheEntry *cached, 
 	stamps->total += stamp;
 }
 
-static SlowReason buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind, UINT stride, const D3D12_INDEX_BUFFER_VIEW *indices,
-		DrawStamps *stamps = NULL)
+static SlowReason buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64 va, UINT64 bytes, UINT kind, UINT stride,
+		const D3D12_INDEX_BUFFER_VIEW *indices, DrawStamps *stamps = NULL)
 {
 	BufferCacheEntry asked = {}, cached;
 	UINT64 stamp, tag;
@@ -4971,6 +5332,8 @@ static SlowReason buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind, UINT stri
 		// away does not change what the buffer is.
 		if (!cached.generation || cached.config != config_generation)
 			break;
+		if (list_wrote(writes, &cached))
+			return unhashed_buffer_is_boring(writes, va, bytes, kind) ? SLOW_NOT : SLOW_VB_CHANGED;
 		if (!cached.boring)
 			return SLOW_VB_WANTED;
 		if (!buffer_cache_stamp(&cached, &stamp))
@@ -5001,7 +5364,7 @@ static SlowReason buffer_is_boring(UINT64 va, UINT64 bytes, UINT kind, UINT stri
 	}
 	if (stamps)
 		stamps->whole = false;
-	return unhashed_buffer_is_boring(va, bytes, kind) ? SLOW_NOT : SLOW_VB_UNKNOWN;
+	return unhashed_buffer_is_boring(writes, va, bytes, kind) ? SLOW_NOT : SLOW_VB_UNKNOWN;
 }
 
 // The buffers of a draw all at once: most draws of a frame are of meshes drawn
@@ -5209,18 +5572,23 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 		memo_key.vb_slots |= 1u << slot;
 		memo_buffers++;
 	}
+	// The memo is of the buffers as all lists left them, which the list's
+	// own copies may not have
+	if (!list->mBufferWrites.recorded.empty())
+		stamps.whole = false;
 	if (!stamps.whole || !draw_memo_holds(&memo_key)) {
 		for (vbs = worked_out.vbs & pipeline->vb_slots; _BitScanForward(&slot, vbs); vbs &= vbs - 1) {
 			if (slot >= ARRAYSIZE(game->vertex_buffers) || !game->vertex_buffers[slot].BufferLocation)
 				continue;
-			reason = buffer_is_boring(game->vertex_buffers[slot].BufferLocation, game->vertex_buffers[slot].SizeInBytes,
-					PUBLISHED_VERTEX_BUFFER, game->vertex_buffers[slot].StrideInBytes, &game->index_buffer, &stamps);
+			reason = buffer_is_boring(&list->mBufferWrites, game->vertex_buffers[slot].BufferLocation,
+					game->vertex_buffers[slot].SizeInBytes, PUBLISHED_VERTEX_BUFFER, game->vertex_buffers[slot].StrideInBytes,
+					&game->index_buffer, &stamps);
 			if (reason != SLOW_NOT)
 				return reason;
 		}
 		if (worked_out.ib && game->index_buffer.BufferLocation
-		    && buffer_is_boring(game->index_buffer.BufferLocation, game->index_buffer.SizeInBytes, PUBLISHED_INDEX_BUFFER, 0, NULL,
-				&stamps) != SLOW_NOT)
+		    && buffer_is_boring(&list->mBufferWrites, game->index_buffer.BufferLocation, game->index_buffer.SizeInBytes,
+				PUBLISHED_INDEX_BUFFER, 0, NULL, &stamps) != SLOW_NOT)
 			return SLOW_IB;
 		if (stamps.whole)
 			remember_draw(&memo_key, &stamps);
@@ -5262,7 +5630,7 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 // skins to. The scope of such a dispatch answers for vertex buffer slots 0 and
 // SKIN_BLEND_SLOT, no index buffer and the constant buffers of the compute
 // shader, see the Dx12Scope functions.
-static SlowReason skin_is_boring(const Dx12PipelineInfo *pipeline, const SkinDispatch *skin)
+static SlowReason skin_is_boring(Dx12GraphicsCommandList *list, const Dx12PipelineInfo *pipeline, const SkinDispatch *skin)
 {
 	Dx12DrawFilter worked_out;
 	SlowReason reason;
@@ -5287,13 +5655,14 @@ static SlowReason skin_is_boring(const Dx12PipelineInfo *pipeline, const SkinDis
 		return reason;
 
 	if (worked_out.vbs & 1) {
-		reason = buffer_is_boring(skin->source_va, (UINT64)skin->count * skin->stride, PUBLISHED_SKIN_BUFFER, skin->stride, NULL);
+		reason = buffer_is_boring(&list->mBufferWrites, skin->source_va, (UINT64)skin->count * skin->stride, PUBLISHED_SKIN_BUFFER,
+				skin->stride, NULL);
 		if (reason != SLOW_NOT)
 			return reason;
 	}
 	if (worked_out.vbs & 1u << SKIN_BLEND_SLOT) {
-		reason = buffer_is_boring(skin->weights_va, (UINT64)skin->count * skin->weight_stride, PUBLISHED_SKIN_BUFFER,
-				skin->weight_stride, NULL);
+		reason = buffer_is_boring(&list->mBufferWrites, skin->weights_va, (UINT64)skin->count * skin->weight_stride,
+				PUBLISHED_SKIN_BUFFER, skin->weight_stride, NULL);
 		if (reason != SLOW_NOT)
 			return reason;
 	}
@@ -5567,7 +5936,7 @@ bool Dx12Dispatch(Dx12GraphicsCommandList *list, UINT x, UINT y, UINT z)
 			unconfirmed = true;
 		}
 		if (skinning)
-			reason = skin_is_boring(pipeline, &skin);
+			reason = skin_is_boring(list, pipeline, &skin);
 	}
 	if (skinning) {
 		if (reason == SLOW_NOT) {
@@ -5658,8 +6027,26 @@ bool Dx12Dispatch(Dx12GraphicsCommandList *list, UINT x, UINT y, UINT z)
 
 void Dx12ToggleMods()
 {
+	if (mods_faulted) {
+		Dx12LogInfo("disable_dx12_mods pressed - mods stay off: a command list of theirs failed to close\n");
+		return;
+	}
 	dx12_mods_disabled = !dx12_mods_disabled;
 	Dx12LogInfo("disable_dx12_mods pressed - mods %s\n", dx12_mods_disabled ? "disabled" : "enabled");
+}
+
+void Dx12ModsFaulted(HRESULT hr)
+{
+	if (mods_faulted)
+		return;
+	mods_faulted = true;
+	dx12_mods_disabled = true;
+	dx12_draw_path_active = false;
+
+	Dx12DumpNote("*** Frame %u: a command list of the mods failed to close (0x%x) and was not executed. "
+		"Mods are off until the game restarts.\n", dx12_frame, hr);
+	LogOverlay(LOG_WARNING, "Mods are off until the game restarts: a command list of the mods failed to close (0x%x). "
+		"Details are in the log.\n", hr);
 }
 
 void Dx12DumpMarkedShader(UINT64 hash, const char *type)
@@ -5872,8 +6259,8 @@ void Dx12DrawPathFramePresented()
 			stats.table_descriptors, stats.side_switches, stats.table_unbounded, stats.table_no_room);
 		Dx12DumpNote("  Buffers of the game that mods write: %u have one of ours standing in, which %u vertex buffers of mod draws were swapped for\n",
 			dx12_standins_live, stats.written_swapped);
-		Dx12DumpNote("  Mod draws with shaders of their own: %u made with them, %u with the game's for want of a pipeline with them\n",
-			stats.custom_draws, stats.custom_failed);
+		Dx12DumpNote("  Mod draws with shaders of their own: %u made with them, %u of those with the game's root signature extended for them, %u with the game's for want of a pipeline with them\n",
+			stats.custom_draws, stats.custom_extended, stats.custom_failed);
 		if (stats.republished) {
 			Dx12DumpNote("  Buffers a mod matches were worked out again %u times, %u of them without a line for being too many\n",
 				stats.republished, stats.republished_unnoted);

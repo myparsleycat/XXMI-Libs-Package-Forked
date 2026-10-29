@@ -11,6 +11,9 @@
 
 bool SpirvToolsAvailable();
 
+// Of the file of the DLL, its size and time: 0 if it is not there
+uint64_t SpirvToolsIdentity();
+
 // friendly: types and constants by names like %float rather than numbers
 bool SpirvDisassemble(const uint32_t *code, size_t words, bool friendly, std::string *text, std::string *error);
 

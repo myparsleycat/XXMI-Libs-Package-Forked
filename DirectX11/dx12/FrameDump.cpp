@@ -367,7 +367,7 @@ static void write_batch(std::vector<TextureCopy> *batch, const wchar_t *director
 	fence = Dx12ShimPendingFence();
 	Dx12ShimSubmitAndWait();
 	// Which gives up after a while
-	done = Dx12ShimFenceReached(fence);
+	done = Dx12ShimFenceReached(fence) && !Dx12ShimSubmissionDiscarded(fence);
 
 	for (TextureCopy &copy : *batch) {
 		const DumpedTexture *texture = &textures[copy.texture];

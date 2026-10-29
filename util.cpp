@@ -588,11 +588,54 @@ static DWORD WINAPI crash_handler_switch_to_window(_In_ LPVOID lpParameter)
 	return 0;
 }
 
-static LONG WINAPI migoto_exception_filter(_In_ struct _EXCEPTION_POINTERS *ExceptionInfo)
+static SRWLOCK minidump_lock = SRWLOCK_INIT;
+static volatile DWORD minidump_thread;
+
+void write_minidump(struct _EXCEPTION_POINTERS *ExceptionInfo)
 {
 	wchar_t path[MAX_PATH];
 	tm timestruct;
 	time_t ltime;
+
+	// DbgHelp is single threaded, and the crash filter and the D3D12 stall
+	// watchdog can get here at once. A crash in the middle of writing one
+	// on this thread gets none, as the lock does not recurse.
+	if (minidump_thread == GetCurrentThreadId())
+		return;
+	AcquireSRWLockExclusive(&minidump_lock);
+	minidump_thread = GetCurrentThreadId();
+
+	ltime = time(NULL);
+	localtime_s(&timestruct, &ltime);
+	wcsftime(path, MAX_PATH, L"3DM-%Y%m%d%H%M%S.dmp", &timestruct);
+
+	auto fp = CreateFile(path, GENERIC_WRITE, FILE_SHARE_READ,
+			0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (fp != INVALID_HANDLE_VALUE) {
+		LogInfo("Writing minidump to %S...\n", path);
+
+		MINIDUMP_EXCEPTION_INFORMATION dump_info =
+			{ GetCurrentThreadId(), ExceptionInfo, FALSE };
+
+		if (MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
+				fp, MiniDumpWithHandleData, ExceptionInfo ? &dump_info : NULL, NULL, NULL))
+			LogInfo("Succeeded\n");
+		else
+			LogInfo("Failed :(\n");
+
+		CloseHandle(fp);
+	} else
+		LogInfo("Error creating minidump file \"%S\": %d\n", path, GetLastError());
+
+	if (LogFile)
+		fflush(LogFile);
+
+	minidump_thread = 0;
+	ReleaseSRWLockExclusive(&minidump_lock);
+}
+
+static LONG WINAPI migoto_exception_filter(_In_ struct _EXCEPTION_POINTERS *ExceptionInfo)
+{
 	LONG ret = EXCEPTION_CONTINUE_EXECUTION;
 
 	// SOS
@@ -635,34 +678,11 @@ static LONG WINAPI migoto_exception_filter(_In_ struct _EXCEPTION_POINTERS *Exce
 	// this could fail - if we really want a robust crash handler we could
 	// bring in something like breakpad
 
-	ltime = time(NULL);
-	localtime_s(&timestruct, &ltime);
-	wcsftime(path, MAX_PATH, L"3DM-%Y%m%d%H%M%S.dmp", &timestruct);
-
 	// If multiple threads crash only allow one to write the crash dump and
 	// the rest stop here:
 	EnterCriticalSectionPretty(&crash_handler_lock);
 
-	auto fp = CreateFile(path, GENERIC_WRITE, FILE_SHARE_READ,
-			0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (fp != INVALID_HANDLE_VALUE) {
-		LogInfo("Writing minidump to %S...\n", path);
-
-		MINIDUMP_EXCEPTION_INFORMATION dump_info =
-			{ GetCurrentThreadId(), ExceptionInfo, FALSE };
-
-		if (MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
-				fp, MiniDumpWithHandleData, &dump_info, NULL, NULL))
-			LogInfo("Succeeded\n");
-		else
-			LogInfo("Failed :(\n");
-
-		CloseHandle(fp);
-	} else
-		LogInfo("Error creating minidump file \"%S\": %d\n", path, GetLastError());
-
-	if (LogFile)
-		fflush(LogFile);
+	write_minidump(ExceptionInfo);
 
 	// If crash is set to 2 instead of continuing we will stop and start
 	// responding to various key bindings, sounding a reminder tone every

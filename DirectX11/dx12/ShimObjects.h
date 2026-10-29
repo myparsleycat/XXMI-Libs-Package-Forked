@@ -193,6 +193,9 @@ struct ShimResource {
 	ID3D12Resource *readback;
 	UINT64 readback_fence;
 	bool readback_pending;
+	// A copy into it was in a submission that failed to close: until a
+	// copy fills all of it again, what it holds is not what was copied
+	bool readback_lost = false;
 
 	// Not 0 for a vertex buffer that stands for vertices DrawPath had
 	// skinned for a mod, which are in a buffer only it knows: the buffer
@@ -205,8 +208,15 @@ struct ShimResource {
 	std::vector<ShimView*> views;
 	// The D3D12 resources the game's lists were left with by
 	// ShimRenameResource, kept for the next renaming once those lists
-	// are done with them. Referenced.
-	std::vector<ID3D12Resource*> spares;
+	// are done with them, oldest first, with when each was left
+	// (GetTickCount64). Referenced. spare_index is where the resource is
+	// among those that have spares, see ShimTrimSpares.
+	struct Spare {
+		ID3D12Resource *resource;
+		ULONGLONG stashed;
+	};
+	std::vector<Spare> spares;
+	size_t spare_index;
 };
 
 // Not to be used for now, though it may be later: evicted and not made

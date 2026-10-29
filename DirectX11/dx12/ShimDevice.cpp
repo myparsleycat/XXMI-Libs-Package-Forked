@@ -298,69 +298,127 @@ static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC
 	return S_OK;
 }
 
-// A resource written once for each of the draws of a frame that use it goes
-// through as many D3D12 resources a frame, which the lists of the last frames
-// still hold, so a few more than that are kept before any is let go
-const size_t SPARES_KEPT = 16;
+// A resource written for each of the draws of a frame that use it goes
+// through as many D3D12 resources a frame, which the lists of the last two or
+// three frames hold until the GPU is done with them. All of those are kept,
+// as letting go of one the lists still hold frees no memory, and a spare is
+// only let go of once no list has used it for SPARE_IDLE_MS. SPARES_MAX only
+// bounds the search for one the lists are done with, for lists that are
+// never done (stranded pins).
+const ULONGLONG SPARE_IDLE_MS = 1000;
+const size_t SPARES_MAX = 256;
+
+// The resources with spares, for ShimTrimSpares
+static std::vector<ShimResource*> spare_holders;
 
 // After resource->spares changed by one
 static void count_spares(ShimResource *resource, int sign)
 {
 	InterlockedAdd64(&dx12_memory.spare_bytes, (LONG64)resource->allocated * sign);
 	InterlockedAdd(&dx12_memory.spares, sign);
-	if (resource->spares.size() == (sign > 0 ? 1 : 0))
-		InterlockedAdd(&dx12_memory.renamed, sign);
+	if (resource->spares.size() != (sign > 0 ? 1 : 0))
+		return;
+	InterlockedAdd(&dx12_memory.renamed, sign);
+	if (sign > 0) {
+		resource->spare_index = spare_holders.size();
+		spare_holders.push_back(resource);
+	} else {
+		spare_holders.back()->spare_index = resource->spare_index;
+		spare_holders[resource->spare_index] = spare_holders.back();
+		spare_holders.pop_back();
+	}
 }
 
-bool ShimRenameResource(ShimResource *resource)
+static bool spare_unused(ID3D12Resource *spare)
+{
+	spare->AddRef();
+	return spare->Release() == 1;
+}
+
+// Our list may still read it, as the source of the copy that renamed it
+static void release_spare(ID3D12Resource *spare)
+{
+	Dx12ShimDeferRelease(spare);
+	spare->Release();
+}
+
+void ShimTrimSpares()
+{
+	ULONGLONG idle_since = GetTickCount64() - SPARE_IDLE_MS;
+
+	// Backwards, as a resource that has none left takes the place of the
+	// last in spare_holders
+	for (size_t h = spare_holders.size(); h-- > 0;) {
+		ShimResource *resource = spare_holders[h];
+
+		for (size_t i = resource->spares.size(); i-- > 0;) {
+			if (resource->spares[i].stashed > idle_since || !spare_unused(resource->spares[i].resource))
+				continue;
+			release_spare(resource->spares[i].resource);
+			resource->spares.erase(resource->spares.begin() + i);
+			count_spares(resource, -1);
+		}
+	}
+}
+
+void ShimForgetSpares(ShimResource *resource)
+{
+	if (resource->spares.empty())
+		return;
+	for (ShimResource::Spare &spare : resource->spares)
+		release_spare(spare.resource);
+	resource->spares.clear();
+	spare_holders.back()->spare_index = resource->spare_index;
+	spare_holders[resource->spare_index] = spare_holders.back();
+	spare_holders.pop_back();
+}
+
+bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 {
 	static bool failed;
 	ID3D12Resource *old = resource->resource, *fresh = NULL;
-	D3D12_HEAP_PROPERTIES heap = {};
 	D3D12_RESOURCE_BARRIER barrier = {};
 	size_t i;
 	Profiling::Spike::Scope spike(Profiling::Spike::DX12_RENAME, L"bytes or texels wide", resource->desc.Width);
 
 	// One the lists are done with comes before a new one
 	for (i = 0; i < resource->spares.size(); i++) {
-		resource->spares[i]->AddRef();
-		if (resource->spares[i]->Release() != 1)
+		if (!spare_unused(resource->spares[i].resource))
 			continue;
-		fresh = resource->spares[i];
+		fresh = resource->spares[i].resource;
 		resource->spares.erase(resource->spares.begin() + i);
 		count_spares(resource, -1);
 		break;
 	}
-	if (!fresh) {
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		if (FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resource->desc,
-				D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&fresh)))) {
-			if (!failed)
-				Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it. The lists see the write.\n");
-			failed = true;
-			return false;
-		}
+	if (!fresh && FAILED(Dx12ShimCreateResource(&resource->desc, &fresh))) {
+		if (!failed)
+			Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it. The lists see the write.\n");
+		failed = true;
+		return false;
 	}
 
 	// The fresh resource is in the common state, from where the copy
 	// promotes it. The old one is left in the common state as well, as
 	// the lists that use it expect.
-	Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
-	Dx12ShimList()->CopyResource(fresh, old);
-	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = old;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	barrier.Transition.StateBefore = resource->state;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-	Dx12ShimList()->ResourceBarrier(1, &barrier);
+	if (keep_contents) {
+		Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Dx12ShimList()->CopyResource(fresh, old);
+	}
+	if (resource->state != D3D12_RESOURCE_STATE_COMMON) {
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition.pResource = old;
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barrier.Transition.StateBefore = resource->state;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		Dx12ShimList()->ResourceBarrier(1, &barrier);
+	}
 
 	resource->resource = fresh;
-	resource->state = D3D12_RESOURCE_STATE_COPY_DEST;
-	resource->spares.push_back(old);
+	resource->state = keep_contents ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON;
+	resource->spares.push_back({ old, GetTickCount64() });
 	count_spares(resource, 1);
-	if (resource->spares.size() > SPARES_KEPT) {
-		Dx12ShimDeferRelease(resource->spares.front());
-		resource->spares.front()->Release();
+	if (resource->spares.size() > SPARES_MAX) {
+		release_spare(resource->spares.front().resource);
 		resource->spares.erase(resource->spares.begin());
 		count_spares(resource, -1);
 	}

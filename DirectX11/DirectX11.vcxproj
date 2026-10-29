@@ -67,6 +67,7 @@
     <ClCompile Include="dx12\Dx12Device.cpp" />
     <ClCompile Include="dx12\Dx12SwapChain.cpp" />
     <ClCompile Include="dx12\Bridge.cpp" />
+    <ClCompile Include="dx12\DeviceRemoved.cpp" />
     <ClCompile Include="dx12\DrawPath.cpp" />
     <ClCompile Include="dx12\Dxc.cpp" />
     <ClCompile Include="dx12\DxilMetadata.cpp" />
@@ -78,6 +79,7 @@
     <ClCompile Include="vk\Spirv.cpp" />
     <ClCompile Include="vk\SpirvConvert.cpp" />
     <ClCompile Include="vk\SpirvPatch.cpp" />
+    <ClCompile Include="vk\SpirvPatchCache.cpp" />
     <ClCompile Include="vk\SpirvTools.cpp" />
     <ClCompile Include="vk\VkDrawPath.cpp" />
     <ClCompile Include="vk\VkDump.cpp" />
@@ -134,6 +136,7 @@
     <ClInclude Include="dx12\Dx12Device.h" />
     <ClInclude Include="dx12\Dx12SwapChain.h" />
     <ClInclude Include="dx12\Bridge.h" />
+    <ClInclude Include="dx12\DeviceRemoved.h" />
     <ClInclude Include="dx12\DrawPath.h" />
     <ClInclude Include="dx12\Dxc.h" />
     <ClInclude Include="dx12\DxilMetadata.h" />
@@ -145,6 +148,7 @@
     <ClInclude Include="vk\Spirv.h" />
     <ClInclude Include="vk\SpirvConvert.h" />
     <ClInclude Include="vk\SpirvPatch.h" />
+    <ClInclude Include="vk\SpirvPatchCache.h" />
     <ClInclude Include="vk\SpirvTools.h" />
     <ClInclude Include="vk\VkCommon.h" />
     <ClInclude Include="vk\VkDrawPath.h" />

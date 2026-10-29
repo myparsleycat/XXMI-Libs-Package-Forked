@@ -1769,14 +1769,45 @@ public:
 	bool optimise(HackerDevice *device, std::shared_ptr<CommandListEvaluatable> *replacement) override;
 };
 
+// One step of an expression evaluated as a stack machine, see
+// CommandListExpression::compile()
+struct ExpressionStep {
+	enum class Kind : uint8_t {
+		VALUE,
+		VARIABLE,
+		CALL,
+		UNARY,
+		BINARY,
+	};
+
+	Kind kind;
+	// For UNARY and BINARY, which operator, where it is one that
+	// evaluate() applies without a virtual call, else 0
+	uint8_t fast_op;
+	float value;
+	union {
+		const float *variable;
+		CommandListEvaluatable *evaluatable;
+		CommandListOperator *op;
+	};
+};
+
 class CommandListExpression {
 public:
 	std::shared_ptr<CommandListEvaluatable> evaluatable;
+	// The tree of evaluatable in the order it is evaluated, kept in one
+	// block: walking the nodes of the tree took a cache miss each. Empty
+	// where the tree is evaluated as it is. Points into the tree, which
+	// evaluatable keeps.
+	std::vector<ExpressionStep> steps;
 
 	bool parse(const wstring *expression, const wstring *ini_namespace, CommandListScope *scope);
 	float evaluate(CommandListState *state, HackerDevice *device=NULL);
 	bool static_evaluate(float *ret, HackerDevice *device=NULL, bool evaluate_variables=false);
 	bool optimise(HackerDevice *device);
+
+private:
+	void compile();
 };
 
 class AssignmentCommand : public CommandListCommand {

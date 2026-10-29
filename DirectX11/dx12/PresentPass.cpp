@@ -4,6 +4,7 @@
 
 #include "../ResourceLoading.h"
 #include "Bridge.h"
+#include "DeviceRemoved.h"
 #include "DrawPath.h"
 #include "Dx12CommandQueue.h"
 #include "Dx12Device.h"
@@ -289,6 +290,7 @@ static void frame_actions()
 		ReloadConfig(device);
 		Dx12DrawPathConfigReloaded();
 		VkModsConfigReloaded();
+		Dx12WatchDevice(dx12_shim->device);
 	}
 
 	if (G->gConfigInitialized) {
@@ -301,6 +303,7 @@ static void frame_actions()
 		ReloadConfig(device);
 		Dx12DrawPathConfigReloaded();
 		VkModsConfigReloaded();
+		Dx12WatchDevice(dx12_shim->device);
 	}
 
 	if (!G->suppress_overlay)

@@ -19,6 +19,10 @@ struct ShimStageState {
 	// through the few that do
 	UINT cb_mask;
 	UINT srv_mask[(SHIM_SRV_SLOTS + 31) / 32];
+	// A bit per slot of srvs a mod set none at, as with a resource whose
+	// file is missing, which D3D11 reads as zeros: not the same as nothing
+	// set there for the game's being kept
+	UINT srv_unbound[(SHIM_SRV_SLOTS + 31) / 32];
 };
 
 struct ShimState {
@@ -71,3 +75,6 @@ bool Dx12ShimPrepareDispatch(const ShimState *state);
 void Dx12ShimForgetPipelines(UINT64 id);
 
 D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimDefaultSampler();
+
+// A view of nothing, of the dimension a shader declares (ShimShader::srv_dimension)
+void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle);

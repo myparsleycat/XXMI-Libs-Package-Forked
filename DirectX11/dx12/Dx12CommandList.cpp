@@ -128,7 +128,9 @@ HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Close()
 	mDraws = mDispatches = 0;
 	Dx12FlushFastDraws(this);
 
-	return mOrig->Close();
+	HRESULT hr = mOrig->Close();
+	Dx12LogCloseFailure(mOrig, hr);
+	return hr;
 }
 
 void Dx12GraphicsCommandList::ForgetInfo()
@@ -151,6 +153,7 @@ HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Reset(ID3D12CommandAllocator 
 	Dx12ResetCmdState(&mState, pInitialState);
 	ForgetInfo();
 	mTransitions.clear();
+	mBufferWrites.clear();
 	if (!mPins.empty())
 		Dx12ShimPinsAbandoned(&mPins, mExecuted);
 	memset(mPinned, 0, sizeof(mPinned));
@@ -571,13 +574,14 @@ void STDMETHODCALLTYPE Dx12GraphicsCommandList::CopyTextureRegion(const D3D12_TE
 
 void STDMETHODCALLTYPE Dx12GraphicsCommandList::CopyResource(ID3D12Resource *pDstResource, ID3D12Resource *pSrcResource)
 {
+	Dx12CopyBuffer(&mBufferWrites, pDstResource, pSrcResource);
 	Dx12CopyResource(pDstResource, pSrcResource);
 	mOrig->CopyResource(pDstResource, pSrcResource);
 }
 
 void STDMETHODCALLTYPE Dx12GraphicsCommandList::CopyBufferRegion(ID3D12Resource *pDstBuffer, UINT64 DstOffset, ID3D12Resource *pSrcBuffer, UINT64 SrcOffset, UINT64 NumBytes)
 {
-	Dx12CopyBufferRegion(pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, NumBytes);
+	Dx12CopyBufferRegion(&mBufferWrites, pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, NumBytes);
 	mOrig->CopyBufferRegion(pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, NumBytes);
 }
 

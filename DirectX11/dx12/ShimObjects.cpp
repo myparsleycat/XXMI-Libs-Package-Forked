@@ -147,10 +147,7 @@ void ShimDestroyResource(ShimResource *resource)
 	// The lists using it have their own references
 	if (resource->game_upload)
 		resource->game_upload->Release();
-	for (ID3D12Resource *spare : resource->spares) {
-		Dx12ShimDeferRelease(spare);
-		spare->Release();
-	}
+	ShimForgetSpares(resource);
 }
 
 void ShimDestroyView(ShimView *view)

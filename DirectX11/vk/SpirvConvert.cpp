@@ -602,10 +602,14 @@ bool build_groups(const SpirvConverted &converted, ShaderRegexGroups *groups, st
 		if (groups->count(entry.first))
 			return fail("a group of that name is there already: " + narrow(entry.first));
 	}
+	uint32_t text_hash = 0;
+	for (const std::string &line : converted.lines)
+		text_hash = crc32c_hw(text_hash, line.data(), line.size() + 1);
 	for (auto &entry : written) {
 		ShaderRegexGroup &made = (*groups)[entry.first];
 
 		made.ini_section = entry.first;
+		made.text_hash = text_hash;
 		made.shader_models = words(entry.second.main[L"shader_model"]);
 		made.temp_regs = words(entry.second.main[L"temps"]);
 		for (const std::string &line : entry.second.declarations) {

@@ -6297,6 +6297,7 @@ bool CommandListExpression::parse(const wstring *expression, const wstring *ini_
 
 		evaluatable = tree.finalise();
 		log_syntax_tree(evaluatable, "Final syntax tree:\n");
+		compile();
 		return true;
 	} catch (const CommandListSyntaxError &e) {
 		LogOverlay(LOG_WARNING_MONOSPACE,
@@ -6324,9 +6325,149 @@ static inline float evaluate_operand_or_call(CommandListEvaluatable *evaluatable
 	return evaluatable->evaluate(state, device);
 }
 
+// The operators evaluate() applies by name rather than through the virtual
+// call, each with the very function of its class:
+enum FastOp : uint8_t {
+	FAST_OP_NONE,
+	FAST_OP_NOT,
+	FAST_OP_NEGATE,
+	FAST_OP_MULTIPLY,
+	FAST_OP_DIVIDE,
+	FAST_OP_MODULUS,
+	FAST_OP_ADD,
+	FAST_OP_SUBTRACT,
+	FAST_OP_LESS,
+	FAST_OP_LESS_EQUAL,
+	FAST_OP_GREATER,
+	FAST_OP_GREATER_EQUAL,
+	FAST_OP_EQUAL,
+	FAST_OP_NOT_EQUAL,
+	FAST_OP_AND,
+	FAST_OP_OR,
+};
+
+#define FAST_OPS(X) \
+	X(FAST_OP_NOT, unary_not_operatorT) \
+	X(FAST_OP_NEGATE, unary_negate_operatorT) \
+	X(FAST_OP_MULTIPLY, multiplication_operatorT) \
+	X(FAST_OP_DIVIDE, division_operatorT) \
+	X(FAST_OP_MODULUS, modulus_operatorT) \
+	X(FAST_OP_ADD, addition_operatorT) \
+	X(FAST_OP_SUBTRACT, subtraction_operatorT) \
+	X(FAST_OP_LESS, less_operatorT) \
+	X(FAST_OP_LESS_EQUAL, less_equal_operatorT) \
+	X(FAST_OP_GREATER, greater_operatorT) \
+	X(FAST_OP_GREATER_EQUAL, greater_equal_operatorT) \
+	X(FAST_OP_EQUAL, equality_operatorT) \
+	X(FAST_OP_NOT_EQUAL, inequality_operatorT) \
+	X(FAST_OP_AND, and_operatorT) \
+	X(FAST_OP_OR, or_operatorT)
+
+static uint8_t fast_op_of(CommandListOperator *op)
+{
+#define FAST_OP_OF(fast_op, type) if (typeid(*op) == typeid(type)) return fast_op;
+	FAST_OPS(FAST_OP_OF)
+#undef FAST_OP_OF
+	return FAST_OP_NONE;
+}
+
+static inline float apply_operator(const ExpressionStep &step, float lhs, float rhs)
+{
+	switch (step.fast_op) {
+#define FAST_OP_CASE(fast_op, type) case fast_op: return static_cast<type*>(step.op)->type::evaluate(lhs, rhs);
+		FAST_OPS(FAST_OP_CASE)
+#undef FAST_OP_CASE
+	}
+	return step.op->evaluate(lhs, rhs);
+}
+
+// Deep enough for any expression written by hand; a deeper one is evaluated
+// as a tree
+const size_t MAX_EXPRESSION_STACK = 32;
+
+// Appends the steps of the node, returns how deep the stack gets. The order is
+// that of CommandListOperator::evaluate(), which evaluates the right hand
+// side before the left as compiled.
+static size_t compile_node(CommandListEvaluatable *node, std::vector<ExpressionStep> *steps)
+{
+	ExpressionStep step = {};
+	size_t depth, lhs_depth;
+
+	CommandListOperator *op = dynamic_cast<CommandListOperator*>(node);
+	if (op && op->rhs) {
+		depth = compile_node(op->rhs.get(), steps);
+		if (op->lhs) {
+			lhs_depth = compile_node(op->lhs.get(), steps);
+			depth = max(depth, lhs_depth + 1);
+		}
+		step.kind = op->lhs ? ExpressionStep::Kind::BINARY : ExpressionStep::Kind::UNARY;
+		step.fast_op = fast_op_of(op);
+		step.op = op;
+		steps->push_back(step);
+		return depth;
+	}
+
+	// As evaluate_operand_or_call() does with a state or a device
+	CommandListOperand *operand = node->as_operand;
+	if (operand && operand->type == ParamOverrideType::VALUE) {
+		step.kind = ExpressionStep::Kind::VALUE;
+		step.value = operand->val;
+	} else if (operand && operand->type == ParamOverrideType::VARIABLE) {
+		step.kind = ExpressionStep::Kind::VARIABLE;
+		step.variable = operand->var_ftarget;
+	} else {
+		step.kind = ExpressionStep::Kind::CALL;
+		step.evaluatable = node;
+	}
+	steps->push_back(step);
+	return 1;
+}
+
+void CommandListExpression::compile()
+{
+	steps.clear();
+	if (!evaluatable)
+		return;
+	// A lone operand gains nothing from it
+	if (evaluatable->as_operand)
+		return;
+	if (compile_node(evaluatable.get(), &steps) > MAX_EXPRESSION_STACK)
+		steps.clear();
+	steps.shrink_to_fit();
+}
+
 float CommandListExpression::evaluate(CommandListState *state, HackerDevice *device)
 {
-	return evaluate_operand_or_call(evaluatable.get(), state, device);
+	float stack[MAX_EXPRESSION_STACK], lhs, rhs;
+	size_t top = 0;
+
+	// Without either, the operands complain the way they always have
+	if (steps.empty() || !(state || device))
+		return evaluate_operand_or_call(evaluatable.get(), state, device);
+
+	for (const ExpressionStep &step : steps) {
+		switch (step.kind) {
+		case ExpressionStep::Kind::VALUE:
+			stack[top++] = step.value;
+			break;
+		case ExpressionStep::Kind::VARIABLE:
+			stack[top++] = *step.variable;
+			break;
+		case ExpressionStep::Kind::CALL:
+			stack[top++] = step.evaluatable->evaluate(state, device);
+			break;
+		case ExpressionStep::Kind::UNARY:
+			rhs = stack[--top];
+			stack[top++] = apply_operator(step, std::numeric_limits<float>::quiet_NaN(), rhs);
+			break;
+		case ExpressionStep::Kind::BINARY:
+			lhs = stack[--top];
+			rhs = stack[--top];
+			stack[top++] = apply_operator(step, lhs, rhs);
+			break;
+		}
+	}
+	return stack[0];
 }
 
 bool CommandListExpression::static_evaluate(float *ret, HackerDevice *device, bool evaluate_variables)
@@ -6342,6 +6483,7 @@ bool CommandListExpression::optimise(HackerDevice *device)
 	if (!evaluatable) {
 		LogOverlay(LOG_DIRE, "BUG: Non-evaluatable expression, please report this and provide your d3dx.ini\n");
 		evaluatable = std::make_shared<CommandListOperand>(0, L"<BUG>");
+		compile();
 		return false;
 	}
 
@@ -6350,6 +6492,7 @@ bool CommandListExpression::optimise(HackerDevice *device)
 	if (replacement)
 		evaluatable = replacement;
 
+	compile();
 	return ret;
 }
 
@@ -12126,7 +12269,10 @@ static ID3D11Buffer *RecreateCompatibleBuffer(
 {
 	D3D11_BUFFER_DESC new_desc;
 	ID3D11Buffer *buffer = NULL;
-	UINT dst_size;
+
+	// Preserve an explicitly requested copy size before the compatibility
+	// logic below adjusts the destination size. Zero means use the default size.
+	UINT dst_size = *buf_dst_size;
 
 	src_resource->GetDesc(&new_desc);
 	new_desc.BindFlags = bind_flags;
@@ -12147,72 +12293,88 @@ static ID3D11Buffer *RecreateCompatibleBuffer(
 		new_desc.CPUAccessFlags = 0;
 	}
 
-	if (bind_flags & D3D11_BIND_CONSTANT_BUFFER || (src && src->type == ResourceCopyTargetType::CONSTANT_BUFFER)) {
-		// Constant buffers created via SetConstantBuffer1 may have region size specified (derived from NumConstants).
-		// So we'll use source CB size whenever it's available, since other data is irrelevant for current shader call.
-		if (src && src->type == ResourceCopyTargetType::CONSTANT_BUFFER) {
-			if (*buf_src_size) {
-				*buf_dst_size = *buf_src_size;      // Set DST CB size to "visible region" size
-				*buf_src_size = new_desc.ByteWidth; // Set SRC CB size to its actual size
-				new_desc.ByteWidth = *buf_dst_size; // Set DST DESC size to "visible region" size
-			}
-		}
+	bool src_is_cb = src && src->type == ResourceCopyTargetType::CONSTANT_BUFFER;
 
-		if (bind_flags & D3D11_BIND_CONSTANT_BUFFER) {
-			// Constant buffers have additional limitations. The size must
-			// be a multiple of 16, so round up if necessary, and it cannot
-			// be larger than 4096 x 4 component x 4 byte constants.
-			dst_size = (new_desc.ByteWidth + 15) & ~0xf;
-			dst_size = min(dst_size, D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
+	// SetConstantBuffers1 can expose a subrange of a larger backing buffer.
+	// Use the visible range as the default destination size, but retain the
+	// backing buffer's full size in buf_src_size for source-bound calculations.
+	// An explicit copy size is preserved separately in dst_size.
+	if (src_is_cb && *buf_src_size) {
+		*buf_dst_size = *buf_src_size;
+		*buf_src_size = new_desc.ByteWidth;
+		new_desc.ByteWidth = *buf_dst_size;
+	}
 
-			// Constant buffers cannot be structured, so clear that flag
-			// and the stride that came with it. D3D11 ignores a stride
-			// without the flag, but GetResourceStride() (`->stride`) and
-			// FillInMissingInfo() both read it back out of the buffer
-			// description, and would report the source's element size for
-			// a buffer that is no longer made of elements:
-			new_desc.MiscFlags &= ~D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-			new_desc.StructureByteStride = 0;
+	// Constant-buffer handling above may reduce new_desc.ByteWidth to the
+	// currently bound range, while buf_src_size retains the backing-buffer size.
+	UINT max_dst_size = new_desc.ByteWidth;
+	if (src_is_cb && *buf_src_size)
+		max_dst_size = max(max_dst_size, *buf_src_size);
 
-			// If the size of the new resource doesn't match the old or
-			// there is an offset we will have to perform a region copy
-			// instead of a regular copy:
-			if (offset || dst_size != new_desc.ByteWidth) {
-				// It might be temping to take the offset into account
-				// here and make the buffer only as large as it need to
-				// be, but it's possible that the source offset might
-				// change much more often than the source buffer (just
-				// a guess), which could potentially lead us to
-				// constantly recreating the destination buffer.
+	if (dst_size > 0) {
+		// Preserve the requested copy length up to the available buffer extent.
+		// Do not truncate it to the visible constant-buffer range.
+		dst_size = min(dst_size, max_dst_size);
+	} else {
+		dst_size = new_desc.ByteWidth;
+	}
 
-				// Note down the size of the source and destination:
-				*buf_dst_size = dst_size;
-				new_desc.ByteWidth = dst_size;
-			}
-		}
-	} else if (IsConversionToStructuredBufferRequired(src_view, stride, offset, format, bind_flags)) {
+	if (bind_flags & D3D11_BIND_CONSTANT_BUFFER)
+	{
+		// Constant buffers have additional limitations. The size must
+		// be a multiple of 16, so round up if necessary, and it cannot
+		// be larger than 4096 x 4 component x 4 byte constants.
+		dst_size = (dst_size + 15) & ~0xf;
+		dst_size = min(dst_size, D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16);
+
+		// Constant buffers cannot be structured, so clear that flag
+		// and the stride that came with it. D3D11 ignores a stride
+		// without the flag, but GetResourceStride() (`->stride`) and
+		// FillInMissingInfo() both read it back out of the buffer
+		// description, and would report the source's element size for	
+		// a buffer that is no longer made of elements:
+		new_desc.MiscFlags &= ~D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		new_desc.StructureByteStride = 0;
+	}
+	else if (src_is_cb)
+	{
+		// Optimize away the checks below.
+	}
+	else if (IsConversionToStructuredBufferRequired(src_view, stride, offset, format, bind_flags))
+	{
 		new_desc.MiscFlags |= D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
 		new_desc.StructureByteStride = stride;
 
 		// A structured buffer needs to be a multiple of it's stride,
 		// which may not be the case if we're converting a buffer to
 		// one. Round it down:
-		dst_size = new_desc.ByteWidth / stride * stride;
-		// For now always using the region copy if there's an offset.
-		// We might not need to do that if the offset is aligned to the
-		// stride (although we would need to recreate the view every
-		// time it changed), but for now it seems safest to use the
-		// region copy method whenever there is an offset:
-		if (offset || dst_size != new_desc.ByteWidth) {
-			*buf_dst_size = dst_size;
-			new_desc.ByteWidth = dst_size;
-		}
-	} else if (!src_view && offset) {
+		dst_size = dst_size / stride * stride;
+	}
+	else if (offset)
+	{
 		// No source view but we do have an offset - use the region
 		// copy to knock out the offset. We can probably assume the
 		// original resource met all the size and alignment
 		// constraints, so we shouldn't need to resize it.
-		*buf_dst_size = new_desc.ByteWidth;
+		if (src_view)
+			offset = 0;
+	}
+
+	// If the size of the new resource doesn't match the old or
+	// there is an offset we will have to perform a region copy
+	// instead of a regular copy. A Region() size larger than the source
+	// was clamped into dst_size, so the region copy size must be updated
+	// too, or it would be larger than the new resource:
+	if (offset || dst_size != new_desc.ByteWidth || *buf_dst_size)
+	{
+		// It might be temping to take the offset into account
+		// here and make the buffer only as large as it need to
+		// be, but it's possible that the source offset might
+		// change much more often than the source buffer (just
+		// a guess), which could potentially lead us to
+		// constantly recreating the destination buffer.
+		*buf_dst_size = dst_size;
+		new_desc.ByteWidth = dst_size;
 	}
 
 	if (dst && dst->type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
@@ -13155,24 +13317,32 @@ static void ResolveMSAA(ID3D11Resource *dst_resource, ID3D11Resource *src_resour
 }
 
 static void SpecialCopyBufferRegion(ID3D11Resource *dst_resource,ID3D11Resource *src_resource,
-		CommandListState *state, UINT src_stride, UINT *src_offset,
+		CommandListState *state, UINT *src_offset,
 		UINT buf_src_size, UINT buf_dst_size)
 {
-	// We are copying a buffer for use in a constant buffer and the size of
-	// the original buffer did not meet the constraints of a constant
-	// buffer.
+	// Copy a byte range from the source buffer into the destination, starting
+	// at destination offset 0. This also handles buffer conversions that require
+	// a region copy, including constant-buffer size and alignment constraints.
 	D3D11_BOX src_box;
+	D3D11_BUFFER_DESC dst_desc;
 
-	// We want to copy from the offset to the end of the source buffer, but
-	// cap it to the destination size to avoid "undefined behaviour". Keep
-	// in mind that this is "right", not "size":
+	// D3D11_BOX::right is an exclusive end offset, whereas buf_dst_size is a
+	// byte count. Calculate the requested end and clamp it to the source buffer's
+	// total size so the copy does not extend beyond the source.
+	UINT available_size = *src_offset < buf_src_size ? buf_src_size - *src_offset : 0;
+	UINT copy_size = min(buf_dst_size, available_size);
 	src_box.left = *src_offset;
-	src_box.right = min(buf_src_size, *src_offset + buf_dst_size);
+	src_box.right = *src_offset + copy_size;
 
-	if (src_stride) {
-		// If we are copying to a structured resource, the source box
-		// must be a multiple of the stride, so round it down:
-		src_box.right = (src_box.right - src_box.left) / src_stride * src_stride + src_box.left;
+	// The copied byte range must contain whole elements when copying into
+	// a structured buffer. Round the end down to the nearest stride boundary.
+	// The stride of the copy is not used for this: for a buffer with neither
+	// a format nor a structure, such as a constant buffer, it is the size of
+	// the whole buffer, which would round a part of it down to nothing.
+	static_cast<ID3D11Buffer*>(dst_resource)->GetDesc(&dst_desc);
+	if ((dst_desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && dst_desc.StructureByteStride) {
+		UINT stride = dst_desc.StructureByteStride;
+		src_box.right = (src_box.right - src_box.left) / stride * stride + src_box.left;
 	}
 
 	src_box.top = 0;
@@ -13180,7 +13350,11 @@ static void SpecialCopyBufferRegion(ID3D11Resource *dst_resource,ID3D11Resource 
 	src_box.front = 0;
 	src_box.back = 1;
 
-	state->mOrigContext1->CopySubresourceRegion(dst_resource, 0, 0, 0, 0, src_resource, 0, &src_box);
+	// An offset past the end of the source leaves nothing to copy. The
+	// D3D12 shim takes right - left as the size, so an empty box is not
+	// passed on:
+	if (src_box.right > src_box.left)
+		state->mOrigContext1->CopySubresourceRegion(dst_resource, 0, 0, 0, 0, src_resource, 0, &src_box);
 
 	// We have effectively removed the offset during the region copy, so
 	// set it to 0 to make sure nothing will try to use it again elsewhere:
@@ -13559,6 +13733,19 @@ void ResourceCopyOperation::CopyResourceToResource(
 			COMMAND_LIST_LOG(state, "  WARNING: referenced resource is missing bind flags required by destination, view creation will fail\n");
 	}
 
+	// Region(offset, size) specifies a byte offset and a byte count.
+	// Keep size as the requested destination copy size.
+	// The copy helper calculates the exclusive source end offset from both values.
+	// A region of a texture means nothing, and the region copy only takes buffers.
+	D3D11_RESOURCE_DIMENSION src_dimension;
+	src_resource->GetType(&src_dimension);
+	bool src_region = src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION
+		&& src_dimension == D3D11_RESOURCE_DIMENSION_BUFFER;
+	if (src_region) {
+		offset = (UINT)src.member_args[0].GetValue(state);
+		buf_dst_size = (UINT)src.member_args[1].GetValue(state);
+	}
+
 	if (options & ResourceCopyOptions::COPY_MASK) {
 		RecreateCompatibleResource(&ini_line, &src, &dst, src_resource, pp_cached_resource, p_resource_pool, src_view, pp_cached_view,
 			state, options, stride, offset, format, &buf_src_size, &buf_dst_size);
@@ -13584,28 +13771,45 @@ void ResourceCopyOperation::CopyResourceToResource(
 			Profiling::buffer_region_copies++;
 			if (G->cache_resource_data != DataCacheBindFlags::INVALID && dst_custom_resource)
 				dst_custom_resource->SetHandleInfo(src_resource, offset, buf_dst_size);
-			SpecialCopyBufferRegion(dst_resource, src_resource,
-					state, stride, &offset,
-					buf_src_size, buf_dst_size);
+			SpecialCopyBufferRegion(dst_resource, src_resource, state, &offset, buf_src_size, buf_dst_size);
+			// The destination only holds the copied range, so a view of
+			// it must not be sized by the source:
+			buf_src_size = buf_dst_size;
 		} else {
-			COMMAND_LIST_LOG(state, "  performing full copy (src_stride=%d src_offset=%d src_size=%d dst_size=%d)\n", stride, offset, buf_src_size, buf_dst_size);
+			COMMAND_LIST_LOG(state, "  performing full copy (src_stride=%d src_offset=%d src_size=%d)\n", stride, offset, buf_src_size);
 			Profiling::resource_full_copies++;
 			if (G->cache_resource_data != DataCacheBindFlags::INVALID && dst_custom_resource)
 				dst_custom_resource->SetHandleInfo(src_resource, 0, buf_dst_size);
 			state->mOrigContext1->CopyResource(dst_resource, src_resource);
 		}
 	} else {
-		COMMAND_LIST_LOG(state, "  copying by reference\n");
+		COMMAND_LIST_LOG(state, "  copying by reference (src_stride=%d src_offset=%d src_size=%d dst_size=%d)\n", stride, offset, buf_src_size, buf_dst_size);
 		Profiling::resource_reference_copies++;
-		if (src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION)
-		{
-			offset = (UINT)src.member_args[0].GetValue(state);
-			buf_dst_size = (UINT)src.member_args[1].GetValue(state);
-		}
 		if (G->cache_resource_data != DataCacheBindFlags::INVALID && dst_custom_resource)
-			dst_custom_resource->SetHandleInfo(src_resource, offset, buf_src_size);
+			dst_custom_resource->SetHandleInfo(src_resource, offset, buf_dst_size ? buf_dst_size : buf_src_size);
 		dst_resource = src_resource;
-		dst_view = UsableRefView(&dst, state, src_view, dst_resource);
+
+		// A Region() bound to a view slot needs a view of that range. The
+		// source's view and the view cache, which is only matched by
+		// resource, are of other ranges. Views take the end of the range:
+		ResourceCopyTargetType dst_type = dst.type;
+		if (dst_type == ResourceCopyTargetType::THIS_RESOURCE && state->this_target)
+			dst_type = state->this_target->type;
+		bool region_view = src_region && buf_dst_size
+			&& (dst_type == ResourceCopyTargetType::SHADER_RESOURCE
+				|| dst_type == ResourceCopyTargetType::UNORDERED_ACCESS_VIEW
+				|| dst_type == ResourceCopyTargetType::RENDER_TARGET);
+		if (region_view) {
+			D3D11_BUFFER_DESC src_desc;
+			static_cast<ID3D11Buffer*>(src_resource)->GetDesc(&src_desc);
+			buf_src_size = (UINT)min((UINT64)src_desc.ByteWidth, (UINT64)offset + buf_dst_size);
+			if (*pp_cached_view) {
+				(*pp_cached_view)->Release();
+				*pp_cached_view = NULL;
+			}
+		} else {
+			dst_view = UsableRefView(&dst, state, src_view, dst_resource);
+		}
 		if (!dst_view && *pp_cached_view) {
 			if (ViewMatchesResource(*pp_cached_view, dst_resource)) {
 				dst_view = *pp_cached_view;
@@ -13744,12 +13948,6 @@ void ResourceCopyOperation::run(CommandListState *state)
 	UINT buf_src_size = 0;
 
 	src_resource = src.GetResource(state, &src_view, &stride, &offset, &format, &buf_src_size, ((options & ResourceCopyOptions::REFERENCE) ? &dst : NULL));
-	
-	if (src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION)
-	{
-		offset = (UINT)src.member_args[0].GetValue(state);
-		buf_src_size = (UINT)src.member_args[1].GetValue(state);
-	}
 
 	// A D3D12 constant buffer of the game does not keep its contents: a
 	// reference kept for later draws would be to whatever that draw has in

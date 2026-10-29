@@ -48,16 +48,18 @@ static void enable_debug_layer()
 	Dx12LogInfo("dx12_debug_layer: debug layer enabled\n");
 }
 
-// For a Vulkan game with vk_dump_hashes: the D3D12 device of the driver that
-// presents its frames then keeps a record of where its queues were, for
-// VkModsDeviceLost. Like the debug layer, only before the device is created.
+// With dx12_dred, or for a Vulkan game with vk_dump_hashes: the device then
+// keeps a record of where its queues were and of the memory a page fault was
+// in, for Dx12NoteDred. Like the debug layer, only before the device is
+// created.
 static void enable_dred()
 {
 	static bool enabled;
 	HRESULT (WINAPI *get_debug_interface)(REFIID, void**);
 	ID3D12DeviceRemovedExtendedDataSettings *settings = NULL;
+	ID3D12DeviceRemovedExtendedDataSettings1 *settings1;
 
-	if (enabled || !dx12_enabled() || !G->vk_dump_hashes)
+	if (enabled || !dx12_enabled() || (!G->dx12_dred && !G->vk_dump_hashes))
 		return;
 	enabled = true;
 
@@ -68,6 +70,10 @@ static void enable_dred()
 	}
 	settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
 	settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+	if (SUCCEEDED(settings->QueryInterface(IID_PPV_ARGS(&settings1)))) {
+		settings1->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+		settings1->Release();
+	}
 	settings->Release();
 	Dx12LogInfo("DRED enabled\n");
 }
@@ -309,19 +315,14 @@ HRESULT Dx12D3D11On12CreateDevice(PFN_D3D11ON12_CREATE_DEVICE orig, IUnknown *pD
 	Dx12Device *device;
 	std::vector<Dx12CommandQueue*> proxies;
 	std::vector<IUnknown*> queues;
-	HRESULT hr;
+	ID3D12CommandQueue *present_queue = NULL;
+	HRESULT hr = S_OK;
 	UINT i;
 
 	// Checked before anything is called on them, see Dx12KeepGone
 	if (Dx12IsGone(pDevice)) {
 		Dx12LogInfo("*** D3D11On12CreateDevice refused: device %p was destroyed\n", pDevice);
 		return E_INVALIDARG;
-	}
-	for (i = 0; ppCommandQueues && i < NumQueues; i++) {
-		if (Dx12IsGone(ppCommandQueues[i])) {
-			Dx12LogInfo("*** D3D11On12CreateDevice refused: queue %p was destroyed\n", ppCommandQueues[i]);
-			return E_INVALIDARG;
-		}
 	}
 
 	device = Dx12QueryProxy<Dx12Device>(pDevice);
@@ -330,8 +331,31 @@ HRESULT Dx12D3D11On12CreateDevice(PFN_D3D11ON12_CREATE_DEVICE orig, IUnknown *pD
 
 	if (ppCommandQueues) {
 		for (i = 0; i < NumQueues; i++) {
-			Dx12CommandQueue *proxy = Dx12QueryProxy<Dx12CommandQueue>(ppCommandQueues[i]);
+			Dx12CommandQueue *proxy;
 
+			// RTSS keeps the queue of a swap chain the game has since made
+			// again, and draws its OSD only on a device made on the queue
+			// presenting now
+			if (Dx12IsGone(ppCommandQueues[i])) {
+				if (!present_queue) {
+					Dx12ShimLock();
+					if (dx12_shim && dx12_shim->device == pDevice) {
+						present_queue = dx12_shim->queue;
+						present_queue->AddRef();
+					}
+					Dx12ShimUnlock();
+				}
+				if (!present_queue) {
+					Dx12LogInfo("*** D3D11On12CreateDevice refused: queue %p was destroyed\n", ppCommandQueues[i]);
+					hr = E_INVALIDARG;
+					break;
+				}
+				Dx12LogInfo("*** D3D11On12CreateDevice: queue %p was destroyed, using ID3D12CommandQueue %p the swap chain presents on\n",
+					ppCommandQueues[i], present_queue);
+				queues.push_back(present_queue);
+				continue;
+			}
+			proxy = Dx12QueryProxy<Dx12CommandQueue>(ppCommandQueues[i]);
 			queues.push_back(proxy ? proxy->mOrig : ppCommandQueues[i]);
 			if (proxy)
 				proxies.push_back(proxy);
@@ -339,11 +363,14 @@ HRESULT Dx12D3D11On12CreateDevice(PFN_D3D11ON12_CREATE_DEVICE orig, IUnknown *pD
 		ppCommandQueues = queues.data();
 	}
 
-	hr = orig(pDevice, Flags, pFeatureLevels, FeatureLevels, ppCommandQueues, NumQueues, NodeMask,
-		ppDevice, ppImmediateContext, pChosenFeatureLevel);
+	if (SUCCEEDED(hr))
+		hr = orig(pDevice, Flags, pFeatureLevels, FeatureLevels, ppCommandQueues, NumQueues, NodeMask,
+			ppDevice, ppImmediateContext, pChosenFeatureLevel);
 
 	for (Dx12CommandQueue *proxy : proxies)
 		proxy->Release();
+	if (present_queue)
+		present_queue->Release();
 	if (device)
 		device->Release();
 

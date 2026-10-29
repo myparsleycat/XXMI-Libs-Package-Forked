@@ -1,0 +1,6 @@
+# bash fails on scripts checked out with CRLF; cmd wants CRLF batch files
+*.sh text eol=lf
+*.py text eol=lf
+*.bat text eol=crlf
+*.dds binary
+*.buf binary

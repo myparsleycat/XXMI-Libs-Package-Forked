@@ -1,0 +1,55 @@
+#version 450
+layout(set = 1, binding = 0) uniform texture2D _Tex0;
+layout(set = 1, binding = 1) uniform texture2D _Tex1;
+layout(set = 1, binding = 2) uniform texture2D _Tex2;
+layout(set = 1, binding = 3) uniform texture2D _Tex3;
+layout(set = 1, binding = 4) uniform texture2D _Tex4;
+layout(set = 1, binding = 5) uniform texture2D _Tex5;
+layout(set = 1, binding = 6) uniform texture2D _Tex6;
+layout(set = 1, binding = 7) uniform texture2D _Tex7;
+layout(set = 1, binding = 8) uniform texture2D _Tex8;
+layout(set = 1, binding = 9) uniform texture2D _Tex9;
+layout(set = 1, binding = 10) uniform texture2D _Tex10;
+layout(set = 1, binding = 11) uniform texture2D _Tex11;
+layout(set = 1, binding = 12) uniform texture2D _Tex12;
+layout(set = 1, binding = 13) uniform texture2D _Tex13;
+layout(set = 1, binding = 14) uniform texture2D _Tex14;
+layout(set = 1, binding = 15) uniform texture2D _Tex15;
+layout(set = 1, binding = 16) uniform texture2D _Tex16;
+layout(set = 1, binding = 17) uniform texture2D _Tex17;
+layout(set = 1, binding = 18) uniform texture2D _Tex18;
+layout(set = 1, binding = 19) uniform texture2D _Tex19;
+layout(set = 1, binding = 20) uniform texture2D _Tex20;
+layout(set = 1, binding = 21) uniform texture2D _Tex21;
+layout(set = 1, binding = 22) uniform sampler sampler_Tex;
+layout(set = 1, binding = 23, std140) uniform UnityPerMaterial { vec4 _BaseColor[4]; };
+layout(set = 2, binding = 0, std140) uniform UnityInstancing { vec4 instance_rows[4096]; };
+layout(location = 0) in vec4 vs_TEXCOORD0;
+layout(location = 0) out vec4 SV_Target0;
+void main()
+{
+	vec4 colour = _BaseColor[0] + instance_rows[int(vs_TEXCOORD0.w) & 4095] * 0.0;
+	colour += texture(sampler2D(_Tex0, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex1, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex2, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex3, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex4, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex5, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex6, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex7, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex8, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex9, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex10, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex11, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex12, sampler_Tex), vs_TEXCOORD0.xy) * 0.3;
+	colour += texture(sampler2D(_Tex13, sampler_Tex), vs_TEXCOORD0.xy) * 0.3;
+	colour += texture(sampler2D(_Tex14, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex15, sampler_Tex), vs_TEXCOORD0.xy) * 0.3;
+	colour += texture(sampler2D(_Tex16, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex17, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex18, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex19, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex20, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	colour += texture(sampler2D(_Tex21, sampler_Tex), vs_TEXCOORD0.xy) * 0.01;
+	SV_Target0 = colour;
+}

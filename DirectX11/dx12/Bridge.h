@@ -106,8 +106,14 @@ void Dx12ShimUnlock();
 // By the calling thread
 bool Dx12ShimLockHeld();
 
+// The result of a list's Close(), of the game's or ours
+void Dx12LogCloseFailure(ID3D12GraphicsCommandList *list, HRESULT hr);
+
 // Moves what the debug layer has said since the last call to our log. Does
-// nothing unless the device was created with dx12_debug_layer.
+// nothing unless the device was created with dx12_debug_layer. Where the
+// debug layer takes a callback, the first call registers one, which logs each
+// message in the thread of the call it is about, as the message that removes
+// the device would otherwise be lost with the process.
 void Dx12LogDebugMessages();
 
 // The command list to record to. Stays valid until the next submission.
@@ -135,6 +141,9 @@ void Dx12ShimFlush();
 // have been executed
 UINT64 Dx12ShimPendingFence();
 bool Dx12ShimFenceReached(UINT64 value);
+// The fence reaches the value of a submission that failed to close too, but
+// nothing of it was executed: what it was to copy is not there
+bool Dx12ShimSubmissionDiscarded(UINT64 value);
 // Counts submissions. Memory from Dx12ShimUpload and descriptors from
 // Dx12ShimAllocViews are gone when it changes.
 extern UINT dx12_shim_epoch;
@@ -166,8 +175,9 @@ void Dx12ShimFreeDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE type, D3D12_CPU_DESCRIPTO
 // not there already. Read states accumulate, as a resource may be read in
 // several ways by one draw. False if there is nothing the GPU may use: no
 // resource, or one that is not ready (ShimNotReady), which whatever was to
-// use it leaves out.
-bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state);
+// use it leaves out. overwrite is for a write that will cover all of the
+// resource, which then need not keep what it held if it is renamed for it.
+bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite = false);
 void Dx12ShimForgetResource(ShimResource *resource);
 
 // D3D12 keeps what mods load in the GPU's memory for good, where D3D11 has
@@ -196,6 +206,9 @@ bool Dx12ShimReadGameResource(ID3D12Resource *resource);
 // What the process uses of the GPU's local memory and the budget it has, as
 // the system counts them
 bool Dx12ShimProcessMemory(DXGI_QUERY_VIDEO_MEMORY_INFO *info);
+// For a report of a removed device: which resources of the mods are at the
+// address of a page fault or among the allocations DRED found there
+void Dx12ShimNoteFault(UINT64 va, const std::vector<const void*> &objects, void (*note)(const char *format, ...));
 
 // Keeps the object alive until the game's list has been executed, as often
 // as it is, or has been reset without being executed. False if the list had

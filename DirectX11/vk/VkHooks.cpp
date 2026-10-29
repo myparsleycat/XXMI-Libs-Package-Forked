@@ -46,7 +46,10 @@
 	X(CreateImageView) \
 	X(DestroyImageView) \
 	X(CmdCopyBufferToImage) \
+	X(CmdCopyImage) \
+	X(CmdCopyImage2) \
 	X(CmdUpdateBuffer) \
+	X(CmdFillBuffer) \
 	X(CmdBindPipeline) \
 	X(CmdBindVertexBuffers) \
 	X(CmdBindIndexBuffer) \
@@ -475,10 +478,36 @@ static void VKAPI_CALL Hooked_vkCmdCopyBufferToImage(VkCommandBuffer cmd, VkBuff
 	next_CmdCopyBufferToImage(cmd)(cmd, src, dst, layout, count, regions);
 }
 
+static void VKAPI_CALL Hooked_vkCmdCopyImage(VkCommandBuffer cmd, VkImage src, VkImageLayout src_layout, VkImage dst,
+		VkImageLayout dst_layout, uint32_t count, const VkImageCopy *regions)
+{
+	if (vk_mods_active)
+		VkModsCopyImage(src, dst, count, regions);
+	next_CmdCopyImage(cmd)(cmd, src, src_layout, dst, dst_layout, count, regions);
+}
+
+static void VKAPI_CALL Hooked_vkCmdCopyImage2(VkCommandBuffer cmd, const VkCopyImageInfo2 *info)
+{
+	uint32_t i;
+
+	if (vk_mods_active) {
+		std::vector<VkImageCopy> regions(info->regionCount);
+
+		for (i = 0; i < info->regionCount; i++) {
+			const VkImageCopy2 &region = info->pRegions[i];
+			regions[i] = { region.srcSubresource, region.srcOffset, region.dstSubresource, region.dstOffset, region.extent };
+		}
+		VkModsCopyImage(info->srcImage, info->dstImage, info->regionCount, regions.data());
+	}
+	next_CmdCopyImage2(cmd)(cmd, info);
+}
+
 static void VKAPI_CALL Hooked_vkCmdCopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions)
 {
 	if (vk_dump_active)
 		VkDumpCopyBuffer(src, dst, count, regions);
+	if (vk_mods_active)
+		VkModsCopyBuffer(cmd, src, dst, count, regions);
 	next_CmdCopyBuffer(cmd)(cmd, src, dst, count, regions);
 }
 
@@ -486,12 +515,15 @@ static void VKAPI_CALL Hooked_vkCmdCopyBuffer2(VkCommandBuffer cmd, const VkCopy
 {
 	uint32_t i;
 
-	if (vk_dump_active) {
+	if (vk_dump_active || vk_mods_active) {
 		std::vector<VkBufferCopy> regions(info->regionCount);
 
 		for (i = 0; i < info->regionCount; i++)
 			regions[i] = { info->pRegions[i].srcOffset, info->pRegions[i].dstOffset, info->pRegions[i].size };
-		VkDumpCopyBuffer(info->srcBuffer, info->dstBuffer, info->regionCount, regions.data());
+		if (vk_dump_active)
+			VkDumpCopyBuffer(info->srcBuffer, info->dstBuffer, info->regionCount, regions.data());
+		if (vk_mods_active)
+			VkModsCopyBuffer(cmd, info->srcBuffer, info->dstBuffer, info->regionCount, regions.data());
 	}
 	next_CmdCopyBuffer2(cmd)(cmd, info);
 }
@@ -500,7 +532,16 @@ static void VKAPI_CALL Hooked_vkCmdUpdateBuffer(VkCommandBuffer cmd, VkBuffer ds
 {
 	if (vk_dump_active)
 		VkDumpUpdateBuffer(dst, bytes);
+	if (vk_mods_active)
+		VkModsUpdateBuffer(cmd, dst, offset, bytes, data);
 	next_CmdUpdateBuffer(cmd)(cmd, dst, offset, bytes, data);
+}
+
+static void VKAPI_CALL Hooked_vkCmdFillBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes, uint32_t data)
+{
+	if (vk_mods_active)
+		VkModsFillBuffer(cmd, dst, offset, bytes);
+	next_CmdFillBuffer(cmd)(cmd, dst, offset, bytes, data);
 }
 
 static VkResult VKAPI_CALL Hooked_vkFlushMappedMemoryRanges(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges)
@@ -697,6 +738,8 @@ static inline VkResult check_lost(VkQueue queue, VkResult result)
 // What the submission had of draws the engine was shown, once the queue took it
 static VkResult submitted(VkQueue queue, VkResult result, const std::vector<VkCommandBuffer> &shown_cmds)
 {
+	if (vk_mods_active)
+		VkModsIndexWritesSubmitted(result == VK_SUCCESS);
 	if (result == VK_SUCCESS && !shown_cmds.empty())
 		VkModsSubmitted(queue, shown_cmds.data(), shown_cmds.size());
 	return check_lost(queue, result);
@@ -720,6 +763,7 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit(VkQueue queue, uint32_t count, c
 	if (vk_mods_active) {
 		for (i = 0; i < count; i++) {
 			for (j = 0; j < submits[i].commandBufferCount; j++) {
+				VkModsIndexWritesSubmitting(submits[i].pCommandBuffers[j]);
 				draws = VkModsCommandsShown(submits[i].pCommandBuffers[j]);
 				if (draws)
 					shown_cmds.push_back(submits[i].pCommandBuffers[j]);
@@ -770,6 +814,7 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit2(VkQueue queue, uint32_t count, 
 	if (vk_mods_active) {
 		for (i = 0; i < count; i++) {
 			for (j = 0; j < submits[i].commandBufferInfoCount; j++) {
+				VkModsIndexWritesSubmitting(submits[i].pCommandBufferInfos[j].commandBuffer);
 				draws = VkModsCommandsShown(submits[i].pCommandBufferInfos[j].commandBuffer);
 				if (draws)
 					shown_cmds.push_back(submits[i].pCommandBufferInfos[j].commandBuffer);
@@ -1074,6 +1119,11 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		if (exports.UnmapMemory2KHR && (void*)next.UnmapMemory2KHR == NktHookLibHelpers::GetProcedureAddress(vulkan, "vkUnmapMemory2"))
 			next.UnmapMemory2KHR = exports.UnmapMemory2KHR;
 	}
+	// And a device from before Vulkan 1.3 by the name of their extension only
+	if (!next.CmdCopyBuffer2)
+		next.CmdCopyBuffer2 = (PFN_vkCmdCopyBuffer2)get(device, "vkCmdCopyBuffer2KHR");
+	if (!next.CmdCopyImage2)
+		next.CmdCopyImage2 = (PFN_vkCmdCopyImage2)get(device, "vkCmdCopyImage2KHR");
 
 	AcquireSRWLockExclusive(&dispatch_lock);
 
@@ -1131,6 +1181,7 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 		api.EndCommandBuffer = (PFN_vkEndCommandBuffer)get(device, "vkEndCommandBuffer");
 		api.CmdPipelineBarrier = (PFN_vkCmdPipelineBarrier)get(device, "vkCmdPipelineBarrier");
 		api.CmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)get(device, "vkCmdCopyBufferToImage");
+		api.CmdFillBuffer = (PFN_vkCmdFillBuffer)get(device, "vkCmdFillBuffer");
 		api.QueueSubmit = next.QueueSubmit;
 		api.CreateSemaphore = (PFN_vkCreateSemaphore)get(device, "vkCreateSemaphore");
 		api.DestroySemaphore = (PFN_vkDestroySemaphore)get(device, "vkDestroySemaphore");
@@ -1558,6 +1609,8 @@ static PFN_vkVoidFunction VKAPI_CALL Hooked_vkGetDeviceProcAddr(VkDevice device,
 		return (PFN_vkVoidFunction)Hooked_vkBindBufferMemory2;
 	if (!strcmp(name, "vkCmdCopyBuffer2KHR") && dispatch->next.CmdCopyBuffer2)
 		return (PFN_vkVoidFunction)Hooked_vkCmdCopyBuffer2;
+	if (!strcmp(name, "vkCmdCopyImage2KHR") && dispatch->next.CmdCopyImage2)
+		return (PFN_vkVoidFunction)Hooked_vkCmdCopyImage2;
 	if (!strcmp(name, "vkCreateDescriptorUpdateTemplateKHR") && dispatch->next.CreateDescriptorUpdateTemplate)
 		return (PFN_vkVoidFunction)Hooked_vkCreateDescriptorUpdateTemplate;
 	if (!strcmp(name, "vkUpdateDescriptorSetWithTemplateKHR") && dispatch->next.UpdateDescriptorSetWithTemplate)

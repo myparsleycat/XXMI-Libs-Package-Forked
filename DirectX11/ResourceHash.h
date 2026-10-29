@@ -625,6 +625,16 @@ public:
 uint32_t CalcTexture2DDescHash(uint32_t initial_hash, const D3D11_TEXTURE2D_DESC *const_desc);
 uint32_t CalcTexture3DDescHash(uint32_t initial_hash, const D3D11_TEXTURE3D_DESC *const_desc);
 
+// match_lower_mip_textures: how many top mip levels a texture streaming copy
+// may lack, and the descriptions the texture it would be a copy of could have
+// with `levels` more of them. Returns how many it wrote to origins: more than
+// one where a side is 1, and where the texture has all its levels, which
+// MipLevels = 0 also asks for.
+static const UINT LOWER_MIP_TEXTURE_LEVELS = 4;
+static const UINT LOWER_MIP_TEXTURE_ORIGINS = (LOWER_MIP_TEXTURE_LEVELS + 1) * (LOWER_MIP_TEXTURE_LEVELS + 1) * 2;
+UINT LowerMipTextureOrigins(const D3D11_TEXTURE2D_DESC *desc, UINT levels,
+		D3D11_TEXTURE2D_DESC origins[LOWER_MIP_TEXTURE_ORIGINS]);
+
 uint32_t CalcTexture1DDataHash(const D3D11_TEXTURE1D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData);
 uint32_t CalcTexture2DDataHash(const D3D11_TEXTURE2D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, bool zero_padding = false);
 uint32_t CalcTexture2DDataHashAccurate(const D3D11_TEXTURE2D_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData);
