@@ -484,6 +484,7 @@ static void RunCommandListComplete(HackerDevice *mHackerDevice,
 	// them anyway, so bail out before constructing the state:
 	if (command_list->ResolveCommandList()->commands.empty())
 		return;
+	Profiling::Spike::Scope spike(Profiling::Spike::COMMAND_LIST, command_list->ini_section.c_str());
 
 	CommandListState state;
 	state.mHackerDevice = mHackerDevice;

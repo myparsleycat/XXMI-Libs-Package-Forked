@@ -1196,6 +1196,7 @@ static void forget_region_memos(const std::vector<VkBuffer> &gone)
 static uint32_t region_hash(VkBuffer buffer, PublishedBuffer *entry, VkDeviceSize offset, UINT bytes,
 		const std::vector<IndexWrite> *writes)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_REGION_HASH);
 	Region *region;
 	BYTE samples[sizeof(region->samples)];
 	UINT frame = mods_frame;
@@ -1228,6 +1229,7 @@ static uint32_t region_hash(VkBuffer buffer, PublishedBuffer *entry, VkDeviceSiz
 	if (!region->hashed || memcmp(samples, region->samples, sizeof(samples))
 	    || frame - region->hashed_frame >= REGION_REHASH_FRAMES) {
 		region->hash = Dx12Crc32cWriteCombined(0, data, bytes);
+		spike.add_bytes(bytes);
 		region->hashed = true;
 		// Not all of them in the same frame
 		region->hashed_frame = frame - (UINT)(offset >> 4) % (REGION_REHASH_FRAMES / 4);
@@ -1520,14 +1522,16 @@ static void copy_mapped(BYTE *dst, const BYTE *src, size_t bytes)
 // lock of dx12/Bridge.h held, as everything is that runs the engine.
 static void read_constants(BYTE *dst, VkBuffer buffer, VkDeviceSize offset, size_t bytes)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_CONSTANT_READ);
 	UINT64 start = G->vk_dump_hashes ? ticks() : 0;
 	const BYTE *data;
 
 	AcquireSRWLockShared(&memory_lock);
 	data = mapped_bytes(buffer, offset, bytes);
-	if (data)
+	if (data) {
 		copy_mapped(dst, data, bytes);
-	else
+		spike.add_bytes(bytes);
+	} else
 		memset(dst, 0, bytes);
 	ReleaseSRWLockShared(&memory_lock);
 
@@ -1549,6 +1553,7 @@ void VkScopeFillShadow(ShimResource *resource, UINT64 offset, UINT64 size)
 		resource->shadow_pending = false;
 		return;
 	}
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_SHADOW_FILL);
 	source = &found->second;
 	bytes = std::get<2>(source->key);
 	if (offset >= bytes)
@@ -1600,6 +1605,7 @@ struct Refresh {
 // For the pages from one to another that have not been read this frame
 static void refresh_job(void *context, size_t from, size_t to)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_REFRESH);
 	const Refresh *refresh = (const Refresh*)context;
 	__declspec(align(32)) BYTE now[SHADOW_PAGE];
 	size_t page, start, size;
@@ -1610,6 +1616,7 @@ static void refresh_job(void *context, size_t from, size_t to)
 		start = page * SHADOW_PAGE;
 		size = min((size_t)SHADOW_PAGE, refresh->bytes - start);
 		copy_mapped(now, refresh->data + start, size);
+		spike.add_bytes(size);
 		if (!memcmp(now, refresh->shadow + start, size))
 			continue;
 		memcpy(refresh->shadow + start, now, size);
@@ -1725,12 +1732,16 @@ static void finish_refresh()
 	if (!resource)
 		return;
 	start_ticks = G->vk_dump_hashes ? ticks() : 0;
-	for (CopyWorker &worker : refresh_workers)
-		WaitForSingleObject(worker.done, INFINITE);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_REFRESH_WAIT);
+		for (CopyWorker &worker : refresh_workers)
+			WaitForSingleObject(worker.done, INFINITE);
+	}
 	refreshing.resource = NULL;
 	resource->shadow_pending = false;
 	if (start_ticks)
 		stats.refresh_wait_ticks += ticks() - start_ticks;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_REFRESH_UPLOAD);
 
 	list = Dx12ShimEarlyList();
 	source = &constants_sources[resource];
@@ -1762,6 +1773,7 @@ static void finish_refresh()
 			list->ResourceBarrier(1, &barrier);
 		copied = true;
 		list->CopyBufferRegion(refreshing.target, start, upload_buffer, upload_offset, size);
+		spike.add_bytes(size);
 		memset(&source->stale[first], 0, page - first);
 		stats.uploaded_bytes += size;
 	}
@@ -1796,6 +1808,7 @@ bool VkScopeUploadShadow(ShimResource *resource)
 
 	if (found == constants_sources.end())
 		return false;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_SHADOW_UPLOAD);
 	// What it will be given is the same
 	if (resource == refreshing.resource)
 		return true;
@@ -1848,24 +1861,28 @@ bool VkScopeUploadShadow(ShimResource *resource)
 	}
 	resource->shadow_pending = false;
 
-	for (page = 0; page < pages;) {
-		if (!source->stale[page]) {
-			page++;
-			continue;
+	{
+		Profiling::Spike::Scope upload_spike(Profiling::Spike::VK_REFRESH_UPLOAD);
+		for (page = 0; page < pages;) {
+			if (!source->stale[page]) {
+				page++;
+				continue;
+			}
+			first = last = page;
+			for (; page < pages && page - first < UPLOAD_RUN_PAGES && page - last <= UPLOAD_GAP_PAGES; page++) {
+				if (source->stale[page])
+					last = page;
+			}
+			page = last + 1;
+			start = first * SHADOW_PAGE;
+			size = min(page * SHADOW_PAGE, bytes) - start;
+			// The rest is left for the next time it is asked for
+			if (!ShimWriteBuffer(resource, start, resource->shadow.data() + start, size))
+				break;
+			upload_spike.add_bytes(size);
+			memset(&source->stale[first], 0, page - first);
+			stats.uploaded_bytes += size;
 		}
-		first = last = page;
-		for (; page < pages && page - first < UPLOAD_RUN_PAGES && page - last <= UPLOAD_GAP_PAGES; page++) {
-			if (source->stale[page])
-				last = page;
-		}
-		page = last + 1;
-		start = first * SHADOW_PAGE;
-		size = min(page * SHADOW_PAGE, bytes) - start;
-		// The rest is left for the next time it is asked for
-		if (!ShimWriteBuffer(resource, start, resource->shadow.data() + start, size))
-			break;
-		memset(&source->stale[first], 0, page - first);
-		stats.uploaded_bytes += size;
 	}
 	if (start_ticks)
 		stats.upload_ticks += ticks() - (read_ticks ? read_ticks : start_ticks);
@@ -1874,6 +1891,7 @@ bool VkScopeUploadShadow(ShimResource *resource)
 
 static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offset, UINT bytes, UINT stride)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_BUFFER_PUBLISH);
 	ConstantsKey key = std::make_tuple(buffer, offset, bytes, stride);
 	auto found = published_constants.find(key);
 	D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {};
@@ -6065,6 +6083,7 @@ ID3D11Buffer* VkScopeConstantBuffer(int stage, UINT slot)
 		return NULL;
 	if (scope->cbs_asked[stage] & 1u << slot)
 		return scope->cbs[stage][slot];
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_CB_LOOKUP);
 	scope->cbs_asked[stage] |= 1u << slot;
 	scope->cbs[stage][slot] = NULL;
 	Timed timed(TIMED_ANSWERS);
@@ -6232,6 +6251,7 @@ ID3D11ShaderResourceView* VkScopeShaderResource(int stage, UINT slot)
 		return NULL;
 	if (scope->srvs_asked[stage] & 1u << slot)
 		return scope->srvs[stage][slot];
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_SRV_LOOKUP);
 	scope->srvs_asked[stage] |= 1u << slot;
 	scope->srvs[stage][slot] = NULL;
 	Timed timed(TIMED_ANSWERS);
@@ -6573,6 +6593,7 @@ static bool bind_for_mod(const ShimState *mod, ModDraw *draw)
 
 static void record_mod_draws()
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_RECORD_DRAWS);
 	const CmdState *game = &scope->state;
 	Timed timed(TIMED_RECORDING);
 	UINT slot;
@@ -7982,6 +8003,7 @@ static void patch_for_mod(const ShimState *mod, ModDraw *draw)
 
 void VkScopeDraw(bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_MOD_BINDINGS);
 	const ShimState *mod = dx12_shim->shim_context->mState;
 	Timed timed(TIMED_MOD_DRAWS);
 	ModDraw draw = {};

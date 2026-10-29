@@ -159,6 +159,19 @@ namespace Profiling {
 			VK_TEXTURE_COPY,
 			VK_MEMORY,
 			VK_TRANSFERS,
+			COMMAND_LIST,
+			VK_CB_LOOKUP,
+			VK_SRV_LOOKUP,
+			VK_BUFFER_PUBLISH,
+			VK_REGION_HASH,
+			VK_CONSTANT_READ,
+			VK_SHADOW_FILL,
+			VK_SHADOW_UPLOAD,
+			VK_REFRESH,
+			VK_REFRESH_WAIT,
+			VK_REFRESH_UPLOAD,
+			VK_MOD_BINDINGS,
+			VK_RECORD_DRAWS,
 
 			NUM_CATEGORIES, // Must be last
 		};
@@ -170,8 +183,10 @@ namespace Profiling {
 		// A frame is logged for taking threshold_ms, or relative times
 		// the recent average, whichever is given
 		void init(float threshold_ms, float relative, const wchar_t *log_dir);
-		void add(Category category, INT64 start, const wchar_t *name, UINT64 id);
+		void add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes = 0);
 		void frame(bool mods_disabled = false);
+		void configure_mod_state(const wchar_t *variable);
+		void sample_mod_state();
 
 		// Things counted per frame for whoever has names for them,
 		// listed with the summaries and the slow frames
@@ -193,9 +208,10 @@ namespace Profiling {
 			// be listed by itself, so has to outlive the scope:
 			const wchar_t *name;
 			UINT64 id;
+			UINT64 bytes;
 		public:
 			Scope(Category category, const wchar_t *name = NULL, UINT64 id = 0) :
-				category(category), name(name), id(id)
+				category(category), name(name), id(id), bytes(0)
 			{
 				start.QuadPart = 0;
 				if (threshold)
@@ -205,8 +221,10 @@ namespace Profiling {
 			~Scope()
 			{
 				if (start.QuadPart)
-					add(category, start.QuadPart, name, id);
+					add(category, start.QuadPart, name, id, bytes);
 			}
+
+			void add_bytes(UINT64 count) { bytes += count; }
 		};
 	}
 

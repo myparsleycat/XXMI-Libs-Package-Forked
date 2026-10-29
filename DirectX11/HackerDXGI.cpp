@@ -333,6 +333,8 @@ void HackerSwapChain::RunFrameActions()
 		}
 	}
 
+	Profiling::Spike::sample_mod_state();
+
 	// Draw the on-screen overlay text with hunting and informational
 	// messages, before final Present. We now do this after the shader and
 	// config reloads, so if they have any notices we will see them this

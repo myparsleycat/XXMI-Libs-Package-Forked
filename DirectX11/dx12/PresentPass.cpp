@@ -306,6 +306,8 @@ static void frame_actions()
 		Dx12WatchDevice(dx12_shim->device);
 	}
 
+	Profiling::Spike::sample_mod_state();
+
 	if (!G->suppress_overlay)
 		Dx12DrawOverlay();
 	G->suppress_overlay = false;

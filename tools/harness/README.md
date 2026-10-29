@@ -102,6 +102,12 @@ Run the other harness options by hand and read their output. These are
 `--overlay`, `--bonetick`, `--unmapped`, `--map2`, `--gpufilled`, `--reload`
 and `--appear`. They are described in `harness.cpp`.
 
+`python tools/harness/vk/check_spike.py <fresh run folder>` checks spike-log
+timings and byte counts with hash dumping and general logging disabled. It
+also switches a namespaced mod variable ON/OFF/ON to check summary boundaries,
+then disables spike logging to check that no log is created. Prepare an isolated
+folder with `vk/setup.sh` first; the check restores its ini files.
+
 ### skin
 
 - `check.sh`: runs each mode of `make_mod.py` with its `skin.exe` arguments

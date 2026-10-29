@@ -5243,6 +5243,9 @@ void LoadConfigFile()
 	// so we parse it before all other command lists, key bindings and
 	// presets that may use those variables.
 	ParseConstantsSection();
+	wchar_t spike_mod_variable[MAX_PATH];
+	GetIniString(L"Logging", L"spike_log_mod_state", L"", spike_mod_variable, ARRAYSIZE(spike_mod_variable));
+	Profiling::Spike::configure_mod_state(spike_mod_variable);
 
 	// Must be done before any command lists that may refer to them:
 	ParseResourceSections();
