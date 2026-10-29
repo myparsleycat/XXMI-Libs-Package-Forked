@@ -2394,6 +2394,7 @@ void RegionHashesCache::Initialize(size_t buffer_size)
 		//LogInfo("RegionHashesCache::Initialize buffer_size=%d \n", buffer_size);
 		UINT num_pages = (UINT)((buffer_size + PAGE_SIZE - 1) / PAGE_SIZE);
 		page_versions.assign(num_pages, 0);
+		data_size = buffer_size;
 		if (cache)
 			cache->clear();
 	}
@@ -2571,7 +2572,7 @@ uint8_t* ResourceHandleInfo::GetCachedData() {
 // The deleter of the data of a lazy cache, which is what the views of the
 // data share with it (CustomResource::SetHandleInfo)
 struct LazyDataCache {
-	static const size_t PAGE = 4096;
+	static const size_t PAGE = 256;
 
 	std::function<void(uint8_t *dst, size_t offset, size_t size)> read;
 	size_t size;
@@ -2583,16 +2584,20 @@ struct LazyDataCache {
 uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
 {
 	LazyDataCache *lazy = cached_data ? std::get_deleter<LazyDataCache>(cached_data) : nullptr;
-	size_t page, start = cached_data_offset + offset;
+	size_t page, first, start = cached_data_offset + offset;
 
-	if (lazy && start < lazy->size) {
+	if (lazy && size && start < lazy->size) {
 		size = min(size, lazy->size - start);
-		for (page = start / LazyDataCache::PAGE; page * LazyDataCache::PAGE < start + size; page++) {
-			if (lazy->pages[page])
+		for (page = start / LazyDataCache::PAGE; page * LazyDataCache::PAGE < start + size;) {
+			if (lazy->pages[page]) {
+				page++;
 				continue;
-			lazy->pages[page] = true;
-			lazy->read(cached_data.get() + page * LazyDataCache::PAGE, page * LazyDataCache::PAGE,
-				min(LazyDataCache::PAGE, lazy->size - page * LazyDataCache::PAGE));
+			}
+			first = page;
+			for (; page * LazyDataCache::PAGE < start + size && !lazy->pages[page]; page++);
+			lazy->read(cached_data.get() + first * LazyDataCache::PAGE, first * LazyDataCache::PAGE,
+				min(page * LazyDataCache::PAGE, lazy->size) - first * LazyDataCache::PAGE);
+			std::fill(lazy->pages.begin() + first, lazy->pages.begin() + page, true);
 		}
 	}
 	return GetCachedData();
@@ -2600,6 +2605,15 @@ uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
 
 void ResourceHandleInfo::SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read)
 {
+	if (cached_data && cached_data.use_count() == 1 && !cached_data_offset && cached_data_size == size) {
+		LazyDataCache *existing = std::get_deleter<LazyDataCache>(cached_data);
+		if (existing && existing->size == size) {
+			existing->read = std::move(read);
+			std::fill(existing->pages.begin(), existing->pages.end(), false);
+			region_hashes_cache->Initialize(size);
+			return;
+		}
+	}
 	LazyDataCache lazy;
 	uint8_t *data = static_cast<uint8_t*>(malloc(size));
 

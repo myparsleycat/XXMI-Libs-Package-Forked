@@ -395,7 +395,7 @@ private:
 	// Avoids recomputing hashes for the same draw-call regions.
 	std::unique_ptr <FlatHashMap<RegionHashKeyL2, RegionCacheEntry, RegionHashKeyHasherL2>> cache;
 	std::vector<UINT> page_versions;
-	size_t data_size;
+	size_t data_size = 0;
 };
 
 struct TextureOverride;

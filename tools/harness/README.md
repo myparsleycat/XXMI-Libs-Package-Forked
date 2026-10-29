@@ -19,6 +19,7 @@ to apply this behavior there; the DLL does not need rebuilding.
 | `skin` | D3D12 GPU skinning with character mods (`make_mod.py` modes), queue and device lifetimes with D3D11On12 |
 | `sampler` | `type = SamplerState` resources and `ps-s0` bindings on D3D11 |
 | `cpu` | The CPU work of the DLL on the configuration of an installed importer: call-for-call equality and frame time against a reference DLL |
+| `cache` | CPU data-cache snapshots, shared views, bounded lazy reads and allocation reuse, without a GPU |
 
 ## Requirements
 
@@ -188,3 +189,18 @@ folders.
 `common/profile.inc` is the sampling profiler that the `profile` options of
 the harnesses use. `dx12/symbolize.py` turns offsets into `d3d11.dll` into
 function names and lines.
+
+### cache
+
+Run `cache/build.bat`, then `cache/bin/cache.exe --bounded`. The build compiles
+the cache definitions from `DirectX11/ResourceHash.cpp` with the production
+header, excluding the resource-tracking and GPU hooks. The checks cover
+snapshot invalidation, retained shared views, resize, clear, sparse reads,
+block boundaries and a complete read after sparse reads. Small value reads
+must fetch at most 256 bytes; consecutive missing blocks must be read together.
+
+The executable also reports time, storage replacements and bytes read for
+100,000 cache renewals with and without a retained shared view. These use CPU
+memory and do not predict the cost of reading mapped GPU memory. To compare
+an older implementation, pass its saved `ResourceHash.cpp` to `build.bat` and
+run without `--bounded`; the snapshot checks still apply.

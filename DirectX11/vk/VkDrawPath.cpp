@@ -6464,7 +6464,8 @@ static bool bind_for_mod(const ShimState *mod, ModDraw *draw)
 	UINT strides[MAX_VBS];
 	VkDeviceSize size;
 	Mirror *mirror;
-	UINT slot;
+	UINT replaced_slots = 0;
+	unsigned long slot;
 
 	memcpy(strides, pipeline->vb_strides, sizeof(strides));
 	if (mod->input_layout && scope->game_layout && mod->input_layout != scope->game_layout)
@@ -6492,6 +6493,7 @@ static bool bind_for_mod(const ShimState *mod, ModDraw *draw)
 			mod_draw_failed("the contents of a vertex buffer are not known to the CPU, or no Vulkan buffer could be made of them");
 			return false;
 		}
+		replaced_slots |= 1u << slot;
 		if (mod->vb_strides[slot] && !(pipeline->vbs_per_instance & 1u << slot))
 			vertices = min(vertices, (replaced[slot]->size - mod->vb_offsets[slot]) / mod->vb_strides[slot]);
 	}
@@ -6499,16 +6501,18 @@ static bool bind_for_mod(const ShimState *mod, ModDraw *draw)
 	// What the game has bound to more than one binding is one stream to the
 	// mod: the others follow. What is left of the game's is read as far as
 	// the mod's vertices go, which has to be within the buffer.
-	for (slot = 0; slot < MAX_VBS; slot++) {
-		UINT other;
+	for (UINT slots = pipeline->vbs & ~replaced_slots; _BitScanForward(&slot, slots); slots &= slots - 1) {
+		unsigned long other = MAX_VBS;
 
-		if (replaced[slot] || !(pipeline->vbs & 1u << slot) || !game->vbs[slot])
+		if (!game->vbs[slot])
 			continue;
-		for (other = 0; other < MAX_VBS; other++) {
-			if (replaced[other] && game->vbs[other] == game->vbs[slot]
+		for (UINT candidates = replaced_slots; candidates; candidates &= candidates - 1) {
+			_BitScanForward(&other, candidates);
+			if (game->vbs[other] == game->vbs[slot]
 			    && game->vb_offsets[other] == game->vb_offsets[slot]
 			    && pipeline->vb_strides[other] == pipeline->vb_strides[slot])
 				break;
+			other = MAX_VBS;
 		}
 		if (other < MAX_VBS) {
 			draw->vbs_set |= 1u << slot;
@@ -6529,9 +6533,7 @@ static bool bind_for_mod(const ShimState *mod, ModDraw *draw)
 			return false;
 		}
 	}
-	for (slot = 0; slot < MAX_VBS; slot++) {
-		if (!replaced[slot])
-			continue;
+	for (UINT slots = replaced_slots; _BitScanForward(&slot, slots); slots &= slots - 1) {
 		draw->vbs_set |= 1u << slot;
 		draw->vbs[slot] = replaced[slot]->buffer;
 		draw->vb_offsets[slot] = replaced[slot]->offset + mod->vb_offsets[slot];
