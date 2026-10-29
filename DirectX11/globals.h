@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <atomic>
 
 #include "DLLMainHook.h"
 #include "DirectXMath.h"
@@ -477,6 +478,7 @@ struct Globals
 	bool enable_check_interface;
 	int enable_create_device;
 	bool enable_platform_update;
+	std::atomic<bool> force_multithreaded_device;
 
 	int GAME_INTERNAL_WIDTH; // this variable stores the resolution width provided by the game (required for the upscaling feature)
 	int GAME_INTERNAL_HEIGHT; // this variable stores the resolution height provided by the game (required for the upscaling feature)
@@ -840,6 +842,7 @@ struct Globals
 		enable_check_interface(false),
 		enable_create_device(0),
 		enable_platform_update(false),
+		force_multithreaded_device(false),
 		gInitialized(false),
 		bIntendedTargetExe(false),
 		gReloadConfigPending(false),
