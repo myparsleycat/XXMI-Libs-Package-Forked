@@ -5884,8 +5884,11 @@ bool Dx12Draw(Dx12GraphicsCommandList *list, bool indexed, UINT count, UINT inst
 	if (timed)
 		times[2] = ticks();
 	stats.draws++;
-	stats.skipped += c.call_info.skip;
-	if (!c.call_info.skip) {
+	// D3D11 draws no triangles when the index buffer is explicitly unbound.
+	// The D3D12 command list still has the game's index buffer bound.
+	bool skip_draw = c.call_info.skip || (indexed && dx12_shim->shim_context->mState->ib_unbound);
+	stats.skipped += skip_draw;
+	if (!skip_draw) {
 		Profiling::Spike::Scope spike_apply(Profiling::Spike::DX12_APPLY);
 		apply_overrides(false);
 		if (indexed)
