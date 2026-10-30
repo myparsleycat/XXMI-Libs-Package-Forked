@@ -142,6 +142,7 @@ struct ShimResource {
 	UINT64 upload_va;
 	UINT64 upload_version;
 	UINT upload_epoch;
+	UINT64 upload_offset, upload_size;
 	// Counts the writes: of the shadow of a cpu_only buffer, and the times
 	// a list of ours was to write a resource (Dx12ShimTransition)
 	UINT64 version;
@@ -333,9 +334,14 @@ void ShimGetResourceDesc(ID3D11Resource *resource, ShimResourceDesc *desc);
 // commands we record find it in and have to leave it in.
 ShimTexture2D* ShimWrapTexture2D(ID3D12Resource *resource, D3D12_RESOURCE_STATES state);
 
-// The address a draw can use for the buffer's current contents, uploading
-// them first if the buffer has no resource. 0 if there is nothing to use.
-UINT64 Dx12ShimBufferAddress(ID3D11Buffer *buffer, D3D12_RESOURCE_STATES state);
+// The address a draw can use for the buffer's current contents at offset,
+// uploading them first if the buffer has no resource. Only offset to
+// offset + size is uploaded, starting 256-byte aligned for a constant buffer
+// view. 0 if there is nothing to use. Vertex and index buffers ask for all of
+// it and add their own offsets: theirs need not be 256-byte apart, so ranges
+// of one could not share an upload.
+UINT64 Dx12ShimBufferAddress(ID3D11Buffer *buffer, D3D12_RESOURCE_STATES state,
+		UINT64 offset = 0, UINT64 size = UINT64_MAX);
 
 // -----------------------------------------------------------------------------
 // Views

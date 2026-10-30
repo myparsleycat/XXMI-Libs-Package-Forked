@@ -20,5 +20,6 @@ python ../common/make_ini.py "$dir/d3dx.ini" Loader.target=harness.exe Loader.re
 	Logging.log_level=info Logging.unbuffered=1 "$@" || exit 1
 cp -r case/Mods "$dir/" || exit 1
 python make_dds.py "$dir/Mods/tex_bc7.dds" || exit 1
+python make_cb.py "$dir/Mods/range_cb.buf" || exit 1
 cp case/tests/test_texture.ini "$dir/Mods/test.ini" || exit 1
 echo "$dir ready"

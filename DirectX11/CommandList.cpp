@@ -1693,6 +1693,21 @@ static bool branch_only_checks_texture_overrides(CommandList *pre, CommandList *
 	return false;
 }
 
+static bool if_only_checks_texture_overrides(IfCommand *branch, CommandListCheckedSlots *slots, unsigned depth)
+{
+	// Evaluating the condition changes nothing, and either branch may be
+	// the one that runs, unless only one of them will do and the condition
+	// is one that can be watched:
+	bool if_true = branch_only_checks_texture_overrides(branch->true_commands_pre.get(),
+			branch->true_commands_post.get(), slots, depth + 1);
+	bool if_false = branch_only_checks_texture_overrides(branch->false_commands_pre.get(),
+			branch->false_commands_post.get(), slots, depth + 1);
+
+	if (!if_true && !if_false)
+		return false;
+	return if_true == if_false || note_guard(branch, if_true, slots);
+}
+
 bool CommandListOnlyChecksTextureOverrides(CommandList *command_list, CommandListCheckedSlots *slots, unsigned depth)
 {
 	// Bounds circular references:
@@ -1705,19 +1720,20 @@ bool CommandListOnlyChecksTextureOverrides(CommandList *command_list, CommandLis
 		CommandListCommand *cmd = command.get();
 
 		if (IfCommand *branch = dynamic_cast<IfCommand*>(cmd)) {
-			// Evaluating the condition changes nothing, and either
-			// branch may be the one that runs, unless only one of
-			// them will do and the condition is one that can be
-			// watched:
-			bool if_true = branch_only_checks_texture_overrides(branch->true_commands_pre.get(),
-					branch->true_commands_post.get(), slots, depth + 1);
-			bool if_false = branch_only_checks_texture_overrides(branch->false_commands_pre.get(),
-					branch->false_commands_post.get(), slots, depth + 1);
+			if (!if_only_checks_texture_overrides(branch, slots, depth))
+				return false;
+		} else if (ShaderResourceBatch *batch = dynamic_cast<ShaderResourceBatch*>(cmd)) {
+			// The optimiser folds an if/elif/else chain that drives
+			// one slot into a batch, so judge each by the chain it
+			// was folded from. A plain binding fails as it would
+			// outside a batch:
+			for (auto &op : batch->operations) {
+				auto folded = dynamic_cast<ConditionalSlotCopyOperation*>(op.get());
+				IfCommand *branch = folded ? dynamic_cast<IfCommand*>(folded->source_if.get()) : NULL;
 
-			if (!if_true && !if_false)
-				return false;
-			if (if_true != if_false && !note_guard(branch, if_true, slots))
-				return false;
+				if (!branch || !if_only_checks_texture_overrides(branch, slots, depth))
+					return false;
+			}
 		} else if (RunExplicitCommandList *run = dynamic_cast<RunExplicitCommandList*>(cmd)) {
 			if (!run->command_list_section
 			    || !CommandListOnlyChecksTextureOverrides(&run->command_list_section->command_list, slots, depth + 1)

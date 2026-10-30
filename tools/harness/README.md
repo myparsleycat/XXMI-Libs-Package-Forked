@@ -109,6 +109,36 @@ also switches a namespaced mod variable ON/OFF/ON to check summary boundaries,
 then disables spike logging to check that no log is created. Prepare an isolated
 folder with `vk/setup.sh` first; the check restores its ini files.
 
+`vk/build_shadow.bat` and `vk/bin/shadow.exe --bounded` check the production
+shadow fill, publication reset and CPU buffer uploads with isolated readers and
+upload allocations, without a GPU.
+CB requests use 256-byte validity blocks; SSBO requests retain 4 KiB pages.
+The checks cover sparse reads followed by a full read, block boundaries,
+publication invalidation and the 4 KiB pages marked for upload. Upload checks
+cover requested ranges, 256-byte address alignment and padding, version and
+submission epoch invalidation, retained contents and allocation failure. Pass
+saved `VkDrawPath.cpp` and `ShimObjects.cpp` paths to the build script to compare
+an older implementation; omit `--bounded` to run value and invalidation checks
+without the read and upload size limits. The rendering case `test_cb_ranges.ini`
+dispatches twice with distinct regions of a 64 KiB CB and must draw green.
+A `case/tests/<name>.want` file holds an extended regular expression that the
+reference picture of that test must match before the new DLL is compared.
+
+`vk/build_bindings.bat` and `vk/bin/bindings.exe --batched` compile the production
+SRV getter and Vulkan prefetch against local descriptor and reference fixtures.
+They check mixed game, mod and null bindings, descriptor updates and handle reuse
+between draws, slot bounds and COM references. Add `--timed` to check that hash
+statistics include descriptor and image lookup time, exclude cached answers and
+stop accumulating when disabled, using the production timer with a fixture clock.
+Pass saved `VkDrawPath.cpp` and
+`ShimContext.cpp` paths to the build script to compare an older implementation;
+omit `--batched` to omit the lock-count requirement. These CPU checks supplement
+the Vulkan rendering checks; they do not exercise driver or GPU synchronization.
+
+Vulkan PS requests for multiple game SRVs resolve their descriptors under one
+lock. Spike SRV lookup counts include one call for each such batch, rather than
+one per slot; the batch time remains inclusive of descriptor and image lookup.
+
 ### skin
 
 - `check.sh`: runs each mode of `make_mod.py` with its `skin.exe` arguments

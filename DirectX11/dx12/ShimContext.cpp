@@ -290,6 +290,17 @@ void ShimContext::GetShaderResources(Dx12ShaderStage stage, UINT start, UINT cou
 	ID3D11ShaderResourceView *view;
 	UINT i;
 
+	if (stage == DX12_STAGE_PS && count > 1 && start < 32 && VkInDrawScope()) {
+		UINT slots = 0;
+		const ShimStageState &state = mState->stages[stage];
+		for (i = start; i < 32 && i - start < count; i++) {
+			if (!state.srvs[i] && !(state.srv_unbound[i / 32] & (1u << (i & 31))))
+				slots |= 1u << i;
+		}
+		if (slots)
+			VkScopePrefetchShaderResources(stage, slots);
+	}
+
 	for (i = 0; i < count; i++) {
 		view = start + i < SHIM_SRV_SLOTS ? mState->stages[stage].srvs[start + i] : NULL;
 		// What a mod has not bound over is still the game's

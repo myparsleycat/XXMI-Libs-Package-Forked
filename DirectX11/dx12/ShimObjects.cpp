@@ -299,29 +299,46 @@ bool Dx12ShimIsGameConstants(ID3D11Resource *resource)
 		&& (static_cast<ShimBuffer*>(resource)->mDesc.BindFlags & D3D11_BIND_CONSTANT_BUFFER);
 }
 
-UINT64 Dx12ShimBufferAddress(ID3D11Buffer *buffer, D3D12_RESOURCE_STATES state)
+UINT64 Dx12ShimBufferAddress(ID3D11Buffer *buffer, D3D12_RESOURCE_STATES state, UINT64 offset, UINT64 size)
 {
 	ShimResource *resource = ShimResourceOf(buffer);
 	BYTE *upload;
+	UINT64 va;
 
 	if (resource->foreign)
-		return resource->foreign_va;
+		return resource->foreign_va ? resource->foreign_va + offset : 0;
 
 	if (!resource->cpu_only) {
 		if (!Dx12ShimTransition(resource, state))
 			return 0;
-		return resource->resource->GetGPUVirtualAddress();
+		return resource->resource->GetGPUVirtualAddress() + offset;
 	}
 
-	if (resource->upload_epoch == dx12_shim_epoch && resource->upload_version == resource->version)
-		return resource->upload_va;
+	if (offset >= resource->shadow.size() || !size)
+		return 0;
+	size = min(size, resource->shadow.size() - offset);
+	UINT64 first = offset, end = offset + size;
+	if (resource->upload_epoch == dx12_shim_epoch && resource->upload_version == resource->version
+	    && !((max(offset, resource->upload_offset) - min(offset, resource->upload_offset)) & 255)) {
+		if (offset >= resource->upload_offset && end <= resource->upload_offset + resource->upload_size)
+			return resource->upload_va + offset - resource->upload_offset;
+		// Ranges bound together are uploaded together, or each draw would
+		// upload them again in turn
+		first = min(first, resource->upload_offset);
+		end = max(end, resource->upload_offset + resource->upload_size);
+	}
 
 	// 256 is what a constant buffer view has to be aligned to
-	upload = Dx12ShimUpload(resource->shadow.size(), 256, NULL, NULL, &resource->upload_va);
+	UINT64 padded = (end - first + 255) & ~255ull;
+	upload = Dx12ShimUpload(padded, 256, NULL, NULL, &va);
 	if (!upload)
 		return 0;
-	memcpy(upload, resource->shadow.data(), resource->shadow.size());
+	memcpy(upload, resource->shadow.data() + first, (size_t)(end - first));
+	memset(upload + (end - first), 0, (size_t)(padded - (end - first)));
+	resource->upload_va = va;
 	resource->upload_epoch = dx12_shim_epoch;
 	resource->upload_version = resource->version;
-	return resource->upload_va;
+	resource->upload_offset = first;
+	resource->upload_size = end - first;
+	return va + offset - first;
 }

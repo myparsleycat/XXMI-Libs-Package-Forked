@@ -1556,23 +1556,27 @@ void VkScopeFillShadow(ShimResource *resource, UINT64 offset, UINT64 size)
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_SHADOW_FILL);
 	source = &found->second;
 	bytes = std::get<2>(source->key);
-	if (offset >= bytes)
+	const UINT block = std::get<3>(source->key) ? SHADOW_PAGE : 256;
+	if (!size || offset >= bytes)
 		return;
 	size = min(size, bytes - offset);
 
-	for (page = (UINT)(offset / SHADOW_PAGE); (UINT64)page * SHADOW_PAGE < offset + size; page++) {
-		if (source->pages[page])
+	for (page = (UINT)(offset / block); (UINT64)page * block < offset + size;) {
+		if (source->pages[page]) {
+			page++;
 			continue;
+		}
 		// With those after it in one go: a large read is a faster one
-		start = page * SHADOW_PAGE;
-		for (; (UINT64)page * SHADOW_PAGE < offset + size && !source->pages[page]; page++) {
+		start = page * block;
+		for (; (UINT64)page * block < offset + size && !source->pages[page]; page++) {
 			source->pages[page] = true;
 			source->pages_left--;
 		}
+		UINT end = min(page * block, bytes);
 		read_constants(resource->shadow.data() + start, std::get<0>(source->key), std::get<1>(source->key) + start,
-			min(page * SHADOW_PAGE, bytes) - start);
+			end - start);
 		if (!source->stale.empty())
-			memset(&source->stale[start / SHADOW_PAGE], 1, page - start / SHADOW_PAGE);
+			memset(&source->stale[start / SHADOW_PAGE], 1, (end + SHADOW_PAGE - 1) / SHADOW_PAGE - start / SHADOW_PAGE);
 		read = true;
 	}
 	if (read)
@@ -1674,7 +1678,7 @@ static void refresh_part(void *context, size_t from, size_t to)
 
 static void finish_refresh();
 
-static bool refresh_later(ShimResource *resource, ConstantsSource *source, UINT bytes, UINT pages)
+static bool refresh_later(ShimResource *resource, ConstantsSource *source, const std::vector<bool> &read, UINT bytes, UINT pages)
 {
 	static bool tried, started;
 	size_t part, i;
@@ -1701,7 +1705,7 @@ static bool refresh_later(ShimResource *resource, ConstantsSource *source, UINT 
 	refreshing.key = source->key;
 	refreshing.bytes = bytes;
 	refreshing.pages = pages;
-	refreshing.read = source->pages;
+	refreshing.read = read;
 	refreshing.stale = source->stale.data();
 
 	part = pages / ARRAYSIZE(refresh_workers);
@@ -1802,9 +1806,10 @@ bool VkScopeUploadShadow(ShimResource *resource)
 {
 	auto found = constants_sources.find(resource);
 	UINT64 start_ticks = G->vk_dump_hashes ? ticks() : 0, read_ticks = 0;
-	UINT bytes, pages, page, first, last, start, size;
+	UINT bytes, pages, page, first, last, start, size, left;
 	ConstantsSource *source;
 	Refresh refresh;
+	std::vector<bool> whole_pages;
 
 	if (found == constants_sources.end())
 		return false;
@@ -1815,29 +1820,39 @@ bool VkScopeUploadShadow(ShimResource *resource)
 	source = &found->second;
 	bytes = (UINT)min((UINT64)std::get<2>(source->key), min((UINT64)resource->shadow.size(), resource->desc.Width));
 	pages = (bytes + SHADOW_PAGE - 1) / SHADOW_PAGE;
-	if (pages > source->pages.size())
-		return false;
-	// All of it the first time
+	const std::vector<bool> *read = &source->pages;
+	left = source->pages_left;
+	// What was read of constants is in blocks of 256 bytes: here a page is
+	// read once all of its blocks are, and the rest of it is compared
+	if (!std::get<3>(source->key) && left) {
+		const UINT blocks = SHADOW_PAGE / 256;
+		whole_pages.assign(pages, true);
+		for (page = 0; page < source->pages.size() && page / blocks < pages; page++)
+			whole_pages[page / blocks] = whole_pages[page / blocks] && source->pages[page];
+		left = (UINT)std::count(whole_pages.begin(), whole_pages.end(), false);
+		read = &whole_pages;
+	}
+	// All of it the first time. Sized as VkScopeFillShadow marks it.
 	if (source->stale.empty())
-		source->stale.assign(source->pages.size(), 1);
+		source->stale.assign((std::get<2>(source->key) + SHADOW_PAGE - 1) / SHADOW_PAGE, 1);
 
-	if (source->pages_left && refresh_later(resource, source, bytes, pages)) {
+	if (left && refresh_later(resource, source, *read, bytes, pages)) {
 		stats.refreshed_apart++;
 		stats.constants_read++;
-		stats.constants_bytes += (UINT64)source->pages_left * SHADOW_PAGE;
-		stats.compared_bytes += (UINT64)source->pages_left * SHADOW_PAGE;
+		stats.constants_bytes += (UINT64)left * SHADOW_PAGE;
+		stats.compared_bytes += (UINT64)left * SHADOW_PAGE;
 		source->pages.assign(source->pages.size(), true);
 		source->pages_left = 0;
 		return true;
 	}
 
-	if (source->pages_left) {
+	if (left) {
 		AcquireSRWLockShared(&memory_lock);
 		refresh = { resource->shadow.data(), mapped_bytes(std::get<0>(source->key), std::get<1>(source->key), bytes),
-			bytes, &source->pages, source->stale.data() };
+			bytes, read, source->stale.data() };
 		if (!refresh.data) {
 			for (page = 0; page < pages; page++) {
-				if (source->pages[page])
+				if ((*read)[page])
 					continue;
 				memset(refresh.shadow + page * SHADOW_PAGE, 0, min(SHADOW_PAGE, bytes - page * SHADOW_PAGE));
 				source->stale[page] = 1;
@@ -1850,8 +1865,8 @@ bool VkScopeUploadShadow(ShimResource *resource)
 		ReleaseSRWLockShared(&memory_lock);
 
 		stats.constants_read++;
-		stats.constants_bytes += (UINT64)source->pages_left * SHADOW_PAGE;
-		stats.compared_bytes += (UINT64)source->pages_left * SHADOW_PAGE;
+		stats.constants_bytes += (UINT64)left * SHADOW_PAGE;
+		stats.compared_bytes += (UINT64)left * SHADOW_PAGE;
 		source->pages.assign(source->pages.size(), true);
 		source->pages_left = 0;
 		if (start_ticks) {
@@ -1951,7 +1966,8 @@ static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offse
 	// Other contents than the frame before, as far as anyone knows
 	finish_refresh_of(&object->r);
 	ConstantsSource *source = &constants_sources[&object->r];
-	source->pages.assign((bytes + SHADOW_PAGE - 1) / SHADOW_PAGE, false);
+	const UINT block = stride ? SHADOW_PAGE : 256;
+	source->pages.assign((bytes + block - 1) / block, false);
 	source->pages_left = (UINT)source->pages.size();
 	object->r.shadow_pending = true;
 	object->r.upload_pending = !object->r.cpu_only;
@@ -3748,6 +3764,7 @@ struct SetBinding {
 struct DescriptorLayout {
 	// By binding number
 	std::vector<SetBinding> bindings;
+	std::vector<UINT> active_bindings;
 	UINT buffers, dynamic, images;
 	// What a pool needs for a set of it. None if a set like one of the
 	// game's cannot be made here.
@@ -3767,6 +3784,15 @@ struct DescriptorSet {
 	// Counts the times it was allocated or written
 	UINT64 generation;
 };
+
+// With descriptor_lock held: the image a shader samples at the binding
+static VkImageView bound_image(const DescriptorSet *set, UINT binding)
+{
+	if (!set || binding >= set->layout->bindings.size())
+		return VK_NULL_HANDLE;
+	const SetBinding &bound = set->layout->bindings[binding];
+	return bound.image && bound.count ? set->images[bound.first_image] : VK_NULL_HANDLE;
+}
 
 static SRWLOCK descriptor_lock = SRWLOCK_INIT;
 static std::unordered_map<VkDescriptorSetLayout, std::shared_ptr<const DescriptorLayout>> set_layouts;
@@ -3831,7 +3857,10 @@ void VkModsSetLayout(VkDescriptorSetLayout handle, const VkDescriptorSetLayoutCr
 			layout->pool_sizes.push_back({ (VkDescriptorType)i, counts[i] });
 	}
 	// The offsets a set is bound with are in the order of its bindings
-	for (SetBinding &binding : layout->bindings) {
+	for (i = 0; i < layout->bindings.size(); i++) {
+		SetBinding &binding = layout->bindings[i];
+		if (binding.count)
+			layout->active_bindings.push_back(i);
 		if (binding.image) {
 			binding.first_image = layout->images;
 			layout->images += binding.count;
@@ -5059,12 +5088,12 @@ static VkDescriptorSet spare_set(const GameSet *game)
 static VkDescriptorSet mod_set(const GameSet *game, const std::vector<SetReplacement> &replacements)
 {
 	const std::vector<SetBinding> &bindings = game->layout->bindings;
-	std::vector<VkDescriptorBufferInfo> buffers;
-	std::vector<VkDescriptorImageInfo> images;
-	std::vector<VkWriteDescriptorSet> writes;
-	std::vector<VkCopyDescriptorSet> copies;
+	// Calls are serialized by the shim lock; retain scratch capacity across cache misses.
+	static std::vector<VkDescriptorBufferInfo> buffers;
+	static std::vector<VkDescriptorImageInfo> images;
+	static std::vector<VkWriteDescriptorSet> writes;
+	static std::vector<VkCopyDescriptorSet> copies;
 	VkDescriptorSet set;
-	UINT binding;
 
 	auto found = mod_sets.find(std::forward_as_tuple(game->set, game->generation, replacements));
 	if (found != mod_sets.end()) {
@@ -5076,14 +5105,18 @@ static VkDescriptorSet mod_set(const GameSet *game, const std::vector<SetReplace
 	if (!set)
 		return VK_NULL_HANDLE;
 
+	buffers.clear();
+	images.clear();
+	writes.clear();
+	copies.clear();
 	// Pointed at by the writes
 	buffers.reserve(replacements.size());
 	images.reserve(replacements.size());
-	for (binding = 0; binding < bindings.size(); binding++) {
+	writes.reserve(replacements.size());
+	copies.reserve(game->layout->active_bindings.size());
+	for (UINT binding : game->layout->active_bindings) {
 		const SetReplacement *replaced = NULL;
 
-		if (!bindings[binding].count)
-			continue;
 		for (const SetReplacement &replacement : replacements) {
 			if (std::get<0>(replacement) == binding)
 				replaced = &replacement;
@@ -6149,22 +6182,12 @@ static ShownTexture shown_textures[1024];
 // With the lock of dx12/Bridge.h held: the texture of the game a shader samples
 // at one of its bindings, as an object the engine finds the hash of. There is
 // nothing behind it, a mod cannot read the texture or bind it elsewhere.
-static ID3D11ShaderResourceView* game_texture(const SpirvBinding *slot)
+static ID3D11ShaderResourceView* shown_texture(VkImageView bound)
 {
-	const CmdState *game = &scope->state;
 	ID3D11ShaderResourceView *shown = NULL;
-	VkImageView bound = VK_NULL_HANDLE;
 	D3D11_TEXTURE2D_DESC desc = {};
 	GameImage *image;
 
-	if (slot->set >= MAX_SETS || !game->sets[slot->set])
-		return NULL;
-	AcquireSRWLockShared(&descriptor_lock);
-	DescriptorSet *set = find_set(game->sets[slot->set]);
-	if (set && slot->binding < set->layout->bindings.size() && set->layout->bindings[slot->binding].image
-	    && set->layout->bindings[slot->binding].count)
-		bound = set->images[set->layout->bindings[slot->binding].first_image];
-	ReleaseSRWLockShared(&descriptor_lock);
 	if (!bound)
 		return NULL;
 
@@ -6236,6 +6259,65 @@ static ID3D11ShaderResourceView* game_texture(const SpirvBinding *slot)
 	remembered->srv = image ? image->srv : NULL;
 	ReleaseSRWLockExclusive(&image_lock);
 	return shown;
+}
+
+static ID3D11ShaderResourceView* game_texture(const SpirvBinding *slot)
+{
+	const CmdState *game = &scope->state;
+	VkImageView bound = VK_NULL_HANDLE;
+
+	if (slot->set >= MAX_SETS || !game->sets[slot->set])
+		return NULL;
+	AcquireSRWLockShared(&descriptor_lock);
+	bound = bound_image(find_set(game->sets[slot->set]), slot->binding);
+	ReleaseSRWLockShared(&descriptor_lock);
+	return shown_texture(bound);
+}
+
+void VkScopePrefetchShaderResources(int stage, UINT slots)
+{
+	if (!scope || stage != DX12_STAGE_PS)
+		return;
+	slots &= ~scope->srvs_asked[stage];
+	if (!slots || !(slots & (slots - 1)))
+		return;
+	const ShaderLayout *shader = scope->state.pipeline->layouts[stage];
+	if (!shader)
+		return;
+	unsigned long slot;
+	UINT textures = 0;
+	for (UINT pending = slots; _BitScanForward(&slot, pending); pending &= pending - 1) {
+		if (slot >= shader->views.size())
+			continue;
+		const SpirvBinding &view = shader->views[slot];
+		if ((view.kind == SPIRV_TEXTURE || view.kind == SPIRV_TEXTURE_SAMPLER)
+		    && view.set < MAX_SETS && scope->state.sets[view.set])
+			textures |= 1u << slot;
+	}
+	if (!textures || !(textures & (textures - 1)))
+		return;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_SRV_LOOKUP);
+	Timed timed(TIMED_ANSWERS);
+	const DescriptorSet *sets[MAX_SETS] = {};
+	UINT found_sets = 0;
+	VkImageView images[SCOPE_SRVS] = {};
+
+	AcquireSRWLockShared(&descriptor_lock);
+	for (UINT pending = textures; _BitScanForward(&slot, pending); pending &= pending - 1) {
+		const SpirvBinding &view = shader->views[slot];
+		if (!(found_sets & (1u << view.set))) {
+			sets[view.set] = find_set(scope->state.sets[view.set]);
+			found_sets |= 1u << view.set;
+		}
+		images[slot] = bound_image(sets[view.set], view.binding);
+	}
+	ReleaseSRWLockShared(&descriptor_lock);
+
+	for (UINT pending = textures; _BitScanForward(&slot, pending); pending &= pending - 1) {
+		scope->srvs[stage][slot] = shown_texture(images[slot]);
+		stats.textures_shown += !!scope->srvs[stage][slot];
+	}
+	scope->srvs_asked[stage] |= textures;
 }
 
 ID3D11ShaderResourceView* VkScopeShaderResource(int stage, UINT slot)

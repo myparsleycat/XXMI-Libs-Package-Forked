@@ -280,22 +280,21 @@ static bool write_cbv(const ShimStageState *stage, UINT slot, D3D12_CPU_DESCRIPT
 	D3D12_CONSTANT_BUFFER_VIEW_DESC desc = {};
 	ID3D11Buffer *buffer = stage->cbs[slot];
 	ShimResourceDesc buffer_desc;
-	UINT64 va, offset, size;
+	UINT64 va, offset = 0, size = 0;
 
 	if (buffer) {
 		ShimGetResourceDesc(buffer, &buffer_desc);
 		offset = (UINT64)stage->cb_first[slot] * 16;
 		size = stage->cb_count[slot] ? (UINT64)stage->cb_count[slot] * 16 : buffer_desc.byte_width;
+		size = offset < buffer_desc.byte_width ? min(size, buffer_desc.byte_width - offset) : 0;
 		// Before the address: this may have the contents uploaded again
 		ShimReadShadow(ShimResourceOf(buffer), offset, size);
 	}
-	if (buffer && (va = Dx12ShimBufferAddress(buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER))) {
-		if (offset < buffer_desc.byte_width) {
-			size = min(size, buffer_desc.byte_width - offset);
-			desc.BufferLocation = va + offset;
-			// Buffers are padded for this when they are created
-			desc.SizeInBytes = (UINT)((size + 255) & ~255ull);
-		}
+	if (buffer && size && (va = Dx12ShimBufferAddress(buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, offset, size))) {
+		desc.BufferLocation = va;
+		// Buffers with a resource are padded for this when they are
+		// created, an upload by Dx12ShimBufferAddress
+		desc.SizeInBytes = (UINT)((size + 255) & ~255ull);
 	}
 
 	dx12_shim->device->CreateConstantBufferView(desc.BufferLocation ? &desc : NULL, handle);

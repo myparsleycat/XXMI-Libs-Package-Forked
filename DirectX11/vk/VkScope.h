@@ -23,6 +23,7 @@ ID3D11Buffer* VkScopeConstantBuffer(int stage, UINT slot);
 // The same for a buffer the shader reads as a whole, which is what it has at
 // a t register. NULL for a texture. Not referenced.
 ID3D11ShaderResourceView* VkScopeShaderResource(int stage, UINT slot);
+void VkScopePrefetchShaderResources(int stage, UINT slots);
 // What the shader of the stage declares, by the same registers. NULL if it
 // has none.
 struct ShaderBindings;

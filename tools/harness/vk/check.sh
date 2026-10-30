@@ -55,6 +55,10 @@ run_tests() {
 		cp "$ini" Mods/test.ini
 		cp ../ref/d3d11.dll d3d11.dll || { echo "tests: FAILED, cannot put the DLL of ref in place"; ok=0; break; }
 		want=$(picture --pool)
+		if [ -f "../case/tests/$name.want" ] && ! echo "$want" | grep -Eqf "../case/tests/$name.want"; then
+			echo "FAILED $name: reference does not match $name.want: $want"
+			ok=0
+		fi
 		cp d3d11.dll.new d3d11.dll || { echo "tests: FAILED, cannot put the DLL of run back"; ok=0; break; }
 		got=$(picture --pool)
 		if [ "$want" = "$got" ] && echo "$got" | grep -q "^middle.*checksum.*exit 0$" &&! echo "$got" | grep -q FAILED; then
