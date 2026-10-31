@@ -29,7 +29,13 @@ cases="0||bar low
 13|noheap|bar low|green
 13|noheap second place rs11|bar low second|green
 14|bindings second rs11|bar low second|green
-15|bindings second rs11|bar low second|green"
+15|bindings second rs11|bar low second|green
+16||bar low
+17|rigid|bar low
+18||square
+19|rigid|bar low
+20|rigid|rigid
+21|unusedblend||"
 # Mode 12 is a mod copying so0 where it had more vertices skinned than the
 # game's buffer holds; the copy has to stay within that buffer.
 # Mode 13's shaders read registers the game's root signature has nothing for:
@@ -48,7 +54,7 @@ cases="0||bar low
 spots() {
 	# skin.exe output -> the names of the spots drawn
 	sed -n 's/^ *\(.*[^ ]\) *DRAWN .*/\1/p' | sed 's/^game square$/square/; s/^mod bar where it is in its file$/bar/; s/^mod bar, its lower rows$/low/;
-		s/^mod bar where its compute shader moves it$/moved/; s/^second game square$/second/; s/^\.\.\. with the game.s vertices: \(.*\) wrong$/\1-wrong/' |
+		s/^mod bar where its compute shader moves it$/moved/; s/^second game square$/second/; s/^mod bar moved by rigid bone$/rigid/; s/^\.\.\. with the game.s vertices: \(.*\) wrong$/\1-wrong/' |
 		tr '\n' ' ' | sed 's/ $//'
 }
 

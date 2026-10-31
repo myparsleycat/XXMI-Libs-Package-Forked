@@ -12,7 +12,7 @@ shift $(( $# < 2 ? $# : 2 ))
 [ -f bin/skin.exe ] || { echo "no bin/skin.exe: run build.bat first"; exit 1; }
 rm -rf "$dir/Mods" "$dir/ShaderCache"
 bash ../common/install_dll.sh "$dir" "$dll" || exit 1
-cp bin/skin.exe bin/skin.pdb bin/skin_cs.cso bin/draw_vs.cso bin/draw_vs_place.cso bin/draw_ps.cso \
+	cp bin/skin.exe bin/skin.pdb bin/skin_cs.cso bin/skin_rigid_cs.cso bin/draw_vs.cso bin/draw_vs_place.cso bin/draw_ps.cso \
 	bin/draw_vs_bindings.cso bin/draw_ps_bindings.cso "$dir/" || exit 1
 python ../common/make_ini.py "$dir/d3dx.ini" System.check_foreground_window=0 Hunting.dx12_dump_hashes=1 \
 	Rendering.dx12_debug_layer=1 Logging.log_level=info Logging.unbuffered=1 "$@" || exit 1
