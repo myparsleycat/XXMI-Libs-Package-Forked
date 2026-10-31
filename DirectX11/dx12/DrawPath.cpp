@@ -6,6 +6,7 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1868,6 +1869,7 @@ void Dx12ScopeDispatched(bool recorded)
 }
 
 static bool skin_output_at(UINT64 va);
+static ID3D11Buffer *skin_blend_for_draw(UINT *stride);
 static UINT64 skin_output_bytes(UINT64 va);
 static void alias_skin_vertices(Published *vertices, const SkinDispatch *skin);
 
@@ -1905,8 +1907,13 @@ ID3D11Buffer* Dx12ScopeVertexBuffer(UINT slot, UINT *stride)
 	// as they were, where its D3D11 counterpart unbinds them. What an
 	// earlier draw left in a slot is no part of this one: a mod going by
 	// it would take a light volume for the mesh drawn before it.
-	if (!(scope->pipeline->vb_slots & 1u << slot))
+	if (!(scope->pipeline->vb_slots & 1u << slot)
+	    || (slot == SKIN_BLEND_SLOT && scope->pipeline->vb_reads_known
+	        && !(scope->pipeline->vb_read_slots & 1u << slot))) {
+		if (slot == SKIN_BLEND_SLOT)
+			return skin_blend_for_draw(stride);
 		return NULL;
+	}
 
 	view = &scope->list->mState.vertex_buffers[slot];
 	start = G->dx12_dump_hashes ? ticks() : 0;
@@ -3085,6 +3092,10 @@ struct SkinOutput {
 	UINT64 spare_bytes;
 	UINT written_frame;
 	UINT stride, vertices;
+	// Original weights used to produce this skinned output, for legacy vb2 checks.
+	UINT64 weights_va, weights_stamp;
+	UINT64 weights_serial;
+	UINT weights_count, weights_stride;
 	// When it was last written or bound
 	UINT frame;
 	// The game's buffer it stands in for, to notice when the address has
@@ -3222,6 +3233,37 @@ static SkinOutput* find_skin_output(UINT64 va)
 	return &found->second;
 }
 
+// Legacy D3D11 draws expose the skin weights in vb2 even when their vertex
+// shader does not consume them. D3D12 does not bind them on the draw; use the
+// weights of this draw's skinned vb0 only while that buffer is still valid.
+static ID3D11Buffer *skin_blend_for_draw(UINT *stride)
+{
+	const Dx12ShaderInfo *vs = scope->pipeline->shaders[DX12_STAGE_VS];
+	if (!(scope->pipeline->vb_slots & 1) || !vs || !vs->reads_position) return NULL;
+	bool position_in_slot_zero = false;
+	for (const Dx12InputElement &input : scope->pipeline->input_layout)
+		if (input.slot == 0 && !input.per_instance && !input.index && !_stricmp(input.semantic.c_str(), "POSITION"))
+			position_in_slot_zero = true;
+	if (!position_in_slot_zero) return NULL;
+	const D3D12_VERTEX_BUFFER_VIEW &view = scope->list->mState.vertex_buffers[0];
+	SkinOutput *output = view.BufferLocation ? find_skin_output(view.BufferLocation) : NULL;
+	if (!output || !output->weights_va || !output->weights_count || !output->weights_serial) return NULL;
+	UINT64 stamp = Dx12FindBufferStamp(output->weights_va);
+	if (stamp != output->weights_stamp) {
+		ID3D12Resource *resource;
+		Dx12ResourceInfo info;
+		UINT64 offset;
+		if (!Dx12FindBuffer(output->weights_va, &resource, &offset) ||
+		    !Dx12GetResourceInfo(resource, &info) || info.serial != output->weights_serial)
+			return NULL;
+		output->weights_stamp = stamp;
+	}
+	Published *entry = publish_buffer(output->weights_va, (UINT64)output->weights_count * output->weights_stride,
+	    PUBLISHED_SKIN_BUFFER, output->weights_stride, NULL);
+	if (!entry) return NULL;
+	*stride = output->weights_stride;
+	return static_cast<ShimBuffer*>(entry->resource);
+}
 // The vertices a D3D12 renderer skins need not be those of its D3D11
 // counterpart to the bit: Unity has their normals and tangents made
 // orthonormal for the compute shader, which nothing can be undone from, so the
@@ -3241,6 +3283,7 @@ static SkinOutput* find_skin_output(UINT64 va)
 // coordinates of the mod's ...IB or ...Texcoord section says the mesh is the
 // mod's: its weights go by the ...Position section from then on.
 static std::unordered_map<uint32_t, uint32_t> skin_aliases;
+static std::unordered_map<uint32_t, uint32_t> skin_alias_outputs;
 static UINT skin_aliases_config;
 
 struct SkinCandidate {
@@ -3271,7 +3314,10 @@ static std::set<std::pair<UINT64, uint32_t>> skin_rejected;
 
 // The weights of the meshes that draws said are the mods', and the hash of the
 // vertices they go with
-static std::unordered_map<uint32_t, uint32_t> skin_learned;
+// Stable mesh identity survives rotating skinned-output allocations. Keep
+// input and weight addresses too, so equal-sized meshes with equal weight
+// contents do not borrow one another's learned position hash.
+static std::map<std::tuple<uint32_t, uint32_t, UINT64, UINT64>, uint32_t> skin_learned;
 // For skin_is_boring to tell without the lock which vertices those are: a bit
 // per address of them. Their dispatch has to be looked at again however much
 // it was found to be nothing to the mods before.
@@ -3332,6 +3378,7 @@ static void collect_skin_aliases()
 	skin_aliases_config = config_generation;
 
 	skin_aliases.clear();
+	skin_alias_outputs.clear();
 	skin_candidates.clear();
 	skin_noted.clear();
 	rebuild_noted_filter();
@@ -3362,8 +3409,11 @@ static void collect_skin_aliases()
 			auto found = weights.find(stem);
 			if (found != weights.end()) {
 				skin_aliases[found->second] = entry.first;
-				continue;
+				auto output = outputs.find(stem);
+				skin_alias_outputs[found->second] = output == outputs.end() ? 0 : output->second;
 			}
+			// A matching name can refer to another mesh. Also let a draw
+			// identify the position override through its index buffer or texcoords.
 			found = outputs.find(stem);
 			if (found == outputs.end())
 				continue;
@@ -3444,7 +3494,7 @@ static void forget_noted_other(const SkinDispatch *skin)
 static void alias_skin_vertices(Published *vertices, const SkinDispatch *skin)
 {
 	Published *weights;
-	uint32_t hash, weights_hash;
+	uint32_t hash, weights_hash, position = 0;
 	bool learned = false;
 
 	collect_skin_aliases();
@@ -3459,28 +3509,32 @@ static void alias_skin_vertices(Published *vertices, const SkinDispatch *skin)
 		return;
 	weights_hash = published_hash(weights->resource);
 	auto found = skin_aliases.find(weights_hash);
-	if (found == skin_aliases.end()) {
+	if (found == skin_aliases.end() || (skin_alias_outputs[weights_hash] &&
+	    skin_alias_outputs[weights_hash] != skin_output_hash(skin))) {
 		// What has no hash of its contents goes by 0, which every other
 		// such mesh would be taken for
 		if (!weights->has_data_hash)
 			return;
-		found = skin_learned.find(weights_hash);
-		if (found == skin_learned.end()) {
+		auto learned_alias = skin_learned.find({ weights_hash, skin_output_hash(skin), skin->source_va, skin->weights_va });
+		if (learned_alias == skin_learned.end()) {
 			note_skin_candidate(skin, weights_hash);
 			return;
 		}
+		position = learned_alias->second;
 		learned = true;
+	} else {
+		position = found->second;
 	}
 
-	set_resource_hash(vertices->resource, D3D11_RESOURCE_DIMENSION_BUFFER, found->second, vertices->data_hash, NULL);
-	vertices->hash = found->second;
+	set_resource_hash(vertices->resource, D3D11_RESOURCE_DIMENSION_BUFFER, position, vertices->data_hash, NULL);
+	vertices->hash = position;
 	stats.skin_aliased++;
 	if (G->dx12_dump_hashes) {
 		static std::unordered_set<UINT64> noted;
 
-		if (noted.size() < 400 && noted.insert((UINT64)hash << 32 | found->second).second) {
+		if (noted.size() < 400 && noted.insert((UINT64)hash << 32 | position).second) {
 			Dx12DumpNote("Skinning: the vertices that would have been hashed as %08x go by %08x, the hash a mod has for those skinned with "
-				"the weights of hash %08x%s\n", hash, found->second, found->first,
+				"the weights of hash %08x%s\n", hash, position, weights_hash,
 				learned ? ", as a draw of what was skinned told" : "");
 		}
 	}
@@ -3530,7 +3584,10 @@ static void confirm_skin_candidate(bool indexed)
 	if (!position)
 		return;
 
-	skin_learned[noted->second.weights_hash] = position;
+	if (skin_learned.size() < 4096 || skin_learned.count({ noted->second.weights_hash, noted->second.output_hash,
+	    noted->second.source_va, noted->second.weights_va }))
+		skin_learned[{ noted->second.weights_hash, noted->second.output_hash, noted->second.source_va,
+			noted->second.weights_va }] = position;
 	va_filter_add(skin_learned_filter, &skin_learned_live, noted->second.source_va);
 	if (G->dx12_dump_hashes) {
 		Dx12DumpNote("Skinning: a draw of the vertices skinned with the weights of hash %08x had the index buffer %08x and texture "
@@ -3700,6 +3757,9 @@ static bool skin_bind_buffer(UINT reg, bool uav, ID3D12Resource *resource, UINT6
 	return true;
 }
 
+static ID3D11Buffer *rigid_weights_copy(ID3D11Buffer *buffer);
+static void forget_rigid_weights_copies();
+
 // The vertex buffer a mod bound to the slot in place of what the dispatch
 // reads through the register. What a mod left alone stays the game's: true
 // unless the mod's cannot be used.
@@ -3713,6 +3773,12 @@ static bool skin_bind_mod_buffer(UINT reg, UINT slot, UINT stride, UINT vertices
 
 	if (!buffer || ShimResourceOf(buffer)->foreign)
 		return true;
+	if (reg == 1 && stride == 4 && mod->vb_strides[slot] == 8) {
+		buffer = rigid_weights_copy(buffer);
+		if (!buffer || start % 8)
+			return false;
+		start /= 2;
+	}
 	if (!Dx12ShimGameBufferView(buffer, scope->list, stride, &resource, &offset, &size))
 		return false;
 	// The shader reads whole elements from the start of a view
@@ -3897,6 +3963,15 @@ static void skin_draw(UINT vertices)
 
 	Dx12ShimPin(scope->list, output->buffer);
 	output->vertices = vertices;
+	output->weights_va = skin->weights_va;
+	output->weights_stamp = Dx12FindBufferStamp(skin->weights_va);
+	UINT64 weights_offset;
+	ID3D12Resource *weights_resource;
+	Dx12ResourceInfo weights_info;
+	output->weights_serial = Dx12FindBuffer(skin->weights_va, &weights_resource, &weights_offset) &&
+	    Dx12GetResourceInfo(weights_resource, &weights_info) ? weights_info.serial : 0;
+	output->weights_count = skin->count;
+	output->weights_stride = skin->weight_stride;
 	output->frame = dx12_frame;
 	output->written_frame = dx12_frame;
 	output->game = skin->output;
@@ -4219,6 +4294,152 @@ static ID3D11Buffer* unpack_buffer(ID3D11Buffer *buffer, UINT stride, ID3D11Buff
 	return out;
 }
 
+// Compact the first word of each 8-byte D3D11 rigid weight to the 4-byte
+// layout consumed by the D3D12 skinning shader. Run on the GPU so copies
+// and mod-generated buffers do not require a current CPU shadow.
+static const char rigid_pack_hlsl[] = R"(
+Buffer<uint> source : register(t0);
+RWBuffer<uint> result : register(u0);
+cbuffer params : register(b0) { uint count; uint words; };
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x < count) result[id.x] = source[id.x * words];
+}
+)";
+static ID3D11ComputeShader *rigid_pack_shader;
+static bool rigid_pack_failed;
+static std::unordered_map<ID3D11Buffer*, UnpackedBuffer> rigid_weights_copies;
+
+static void forget_rigid_weights_copies()
+{
+    for (auto &entry : rigid_weights_copies) {
+        entry.first->Release();
+        if (entry.second.copy) entry.second.copy->Release();
+    }
+    rigid_weights_copies.clear();
+}
+static ID3D11Buffer* pack_rigid_buffer(ID3D11Buffer *buffer, UINT stride, ID3D11Buffer *into, bool *retry)
+{
+	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+	D3D11_BUFFER_DESC desc, out_desc = {}, params_desc = {};
+	D3D11_SUBRESOURCE_DATA initial = {};
+	ID3D11ShaderResourceView *srv = NULL;
+	ID3D11UnorderedAccessView *uav = NULL;
+	ID3D11Buffer *out = into, *params = NULL;
+	ID3DBlob *blob = NULL, *errors = NULL;
+	ShimResource *resource = ShimResourceOf(buffer);
+	ShimState state = {};
+	UINT values[4] = {};
+	bool done = false;
+	HRESULT hr;
+
+	*retry = false;
+	buffer->GetDesc(&desc);
+	if (resource->cpu_only) {
+		if (stride != 8 || desc.ByteWidth % 8 || resource->shadow.size() < desc.ByteWidth) return NULL;
+		std::vector<UINT> indices(desc.ByteWidth / 8);
+		for (size_t i = 0; i < indices.size(); ++i)
+			memcpy(&indices[i], resource->shadow.data() + i * 8, sizeof(UINT));
+		D3D11_BUFFER_DESC packed = {};
+		packed.ByteWidth = (UINT)(indices.size() * sizeof(UINT));
+		packed.Usage = D3D11_USAGE_DEFAULT;
+		packed.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+		D3D11_SUBRESOURCE_DATA data = {};
+		data.pSysMem = indices.data();
+		ID3D11Buffer *copy = NULL;
+		if (FAILED(dx12_shim->shim_device->CreateBuffer(&packed, &data, &copy))) return NULL;
+		return copy;
+	}
+	if (!rigid_pack_shader && !rigid_pack_failed) {
+		hr = D3DCompile(rigid_pack_hlsl, sizeof(rigid_pack_hlsl) - 1, "PackRigidWeights", NULL, NULL, "main", "cs_5_0",
+			D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors);
+		if (SUCCEEDED(hr))
+			hr = dx12_shim->shim_device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL, &rigid_pack_shader);
+		if (FAILED(hr)) {
+			rigid_pack_failed = true;
+			Dx12DumpNote("*** Failed to build the shader that compacts rigid skin weights (0x%x): %s\n", hr,
+				errors ? (const char*)errors->GetBufferPointer() : "");
+		}
+		if (blob)
+			blob->Release();
+		if (errors)
+			errors->Release();
+	}
+	buffer->GetDesc(&desc);
+	if (!rigid_pack_shader || !resource->resource || resource->foreign || stride % 4 || desc.ByteWidth < stride)
+		return NULL;
+
+	values[0] = desc.ByteWidth / 8;
+	values[1] = 2;
+
+	out_desc.ByteWidth = values[0] * 4;
+	out_desc.Usage = D3D11_USAGE_DEFAULT;
+	out_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS;
+	params_desc.ByteWidth = sizeof(values);
+	params_desc.Usage = D3D11_USAGE_DYNAMIC;
+	params_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	params_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	initial.pSysMem = values;
+	srv_desc.Format = DXGI_FORMAT_R32_UINT;
+	srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+	srv_desc.Buffer.NumElements = values[0] * values[1];
+	uav_desc.Format = DXGI_FORMAT_R32_UINT;
+	uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+	uav_desc.Buffer.NumElements = out_desc.ByteWidth / 4;
+
+	if ((out || SUCCEEDED(dx12_shim->shim_device->CreateBuffer(&out_desc, NULL, &out)))
+	    && SUCCEEDED(dx12_shim->shim_device->CreateBuffer(&params_desc, &initial, &params))
+	    && SUCCEEDED(dx12_shim->shim_device->CreateShaderResourceView(buffer, &srv_desc, &srv))
+	    && SUCCEEDED(dx12_shim->shim_device->CreateUnorderedAccessView(out, &uav_desc, &uav))) {
+		state.stages[DX12_STAGE_CS].shader = rigid_pack_shader;
+		state.stages[DX12_STAGE_CS].cbs[0] = params;
+		state.stages[DX12_STAGE_CS].cb_mask = 1;
+		state.stages[DX12_STAGE_CS].srvs[0] = srv;
+		state.stages[DX12_STAGE_CS].srv_mask[0] = 1;
+		state.cs_uavs[0] = uav;
+		if (Dx12ShimPrepareDispatch(&state)) {
+			Dx12ShimList()->Dispatch((values[0] + 63) / 64, 1, 1);
+			stats.buffers_unpacked++;
+			done = true;
+		}
+	}
+	if (!done) {
+		*retry = ShimNotReady(resource) || (out && ShimNotReady(ShimResourceOf(out)));
+		if (out && out != into)
+			out->Release();
+		out = NULL;
+	}
+	if (params)
+		params->Release();
+	if (srv)
+		srv->Release();
+	if (uav)
+		uav->Release();
+	return out;
+}
+
+static ID3D11Buffer *rigid_weights_copy(ID3D11Buffer *buffer)
+{
+    UINT64 version = ShimResourceOf(buffer)->version;
+    auto found = rigid_weights_copies.find(buffer);
+    bool retry;
+    if (found != rigid_weights_copies.end()) {
+        UnpackedBuffer *entry = &found->second;
+        if (!entry->copy || entry->version == version) return entry->copy;
+        ID3D11Buffer *updated = pack_rigid_buffer(buffer, 8, NULL, &retry);
+        if (!updated) return NULL;
+        entry->copy->Release();
+        entry->copy = updated;
+        entry->version = version;
+        return updated;
+    }
+    ID3D11Buffer *out = pack_rigid_buffer(buffer, 8, NULL, &retry);
+    if (!out) return NULL;
+    buffer->AddRef();
+    rigid_weights_copies[buffer] = { out, version };
+    return out;
+}
 // What to bind for the vertex buffer of a mod whose vertices are 4 bytes
 // shorter than those the game has in the slot. NULL to bind it as it is.
 static ID3D11Buffer* unpacked_buffer(ID3D11Buffer *buffer, UINT slot, UINT stride)
@@ -5884,8 +6105,11 @@ bool Dx12Draw(Dx12GraphicsCommandList *list, bool indexed, UINT count, UINT inst
 	if (timed)
 		times[2] = ticks();
 	stats.draws++;
-	stats.skipped += c.call_info.skip;
-	if (!c.call_info.skip) {
+	// D3D11 draws no triangles when the index buffer is explicitly unbound.
+	// The D3D12 command list still has the game's index buffer bound.
+	bool skip_draw = c.call_info.skip || (indexed && dx12_shim->shim_context->mState->ib_unbound);
+	stats.skipped += skip_draw;
+	if (!skip_draw) {
 		Profiling::Spike::Scope spike_apply(Profiling::Spike::DX12_APPLY);
 		apply_overrides(false);
 		if (indexed)
@@ -6114,6 +6338,7 @@ void Dx12DrawPathConfigReloaded()
 {
 	regex_linked_shaders = 0;
 	forget_unpacked_buffers();
+	forget_rigid_weights_copies();
 	// What the mods wrote before is not what the ones there now would
 	// write, if they write at all. The lists that use it have it pinned.
 	for (auto &entry : published)

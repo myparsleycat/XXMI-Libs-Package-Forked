@@ -146,6 +146,7 @@ bool Dx12ReadSignature(const void *bytecode, size_t size, bool output, std::vect
 		    || !read32(part, base + 16, &element.reg) || !read32(part, base + 20, &value))
 			return false;
 		element.mask = value & 0xff;
+		element.read_write_mask = (value >> 8) & 0xff;
 		elements->push_back(element);
 	}
 	return true;
@@ -327,6 +328,15 @@ static const Dx12ShaderInfo* shader_info(Dx12ShaderStage stage, const D3D12_SHAD
 		for (const Dx12DxilCBuffer &cbuffer : cbuffers) {
 			if (!cbuffer.space && cbuffer.reg < DX12_CB_SIZES)
 				info->cb_bytes[cbuffer.reg] = cbuffer.bytes;
+		}
+	}
+	if (stage == DX12_STAGE_VS) {
+		std::vector<Dx12SignatureElement> inputs;
+		if (Dx12ReadSignature(bytecode->pShaderBytecode, bytecode->BytecodeLength, false, &inputs)) {
+			for (const auto &input : inputs) {
+				if (!_stricmp(input.name, "POSITION") && input.index == 0 && input.read_write_mask)
+					info->reads_position = true;
+			}
 		}
 	}
 	if (stage == DX12_STAGE_PS) {
@@ -762,6 +772,26 @@ static void set_input_layout(Dx12PipelineInfo *info, const D3D12_INPUT_LAYOUT_DE
 	}
 }
 
+static void set_input_slots_read(Dx12PipelineInfo *info, const D3D12_SHADER_BYTECODE *shader)
+{
+	std::vector<Dx12SignatureElement> inputs;
+
+	if (!shader || !shader->pShaderBytecode || !shader->BytecodeLength
+	    || !Dx12ReadSignature(shader->pShaderBytecode, shader->BytecodeLength, false, &inputs))
+		return;
+	info->vb_reads_known = true;
+	for (const Dx12InputElement &layout : info->input_layout) {
+		if (layout.slot >= 32)
+			continue;
+		for (const Dx12SignatureElement &input : inputs) {
+			if (input.read_write_mask && input.index == layout.index && !_stricmp(input.name, layout.semantic.c_str())) {
+				info->vb_read_slots |= 1u << layout.slot;
+				break;
+			}
+		}
+	}
+}
+
 Dx12PipelineInfo::~Dx12PipelineInfo()
 {
 	for (auto &variant : variants) {
@@ -795,6 +825,7 @@ void Dx12RegisterPipeline(void **ppPipelineState, const D3D12_GRAPHICS_PIPELINE_
 	info->shaders[DX12_STAGE_HS] = shader_info(DX12_STAGE_HS, &desc->HS);
 	info->shaders[DX12_STAGE_DS] = shader_info(DX12_STAGE_DS, &desc->DS);
 	set_input_layout(info, &desc->InputLayout);
+	set_input_slots_read(info, &desc->VS);
 	keep_creation(info, desc, sizeof(*desc), false, desc->pRootSignature);
 
 	register_pipeline(ppPipelineState, info);
@@ -880,6 +911,7 @@ void Dx12RegisterPipeline(void **ppPipelineState, const D3D12_PIPELINE_STATE_STR
 {
 	D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
 	ID3D12RootSignature *signature = NULL;
+	D3D12_SHADER_BYTECODE vs = {};
 	Dx12PipelineInfo *info;
 	Dx12ShaderStage stage;
 	const BYTE *stream, *value;
@@ -902,9 +934,11 @@ void Dx12RegisterPipeline(void **ppPipelineState, const D3D12_PIPELINE_STATE_STR
 
 		value = stream + pos + STREAM_VALUE;
 		stage = subobject_stage(type);
-		if (stage != DX12_STAGE_COUNT)
+		if (stage != DX12_STAGE_COUNT) {
 			info->shaders[stage] = shader_info(stage, (const D3D12_SHADER_BYTECODE*)value);
-		else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
+			if (stage == DX12_STAGE_VS)
+				vs = *(const D3D12_SHADER_BYTECODE*)value;
+		} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS)
 			// A stream may have the subobject and no shader in it
 			info->shaders_known &= !((const D3D12_SHADER_BYTECODE*)value)->pShaderBytecode;
 		else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT)
@@ -915,6 +949,7 @@ void Dx12RegisterPipeline(void **ppPipelineState, const D3D12_PIPELINE_STATE_STR
 	}
 	info->stream_bytes = (UINT)desc->SizeInBytes;
 	info->stream_read = (UINT)pos;
+	set_input_slots_read(info, &vs);
 	if (desc->SizeInBytes - pos >= sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
 		info->stream_stopped_at = *(const UINT*)(stream + pos);
 		info->shaders_known = false;

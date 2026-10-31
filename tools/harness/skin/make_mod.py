@@ -105,10 +105,25 @@ filename = ib.buf
 ''' % ('' if mode in (2, 3, 4) else '\thandling = skip\n',
       '\tResourceGameVb0 = ref vb0\n\tvb0 = ResourceSkinPosition' if mode == 3 else
       '\tResourceGameVb0 = copy vb0\n\tvb0 = ResourceSkinPosition' if mode == 4 else
-      '\tvb0 = ResourceSkinPosition' if mode in (0, 2, 12, 13, 14, 15) else '\trun = CustomShaderAnim\n\tvb0 = ResourceAnimated',
+      '\tvb0 = ResourceSkinPosition' if mode in (0, 2, 12, 13, 14, 15, 17, 19, 20, 21) else '\trun = CustomShaderAnim\n\tvb0 = ResourceAnimated',
       V, '\tvb0 = ResourceGameVb0\n' if mode in (3, 4) else '\tResourceSkinCopy = copy so0\n' if mode == 12 else '',
       count, (V + 63) // 64))
 
+if mode in (17, 19, 20):
+    path = os.path.join(out, 'skin.ini')
+    ini = open(path).read().replace('hash = 69bfccb7', 'hash = bac59802').replace('stride = 32\nfilename = blend.buf', 'stride = 8\nfilename = blend.buf')
+    open(path, 'w').write(ini)
+    open(os.path.join(out, 'blend.buf'), 'wb').write(struct.pack('<II', *( (1, 0) if mode == 20 else (0, 1) )) * V)
+if mode == 19:
+    path = os.path.join(out, 'skin.ini')
+    ini = open(path).read().replace('vb2 = ResourceSkinBlend', 'ResourceBlendCopy = copy ResourceSkinBlend\nvb2 = ResourceBlendCopy')
+    open(path, 'w').write(ini + '\n[ResourceBlendCopy]\ntype = Buffer\nstride = 8\n')
+# A legacy blend override skips all draws, including an unmatched IB section.
+if mode == 21:
+    path = os.path.join(out, 'skin.ini')
+    ini = open(path).read().replace('vb2 = ResourceSkinBlend\nif DRAW_TYPE', 'handling = skip\nvb2 = ResourceSkinBlend\nif DRAW_TYPE', 1)
+    ini = ini.replace('hash = 52a140fd\nhandling = skip', 'hash = 52a140fd\nmatch_index_count = 1\nhandling = skip')
+    open(path, 'w').write(ini)
 if mode == 12:
     ini = open(os.path.join(out, 'skin.ini')).read()
     ini = ini.replace('ib = ResourceSkinIB\n', 'ib = ResourceSkinIB\nvb0 = ResourceSkinCopy\n')
@@ -118,7 +133,7 @@ type = Buffer
 stride = 40
 ''')
 
-if mode in (5, 6, 7, 8, 9, 10, 11):
+if mode in (5, 6, 7, 8, 9, 10, 11, 16, 18):
     def crc32c(b):
         c = 0xffffffff
         for x in b:
@@ -145,6 +160,17 @@ hash = %08x
 
 [TextureOverrideSkinIB]''' % (V, vlr) + rest)
 
+if mode == 16:
+    with open(os.path.join(out, 'skin.ini'), 'a') as f:
+        f.write('''
+[TextureOverrideSkinBlend]
+hash = deadbeef
+''')
+
+if mode == 18:
+    path = os.path.join(out, 'skin.ini')
+    ini = open(path).read().replace('hash = %08x' % vlr, 'hash = %08x' % crc32c(struct.pack('<6I', (GAME_VERTICES + 1) * 40, 0, 0x19, 0, 0, 0)))
+    open(path, 'w').write(ini + '\n[TextureOverrideSkinBlend]\nhash = 69bfccb7\n')
 if mode == 6:
     open(os.path.join(out, 'other.ini'), 'w').write('''[TextureOverrideOtherPosition]
 hash = 0badf0ff

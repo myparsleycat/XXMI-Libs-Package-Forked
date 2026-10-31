@@ -272,6 +272,7 @@ static void check_picture(ID3D12Resource *back_buffer, const char *dump)
 		{ "  ... with the game's vertices: stride wrong", 0.7f, -0.6f },
 		{ "  ... with the game's vertices: data wrong", 0.7f, 0.3f },
 		{ "second game square", -0.5f, 0.65f },
+		{ "mod bar moved by rigid bone", 0.3f, 0.8f },
 	};
 	for (auto &spot : spots) {
 		UINT px = (UINT)((spot.x * 0.5f + 0.5f) * WIDTH), py = (UINT)((1.0f - (spot.y * 0.5f + 0.5f)) * HEIGHT);
@@ -316,7 +317,7 @@ int main(int argc, char **argv)
 	UINT frame_count = 120, i, f;
 	bool load_dll = true, deform = false, queue_life = false, queue_gone = false, device_life = false, second = false;
 	UINT others = 0, second_at = 0, reuse_at = 0, replace_at = 0, reupload_at = 0, fault_at = 0, stall_at = 0;
-	bool draw_first = false, unhashed = false, place_vector = false, no_heap = false, bindings = false;
+	bool draw_first = false, unhashed = false, place_vector = false, no_heap = false, bindings = false, rigid = false, unused_blend = false;
 	const char *dump = NULL;
 	HMODULE dll = NULL;
 
@@ -342,6 +343,8 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "place")) place_vector = true;
 		else if (!strcmp(argv[a], "noheap")) no_heap = true;
 		else if (!strcmp(argv[a], "bindings")) bindings = place_vector = true;
+		else if (!strcmp(argv[a], "rigid")) rigid = true;
+		else if (!strcmp(argv[a], "unusedblend")) unused_blend = true;
 		else {
 			printf("unknown argument %s\n", argv[a]);
 			return 1;
@@ -534,7 +537,7 @@ int main(int argc, char **argv)
 	skin_signature_desc.NumParameters = 2;
 	skin_signature_desc.pParameters = skin_parameters;
 	ID3D12RootSignature *skin_signature = root_signature(&skin_signature_desc);
-	std::vector<char> skin_cs = read_file("skin_cs.cso");
+	std::vector<char> skin_cs = read_file(rigid ? "skin_rigid_cs.cso" : "skin_cs.cso");
 	D3D12_COMPUTE_PIPELINE_STATE_DESC skin_pso_desc = {};
 	skin_pso_desc.pRootSignature = skin_signature;
 	skin_pso_desc.CS = { skin_cs.data(), skin_cs.size() };
@@ -567,9 +570,11 @@ int main(int argc, char **argv)
 		static_cast<float*>(place_data)[129] = 0.5f;
 	}
 	place_buffer->Unmap(0, NULL);
-	static const D3D12_INPUT_ELEMENT_DESC layout[] = {
+	std::vector<D3D12_INPUT_ELEMENT_DESC> layout = {
 		{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 	};
+	if (unused_blend)
+		layout.push_back({ "BLENDINDICES", 0, DXGI_FORMAT_R32_UINT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 });
 	D3D12_GRAPHICS_PIPELINE_STATE_DESC draw_pso_desc = {};
 	draw_pso_desc.pRootSignature = draw_signature;
 	draw_pso_desc.VS = { vs.data(), vs.size() };
@@ -579,7 +584,7 @@ int main(int argc, char **argv)
 	draw_pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
 	draw_pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 	draw_pso_desc.RasterizerState.DepthClipEnable = TRUE;
-	draw_pso_desc.InputLayout = { layout, ARRAYSIZE(layout) };
+	draw_pso_desc.InputLayout = { layout.data(), (UINT)layout.size() };
 	draw_pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	draw_pso_desc.NumRenderTargets = 1;
 	draw_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -610,7 +615,8 @@ int main(int argc, char **argv)
 			indices.insert(indices.end(), { a, b, c, b, d, c });
 		}
 	}
-	float bones[4 * 4] = {};
+	float bones[2 * 4 * 4] = {};
+	bones[16 + 7] = 0.8f;
 
 	// The second mesh: a square from y 0.45 to 0.85, its weights split over
 	// two entries of bone 0 and its triangles wound the other way
@@ -634,7 +640,8 @@ int main(int argc, char **argv)
 	std::vector<ID3D12Resource*> staging;
 	const D3D12_RESOURCE_STATES read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 	ID3D12Resource *vertex_buffer = upload(list, &staging, vertices.data(), vertices.size() * sizeof(Vertex), read);
-	ID3D12Resource *weight_buffer = (unhashed ? upload_unhashed : upload)(list, &staging, weights.data(), weights.size() * sizeof(Weight), read);
+	std::vector<UINT> rigid_weights(GAME_VERTICES, 0);
+	ID3D12Resource *weight_buffer = rigid ? upload(list, &staging, rigid_weights.data(), rigid_weights.size() * sizeof(UINT), read) : (unhashed ? upload_unhashed : upload)(list, &staging, weights.data(), weights.size() * sizeof(Weight), read);
 	ID3D12Resource *bone_buffer = upload(list, &staging, bones, sizeof(bones), read);
 	ID3D12Resource *index_buffer = upload(list, &staging, indices.data(), indices.size() * sizeof(UINT), D3D12_RESOURCE_STATE_INDEX_BUFFER);
 	ID3D12Resource *index_staging = staging.back(), *index_gpu = NULL;
@@ -660,7 +667,7 @@ int main(int argc, char **argv)
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu = gpu_heap->GetCPUDescriptorHandleForHeapStart();
 	D3D12_GPU_DESCRIPTOR_HANDLE table = gpu_heap->GetGPUDescriptorHandleForHeapStart();
 	ID3D12Resource *srv_buffers[3] = { vertex_buffer, weight_buffer, bone_buffer };
-	UINT srv_counts[3] = { GAME_VERTICES, GAME_VERTICES, 1 }, srv_strides[3] = { sizeof(Vertex), sizeof(Weight), 64 };
+	UINT srv_counts[3] = { GAME_VERTICES, GAME_VERTICES, rigid ? 2u : 1u }, srv_strides[3] = { sizeof(Vertex), rigid ? 4u : (UINT)sizeof(Weight), 64 };
 	for (i = 0; i < 3; i++) {
 		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
 		srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
