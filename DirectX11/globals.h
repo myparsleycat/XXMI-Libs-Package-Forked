@@ -921,9 +921,13 @@ struct TLS
 
 	bool com_initialized;
 
+	// The innermost Profiling::Spike::SelfTime open on this thread
+	void *spike_self_time;
+
 	TLS() :
 		hooking_quirk_protection(false),
-		com_initialized(false)
+		com_initialized(false),
+		spike_self_time(NULL)
 	{}
 };
 

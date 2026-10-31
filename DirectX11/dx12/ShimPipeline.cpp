@@ -612,6 +612,7 @@ static ID3D12PipelineState* get_pipeline(const ShimState *state, const PipelineK
 
 bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_PREPARE_DRAW);
 	static bool no_vs, no_topology, no_viewport, no_target, no_ib;
 	static const D3D12_RECT no_scissor = { 0, 0, D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX };
 	ID3D12GraphicsCommandList *list;
@@ -775,6 +776,7 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 
 bool Dx12ShimPrepareDispatch(const ShimState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_PREPARE_DISPATCH);
 	D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
 	const ShimShader *shaders[DX12_STAGE_COUNT];
 	ID3D12GraphicsCommandList *list;

@@ -728,6 +728,7 @@ bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, boo
 		if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
 			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 			barrier.UAV.pResource = resource->resource;
+			Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_BARRIER);
 			Dx12ShimList()->ResourceBarrier(1, &barrier);
 		}
 		return true;
@@ -744,6 +745,7 @@ bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, boo
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	barrier.Transition.StateBefore = resource->state;
 	barrier.Transition.StateAfter = state;
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_BARRIER);
 	Dx12ShimList()->ResourceBarrier(1, &barrier);
 	resource->state = state;
 	return true;

@@ -1197,6 +1197,7 @@ static uint32_t region_hash(VkBuffer buffer, PublishedBuffer *entry, VkDeviceSiz
 		const std::vector<IndexWrite> *writes)
 {
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_REGION_HASH);
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_REGION_HASH);
 	Region *region;
 	BYTE samples[sizeof(region->samples)];
 	UINT frame = mods_frame;
@@ -1375,6 +1376,7 @@ static void forget_dead_constants(VkBuffer buffer)
 
 static void forget_unused_constants(bool all)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_FORGET_CONSTANTS);
 	UINT frame = mods_frame;
 
 	for (auto i = published_constants.begin(); i != published_constants.end();) {
@@ -1907,8 +1909,9 @@ bool VkScopeUploadShadow(ShimResource *resource)
 static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offset, UINT bytes, UINT stride)
 {
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_BUFFER_PUBLISH);
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_PUBLISH);
 	ConstantsKey key = std::make_tuple(buffer, offset, bytes, stride);
-	auto found = published_constants.find(key);
+	auto found = published_constants.end();
 	D3D11_SHADER_RESOURCE_VIEW_DESC view_desc = {};
 	ID3D11ShaderResourceView *srv = NULL;
 	D3D11_BUFFER_DESC desc = {};
@@ -1916,21 +1919,29 @@ static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offse
 	ShimBuffer *object;
 	bool mapped;
 
+	{
+		Profiling::Spike::SelfTime lookup_time(Profiling::Spike::CL_PUBLISH_LOOKUP);
+		found = published_constants.find(key);
+	}
 	if (found != published_constants.end() && found->second.shown && found->second.used_frame == mods_frame) {
 		stats.constants_shown++;
 		return &found->second;
 	}
 
-	AcquireSRWLockShared(&memory_lock);
-	mapped = !!mapped_bytes(buffer, offset, bytes);
-	any_published = true;
-	ReleaseSRWLockShared(&memory_lock);
+	{
+		Profiling::Spike::SelfTime mapped_time(Profiling::Spike::CL_PUBLISH_MAPPED);
+		AcquireSRWLockShared(&memory_lock);
+		mapped = !!mapped_bytes(buffer, offset, bytes);
+		any_published = true;
+		ReleaseSRWLockShared(&memory_lock);
+	}
 	if (!mapped) {
 		stats.constants_unmapped++;
 		return NULL;
 	}
 
 	if (found == published_constants.end()) {
+		Profiling::Spike::SelfTime create_time(Profiling::Spike::CL_PUBLISH_CREATE);
 		desc.ByteWidth = (bytes + 15) & ~15u;
 		desc.Usage = D3D11_USAGE_DYNAMIC;
 		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -1964,21 +1975,29 @@ static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offse
 	stats.constants_shown++;
 
 	// Other contents than the frame before, as far as anyone knows
-	finish_refresh_of(&object->r);
-	ConstantsSource *source = &constants_sources[&object->r];
-	const UINT block = stride ? SHADOW_PAGE : 256;
-	source->pages.assign((bytes + block - 1) / block, false);
-	source->pages_left = (UINT)source->pages.size();
-	object->r.shadow_pending = true;
-	object->r.upload_pending = !object->r.cpu_only;
-	object->r.version++;
+	{
+		Profiling::Spike::SelfTime source_time(Profiling::Spike::CL_PUBLISH_SOURCE);
+		finish_refresh_of(&object->r);
+		ConstantsSource *source = &constants_sources[&object->r];
+		const UINT block = stride ? SHADOW_PAGE : 256;
+		source->pages.assign((bytes + block - 1) / block, false);
+		source->pages_left = (UINT)source->pages.size();
+		object->r.shadow_pending = true;
+		object->r.upload_pending = !object->r.cpu_only;
+		object->r.version++;
+	}
 	// A storage buffer is large, and nothing has asked for values of one
 	if (stride)
 		return &found->second;
 
 	EnterCriticalSectionPretty(&G->mCriticalSection);
-	ResourceHandleInfo *handle = GetResourceHandleInfo(object);
+	ResourceHandleInfo *handle;
+	{
+		Profiling::Spike::SelfTime handle_time(Profiling::Spike::CL_PUBLISH_HANDLE);
+		handle = GetResourceHandleInfo(object);
+	}
 	if (handle) {
+		Profiling::Spike::SelfTime lazy_time(Profiling::Spike::CL_PUBLISH_LAZY);
 		handle->SetLazyDataCache(bytes, [buffer, offset](uint8_t *dst, size_t at, size_t size) {
 			read_constants(dst, buffer, offset + at, size);
 		});
@@ -6117,6 +6136,7 @@ ID3D11Buffer* VkScopeConstantBuffer(int stage, UINT slot)
 	if (scope->cbs_asked[stage] & 1u << slot)
 		return scope->cbs[stage][slot];
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_CB_LOOKUP);
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_CB);
 	scope->cbs_asked[stage] |= 1u << slot;
 	scope->cbs[stage][slot] = NULL;
 	Timed timed(TIMED_ANSWERS);
@@ -6297,6 +6317,7 @@ void VkScopePrefetchShaderResources(int stage, UINT slots)
 	if (!textures || !(textures & (textures - 1)))
 		return;
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_SRV_LOOKUP);
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_SRV);
 	Timed timed(TIMED_ANSWERS);
 	const DescriptorSet *sets[MAX_SETS] = {};
 	UINT found_sets = 0;
@@ -6334,6 +6355,7 @@ ID3D11ShaderResourceView* VkScopeShaderResource(int stage, UINT slot)
 	if (scope->srvs_asked[stage] & 1u << slot)
 		return scope->srvs[stage][slot];
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_SRV_LOOKUP);
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_SRV);
 	scope->srvs_asked[stage] |= 1u << slot;
 	scope->srvs[stage][slot] = NULL;
 	Timed timed(TIMED_ANSWERS);
@@ -8088,6 +8110,7 @@ static void patch_for_mod(const ShimState *mod, ModDraw *draw)
 void VkScopeDraw(bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_MOD_BINDINGS);
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_MOD_BINDINGS);
 	const ShimState *mod = dx12_shim->shim_context->mState;
 	Timed timed(TIMED_MOD_DRAWS);
 	ModDraw draw = {};

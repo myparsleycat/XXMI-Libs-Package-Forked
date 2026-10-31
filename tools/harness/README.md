@@ -20,6 +20,7 @@ to apply this behavior there; the DLL does not need rebuilding.
 | `sampler` | `type = SamplerState` resources and `ps-s0` bindings on D3D11 |
 | `cpu` | The CPU work of the DLL on the configuration of an installed importer: call-for-call equality and frame time against a reference DLL |
 | `cache` | CPU data-cache snapshots, shared views, bounded lazy reads and allocation reuse, without a GPU |
+| `etw` | Not a check: where the threads of a running game spend their time, by CPU samples with stacks |
 
 ## Requirements
 
@@ -106,7 +107,8 @@ and `--appear`. They are described in `harness.cpp`.
 `python tools/harness/vk/check_spike.py <fresh run folder>` checks spike-log
 timings and byte counts with hash dumping and general logging disabled. It
 also switches a namespaced mod variable ON/OFF/ON to check summary boundaries,
-then disables spike logging to check that no log is created. Prepare an isolated
+checks that the `spike_log_command_detail` self times add up to the command list
+execution, then disables spike logging to check that no log is created. Prepare an isolated
 folder with `vk/setup.sh` first; the check restores its ini files.
 
 `vk/build_shadow.bat` and `vk/bin/shadow.exe --bounded` check the production
@@ -219,6 +221,28 @@ folders.
 `common/profile.inc` is the sampling profiler that the `profile` options of
 the harnesses use. `dx12/symbolize.py` turns offsets into `d3d11.dll` into
 function names and lines.
+
+### etw
+
+Needs the Windows Performance Toolkit (`xperf.exe`) and an elevated prompt,
+which `capture.ps1` asks for. Nothing is added to the DLL, so it works on a game
+that the harnesses cannot reproduce, and driver time is included.
+
+```
+pwsh -ExecutionPolicy Bypass -File etw/capture.ps1 -Phases on,off -Seconds 20
+python etw/analyze.py <trace.etl> Endfield.exe --pdb x64/Release --frame-ms on=12.4,off=8
+```
+
+A beep starts a phase and three beeps end it; change the state of the game (F8
+for the mods) in the seconds between phases. `--pdb` needs the PDB of the very
+DLL that was running. The frame times are those of the spike log summaries.
+
+Every thread's running and off-CPU shares should add up to about 100% of a
+phase. A lower sum means that the process ended during the phase.
+
+The spike log costs time itself, about 27 ns per measured scope on the `vk`
+harness (3.63 to 3.86 ms a frame, 8,620 scopes). The category counts of a
+summary give the scopes of a run.
 
 ### cache
 

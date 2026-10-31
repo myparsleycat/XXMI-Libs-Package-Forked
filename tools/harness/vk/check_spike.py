@@ -89,12 +89,27 @@ endif
                 f"Concurrent refresh accounting did not preserve the 8 MiB buffer size: {processed}")
         require(not (folder / "vk_report.txt").exists() and not (folder / "vk_shaders").exists(),
                 "Spike measurements enabled Vulkan hash dumping")
+        require("command list self time" not in text, "Self times were measured without being asked for")
         log.rename(folder / "spike-enabled.txt")
+        subprocess.run([sys.executable, str(maker), str(ini), *settings,
+                        "Logging.spike_log_threshold=1000", "Logging.spike_log_command_detail=1"], check=True)
+        run(folder, 7)
+        detail = log.read_text(encoding="utf-8-sig").rsplit("summary of 5.0s with mods on:", 1)
+        require(len(detail) == 2, "No complete summary with self times was recorded")
+        metric = r"\s+([\d.]+)ms \(x[\d.]+\s*\)\s+([\d.]+)ms \(x[\d.]+\s*\)\s+"
+        total = re.search(metric + r"command list execution", detail[1])
+        parts = re.findall(metric + r"command list self time", detail[1])
+        require(total is not None and len(parts) > 1, "Self times were not reported")
+        for column in (0, 1):
+            whole, added = float(total[column + 1]), sum(float(part[column]) for part in parts)
+            require(abs(whole - added) <= 0.15 * whole + 0.01,
+                    f"Self times add up to {added} ms of {whole} ms")
+        log.rename(folder / "spike-detail.txt")
         subprocess.run([sys.executable, str(maker), str(ini), *settings,
                         "Logging.spike_log_threshold=0"], check=True)
         run(folder, 0.2)
         require(not log.exists(), "Disabled spike logging still produced a file")
-        print("PASS: timing and byte summaries without hash dumps, ON/OFF/ON window boundaries, logging disabled")
+        print("PASS: timing and byte summaries without hash dumps, ON/OFF/ON window boundaries, self times adding up, logging disabled")
     finally:
         ini.write_bytes(original_ini)
         mod.write_bytes(original_mod)

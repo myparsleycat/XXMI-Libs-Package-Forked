@@ -507,6 +507,7 @@ void Profiling::clear()
 namespace Profiling {
 	namespace Spike {
 		INT64 threshold;
+		bool command_detail;
 		const wchar_t *reason_names[NUM_REASONS];
 		volatile LONG reason_counts[NUM_REASONS];
 	}
@@ -572,6 +573,31 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"Vulkan: recording refreshed-page uploads",
 	L"Vulkan: preparing mod draw bindings (inclusive)",
 	L"Vulkan: recording mod draws",
+	L"Vulkan: forgetting unused published buffers",
+	L"command list self time: interpreter, conditions, other commands",
+	L"command list self time: checktextureoverride batches",
+	L"command list self time: resource copy commands",
+	L"command list self time: run custom shader commands",
+	L"command list self time: draw commands",
+	L"command list self time: slot binding commands",
+	L"command list self time: IniParams uploads",
+	L"command list self time: Vulkan constant-buffer lookup",
+	L"command list self time: Vulkan shader-resource lookup",
+	L"command list self time: Vulkan publishing a game buffer, the rest",
+	L"command list self time: Vulkan publishing: looking up the entry",
+	L"command list self time: Vulkan publishing: is the memory mapped",
+	L"command list self time: Vulkan publishing: creating an entry",
+	L"command list self time: Vulkan publishing: marking the pages unread",
+	L"command list self time: Vulkan publishing: finding the handle info",
+	L"command list self time: Vulkan publishing: resetting the lazy cache",
+	L"command list self time: Vulkan index-region hash lookup",
+	L"command list self time: Vulkan preparing mod draw bindings",
+	L"command list self time: D3D12 preparing a mod's draw",
+	L"command list self time: D3D12 preparing a dispatch",
+	L"command list self time: D3D12 ResourceBarrier (driver)",
+	L"command list self time: D3D12 copies (driver)",
+	L"command list self time: D3D12 Dispatch (driver)",
+	L"part of the interpreter line: if conditions (estimate from 1 in 16)",
 };
 
 static const struct {
@@ -661,13 +687,14 @@ void Profiling::Spike::sample_mod_state()
 	spike_observed_mod_state.store(state, std::memory_order_relaxed);
 }
 
-void Profiling::Spike::init(float threshold_ms, float relative, const wchar_t *log_dir)
+void Profiling::Spike::init(float threshold_ms, float relative, bool detail, const wchar_t *log_dir)
 {
 	LARGE_INTEGER freq;
 	wchar_t path[MAX_PATH];
 	bool was_enabled = !!threshold;
 
 	threshold = 0;
+	command_detail = false;
 
 	if (threshold_ms < 0)
 		threshold_ms = 0;
@@ -697,10 +724,12 @@ void Profiling::Spike::init(float threshold_ms, float relative, const wchar_t *l
 
 	// The config is loaded more than once while the game starts
 	static float header_threshold_ms = -1, header_relative = -1;
-	if (threshold_ms == header_threshold_ms && relative == header_relative)
+	static bool header_detail;
+	if (threshold_ms == header_threshold_ms && relative == header_relative && detail == header_detail)
 		goto enable;
 	header_threshold_ms = threshold_ms;
 	header_relative = relative;
+	header_detail = detail;
 
 	fwprintf(spike_log, L"Logging frames that take longer than");
 	if (threshold_ms)
@@ -717,10 +746,14 @@ void Profiling::Spike::init(float threshold_ms, float relative, const wchar_t *l
 			L"  Mod state is sampled after frame actions and observed at the following Present.\n"
 			L"Every %.0f seconds a summary of the frames since is written as well.\n\n",
 			spike_window_ms / 1000);
+	if (detail)
+		fwprintf(spike_log, L"The \"command list self time\" lines add up to the command list execution of the same\n"
+				L"column. They slow the frame down themselves: use them for shares, not for frame times.\n\n");
 	fflush(spike_log);
 
 enable:
 	spike_relative = relative;
+	command_detail = detail;
 	threshold = threshold_ms ? (INT64)((double)threshold_ms * freq.QuadPart / 1000.0) : INT64_MAX;
 }
 
@@ -754,6 +787,43 @@ void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, 
 	else
 		spike_events_dropped++;
 	ReleaseSRWLockExclusive(&spike_events_lock);
+}
+
+void Profiling::Spike::add_sampled(Category category, INT64 ticks)
+{
+	bool other_thread = GetCurrentThreadId() != spike_present_thread.load(std::memory_order_relaxed);
+	SpikeTotal &total = spike_totals[category][other_thread];
+
+	total.ticks.fetch_add(ticks * SAMPLED_INTERVAL, std::memory_order_relaxed);
+	total.count.fetch_add(SAMPLED_INTERVAL, std::memory_order_relaxed);
+}
+
+void Profiling::Spike::SelfTime::begin(bool root)
+{
+	TLS *tls = get_tls();
+
+	parent = (SelfTime*)tls->spike_self_time;
+	if (!parent && !root)
+		return;
+	children = 0;
+	tls->spike_self_time = this;
+	QueryPerformanceCounter(&start);
+}
+
+void Profiling::Spike::SelfTime::end()
+{
+	LARGE_INTEGER now;
+
+	QueryPerformanceCounter(&now);
+	INT64 ticks = now.QuadPart - start.QuadPart;
+	get_tls()->spike_self_time = parent;
+	if (parent)
+		parent->children += ticks;
+
+	bool other_thread = GetCurrentThreadId() != spike_present_thread.load(std::memory_order_relaxed);
+	SpikeTotal &total = spike_totals[category][other_thread];
+	total.ticks.fetch_add(ticks - children, std::memory_order_relaxed);
+	total.count.fetch_add(1, std::memory_order_relaxed);
 }
 
 static double spike_ms(INT64 ticks)

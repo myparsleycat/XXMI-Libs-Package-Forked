@@ -172,6 +172,33 @@ namespace Profiling {
 			VK_REFRESH_UPLOAD,
 			VK_MOD_BINDINGS,
 			VK_RECORD_DRAWS,
+			VK_FORGET_CONSTANTS,
+			// With spike_log_command_detail, see SelfTime:
+			CL_OTHER,
+			CL_CHECK_BATCH,
+			CL_COPY,
+			CL_CUSTOM_SHADER,
+			CL_DRAW,
+			CL_BINDINGS,
+			CL_INI_PARAMS,
+			CL_VK_CB,
+			CL_VK_SRV,
+			CL_VK_PUBLISH,
+			CL_PUBLISH_LOOKUP,
+			CL_PUBLISH_MAPPED,
+			CL_PUBLISH_CREATE,
+			CL_PUBLISH_SOURCE,
+			CL_PUBLISH_HANDLE,
+			CL_PUBLISH_LAZY,
+			CL_VK_REGION_HASH,
+			CL_VK_MOD_BINDINGS,
+			CL_PREPARE_DRAW,
+			CL_PREPARE_DISPATCH,
+			CL_D3D12_BARRIER,
+			CL_D3D12_COPY,
+			CL_D3D12_DISPATCH,
+			// Part of CL_OTHER, measured on one in SAMPLED_INTERVAL:
+			CL_IF_CONDITIONS,
 
 			NUM_CATEGORIES, // Must be last
 		};
@@ -179,10 +206,11 @@ namespace Profiling {
 
 		// In QueryPerformanceCounter ticks, 0 while disabled:
 		extern INT64 threshold;
+		extern bool command_detail;
 
 		// A frame is logged for taking threshold_ms, or relative times
 		// the recent average, whichever is given
-		void init(float threshold_ms, float relative, const wchar_t *log_dir);
+		void init(float threshold_ms, float relative, bool detail, const wchar_t *log_dir);
 		void add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes = 0);
 		void frame(bool mods_disabled = false);
 		void configure_mod_state(const wchar_t *variable);
@@ -225,6 +253,37 @@ namespace Profiling {
 			}
 
 			void add_bytes(UINT64 count) { bytes += count; }
+		};
+
+		const unsigned SAMPLED_INTERVAL = 16;
+		void add_sampled(Category category, INT64 ticks);
+
+		// The time of a part of a command list less that of the parts
+		// inside it, so that the categories add up to the time of the
+		// outermost command list. Only runs inside a root, so what the
+		// same code does for anything else is left out. Off unless
+		// spike_log_command_detail is set, since unlike Scope these sit
+		// on calls made thousands of times a frame.
+		class SelfTime {
+			LARGE_INTEGER start;
+			Category category;
+			INT64 children;
+			SelfTime *parent;
+			void begin(bool root);
+			void end();
+		public:
+			SelfTime(Category category, bool root = false) : category(category)
+			{
+				start.QuadPart = 0;
+				if (command_detail)
+					begin(root);
+			}
+
+			~SelfTime()
+			{
+				if (start.QuadPart)
+					end();
+			}
 		};
 	}
 

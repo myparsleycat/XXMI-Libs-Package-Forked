@@ -4928,7 +4928,8 @@ void LoadConfigFile()
 
 	wcsrchr(logFilename, L'\\')[1] = 0;
 	Profiling::Spike::init(GetIniFloat(L"Logging", L"spike_log_threshold", 0, NULL),
-			GetIniFloat(L"Logging", L"spike_log_relative", 0, NULL), logFilename);
+			GetIniFloat(L"Logging", L"spike_log_relative", 0, NULL),
+			GetIniBool(L"Logging", L"spike_log_command_detail", false, NULL), logFilename);
 
 	G->gShowWarnings = GetIniBool(L"Logging", L"show_warnings", true, NULL);
 

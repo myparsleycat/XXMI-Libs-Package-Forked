@@ -458,6 +458,7 @@ static void CommandListFlushState(CommandListState* state)
 	HRESULT hr;
 
 	if (state->update_params && state->mHackerDevice->mIniTexture) {
+		Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_INI_PARAMS);
 		hr = state->mOrigContext1->Map(state->mHackerDevice->mIniTexture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
 		if (FAILED(hr)) {
 			LogInfo("CommandListFlushState: Map failed\n");
@@ -485,6 +486,7 @@ static void RunCommandListComplete(HackerDevice *mHackerDevice,
 	if (command_list->ResolveCommandList()->commands.empty())
 		return;
 	Profiling::Spike::Scope spike(Profiling::Spike::COMMAND_LIST, command_list->ini_section.c_str());
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_OTHER, true);
 
 	CommandListState state;
 	state.mHackerDevice = mHackerDevice;
@@ -1950,6 +1952,7 @@ void DrawCommand::eval_args(int nargs, INT result[5], CommandListState *state)
 
 void DrawCommand::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_DRAW);
 	HackerContext *mHackerContext = state->mHackerContext;
 	ID3D11DeviceContext *mOrigContext1 = state->mOrigContext1;
 	DrawCallInfo *info = state->call_info;
@@ -3433,6 +3436,7 @@ struct saved_shader_inst
 
 void RunCustomShaderCommand::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_CUSTOM_SHADER);
 	ID3D11Device *mOrigDevice1 = state->mOrigDevice1;
 	ID3D11DeviceContext *mOrigContext1 = state->mOrigContext1;
 	ID3D11VertexShader *saved_vs = NULL;
@@ -10635,9 +10639,24 @@ IfCommand::IfCommand(const wchar_t *section) :
 	registered_command_lists.push_back(false_commands_post.get());
 }
 
+static float evaluate_condition(CommandListExpression *expression, CommandListState *state)
+{
+	static unsigned calls;
+
+	if (!Profiling::Spike::command_detail || ++calls % Profiling::Spike::SAMPLED_INTERVAL)
+		return expression->evaluate(state);
+
+	LARGE_INTEGER start, end;
+	QueryPerformanceCounter(&start);
+	float result = expression->evaluate(state);
+	QueryPerformanceCounter(&end);
+	Profiling::Spike::add_sampled(Profiling::Spike::CL_IF_CONDITIONS, end.QuadPart - start.QuadPart);
+	return result;
+}
+
 void IfCommand::run(CommandListState *state)
 {
-	if (expression.evaluate(state)) {
+	if (evaluate_condition(&expression, state)) {
 		COMMAND_LIST_LOG(state, "%S: true {\n", ini_line.c_str());
 		state->extra_indent++;
 		if (state->post)
@@ -13950,6 +13969,7 @@ void ResourceCopyOperation::RunWithSource(CommandListState *state, ID3D11Resourc
 
 void ResourceCopyOperation::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_COPY);
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
 	if (src.type == ResourceCopyTargetType::EMPTY) {
@@ -14027,6 +14047,7 @@ static void SetShaderResourcesBatch(ID3D11DeviceContext1 *context, wchar_t shade
 
 void ShaderResourceBindBatch::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_BINDINGS);
 	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
 
 	// Only the slots of the batch are looked at:
@@ -14167,6 +14188,7 @@ ConditionalSlotBranch* ConditionalSlotCopyOperation::MatchingBranch(CommandListS
 
 void ConditionalSlotCopyOperation::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_BINDINGS);
 	ConditionalSlotBranch *branch = MatchingBranch(state);
 	if (!branch) {
 		COMMAND_LIST_LOG(state, "%S: no branch taken, keeping the current binding\n", ini_line.c_str());
@@ -14485,6 +14507,7 @@ void merge_shader_resource_batches(CommandList *command_list)
 
 void CheckTextureOverrideBatch::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_CHECK_BATCH);
 	HackerContext *context = state->mHackerContext;
 	ID3D11DeviceContext1 *mOrigContext1 = state->mOrigContext1;
 	// Views for t slots, buffers for vb and ib slots. Only the entries of
@@ -15457,6 +15480,7 @@ void SlotRangeCopyOperation::RunFetch(CommandListState *state, unsigned first, u
 
 void SlotRangeCopyOperation::run(CommandListState *state)
 {
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_BINDINGS);
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
 	bool bind = dst.evaluation_mode == ResourceCopyTargetEvaluationMode::SLOT_RANGE;

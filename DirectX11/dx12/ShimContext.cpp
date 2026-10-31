@@ -3,6 +3,7 @@
 #include "DrawPath.h"
 #include "ResourceTracker.h"
 #include "ShimDevice.h"
+#include "../profiling.h"
 
 template <class Slot, class Object>
 static void assign(Slot *&slot, Object *object)
@@ -790,7 +791,10 @@ void STDMETHODCALLTYPE ShimContext::Dispatch(UINT ThreadGroupCountX, UINT Thread
 		return;
 	}
 
-	Dx12ShimList()->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+	{
+		Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_DISPATCH);
+		Dx12ShimList()->Dispatch(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+	}
 	if (Dx12InDrawScope())
 		Dx12ScopeDispatched(true);
 }
@@ -1166,13 +1170,17 @@ static void copy_buffer(ID3D11Resource *dst11, UINT64 dst_offset, ID3D11Resource
 			return;
 		if (game_barrier_needed)
 			Dx12ShimList()->ResourceBarrier(1, &game_barrier);
-		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
+		{
+			Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_COPY);
+			Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, game, game_offset + src_offset, size);
+		}
 		if (game_barrier_needed) {
 			std::swap(game_barrier.Transition.StateBefore, game_barrier.Transition.StateAfter);
 			Dx12ShimList()->ResourceBarrier(1, &game_barrier);
 		}
 	} else if (src->resource && dst->resource && src != dst && Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
 		   && Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, whole)) {
+		Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_COPY);
 		Dx12ShimList()->CopyBufferRegion(dst->resource, dst_offset, src->resource, src_offset, size);
 	}
 }
@@ -1228,6 +1236,7 @@ void STDMETHODCALLTYPE ShimContext::CopyResource(ID3D11Resource *pDstResource, I
 	    || !Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST, true))
 		return;
 
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_COPY);
 	Dx12ShimList()->CopyResource(dst->resource, src->resource);
 }
 
