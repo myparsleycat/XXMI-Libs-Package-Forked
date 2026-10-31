@@ -851,6 +851,49 @@ struct alignas(void*) StreamSubobject {
 	T value;
 };
 
+template <class T>
+static void append_stream_subobject(std::vector<BYTE> *stream, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const T &value)
+{
+	StreamSubobject<T> subobject = {};
+	subobject.type = type;
+	subobject.value = value;
+	const BYTE *bytes = (const BYTE*)&subobject;
+	stream->insert(stream->end(), bytes, bytes + sizeof(subobject));
+}
+
+template <class T>
+static void patch_depth_stencil_core(T *dst, const D3D12_DEPTH_STENCIL_DESC &src)
+{
+	dst->DepthEnable = src.DepthEnable;
+	dst->DepthWriteMask = src.DepthWriteMask;
+	dst->DepthFunc = src.DepthFunc;
+	dst->StencilEnable = src.StencilEnable;
+	dst->FrontFace.StencilFailOp = src.FrontFace.StencilFailOp;
+	dst->FrontFace.StencilDepthFailOp = src.FrontFace.StencilDepthFailOp;
+	dst->FrontFace.StencilPassOp = src.FrontFace.StencilPassOp;
+	dst->FrontFace.StencilFunc = src.FrontFace.StencilFunc;
+	dst->BackFace.StencilFailOp = src.BackFace.StencilFailOp;
+	dst->BackFace.StencilDepthFailOp = src.BackFace.StencilDepthFailOp;
+	dst->BackFace.StencilPassOp = src.BackFace.StencilPassOp;
+	dst->BackFace.StencilFunc = src.BackFace.StencilFunc;
+}
+
+static void patch_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC1 *dst, const D3D12_DEPTH_STENCIL_DESC &src)
+{
+	patch_depth_stencil_core(dst, src);
+	dst->StencilReadMask = src.StencilReadMask;
+	dst->StencilWriteMask = src.StencilWriteMask;
+}
+
+static void patch_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC2 *dst, const D3D12_DEPTH_STENCIL_DESC &src)
+{
+	patch_depth_stencil_core(dst, src);
+	dst->FrontFace.StencilReadMask = src.StencilReadMask;
+	dst->FrontFace.StencilWriteMask = src.StencilWriteMask;
+	dst->BackFace.StencilReadMask = src.StencilReadMask;
+	dst->BackFace.StencilWriteMask = src.StencilWriteMask;
+}
+
 // Where the value is in the subobjects that have a pointer in them, which are
 // the only ones looked into
 const size_t STREAM_VALUE = offsetof(StreamSubobject<void*>, value);
@@ -1014,6 +1057,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 	char stages[32];
 	size_t pos, size;
 	bool has_signature = false;
+	bool changed_states = variant->blend_override || variant->sample_mask_override || variant->depth_stencil_override;
 	HRESULT hr = S_OK;
 
 	for (stage = DX12_STAGE_VS; stage < DX12_STAGE_COUNT; stage = (Dx12ShaderStage)(stage + 1)) {
@@ -1024,6 +1068,15 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 	}
 	key = key * 0x9e3779b97f4a7c15ull ^ variant->removed_stages;
 	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)(uintptr_t)variant->root_signature;
+	key = key * 0x9e3779b97f4a7c15ull ^ variant->blend_override;
+	if (variant->blend_override)
+		key = key * 0x9e3779b97f4a7c15ull ^ fnv_64_buf(&variant->blend, sizeof(variant->blend));
+	key = key * 0x9e3779b97f4a7c15ull ^ variant->sample_mask_override;
+	if (variant->sample_mask_override)
+		key = key * 0x9e3779b97f4a7c15ull ^ variant->sample_mask;
+	key = key * 0x9e3779b97f4a7c15ull ^ variant->depth_stencil_override;
+	if (variant->depth_stencil_override)
+		key = key * 0x9e3779b97f4a7c15ull ^ fnv_64_buf(&variant->depth_stencil, sizeof(variant->depth_stencil));
 	changed_stages = mod_stages | variant->removed_stages;
 
 	for (const auto &made : info->variants) {
@@ -1060,6 +1113,12 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		desc->StreamOutput = {};
 		if (variant->root_signature)
 			desc->pRootSignature = variant->root_signature;
+		if (variant->blend_override)
+			desc->BlendState = variant->blend;
+		if (variant->sample_mask_override)
+			desc->SampleMask = variant->sample_mask;
+		if (variant->depth_stencil_override)
+			desc->DepthStencilState = variant->depth_stencil;
 		desc->InputLayout.pInputElementDescs = elements;
 		desc->InputLayout.NumElements = count;
 		desc->CachedPSO = {};
@@ -1068,6 +1127,8 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 			hr = device->CreateGraphicsPipelineState(desc, IID_PPV_ARGS(&pipeline));
 		}
 	} else {
+		bool blend_patched = false, sample_mask_patched = false, depth_stencil_patched = false;
+
 		for (pos = 0; !failed && pos < creation.size(); pos += size) {
 			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(creation.data() + pos);
 			BYTE *value = creation.data() + pos + STREAM_VALUE;
@@ -1086,6 +1147,24 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 				if (variant->root_signature)
 					*(ID3D12RootSignature**)value = variant->root_signature;
 				has_signature = true;
+			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND && variant->blend_override) {
+				*(D3D12_BLEND_DESC*)value = variant->blend;
+				blend_patched = true;
+			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK && variant->sample_mask_override) {
+				*(UINT*)value = variant->sample_mask;
+				sample_mask_patched = true;
+			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL && variant->depth_stencil_override) {
+				*(D3D12_DEPTH_STENCIL_DESC*)value = variant->depth_stencil;
+				depth_stencil_patched = true;
+			} else if ((type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
+			        || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) && variant->depth_stencil_override) {
+				// These versions add fields D3D11 has no equivalent for. Keep those
+				// game-specific fields and replace only the state D3D11 exposes.
+				if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
+					patch_depth_stencil_state((D3D12_DEPTH_STENCIL_DESC1*)value, variant->depth_stencil);
+				else
+					patch_depth_stencil_state((D3D12_DEPTH_STENCIL_DESC2*)value, variant->depth_stencil);
+				depth_stencil_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) {
 				*(D3D12_CACHED_PIPELINE_STATE*)value = {};
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
@@ -1099,6 +1178,12 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 					failed = "it has view instancing";
 			}
 		}
+		if (!failed && variant->blend_override && !blend_patched)
+			append_stream_subobject(&creation, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, variant->blend);
+		if (!failed && variant->sample_mask_override && !sample_mask_patched)
+			append_stream_subobject(&creation, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, variant->sample_mask);
+		if (!failed && variant->depth_stencil_override && !depth_stencil_patched)
+			append_stream_subobject(&creation, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, variant->depth_stencil);
 		// A subobject is not made up for a stage the game's stream has
 		// none for: the stream would have to be put together again
 		if (!failed && (mod_stages & ~patched))
@@ -1119,7 +1204,11 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 
 	if (!pipeline && reported < 16) {
 		reported++;
-		if (!changed_stages && failed)
+		if (!changed_stages && changed_states && failed)
+			Dx12DumpNote("*** A mod's blend or depth/stencil state cannot be applied to the game's pipeline: %s. The game's state is used.\n", failed);
+		else if (!changed_stages && changed_states)
+			Dx12DumpNote("*** Creating a pipeline of the game with a mod's blend or depth/stencil state failed: 0x%x. The game's state is used.\n", hr);
+		else if (!changed_stages && failed)
 			Dx12DumpNote("*** A mod's input layout cannot be given to a pipeline of the game: %s. The game's layout is used."
 				" (%zu bytes kept, %s, shaders %s, stream of %u bytes read to %u, stopped at subobject %u)\n", failed,
 				info->creation.size(), info->creation_stream ? "a stream" : "a description",

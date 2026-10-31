@@ -1782,6 +1782,8 @@ struct Dx12DrawScope {
 	UINT vbs_changed;
 	bool ib_changed;
 	bool topology_changed;
+	bool blend_factor_changed;
+	bool stencil_ref_changed;
 	// The game's pipeline made again with the input layout or the shaders
 	// of a mod, if that is what the list has set, see apply_pipeline
 	ID3D12PipelineState *variant;
@@ -2361,6 +2363,12 @@ static void restore_overrides()
 	if (scope->topology_changed)
 		list->IASetPrimitiveTopology(game->topology);
 	scope->topology_changed = false;
+	if (scope->blend_factor_changed)
+		list->OMSetBlendFactor(game->blend_factor);
+	scope->blend_factor_changed = false;
+	if (scope->stencil_ref_changed)
+		list->OMSetStencilRef(game->stencil_ref);
+	scope->stencil_ref_changed = false;
 }
 
 // Sets the game's heaps on the list again in place of the side heap. With
@@ -2414,6 +2422,44 @@ static void restore_list()
 
 static const Dx12ShaderStage graphics_stages[] = { DX12_STAGE_VS, DX12_STAGE_PS, DX12_STAGE_GS, DX12_STAGE_HS, DX12_STAGE_DS };
 static const Dx12ShaderStage compute_stages[] = { DX12_STAGE_CS };
+
+static void copy_blend_state(D3D12_BLEND_DESC *dst, const D3D11_BLEND_DESC *src)
+{
+	dst->AlphaToCoverageEnable = src->AlphaToCoverageEnable;
+	dst->IndependentBlendEnable = src->IndependentBlendEnable;
+	for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+		const D3D11_RENDER_TARGET_BLEND_DESC &from = src->RenderTarget[i];
+		D3D12_RENDER_TARGET_BLEND_DESC &to = dst->RenderTarget[i];
+		to.BlendEnable = from.BlendEnable;
+		to.LogicOpEnable = FALSE;
+		to.SrcBlend = (D3D12_BLEND)from.SrcBlend;
+		to.DestBlend = (D3D12_BLEND)from.DestBlend;
+		to.BlendOp = (D3D12_BLEND_OP)from.BlendOp;
+		to.SrcBlendAlpha = (D3D12_BLEND)from.SrcBlendAlpha;
+		to.DestBlendAlpha = (D3D12_BLEND)from.DestBlendAlpha;
+		to.BlendOpAlpha = (D3D12_BLEND_OP)from.BlendOpAlpha;
+		to.LogicOp = D3D12_LOGIC_OP_NOOP;
+		to.RenderTargetWriteMask = from.RenderTargetWriteMask;
+	}
+}
+
+static void copy_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC *dst, const D3D11_DEPTH_STENCIL_DESC *src)
+{
+	dst->DepthEnable = src->DepthEnable;
+	dst->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)src->DepthWriteMask;
+	dst->DepthFunc = (D3D12_COMPARISON_FUNC)src->DepthFunc;
+	dst->StencilEnable = src->StencilEnable;
+	dst->StencilReadMask = src->StencilReadMask;
+	dst->StencilWriteMask = src->StencilWriteMask;
+	dst->FrontFace.StencilFailOp = (D3D12_STENCIL_OP)src->FrontFace.StencilFailOp;
+	dst->FrontFace.StencilDepthFailOp = (D3D12_STENCIL_OP)src->FrontFace.StencilDepthFailOp;
+	dst->FrontFace.StencilPassOp = (D3D12_STENCIL_OP)src->FrontFace.StencilPassOp;
+	dst->FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)src->FrontFace.StencilFunc;
+	dst->BackFace.StencilFailOp = (D3D12_STENCIL_OP)src->BackFace.StencilFailOp;
+	dst->BackFace.StencilDepthFailOp = (D3D12_STENCIL_OP)src->BackFace.StencilDepthFailOp;
+	dst->BackFace.StencilPassOp = (D3D12_STENCIL_OP)src->BackFace.StencilPassOp;
+	dst->BackFace.StencilFunc = (D3D12_COMPARISON_FUNC)src->BackFace.StencilFunc;
+}
 
 // The highest register of a range that any of the shaders declares, as a
 // number of registers from the first of the range. 0 if none does.
@@ -4752,6 +4798,16 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		wanted.elements = layout->mElements.data();
 		wanted.element_count = (UINT)layout->mElements.size();
 	}
+	if (mod->blend) {
+		copy_blend_state(&wanted.blend, &static_cast<const ShimBlendState*>(mod->blend)->mDesc);
+		wanted.blend_override = true;
+		wanted.sample_mask = mod->sample_mask;
+		wanted.sample_mask_override = true;
+	}
+	if (mod->depth_stencil) {
+		copy_depth_stencil_state(&wanted.depth_stencil, &static_cast<const ShimDepthStencilState*>(mod->depth_stencil)->mDesc);
+		wanted.depth_stencil_override = true;
+	}
 	if (mod_draw && !scope->compute && !scope->skin) {
 		for (Dx12ShaderStage stage : graphics_stages) {
 			const ShimShader *shader = mod_shader_form(mod, stage);
@@ -4797,7 +4853,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	if (extension)
 		wanted.root_signature = extension->signature;
 
-	if (wanted.elements || stages || wanted.removed_stages)
+	if (wanted.elements || stages || wanted.removed_stages || wanted.blend_override || wanted.depth_stencil_override)
 		variant = Dx12PipelineVariant(scope->pipeline, dx12_shim->device, &wanted, &why);
 	if (variant && extension)
 		scope->extension = *extension;
@@ -4854,6 +4910,14 @@ static void apply_overrides(bool mod_draw)
 	// Before the bindings, which go by the shaders of the draw
 	scope->custom_failed = false;
 	apply_pipeline(mod, mod_draw, true);
+	if (!scope->compute && mod->blend) {
+		list->OMSetBlendFactor(mod->blend_factor);
+		scope->blend_factor_changed = true;
+	}
+	if (!scope->compute && mod->depth_stencil) {
+		list->OMSetStencilRef(mod->stencil_ref);
+		scope->stencil_ref_changed = true;
+	}
 	if (scope->extension.signature && !write_extra_tables(mod, extra_tables)) {
 		static bool no_room;
 
@@ -5195,6 +5259,8 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	opened->vbs_changed = 0;
 	opened->ib_changed = false;
 	opened->topology_changed = false;
+	opened->blend_factor_changed = false;
+	opened->stencil_ref_changed = false;
 	opened->variant = NULL;
 	opened->game_layout = NULL;
 	opened->parameters.clear();

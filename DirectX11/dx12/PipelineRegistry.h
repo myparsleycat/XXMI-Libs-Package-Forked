@@ -214,6 +214,13 @@ struct Dx12PipelineVariantDesc {
 	// In place of the game's root signature, for registers of the mod's
 	// shaders the game's has nothing for (Dx12ExtendRootSignature)
 	ID3D12RootSignature *root_signature;
+	// Output-merger state set by a CustomShader on the shim context
+	bool blend_override;
+	D3D12_BLEND_DESC blend;
+	bool sample_mask_override;
+	UINT sample_mask;
+	bool depth_stencil_override;
+	D3D12_DEPTH_STENCIL_DESC depth_stencil;
 };
 
 // The game's pipeline made again with that. Not referenced: it lives as long
