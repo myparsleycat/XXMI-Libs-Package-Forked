@@ -70,6 +70,21 @@ check_move_frames() {
 	return 1
 }
 
+# Check that unbinding the index buffer hides the game's indexed draw.
+run_null_ib() {
+	cp case/test.ini run/Mods/test.ini
+	sed -i '/hash = 6c953b73/{n;s/handling = skip/ib = null/;}' run/Mods/test.ini
+	grep -q '^ib = null$' run/Mods/test.ini || { echo 'null_ib: FAILED to prepare test'; rm -f run/Mods/test.ini; ok=0; return; }
+	out=$(cd run && ./harness.exe frames=900 test dump=null_ib.bmp 2>&1); status=$?
+	rm -f run/Mods/test.ini
+	got=$(echo "$out" | watched)
+	if [ $status = 0 ] && [ "$got" = "$expect_test" ]; then
+		echo "null_ib: OK ($got)"
+	else
+		echo "null_ib: FAILED (exit $status)"; echo "  expected: $expect_test"; echo "  got:      $got"
+		ok=0
+	fi
+}
 run_move() {
 	local bad=0
 	cp case/test.ini run/Mods/test.ini
@@ -137,7 +152,7 @@ run_ref() {
 
 for what in ${@:-test move lowmip}; do
 	case $what in
-	test) run_test ;;
+	test) run_test; run_null_ib ;;
 	move) run_move ;;
 	lowmip) run_lowmip ;;
 	ref) run_ref ;;
