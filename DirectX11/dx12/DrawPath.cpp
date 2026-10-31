@@ -1907,11 +1907,16 @@ ID3D11Buffer* Dx12ScopeVertexBuffer(UINT slot, UINT *stride)
 	// as they were, where its D3D11 counterpart unbinds them. What an
 	// earlier draw left in a slot is no part of this one: a mod going by
 	// it would take a light volume for the mesh drawn before it.
-	if (!(scope->pipeline->vb_slots & 1u << slot)
-	    || (slot == SKIN_BLEND_SLOT && scope->pipeline->vb_reads_known
-	        && !(scope->pipeline->vb_read_slots & 1u << slot))) {
-		if (slot == SKIN_BLEND_SLOT)
-			return skin_blend_for_draw(stride);
+	bool declared = scope->pipeline->vb_slots & 1u << slot;
+	if (slot == SKIN_BLEND_SLOT && (!declared || (scope->pipeline->vb_reads_known
+	    && !(scope->pipeline->vb_read_slots & 1u << slot)))) {
+		ID3D11Buffer *blend = skin_blend_for_draw(stride);
+
+		// A slot the layout declares stays visible to the mods and known to
+		// draw_is_boring when the draw is not of skinned vertices
+		if (blend || !declared)
+			return blend;
+	} else if (!declared) {
 		return NULL;
 	}
 
@@ -4312,12 +4317,15 @@ static std::unordered_map<ID3D11Buffer*, UnpackedBuffer> rigid_weights_copies;
 
 static void forget_rigid_weights_copies()
 {
-    for (auto &entry : rigid_weights_copies) {
-        entry.first->Release();
-        if (entry.second.copy) entry.second.copy->Release();
-    }
-    rigid_weights_copies.clear();
+	for (auto &entry : rigid_weights_copies) {
+		entry.first->Release();
+		if (entry.second.copy)
+			entry.second.copy->Release();
+	}
+	rigid_weights_copies.clear();
 }
+
+// into as for unpack_buffer
 static ID3D11Buffer* pack_rigid_buffer(ID3D11Buffer *buffer, UINT stride, ID3D11Buffer *into, bool *retry)
 {
 	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -4341,10 +4349,16 @@ static ID3D11Buffer* pack_rigid_buffer(ID3D11Buffer *buffer, UINT stride, ID3D11
 		std::vector<UINT> indices(desc.ByteWidth / 8);
 		for (size_t i = 0; i < indices.size(); ++i)
 			memcpy(&indices[i], resource->shadow.data() + i * 8, sizeof(UINT));
+		if (into) {
+			dx12_shim->shim_context->UpdateSubresource(into, 0, NULL, indices.data(), 0, 0);
+			return into;
+		}
 		D3D11_BUFFER_DESC packed = {};
 		packed.ByteWidth = (UINT)(indices.size() * sizeof(UINT));
 		packed.Usage = D3D11_USAGE_DEFAULT;
-		packed.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+		// The source can move to the GPU later, see ShimBufferToGpu, and this
+		// copy is then written by the compute shader below
+		packed.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS;
 		D3D11_SUBRESOURCE_DATA data = {};
 		data.pSysMem = indices.data();
 		ID3D11Buffer *copy = NULL;
@@ -4421,25 +4435,36 @@ static ID3D11Buffer* pack_rigid_buffer(ID3D11Buffer *buffer, UINT stride, ID3D11
 
 static ID3D11Buffer *rigid_weights_copy(ID3D11Buffer *buffer)
 {
-    UINT64 version = ShimResourceOf(buffer)->version;
-    auto found = rigid_weights_copies.find(buffer);
-    bool retry;
-    if (found != rigid_weights_copies.end()) {
-        UnpackedBuffer *entry = &found->second;
-        if (!entry->copy || entry->version == version) return entry->copy;
-        ID3D11Buffer *updated = pack_rigid_buffer(buffer, 8, NULL, &retry);
-        if (!updated) return NULL;
-        entry->copy->Release();
-        entry->copy = updated;
-        entry->version = version;
-        return updated;
-    }
-    ID3D11Buffer *out = pack_rigid_buffer(buffer, 8, NULL, &retry);
-    if (!out) return NULL;
-    buffer->AddRef();
-    rigid_weights_copies[buffer] = { out, version };
-    return out;
+	UINT64 version = ShimResourceOf(buffer)->version;
+	auto found = rigid_weights_copies.find(buffer);
+	bool retry;
+
+	if (found != rigid_weights_copies.end()) {
+		UnpackedBuffer *entry = &found->second;
+
+		if (entry->version == version)
+			return entry->copy;
+		ID3D11Buffer *out = pack_rigid_buffer(buffer, 8, entry->copy, &retry);
+		if (!out) {
+			// Left at the version before, to be done at a later draw
+			if (retry)
+				return entry->copy;
+			if (entry->copy)
+				entry->copy->Release();
+		}
+		entry->copy = out;
+		entry->version = version;
+		return out;
+	}
+
+	ID3D11Buffer *out = pack_rigid_buffer(buffer, 8, NULL, &retry);
+	if (retry)
+		return NULL;
+	buffer->AddRef();
+	rigid_weights_copies[buffer] = { out, version };
+	return out;
 }
+
 // What to bind for the vertex buffer of a mod whose vertices are 4 bytes
 // shorter than those the game has in the slot. NULL to bind it as it is.
 static ID3D11Buffer* unpacked_buffer(ID3D11Buffer *buffer, UINT slot, UINT stride)
