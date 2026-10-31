@@ -41,6 +41,8 @@ struct Dx12ShaderInfo {
 	bool reflected;
 	// An SRV range without an upper bound. Any register may be read.
 	bool unbounded_srv;
+	// Whether this vertex shader actually reads POSITION0.
+	bool reads_position;
 	// A view register the masks below have no bit for: of another space
 	// than 0, or past what they reach
 	bool unmasked;
@@ -161,6 +163,9 @@ struct Dx12PipelineInfo {
 	std::vector<Dx12InputElement> input_layout;
 	// Bit per vertex buffer slot the input layout reads
 	UINT vb_slots = 0;
+	// Slots with an input that the vertex shader signature actually consumes.
+	UINT vb_read_slots = 0;
+	bool vb_reads_known = false;
 	mutable Dx12DrawFilter filter = {};
 
 	// What a graphics pipeline was created from, for creating it again
@@ -225,6 +230,7 @@ struct Dx12SignatureElement {
 	UINT index;
 	// Bit per component, x first
 	UINT mask;
+	UINT read_write_mask;
 	UINT reg;
 	UINT system_value;
 };
