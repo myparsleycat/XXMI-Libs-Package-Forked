@@ -4,6 +4,7 @@
 #include "log.h"
 #include "Overlay.h"
 #include "dx12/PipelineRegistry.h"
+#include "ByteCodeReader.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -1224,6 +1225,8 @@ static ID3D11DeviceChild* create_patched_shader(ID3D11Device *device, const wstr
 		shader->Release();
 		shader = NULL;
 	}
+	if (shader)
+		note_replacement_srv_slots(shader, bytecode, size);
 
 	return shader;
 }

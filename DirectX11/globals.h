@@ -668,6 +668,10 @@ struct Globals
 
 	CRITICAL_SECTION mShaderBindingsLock;
 	std::unordered_map<UINT64, ShaderBindings> mShaderBindingsCache;
+	// What a shader made from other bytecode than the game's declares, which
+	// mShaderBindingsCache does not say: the structured and raw buffer t slots of
+	// each ShaderFixes and ShaderRegex replacement. Under mShaderBindingsLock.
+	std::unordered_map<ID3D11DeviceChild *, std::array<UINT64, 2>> mReplacementBufferSrvSlots;
 
 	unordered_map<uint32_t, TextureOverrideFuzzyMatches> mTextureOverrideDrawIndexMap;  // Contains hash+TextureOverrides pairs indexed by match_index_count
 	unordered_map<uint32_t, TextureOverrideFuzzyMatches> mTextureOverrideDrawVertexMap; // Contains hash+TextureOverrides pairs indexed by match_vertex_count

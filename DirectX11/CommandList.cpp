@@ -16,6 +16,7 @@
 #include "IniHandler.h"
 #include "profiling.h"
 #include "GpuWatch.h"
+#include "ByteCodeReader.h"
 #include "Hunting.h"
 #include "cursor.h"
 #include "dx12/Bridge.h"
@@ -2004,6 +2005,9 @@ void DrawCommand::run(CommandListState *state)
 	// Ensure IniParams are visible:
 	CommandListFlushState(state);
 
+	mHackerContext->GuardShaderResources(type == DrawCommandType::DISPATCH || type == DrawCommandType::DISPATCH_INDIRECT
+		|| (type == DrawCommandType::FROM_CALLER && info && (info->type == DrawCall::Dispatch || info->type == DrawCall::DispatchIndirect)));
+
 	Profiling::injected_draw_calls++;
 
 	switch (type) {
@@ -3114,6 +3118,13 @@ void CustomShader::add_dxil(ID3D11Device *mOrigDevice1)
 	compile_dxil('p', ps_source, compile_flags, ps);
 }
 
+static void note_buffer_srv_slots(ID3DBlob *bytecode, UINT64 slots[2])
+{
+	ShaderBindings bindings{};
+	if (get_shader_bindings_from_bytecode(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), &bindings))
+		get_buffer_srv_slots(bindings, slots);
+}
+
 void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 {
 	if (substantiated) {
@@ -3123,36 +3134,42 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 	substantiated = true;
 
 	if (vs_bytecode) {
+		note_buffer_srv_slots(vs_bytecode, buffer_srv_slots[0]);
 		mOrigDevice1->CreateVertexShader(vs_bytecode->GetBufferPointer(), vs_bytecode->GetBufferSize(), NULL, &vs);
 		CleanupShaderMaps(vs);
 		vs_bytecode->Release();
 		vs_bytecode = NULL;
 	}
 	if (hs_bytecode) {
+		note_buffer_srv_slots(hs_bytecode, buffer_srv_slots[1]);
 		mOrigDevice1->CreateHullShader(hs_bytecode->GetBufferPointer(), hs_bytecode->GetBufferSize(), NULL, &hs);
 		CleanupShaderMaps(hs);
 		hs_bytecode->Release();
 		hs_bytecode = NULL;
 	}
 	if (ds_bytecode) {
+		note_buffer_srv_slots(ds_bytecode, buffer_srv_slots[2]);
 		mOrigDevice1->CreateDomainShader(ds_bytecode->GetBufferPointer(), ds_bytecode->GetBufferSize(), NULL, &ds);
 		CleanupShaderMaps(ds);
 		ds_bytecode->Release();
 		ds_bytecode = NULL;
 	}
 	if (gs_bytecode) {
+		note_buffer_srv_slots(gs_bytecode, buffer_srv_slots[3]);
 		mOrigDevice1->CreateGeometryShader(gs_bytecode->GetBufferPointer(), gs_bytecode->GetBufferSize(), NULL, &gs);
 		CleanupShaderMaps(gs);
 		gs_bytecode->Release();
 		gs_bytecode = NULL;
 	}
 	if (ps_bytecode) {
+		note_buffer_srv_slots(ps_bytecode, buffer_srv_slots[4]);
 		mOrigDevice1->CreatePixelShader(ps_bytecode->GetBufferPointer(), ps_bytecode->GetBufferSize(), NULL, &ps);
 		CleanupShaderMaps(ps);
 		ps_bytecode->Release();
 		ps_bytecode = NULL;
 	}
 	if (cs_bytecode) {
+		note_buffer_srv_slots(cs_bytecode, buffer_srv_slots[5]);
 		mOrigDevice1->CreateComputeShader(cs_bytecode->GetBufferPointer(), cs_bytecode->GetBufferSize(), NULL, &cs);
 		CleanupShaderMaps(cs);
 		cs_bytecode->Release();
@@ -3511,6 +3528,17 @@ void RunCustomShaderCommand::run(CommandListState *state)
 
 	saved_shader_inst vs_inst, hs_inst, ds_inst, gs_inst, ps_inst, cs_inst;
 
+	const UINT64 *saved_srv_slots[6];
+	const bool overrides[6] = {
+		custom_shader->vs_override, custom_shader->hs_override, custom_shader->ds_override,
+		custom_shader->gs_override, custom_shader->ps_override, custom_shader->cs_override,
+	};
+	for (int i = 0; i < 6; i++) {
+		saved_srv_slots[i] = state->mHackerContext->mCustomShaderSrvSlots[i];
+		if (overrides[i])
+			state->mHackerContext->mCustomShaderSrvSlots[i] = custom_shader->buffer_srv_slots[i];
+	}
+
 	// Assign custom shaders first before running the command lists, and
 	// restore them last. This is so that if someone was injecting a
 	// sequence of pixel shaders that all shared a common vertex shader
@@ -3582,6 +3610,9 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	_RunCommandList(&custom_shader->command_list, state);
 	state->post = true;
 	_RunCommandList(&custom_shader->post_command_list, state);
+
+	for (int i = 0; i < 6; i++)
+		state->mHackerContext->mCustomShaderSrvSlots[i] = saved_srv_slots[i];
 	state->post = saved_post;
 
 	// Finally restore the original shaders
@@ -11359,6 +11390,7 @@ void ResourceCopyTarget::SetResource(
 
 	case ResourceCopyTargetType::SHADER_RESOURCE:
 		resource_view = (ID3D11ShaderResourceView*)view;
+		state->mHackerContext->NoteCommandListSrv(shader_type, slot, resource_view != NULL);
 		switch(shader_type) {
 		case L'v':
 			mOrigContext1->VSSetShaderResources(slot, 1, &resource_view);
@@ -14203,11 +14235,116 @@ void ShaderResourceBindBatch::run(CommandListState *state)
 	SetShaderResourcesBatch(state->mOrigContext1, shader_type, first_slot, count, views);
 
 	for (unsigned i = 0; i < count; i++) {
+		state->mHackerContext->NoteCommandListSrv(shader_type, first_slot + i, views[i] != NULL);
 		if (views[i])
 			views[i]->Release();
 	}
 
 	COMMAND_LIST_LOG(state, "%s\n", "}");
+}
+
+static int srv_stage(wchar_t shader_type)
+{
+	switch (shader_type) {
+		case L'v': return 0;
+		case L'h': return 1;
+		case L'd': return 2;
+		case L'g': return 3;
+		case L'p': return 4;
+		case L'c': return 5;
+	}
+	return -1;
+}
+
+void HackerContext::NoteCommandListSrv(wchar_t shader_type, UINT slot, bool bound)
+{
+	int stage = srv_stage(shader_type);
+	if (stage < 0 || slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT || dx12_shim)
+		return;
+	if (bound)
+		mCommandListSrvSlots[stage][slot >> 6] |= 1ull << (slot & 63);
+	else
+		mCommandListSrvSlots[stage][slot >> 6] &= ~(1ull << (slot & 63));
+}
+
+// What is in the slot may have changed without the context knowing, so only the
+// view there now decides. A buffer view is left alone, and needs no second look
+// until a command list binds this slot again.
+static void unbind_texture_over_buffer(ID3D11DeviceContext1 *context, wchar_t shader_type, UINT slot, UINT64 shader_hash)
+{
+	ID3D11ShaderResourceView *view = NULL;
+	GetShaderResourcesBatch(context, shader_type, slot, 1, &view);
+	if (!view)
+		return;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+	view->GetDesc(&desc);
+	view->Release();
+	if (desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+		return;
+
+	ID3D11ShaderResourceView *no_view = NULL;
+	SetShaderResourcesBatch(context, shader_type, slot, 1, &no_view);
+
+	static std::unordered_set<UINT64> reported;
+	EnterCriticalSectionPretty(&G->mShaderBindingsLock);
+	const bool first = reported.insert(shader_hash * 31 + (UINT64)shader_type * 257 + slot).second;
+	LeaveCriticalSection(&G->mShaderBindingsLock);
+	if (first)
+		LogInfo("Unbound the texture in %lcs-t%u (view dimension %d, format %d): shader %016llx declares that slot as a structured or raw buffer\n",
+			shader_type, slot, desc.ViewDimension, desc.Format, shader_hash);
+}
+
+void HackerContext::GuardShaderResources(bool compute)
+{
+	static const wchar_t shader_types[] = L"vhdgpc";
+	ID3D11DeviceChild *const handles[6] = {
+		mCurrentVertexShaderHandle, mCurrentHullShaderHandle, mCurrentDomainShaderHandle,
+		mCurrentGeometryShaderHandle, mCurrentPixelShaderHandle, mCurrentComputeShaderHandle,
+	};
+
+	for (int stage = compute ? 5 : 0; stage < (compute ? 6 : 5); stage++) {
+		UINT64 *bound = mCommandListSrvSlots[stage];
+		if (!(bound[0] | bound[1]))
+			continue;
+
+		const UINT64 *declared = mCustomShaderSrvSlots[stage];
+		UINT64 shader_hash = 0;
+		if (!declared) {
+			if (!handles[stage])
+				continue;
+			ShaderHandleCacheEntry *entry = const_cast<ShaderHandleCacheEntry*>(LookupShaderHandle(handles[stage]));
+			ID3D11DeviceChild *running = (entry->reload_info && entry->reload_info->replacement) ? entry->reload_info->replacement : handles[stage];
+			if (entry->buffer_srv_slots_shader != running) {
+				entry->buffer_srv_slots[0] = entry->buffer_srv_slots[1] = 0;
+				EnterCriticalSectionPretty(&G->mShaderBindingsLock);
+				auto replaced = G->mReplacementBufferSrvSlots.find(running);
+				if (replaced != G->mReplacementBufferSrvSlots.end()) {
+					entry->buffer_srv_slots[0] = replaced->second[0];
+					entry->buffer_srv_slots[1] = replaced->second[1];
+				} else if (entry->hash_found) {
+					auto it = G->mShaderBindingsCache.find(entry->hash);
+					if (it != G->mShaderBindingsCache.end())
+						get_buffer_srv_slots(it->second, entry->buffer_srv_slots);
+				}
+				LeaveCriticalSection(&G->mShaderBindingsLock);
+				entry->buffer_srv_slots_shader = running;
+			}
+			declared = entry->buffer_srv_slots;
+			shader_hash = entry->hash;
+		}
+
+		for (int word = 0; word < 2; word++) {
+			UINT64 candidates = bound[word] & declared[word];
+			bound[word] &= ~candidates;
+			while (candidates) {
+				unsigned long bit;
+				_BitScanForward64(&bit, candidates);
+				candidates &= candidates - 1;
+				unbind_texture_over_buffer(mOrigContext1, shader_types[stage], word * 64 + bit, shader_hash);
+			}
+		}
+	}
 }
 
 void ShaderResourceFetchBatch::run(CommandListState *state)

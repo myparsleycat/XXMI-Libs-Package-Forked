@@ -414,6 +414,9 @@ public:
 	// was there before.
 	UINT16 sampler_slots[6];
 
+	// See HackerContext::mCustomShaderSrvSlots
+	UINT64 buffer_srv_slots[6][2] = {};
+
 	D3D11_PRIMITIVE_TOPOLOGY topology;
 
 	CommandList command_list;
