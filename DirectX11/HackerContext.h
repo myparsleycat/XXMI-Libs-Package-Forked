@@ -370,6 +370,7 @@ public:
 	void InitIniParams();
 	ID3D11DeviceContext1* GetPossiblyHookedOrigContext1();
 	ID3D11DeviceContext1* GetPassThroughOrigContext1();
+	void GetShaderHashes(UINT64 hashes[5]);
 	void HookContext();
 
 	// public to allow CommandList access

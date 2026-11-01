@@ -24,6 +24,7 @@
 #include "ShaderRegex.h"
 #include "FrameAnalysis.h"
 #include "profiling.h"
+#include "GpuWatch.h"
 
 // -----------------------------------------------------------------------------------------------
 
@@ -1177,6 +1178,15 @@ out_profile:
 		Profiling::end(&profiling_state, &Profiling::draw_overhead);
 }
 
+void HackerContext::GetShaderHashes(UINT64 hashes[5])
+{
+	hashes[0] = mCurrentVertexShader;
+	hashes[1] = mCurrentHullShader;
+	hashes[2] = mCurrentDomainShader;
+	hashes[3] = mCurrentGeometryShader;
+	hashes[4] = mCurrentPixelShader;
+}
+
 void HackerContext::AfterDraw(DrawContext &data)
 {
 	int i;
@@ -1188,6 +1198,11 @@ void HackerContext::AfterDraw(DrawContext &data)
 
 	if (data.call_info.skip)
 		Profiling::skipped_draw_calls++;
+	else if (GpuWatch::enabled) {
+		UINT64 hashes[5];
+		GetShaderHashes(hashes);
+		GpuWatch::mark_call(mOrigContext1, data.call_info, hashes);
+	}
 
 	for (i = 0; i < 5; i++) {
 		if (data.post_commands[i]) {
@@ -1962,6 +1977,11 @@ bool HackerContext::BeforeDispatch(DispatchContext *context)
 
 void HackerContext::AfterDispatch(DispatchContext *context)
 {
+	if (GpuWatch::enabled && !context->call_info.skip) {
+		const UINT64 hashes[5] = { mCurrentComputeShader };
+		GpuWatch::mark_call(mOrigContext1, context->call_info, hashes);
+	}
+
 	if (context->post_commands)
 		RunCommandList(mHackerDevice, this, context->post_commands, &context->call_info, true);
 }
@@ -2370,8 +2390,11 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 	__in  ID3D11CommandList *pCommandList,
 	BOOL RestoreContextState)
 {
-	if (G->deferred_contexts_enabled)
+	if (G->deferred_contexts_enabled) {
 		mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
+		if (GpuWatch::enabled)
+			GpuWatch::mark_command_list(mOrigContext1);
+	}
 
 	if (!RestoreContextState) {
 		// This is equivalent to calling ClearState() afterwards, so we
@@ -2550,7 +2573,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 		// lookup/find takes measurable amounts of CPU time.
 		//
 		// grumble grumble this optimisation caught me out *TWICE* grumble grumble -DSS
-		if (!G->mShaderOverrideMap.empty() || shader_regex_d3d_groups || (G->hunting == HUNTING_MODE_ENABLED)) {
+		if (!G->mShaderOverrideMap.empty() || shader_regex_d3d_groups || (G->hunting == HUNTING_MODE_ENABLED) || GpuWatch::enabled) {
 			// Both this lookup and the one in mReloadedShaders below:
 			const ShaderHandleCacheEntry *entry = LookupShaderHandle(pShader);
 			reload_info = entry->reload_info;

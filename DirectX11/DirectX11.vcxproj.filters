@@ -25,6 +25,7 @@
     <ClCompile Include="HackerDXGI.cpp" />
     <ClCompile Include="..\iid.cpp" />
     <ClCompile Include="..\util.cpp" />
+    <ClCompile Include="GpuWatch.cpp" />
     <ClCompile Include="profiling.cpp" />
     <ClCompile Include="..\ini_parser_lite.cpp" />
     <ClCompile Include="lock.cpp" />
@@ -96,6 +97,7 @@
     <ClInclude Include="ShaderRegex.h" />
     <ClInclude Include="FrameAnalysis.h" />
     <ClInclude Include="HackerDXGI.h" />
+    <ClInclude Include="GpuWatch.h" />
     <ClInclude Include="profiling.h" />
     <ClInclude Include="lock.h" />
     <ClInclude Include="cursor.h" />

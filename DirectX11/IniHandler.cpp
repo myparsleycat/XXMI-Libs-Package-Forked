@@ -12,6 +12,7 @@
 
 #include "log.h"
 #include "Globals.h"
+#include "GpuWatch.h"
 #include "Override.h"
 #include "Hunting.h"
 #include "ShaderRegex.h"
@@ -4930,6 +4931,7 @@ void LoadConfigFile()
 	Profiling::Spike::init(GetIniFloat(L"Logging", L"spike_log_threshold", 0, NULL),
 			GetIniFloat(L"Logging", L"spike_log_relative", 0, NULL),
 			GetIniBool(L"Logging", L"spike_log_command_detail", false, NULL), logFilename);
+	GpuWatch::init(GetIniInt(L"Logging", L"gpu_watch", 0, NULL), GetIniBool(L"Logging", L"gpu_watch_debug_layer", false, NULL), GetIniBool(L"Logging", L"gpu_watch_aftermath", false, NULL), logFilename);
 
 	G->gShowWarnings = GetIniBool(L"Logging", L"show_warnings", true, NULL);
 

@@ -15,6 +15,7 @@
 #include "D3D11Wrapper.h"
 #include "IniHandler.h"
 #include "profiling.h"
+#include "GpuWatch.h"
 #include "Hunting.h"
 #include "cursor.h"
 #include "dx12/Bridge.h"
@@ -2131,6 +2132,12 @@ void DrawCommand::run(CommandListState *state)
 			else
 				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
 			break;
+	}
+
+	if (GpuWatch::enabled) {
+		UINT64 hashes[5];
+		state->mHackerContext->GetShaderHashes(hashes);
+		GpuWatch::mark_section(mOrigContext1, ini_section.c_str(), hashes);
 	}
 }
 

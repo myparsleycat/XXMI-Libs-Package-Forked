@@ -3,6 +3,7 @@
 #include "log.h"
 #include "Globals.h"
 #include "IniHandler.h"
+#include "GpuWatch.h"
 #include "HookedDXGI.h"
 #include "dx12/Dx12Hooks.h"
 #include "vk/VkHooks.h"
@@ -902,6 +903,9 @@ HRESULT WINAPI D3D11CreateDevice(
 #if _DEBUG_LAYER
 	Flags = EnableDebugFlags(Flags);
 #endif
+	if (GpuWatch::debug_layer)
+		Flags |= D3D11_CREATE_DEVICE_DEBUG;
+	GpuWatch::before_device_create();
 
 	get_tls()->hooking_quirk_protection = true;
 	HRESULT ret = (*_D3D11CreateDevice)(pAdapter, DriverType, Software, Flags, pFeatureLevels,
@@ -917,6 +921,7 @@ HRESULT WINAPI D3D11CreateDevice(
 	// Optional parameters means these might be null.
 	ID3D11Device *retDevice = ppDevice ? *ppDevice : nullptr;
 	ID3D11DeviceContext *retContext = ppImmediateContext ? *ppImmediateContext : nullptr;
+	GpuWatch::after_device_create(retDevice);
 
 	LogInfo("  D3D11CreateDevice returned device handle = %p, context handle = %p\n",
 		retDevice, retContext);
@@ -1029,6 +1034,9 @@ HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
 #if _DEBUG_LAYER
 	Flags = EnableDebugFlags(Flags);
 #endif
+	if (GpuWatch::debug_layer)
+		Flags |= D3D11_CREATE_DEVICE_DEBUG;
+	GpuWatch::before_device_create();
 
 	override_swap_chain(pSwapChainDesc, &origSwapChainDesc);
 
@@ -1047,6 +1055,7 @@ HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
 	ID3D11Device *retDevice = ppDevice ? *ppDevice : nullptr;
 	ID3D11DeviceContext *retContext = ppImmediateContext ? *ppImmediateContext : nullptr;
 	IDXGISwapChain *retSwapChain = ppSwapChain ? *ppSwapChain : nullptr;
+	GpuWatch::after_device_create(retDevice);
 
 	LogInfo("  D3D11CreateDeviceAndSwapChain returned device handle = %p, context handle = %p, swap chain = %p\n",
 		retDevice, retContext, retSwapChain);

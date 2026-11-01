@@ -99,6 +99,7 @@
     <ClCompile Include="lock.cpp" />
     <ClCompile Include="Overlay.cpp" />
     <ClCompile Include="Override.cpp" />
+    <ClCompile Include="GpuWatch.cpp" />
     <ClCompile Include="profiling.cpp" />
     <ClCompile Include="ResourceHash.cpp" />
     <ClCompile Include="ResourceLoading.cpp" />
@@ -172,6 +173,7 @@
     <ClInclude Include="Overlay.h" />
     <ClInclude Include="CommandList.h" />
     <ClInclude Include="Override.h" />
+    <ClInclude Include="GpuWatch.h" />
     <ClInclude Include="profiling.h" />
     <ClInclude Include="ResourceHash.h" />
     <ClInclude Include="ResourceLoading.h" />
