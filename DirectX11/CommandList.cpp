@@ -1640,6 +1640,8 @@ static bool note_checked_slot(CheckTextureOverrideCommand *check, CommandListChe
 }
 
 static bool expression_is_stateless(CommandListEvaluatable *evaluatable, bool of_draw = false);
+static bool known_on_game_draw(CommandListEvaluatable *evaluatable, float *value);
+static const std::shared_ptr<CommandListEvaluatable>& undecided_on_game_draw(const std::shared_ptr<CommandListEvaluatable> &evaluatable);
 
 static bool note_assignment(CommandListVariable *var, int param_idx, float DirectX::XMFLOAT4::*param_component,
 		CommandListExpression *expression, float val, CommandListCheckedSlots *slots)
@@ -1664,20 +1666,20 @@ static bool note_assignment(CommandListVariable *var, int param_idx, float Direc
 	return true;
 }
 
-static bool note_guard(IfCommand *branch, bool nonzero, CommandListCheckedSlots *slots)
+static bool note_guard(CommandListExpression *expression, bool nonzero, CommandListCheckedSlots *slots)
 {
 	unsigned i;
 
-	if (!expression_is_stateless(branch->expression.evaluatable.get()))
+	if (!expression_is_stateless(expression->evaluatable.get()))
 		return false;
 
 	for (i = 0; i < slots->guard_count; i++) {
-		if (slots->guards[i].expression == &branch->expression)
+		if (slots->guards[i].expression == expression)
 			return slots->guards[i].nonzero == nonzero;
 	}
 	if (slots->guard_count == ARRAYSIZE(slots->guards))
 		return false;
-	slots->guards[slots->guard_count].expression = &branch->expression;
+	slots->guards[slots->guard_count].expression = expression;
 	slots->guards[slots->guard_count].nonzero = nonzero;
 	slots->guard_count++;
 	return true;
@@ -1697,6 +1699,22 @@ static bool branch_only_checks_texture_overrides(CommandList *pre, CommandList *
 
 static bool if_only_checks_texture_overrides(IfCommand *branch, CommandListCheckedSlots *slots, unsigned depth)
 {
+	// A list of a game's draw on D3D12 or Vulkan starts with no render
+	// target, depth target or pixel shader UAV bound, and only a command
+	// that binds one would change that, which is no check. So a list that
+	// gets to be judged as only checking finds them unbound, and only the
+	// branch a condition of nothing else would take can run, see
+	// dx12_lists_see_game_targets.
+	CommandListExpression *guard = &branch->expression;
+	float known;
+	if (known_on_game_draw(branch->expression.evaluatable.get(), &known)) {
+		if (known)
+			return branch_only_checks_texture_overrides(branch->true_commands_pre.get(),
+					branch->true_commands_post.get(), slots, depth + 1);
+		return branch_only_checks_texture_overrides(branch->false_commands_pre.get(),
+				branch->false_commands_post.get(), slots, depth + 1);
+	}
+
 	// Evaluating the condition changes nothing, and either branch may be
 	// the one that runs, unless only one of them will do and the condition
 	// is one that can be watched:
@@ -1707,7 +1725,15 @@ static bool if_only_checks_texture_overrides(IfCommand *branch, CommandListCheck
 
 	if (!if_true && !if_false)
 		return false;
-	return if_true == if_false || note_guard(branch, if_true, slots);
+	if (if_true == if_false)
+		return true;
+
+	const std::shared_ptr<CommandListEvaluatable> &undecided = undecided_on_game_draw(branch->expression.evaluatable);
+	if (undecided != branch->expression.evaluatable) {
+		branch->undecided_on_game_draw.evaluatable = undecided;
+		guard = &branch->undecided_on_game_draw;
+	}
+	return note_guard(guard, if_true, slots);
 }
 
 bool CommandListOnlyChecksTextureOverrides(CommandList *command_list, CommandListCheckedSlots *slots, unsigned depth)
@@ -5888,6 +5914,11 @@ DEFINE_OPERATOR(saturate_operator,      "saturate",  max(0.0, min(rhs, 1.0)));
 
 DEFINE_OPERATOR(random_operator,        "random",    random(rhs));
 
+static bool is_deterministic_operator(CommandListOperator *op)
+{
+	return op->rhs && !dynamic_cast<random_operatorT*>(op);
+}
+
 // Whether the value depends on nothing but IniParams and global variables, see
 // CommandListCheckedSlots. A local variable is as the command list that has it
 // left it, which is not for anything outside of that list to go by. of_draw
@@ -5895,7 +5926,7 @@ DEFINE_OPERATOR(random_operator,        "random",    random(rhs));
 static bool expression_is_stateless(CommandListEvaluatable *evaluatable, bool of_draw)
 {
 	if (CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable)) {
-		if (dynamic_cast<random_operatorT*>(op) || !op->rhs)
+		if (!is_deterministic_operator(op))
 			return false;
 		return (!op->lhs || expression_is_stateless(op->lhs.get(), of_draw)) && expression_is_stateless(op->rhs.get(), of_draw);
 	}
@@ -5968,6 +5999,86 @@ DEFINE_OPERATOR(and_operator,           "&&", (lhs && rhs));
 DEFINE_OPERATOR(or_operator,            "||", (lhs || rhs));
 
 // TODO: Ternary if operator
+
+static bool is_unbound_on_game_draw(const ResourceCopyTarget &target)
+{
+	if (target.type == ResourceCopyTargetType::EMPTY)
+		return true;
+	if (dx12_lists_see_game_targets || !is_static_pipeline_slot(target))
+		return false;
+	return target.type == ResourceCopyTargetType::RENDER_TARGET
+	    || target.type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET
+	    || (target.type == ResourceCopyTargetType::UNORDERED_ACCESS_VIEW && target.shader_type == L'p');
+}
+
+// What the expression evaluates to in a list of a game's draw before anything
+// is bound, where that does not depend on the draw or on variables, see
+// if_only_checks_texture_overrides
+static bool known_on_game_draw(CommandListEvaluatable *evaluatable, float *value)
+{
+	float lhs_value = std::numeric_limits<float>::quiet_NaN(), rhs_value = 0;
+	bool lhs_known, rhs_known;
+
+	if (!evaluatable)
+		return false;
+
+	if (CommandListOperand *operand = evaluatable->as_operand) {
+		switch (operand->type) {
+			case ParamOverrideType::VALUE:
+			case ParamOverrideType::DX12:
+			case ParamOverrideType::DLL_SAMPLER_SLOTS:
+				*value = operand->evaluate(NULL, dx12_shim->hacker_device);
+				return true;
+			case ParamOverrideType::TEXTURE:
+				if (operand->texture_filter_target.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE
+				    || !is_unbound_on_game_draw(operand->texture_filter_target))
+					return false;
+				// As process_texture_filter has it for no resource
+				*value = -0.0f;
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable);
+	if (!op || !is_deterministic_operator(op))
+		return false;
+
+	rhs_known = known_on_game_draw(op->rhs.get(), &rhs_value);
+	lhs_known = op->lhs && known_on_game_draw(op->lhs.get(), &lhs_value);
+
+	if (dynamic_cast<and_operatorT*>(op) && ((lhs_known && !lhs_value) || (rhs_known && !rhs_value))) {
+		*value = 0;
+		return true;
+	}
+	if (dynamic_cast<or_operatorT*>(op) && ((lhs_known && lhs_value) || (rhs_known && rhs_value))) {
+		*value = 1;
+		return true;
+	}
+
+	if (!rhs_known || (op->lhs && !lhs_known))
+		return false;
+	*value = op->evaluate(lhs_value, rhs_value);
+	return true;
+}
+
+// For an expression known_on_game_draw does not know: the part of it that tells
+// whether it is zero there, which is less than all of it where a side of && or
+// || is known, as that side cannot be the one that decides.
+static const std::shared_ptr<CommandListEvaluatable>& undecided_on_game_draw(const std::shared_ptr<CommandListEvaluatable> &evaluatable)
+{
+	CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable.get());
+	float known;
+
+	if (!dynamic_cast<and_operatorT*>(op) && !dynamic_cast<or_operatorT*>(op))
+		return evaluatable;
+	if (known_on_game_draw(op->lhs.get(), &known))
+		return undecided_on_game_draw(op->rhs);
+	if (known_on_game_draw(op->rhs.get(), &known))
+		return undecided_on_game_draw(op->lhs);
+	return evaluatable;
+}
 
 static CommandListOperatorFactoryBase *unary_operators[] = {
 	&unary_not_operator,

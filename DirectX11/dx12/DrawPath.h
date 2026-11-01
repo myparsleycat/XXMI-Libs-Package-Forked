@@ -133,6 +133,10 @@ void Dx12DumpMarkedShader(UINT64 hash, const char *type);
 // The engine's half of a scope, for a draw that is not on a D3D12 list: of a
 // Vulkan game (vk/VkDrawPath), which answers what the functions below are
 // asked while it has one open. With the lock of Bridge.h held.
+// Whether a list of a game's draw finds the game's render targets, depth target
+// and pixel shader UAVs bound. ShimContext gives only what mods bound, and
+// CommandListOnlyChecksTextureOverrides goes by that.
+constexpr bool dx12_lists_see_game_targets = false;
 void Dx12OpenForeignScope();
 void Dx12CloseForeignScope();
 
