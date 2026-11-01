@@ -1,6 +1,7 @@
 #include "PipelineRegistry.h"
 
 #include <unordered_map>
+#include <type_traits>
 
 #include "util.h"
 #include "CmdState.h"
@@ -190,6 +191,8 @@ static bool reflect_psv0(Blob psv, Dx12ShaderInfo *info)
 		// PSVResourceType: 2 is a CBV, 3-5 SRVs, 6-9 UAVs
 		if (upper < lower || type < 2)
 			continue;
+		if (type >= 6 && type <= 9)
+			info->has_uav = true;
 		if (space || type > 9) {
 			info->unmasked = true;
 			continue;
@@ -237,6 +240,16 @@ static bool reflect_rdef(Blob rdef, Dx12ShaderInfo *info)
 		space = 0;
 		if (record_size == 40 && !read32(rdef, pos + 32, &space))
 			return false;
+		switch (type) {
+			case D3D_SIT_UAV_RWTYPED:
+			case D3D_SIT_UAV_RWSTRUCTURED:
+			case D3D_SIT_UAV_RWBYTEADDRESS:
+			case D3D_SIT_UAV_APPEND_STRUCTURED:
+			case D3D_SIT_UAV_CONSUME_STRUCTURED:
+			case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
+				info->has_uav = true;
+				break;
+		}
 		if (space) {
 			info->unmasked |= type != D3D_SIT_SAMPLER;
 			continue;
@@ -293,6 +306,19 @@ static bool reflect_rdef(Blob rdef, Dx12ShaderInfo *info)
 	return true;
 }
 
+bool Dx12ReflectShaderResources(const void *bytecode, size_t size, Dx12ShaderInfo *info)
+{
+	Blob container = { (const BYTE*)bytecode, size }, part;
+
+	if (!bytecode || !size || !info)
+		return false;
+	if (find_part(container, "PSV0", &part))
+		return info->reflected = reflect_psv0(part, info);
+	if (find_part(container, "RDEF", &part))
+		return info->reflected = reflect_rdef(part, info);
+	return false;
+}
+
 static const Dx12ShaderInfo* shader_info(Dx12ShaderStage stage, const D3D12_SHADER_BYTECODE *bytecode)
 {
 	Dx12ShaderInfo *info, *existing = NULL;
@@ -345,12 +371,11 @@ static const Dx12ShaderInfo* shader_info(Dx12ShaderStage stage, const D3D12_SHAD
 		else if (find_part(container, "OSGN", &part))
 			info->targets = count_targets(part, false);
 	}
-	if (find_part(container, "PSV0", &part))
-		info->reflected = reflect_psv0(part, info);
-	else if (find_part(container, "RDEF", &part))
-		info->reflected = reflect_rdef(part, info);
+	Dx12ReflectShaderResources(bytecode->pShaderBytecode, bytecode->BytecodeLength, info);
 
-	if (G->hunting || dx12_keep_shader_bytecode) {
+	// DXIL ShaderRegex rules can be added or changed by an F10 reload after a
+	// shader was first seen, so its original bytecode must remain available.
+	if (info->dxil || G->hunting || dx12_keep_shader_bytecode) {
 		copy = (BYTE*)malloc(info->size);
 		if (copy)
 			memcpy(copy, bytecode->pShaderBytecode, info->size);
@@ -443,6 +468,10 @@ static bool parse_root_signature(Blob rts, Dx12RootSignatureInfo *info)
 			    || !read32(rts, range_pos + range_size - 4, &range->offset))
 				return false;
 			range->type = (D3D12_DESCRIPTOR_RANGE_TYPE)range_type;
+			UINT32 flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+			if (version >= 2 && !read32(rts, range_pos + 16, &flags))
+				return false;
+			range->flags = (D3D12_DESCRIPTOR_RANGE_FLAGS)flags;
 
 			if (range->offset == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
 				range->offset = next_offset;
@@ -590,19 +619,55 @@ static HRESULT serialize_extended(const Desc *game, VersionedSerializer serializ
 		ID3DBlob **blob, ID3DBlob **errors)
 {
 	std::vector<Parameter> parameters(game->pParameters, game->pParameters + game->NumParameters);
+	typedef typename std::remove_const<typename std::remove_pointer<decltype(game->pStaticSamplers)>::type>::type StaticSampler;
+	std::vector<StaticSampler> samplers;
 	std::vector<Range> ranges[DX12_STAGE_COUNT];
 	D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};
 	Desc desc = *game;
 	UINT stage, kind, reg;
 	bool extra;
+	if (game->NumStaticSamplers)
+		samplers.assign(game->pStaticSamplers, game->pStaticSamplers + game->NumStaticSamplers);
+	for (const D3D12_STATIC_SAMPLER_DESC &wanted : extended->samplers) {
+		bool exists = false;
+		for (const StaticSampler &current : samplers) {
+			if (current.ShaderRegister == wanted.ShaderRegister && current.RegisterSpace == wanted.RegisterSpace
+			    && (current.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL || current.ShaderVisibility == wanted.ShaderVisibility)) {
+				exists = true;
+				break;
+			}
+		}
+		if (exists)
+			continue;
+		StaticSampler added = {};
+		added.Filter = wanted.Filter;
+		added.AddressU = wanted.AddressU;
+		added.AddressV = wanted.AddressV;
+		added.AddressW = wanted.AddressW;
+		added.MipLODBias = wanted.MipLODBias;
+		added.MaxAnisotropy = wanted.MaxAnisotropy;
+		added.ComparisonFunc = wanted.ComparisonFunc;
+		added.BorderColor = wanted.BorderColor;
+		added.MinLOD = wanted.MinLOD;
+		added.MaxLOD = wanted.MaxLOD;
+		added.ShaderRegister = wanted.ShaderRegister;
+		added.RegisterSpace = wanted.RegisterSpace;
+		added.ShaderVisibility = wanted.ShaderVisibility;
+		samplers.push_back(added);
+		for (stage = 0; stage < DX12_STAGE_CS; stage++)
+			if (wanted.ShaderVisibility == extra_visibility[stage])
+				desc.Flags &= ~extra_denied[stage];
+	}
 
 	for (stage = 0; stage < DX12_STAGE_CS; stage++) {
-		for (kind = 0; kind < 2; kind++) {
-			D3D12_DESCRIPTOR_RANGE_TYPE type = kind ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+		for (kind = 0; kind < 3; kind++) {
+			D3D12_DESCRIPTOR_RANGE_TYPE type = kind == 0 ? D3D12_DESCRIPTOR_RANGE_TYPE_CBV
+				: kind == 1 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
 
-			for (reg = 0; reg < (kind ? 128u : 64u); reg++) {
-				extra = kind ? !!(extended->extra.srv[stage][reg / 64] & (1ull << (reg % 64)))
-					: !!(extended->extra.cbv[stage] & (1ull << reg));
+			for (reg = 0; reg < (kind == 1 ? 128u : 64u); reg++) {
+				extra = kind == 0 ? !!(extended->extra.cbv[stage] & (1ull << reg))
+					: kind == 1 ? !!(extended->extra.srv[stage][reg / 64] & (1ull << (reg % 64)))
+					: !!(extended->extra.uav[stage] & (1ull << reg));
 				if (!extra)
 					continue;
 				if (!ranges[stage].empty() && ranges[stage].back().RangeType == type
@@ -636,8 +701,48 @@ static HRESULT serialize_extended(const Desc *game, VersionedSerializer serializ
 
 	desc.NumParameters = (UINT)parameters.size();
 	desc.pParameters = parameters.data();
+	desc.NumStaticSamplers = (UINT)samplers.size();
+	desc.pStaticSamplers = samplers.data();
 	set_versioned(&versioned, &desc);
 	return serialize(&versioned, blob, errors);
+}
+
+bool Dx12HasStaticSampler(const Dx12RootSignatureInfo *info, Dx12ShaderStage stage, UINT reg)
+{
+	if (!info || reg >= 32)
+		return true;
+	if (!info->static_samplers_read) {
+		typedef HRESULT (WINAPI *Deserialize)(LPCVOID, SIZE_T, REFIID, void**);
+		HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+		Deserialize deserialize = d3d12 ? (Deserialize)GetProcAddress(d3d12, "D3D12CreateVersionedRootSignatureDeserializer") : NULL;
+		ID3D12VersionedRootSignatureDeserializer *decoder = NULL;
+		const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *signature = NULL;
+		if (!deserialize || FAILED(deserialize(info->blob.data(), info->blob.size(), IID_PPV_ARGS(&decoder)))
+		    || !(signature = decoder->GetUnconvertedRootSignatureDesc())) {
+			if (decoder)
+				decoder->Release();
+			return true;
+		}
+		auto collect = [&](const auto &desc) {
+			for (UINT i = 0; i < desc.NumStaticSamplers; i++) {
+				const auto &sampler = desc.pStaticSamplers[i];
+				if (sampler.RegisterSpace || sampler.ShaderRegister >= 32)
+					continue;
+				for (UINT s = 0; s < DX12_STAGE_CS; s++)
+					if (sampler.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL || sampler.ShaderVisibility == extra_visibility[s])
+						info->static_samplers[s] |= 1u << sampler.ShaderRegister;
+			}
+		};
+		switch (signature->Version) {
+		case D3D_ROOT_SIGNATURE_VERSION_1_0: collect(signature->Desc_1_0); break;
+		case D3D_ROOT_SIGNATURE_VERSION_1_1: collect(signature->Desc_1_1); break;
+		case D3D_ROOT_SIGNATURE_VERSION_1_2: collect(signature->Desc_1_2); break;
+		default: decoder->Release(); return true;
+		}
+		decoder->Release();
+		info->static_samplers_read = true;
+	}
+	return !!(info->static_samplers[stage] & (1u << reg));
 }
 
 bool Dx12ExtendRootSignature(const Dx12RootSignatureInfo *info, ID3D12Device *device, Dx12ExtendedSignature *extended)
@@ -1068,13 +1173,13 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 	}
 	key = key * 0x9e3779b97f4a7c15ull ^ variant->removed_stages;
 	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)(uintptr_t)variant->root_signature;
-	key = key * 0x9e3779b97f4a7c15ull ^ variant->blend_override;
+	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)variant->blend_override;
 	if (variant->blend_override)
 		key = key * 0x9e3779b97f4a7c15ull ^ fnv_64_buf(&variant->blend, sizeof(variant->blend));
-	key = key * 0x9e3779b97f4a7c15ull ^ variant->sample_mask_override;
+	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)variant->sample_mask_override;
 	if (variant->sample_mask_override)
 		key = key * 0x9e3779b97f4a7c15ull ^ variant->sample_mask;
-	key = key * 0x9e3779b97f4a7c15ull ^ variant->depth_stencil_override;
+	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)variant->depth_stencil_override;
 	if (variant->depth_stencil_override)
 		key = key * 0x9e3779b97f4a7c15ull ^ fnv_64_buf(&variant->depth_stencil, sizeof(variant->depth_stencil));
 	changed_stages = mod_stages | variant->removed_stages;
@@ -1220,18 +1325,17 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 				stage_list(changed_stages, stages, sizeof(stages)), failed, info->creation.size(),
 				info->creation_stream ? "a stream" : "a description", info->shaders_known ? "known" : "not all known");
 		else
-			Dx12DumpNote("*** Creating a pipeline of the game again with a mod's %s shader failed: 0x%x. The game's vs is %s%s; "
+			Dx12DumpNote("*** Creating a pipeline of the game again with a mod's %s shader failed: 0x%x. The game's vs is %s; "
 				"its ps %016llx writes %u render targets%s\n",
 				stage_list(changed_stages, stages, sizeof(stages)), hr,
 				!info->shaders[DX12_STAGE_VS] ? "none" : info->shaders[DX12_STAGE_VS]->dxil ? "DXIL" : "DXBC",
-				!info->shaders[DX12_STAGE_VS] ? "" : info->shaders[DX12_STAGE_VS]->dxil
-					? ", which the DXBC of a mod may not be put together with" : "",
 				info->shaders[DX12_STAGE_PS] ? info->shaders[DX12_STAGE_PS]->hash : 0,
 				info->shaders[DX12_STAGE_PS] ? info->shaders[DX12_STAGE_PS]->targets : 0,
 				variant->shaders[DX12_STAGE_PS] ? "" : ", and the mod keeps it");
-		if (!failed && variant->shaders[DX12_STAGE_PS])
-			Dx12DumpNote("    The mod's ps %016llx writes %u render targets\n",
-				variant->shaders[DX12_STAGE_PS]->hash, variant->shaders[DX12_STAGE_PS]->targets);
+		if (!pipeline && shaders[DX12_STAGE_PS])
+			Dx12DumpNote("    The chosen ps %016llx is %s and writes %u render targets%s\n",
+				shaders[DX12_STAGE_PS]->hash, shaders[DX12_STAGE_PS]->dxil ? "DXIL" : "DXBC",
+				shaders[DX12_STAGE_PS]->targets, variant->shaders[DX12_STAGE_PS] ? " (replacement)" : " (original)");
 	}
 	if (why_failed && !pipeline)
 		*why_failed = failed ? failed : "D3D12 refused it";

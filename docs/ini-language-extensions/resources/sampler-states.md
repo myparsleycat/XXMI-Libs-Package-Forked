@@ -2,7 +2,7 @@
 
 **XXMI DLL** lets a `[Resource]` section declare a sampler state, and binds it to the sampler slots (`s0`–`s15`) of any shader stage with `<stage>-s<slot>` lines. Custom shaders can then call `Sample()`, `SampleLevel()` and the like with the filtering and addressing they need.
 
-Sampler bindings take effect in **Direct3D 11** games only. In Direct3D 12 and Vulkan games they are ignored, see [Direct3D 12 and Vulkan](#direct3d-12-and-vulkan).
+Sampler bindings work in Direct3D 11 games and, for additional sampler registers, in Direct3D 12 games. Vulkan and Direct3D 12 restrictions are described under [Direct3D 12 and Vulkan](#direct3d-12-and-vulkan).
 
 ## Declaration
 
@@ -81,7 +81,9 @@ The `sampler = point_filter | linear_filter | anisotropic_filter` key of `[Custo
 
 ## Direct3D 12 and Vulkan
 
-In Direct3D 12 and Vulkan games the `<stage>-s<slot>` lines are parsed and checked as above but do nothing when they run. The first such line run is noted once: in `d3d11_log.txt` with logging enabled (`log_level = info` or `debug`), and in `dx12_report.txt` with `dx12_dump_hashes = 1` in `[Hunting]`. The legacy `sampler` key behaves as before.
+In Direct3D 12, a binding works for a sampler used by the mod's shader or a DXIL shader patch when the game's root signature has no sampler at that register. The root signature is extended with the requested state; changes between draws are supported. Existing game samplers, compute-stage bindings, and custom border colours other than transparent black, opaque black and opaque white are not supported by this path. An unsupported binding is ignored and noted in `dx12_report.txt` when `dx12_dump_hashes = 1`.
+
+In Vulkan games, `<stage>-s<slot>` lines are parsed but ignored. The legacy `sampler` key behaves as before.
 
 ## Detecting Support
 

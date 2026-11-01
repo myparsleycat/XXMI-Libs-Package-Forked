@@ -3031,6 +3031,48 @@ static bool parse_shader_regex_spirv_group(const std::wstring *section_id, Shade
 	return true;
 }
 
+// Keep InsertDeclarations as the original D3D11 lines for groups that also
+// have Pattern subsections, and collect Texture1D and Texture2D SRVs for DXIL.
+static bool parse_shader_regex_dxil_group(const std::wstring *section_id, ShaderRegexGroup *regex_group)
+{
+	if (regex_group->spirv()) {
+		IniWarningW(L"A ShaderRegex group cannot contain both SpirvPattern and DxilPattern subsections\n - [%ls]\n", section_id->c_str());
+		return false;
+	}
+	for (const std::string &model : regex_group->shader_models) {
+		if (!_strnicmp(model.c_str(), "cs_", 3)) {
+			IniWarningW(L"DXIL ShaderRegex currently supports graphics shaders only\n - [%ls]\n", section_id->c_str());
+			return false;
+		}
+	}
+
+	regex_group->dxil_declarations.clear();
+	for (const std::string &line : regex_group->declarations) {
+		DxilDeclaration declaration;
+		bool texture = !_strnicmp(line.c_str(), "texture2d", 9) || !_strnicmp(line.c_str(), "dcl_resource_texture2d", 22)
+			|| !_strnicmp(line.c_str(), "texture1d", 9) || !_strnicmp(line.c_str(), "dcl_resource_texture1d", 22);
+
+		bool raw_uav = !_strnicmp(line.c_str(), "dcl_uav_raw", 11);
+		bool sampler = !_strnicmp(line.c_str(), "dcl_sampler", 11);
+		if (!texture && !raw_uav && !sampler)
+			continue;
+		if (!parse_dxil_declaration(line, &declaration)) {
+			IniWarningW(L"A DXIL declaration must name a supported register, not: %S\n - [%ls]\n",
+				line.c_str(), section_id->c_str());
+			return false;
+		}
+		if (!regex_group->patterns.empty() && (!_strnicmp(line.c_str(), "texture2d ", 10) || !_strnicmp(line.c_str(), "texture1d ", 10))) {
+			IniWarningW(L"A group with legacy Pattern subsections must use D3D11 declaration syntax in InsertDeclarations\n - [%ls]\n",
+				section_id->c_str());
+			return false;
+		}
+		if (std::none_of(regex_group->dxil_declarations.begin(), regex_group->dxil_declarations.end(),
+				[&](const DxilDeclaration &other) { return other.reg == declaration.reg && other.uav == declaration.uav && other.sampler == declaration.sampler; }))
+			regex_group->dxil_declarations.push_back(declaration);
+	}
+	return true;
+}
+
 static void ParseShaderRegexSections()
 {
 	IniSections::iterator lower, upper, i;
@@ -3099,6 +3141,9 @@ static void ParseShaderRegexSections()
 				} else if (!_wcsnicmp(subsection_names[1].c_str(), L"SpirvPattern", 12)) {
 					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group, &regex_group->spirv_patterns))
 						continue;
+				} else if (!_wcsnicmp(subsection_names[1].c_str(), L"DxilPattern", 11)) {
+					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group, &regex_group->dxil_patterns))
+						continue;
 				} else if (!_wcsicmp(subsection_names[1].c_str(), L"InsertDeclarations")) {
 					if (parse_shader_regex_section_declarations(section_id, &subsection_names[1], regex_group))
 						continue;
@@ -3113,6 +3158,10 @@ static void ParseShaderRegexSections()
 				 && !_wcsicmp(subsection_names[2].c_str(), L"Replace")) {
 					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], &regex_group->spirv_patterns))
 						continue;
+				} else if (!_wcsnicmp(subsection_names[1].c_str(), L"DxilPattern", 11)
+				 && !_wcsicmp(subsection_names[2].c_str(), L"Replace")) {
+					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], &regex_group->dxil_patterns))
+						continue;
 				}
 				break;
 		}
@@ -3126,16 +3175,30 @@ static void ParseShaderRegexSections()
 	}
 
 	shader_regex_d3d_groups = false;
+	shader_regex_dxil_groups = false;
 	for (j = shader_regex_groups.begin(); j != shader_regex_groups.end();) {
-		std::wstring regex_id = j->first;
+		auto current = j++;
+		std::wstring regex_id = current->first;
+		bool valid = true;
 
-		if (!j->second.spirv()) {
+		if (current->second.spirv() && current->second.dxil()) {
+			IniWarningW(L"A ShaderRegex group cannot contain both SpirvPattern and DxilPattern subsections\n - [%ls]\n", regex_id.c_str());
+			valid = false;
+		} else if (current->second.spirv()) {
+			valid = parse_shader_regex_spirv_group(&regex_id, &current->second);
+		} else if (current->second.dxil()) {
+			valid = parse_shader_regex_dxil_group(&regex_id, &current->second);
+			if (valid) {
+				shader_regex_dxil_groups = true;
+				dx12_keep_shader_bytecode = true;
+			}
+			if (valid && !current->second.patterns.empty())
+				shader_regex_d3d_groups = true;
+		} else {
 			shader_regex_d3d_groups = true;
-			j++;
-			continue;
 		}
-		j++;
-		if (!parse_shader_regex_spirv_group(&regex_id, &shader_regex_groups[regex_id])) {
+
+		if (!valid) {
 			IniWarningW(L"Disabling entire shader regex group\n - [%ls]\n", regex_id.c_str());
 			delete_regex_group(&regex_id);
 		}

@@ -6,7 +6,7 @@
 //
 // harness.exe [frames=3000] [nodll] [meshes=350] [passes=3] [dump=file.bmp]
 //             [key=VK] [keyframe=N] [uploads=60] [churn=1] [table=4] [heap=N]
-//             [video] [dxil] [rootconst] [threads=1] [rereach=K] [contend]
+//             [video] [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend]
 //             [profile | profile=present] [test [move | evict [evictstop=N] | lowmip]]
 //             [scene=file [slot=vb0] [appear=N]]
 // Prints the average frame time of the frames after the first 300, in blocks.
@@ -30,6 +30,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <dxcapi.h>
@@ -52,8 +53,10 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "ole32.lib")
 
-#define CHECK(x) do { HRESULT hr__ = (x); if (FAILED(hr__)) { printf("FAILED %s = 0x%08x at line %d\n", #x, (unsigned)hr__, __LINE__); fflush(stdout); ExitProcess(1); } } while (0)
+static unsigned report_debug_errors();
+#define CHECK(x) do { HRESULT hr__ = (x); if (FAILED(hr__)) { printf("FAILED %s = 0x%08x at line %d\n", #x, (unsigned)hr__, __LINE__); report_debug_errors(); fflush(stdout); ExitProcess(1); } } while (0)
 
 static const UINT WIDTH = 640, HEIGHT = 360;
 static const UINT BACK_BUFFERS = 3;
@@ -153,9 +156,30 @@ static const UINT RING_VBS = 30;
 static UINT TABLE = 4;
 
 static ID3D12Device *device;
+static unsigned report_debug_errors()
+{
+	ID3D12InfoQueue *info = NULL;
+	unsigned errors = 0;
+	if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&info))))
+		return 0;
+	for (UINT64 n = 0; n < info->GetNumStoredMessages(); n++) {
+		SIZE_T bytes = 0;
+		if (FAILED(info->GetMessage(n, NULL, &bytes)))
+			continue;
+		std::vector<BYTE> storage(bytes);
+		D3D12_MESSAGE *message = (D3D12_MESSAGE*)storage.data();
+		if (SUCCEEDED(info->GetMessage(n, message, &bytes)) && message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+			printf("D3D12 debug error: %s\n", message->pDescription);
+			errors++;
+		}
+	}
+	info->Release();
+	return errors;
+}
 static ID3D12CommandQueue *queue;
 static IDXGISwapChain3 *swap_chain;
 static ID3D12Resource *back_buffers[BACK_BUFFERS];
+static ID3D12Resource *game_uav_buffer;
 static ID3D12DescriptorHeap *rtv_heap, *cpu_heap, *gpu_heap;
 static UINT rtv_size, view_size;
 static ID3D12RootSignature *root_signature;
@@ -261,10 +285,28 @@ static UINT64 signal()
 }
 
 static bool use_dxil;
+// Pixel shaders without SRVs, for testing added shader resources.
+static bool no_srv;
+static bool early_depth;
 // rootconst: the pixel shaders scale their colour by root constants (b1) set
 // once a list, which the engine has to set again after switching the root
 // signature for a draw of a mod
 static bool root_constants;
+static bool root_signature_11;
+static bool root_signature_12;
+static bool root_signature_gap;
+static bool root_uav;
+static bool game_shader_uav;
+static bool game_shader_uav_space1;
+static bool game_converted_ps;
+static const char *converted_ps_file;
+static const char *convert_dxbc_path;
+static const char *probe_shader;
+static ID3D12RootSignature *probe_root;
+static ID3D12PipelineState *probe_pipeline;
+static ID3D12DescriptorHeap *probe_srvs, *probe_rtvs;
+static ID3D12Resource *probe_cb;
+static ID3D12Resource *probe_targets[4];
 
 // SM 6.0 through dxcompiler.dll next to the exe, for the shim's DXIL paths
 static ID3DBlob* compile_dxil(const char *source, const char *entry, const char *target, UINT variant)
@@ -287,7 +329,7 @@ static ID3DBlob* compile_dxil(const char *source, const char *entry, const char 
 	swprintf_s(wentry, L"%S", entry);
 	swprintf_s(wtarget, L"%.3S6_0", target);
 	swprintf_s(define, L"VARIANT=%u", variant);
-	const wchar_t *args[] = { L"-E", wentry, L"-T", wtarget, L"-D", define, L"-D", root_constants ? L"ROOTCONST=1" : L"ROOTCONST=0" };
+	const wchar_t *args[] = { L"-E", wentry, L"-T", wtarget, L"-D", define, L"-D", root_constants ? L"ROOTCONST=1" : L"ROOTCONST=0", L"-D", no_srv ? L"NOSRV=1" : L"NOSRV=0", L"-D", early_depth ? L"EARLY_DEPTH=1" : L"EARLY_DEPTH=0", L"-D", game_shader_uav ? L"GAME_UAV=1" : L"GAME_UAV=0", L"-D", game_shader_uav_space1 ? L"GAME_UAV_SPACE1=1" : L"GAME_UAV_SPACE1=0" };
 	DxcBuffer buffer = { source, strlen(source), DXC_CP_UTF8 };
 	CHECK(compiler->Compile(&buffer, args, ARRAYSIZE(args), NULL, IID_PPV_ARGS(&result)));
 	result->GetStatus(&status);
@@ -310,7 +352,7 @@ static ID3DBlob* compile(const char *source, const char *entry, const char *targ
 	if (use_dxil)
 		return compile_dxil(source, entry, target, variant);
 	char value[16];
-	D3D_SHADER_MACRO macros[3] = { { "VARIANT", value }, { "ROOTCONST", root_constants ? "1" : "0" }, { NULL, NULL } };
+	D3D_SHADER_MACRO macros[5] = { { "VARIANT", value }, { "ROOTCONST", root_constants ? "1" : "0" }, { "NOSRV", no_srv ? "1" : "0" }, { "EARLY_DEPTH", early_depth ? "1" : "0" }, { NULL, NULL } };
 	ID3DBlob *code = NULL, *errors = NULL;
 
 	sprintf_s(value, "%u", variant);
@@ -321,10 +363,36 @@ static ID3DBlob* compile(const char *source, const char *entry, const char *targ
 	return code;
 }
 
+static void dump_sampler_dxil()
+{
+	const char *source = "Texture2D<float4> tex : register(t0); SamplerState s : register(s15); float4 ps(float4 p : SV_Position) : SV_Target { return tex.Sample(s, p.xy); }";
+	ID3DBlob *code = compile_dxil(source, "ps", "ps_5_0", 0);
+	DxcCreateInstanceProc create = (DxcCreateInstanceProc)GetProcAddress(GetModuleHandleW(L"dxcompiler.dll"), "DxcCreateInstance");
+	IDxcCompiler3 *compiler = NULL;
+	IDxcResult *result = NULL;
+	IDxcBlobUtf8 *output = NULL;
+	DxcBuffer buffer = { code->GetBufferPointer(), code->GetBufferSize(), 0 };
+	CHECK(create(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler)));
+	CHECK(compiler->Disassemble(&buffer, IID_PPV_ARGS(&result)));
+	CHECK(result->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(&output), NULL));
+	printf("%.*s", (int)output->GetStringLength(), output->GetStringPointer());
+	output->Release();
+	result->Release();
+	compiler->Release();
+	code->Release();
+}
+
 static const char shader_source[] =
 	"cbuffer Draw : register(b0) { float4 placement; float4 tint; };\n"
 	"Texture2D tex0 : register(t0);\n"
 	"Texture2D tex1 : register(t1);\n"
+	"#if GAME_UAV\n"
+	"#if GAME_UAV_SPACE1\n"
+	"RWBuffer<uint> game_values : register(u4, space1);\n"
+	"#else\n"
+	"RWBuffer<uint> game_values : register(u4);\n"
+	"#endif\n"
+	"#endif\n"
 	"SamplerState smp : register(s0);\n"
 	"struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 color : COLOR0; };\n"
 	"VSOut vs(float3 pos : POSITION, float2 uv : TEXCOORD0, float4 color : COLOR0) {\n"
@@ -337,13 +405,245 @@ static const char shader_source[] =
 	"#else\n"
 	"static const float4 scale = 1;\n"
 	"#endif\n"
+	"#if EARLY_DEPTH\n"
+	"[earlydepthstencil]\n"
+	"#endif\n"
 	"float4 ps(VSOut i) : SV_Target0 {\n"
+	"#if GAME_UAV\n"
+	"    if (game_values[0] == 0) discard;\n"
+	"#endif\n"
+	"#if NOSRV\n"
+	"	return i.color * tint * scale * (1 + VARIANT * 0.01);\n"
+	"#else\n"
 	"	return (tex0.Sample(smp, i.uv) * 0.5 + tex1.Sample(smp, i.uv) * 0.5) * i.color * tint * scale * (1 + VARIANT * 0.01);\n"
+	"#endif\n"
 	"}\n";
+
+struct __declspec(uuid("5F956ED5-78D1-4B15-8247-F7187614A041")) ProbeDxbcConverter : IUnknown {
+	virtual HRESULT STDMETHODCALLTYPE Convert(const void *, UINT32, LPCWSTR, void **, UINT32 *, LPWSTR *) = 0;
+};
+
+static ID3DBlob *convert_dxbc(ID3DBlob *dxbc)
+{
+	const CLSID clsid = { 0x4900391e, 0xb752, 0x4edd, { 0xa8, 0x85, 0x6f, 0xb7, 0x6e, 0x25, 0xad, 0xdb } };
+	HMODULE module = LoadLibraryExW(L"dxilconv.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	DxcCreateInstanceProc create = module ? (DxcCreateInstanceProc)GetProcAddress(module, "DxcCreateInstance") : NULL;
+	if (!create) { printf("DXBC converter unavailable\n"); ExitProcess(1); }
+	ProbeDxbcConverter *converter = NULL;
+	CHECK(create(clsid, __uuidof(ProbeDxbcConverter), (void**)&converter));
+	void *dxil = NULL;
+	UINT32 size = 0;
+	LPWSTR diagnostics = NULL;
+	HRESULT hr = converter->Convert(dxbc->GetBufferPointer(), (UINT32)dxbc->GetBufferSize(), NULL, &dxil, &size, &diagnostics);
+	if (diagnostics) { wprintf(L"%ls\n", diagnostics); CoTaskMemFree(diagnostics); }
+	CHECK(hr);
+	if (!dxil || size < 32 || memcmp(dxil, "DXBC", 4)) { printf("invalid converted shader\n"); ExitProcess(1); }
+	ID3DBlob *converted = NULL;
+	CHECK(D3DCreateBlob(size, &converted));
+	memcpy(converted->GetBufferPointer(), dxil, size);
+	CoTaskMemFree(dxil);
+	converter->Release();
+	FreeLibrary(module);
+	return converted;
+}
+
+static void probe_dxbc_conversion()
+{
+	ID3DBlob *dxbc = compile(shader_source, "ps", "ps_5_0", 0);
+	FILE *original = fopen("probe-dxbc.bin", "wb");
+	if (!original || fwrite(dxbc->GetBufferPointer(), 1, dxbc->GetBufferSize(), original) != dxbc->GetBufferSize()) ExitProcess(1);
+	fclose(original);
+	ID3DBlob *assembly = NULL;
+	CHECK(D3DDisassemble(dxbc->GetBufferPointer(), dxbc->GetBufferSize(), 0, NULL, &assembly));
+	FILE *text = fopen("probe-dxbc.txt", "wb");
+	if (!text || fwrite(assembly->GetBufferPointer(), 1, assembly->GetBufferSize(), text) != assembly->GetBufferSize()) ExitProcess(1);
+	fclose(text);
+	assembly->Release();
+	ID3DBlob *dxil = convert_dxbc(dxbc);
+	const BYTE *bytes = (const BYTE*)dxil->GetBufferPointer();
+	UINT32 size = (UINT32)dxil->GetBufferSize();
+	UINT32 parts = *(const UINT32*)(bytes + 28);
+	bool found = false;
+	if (parts <= (size - 32) / 4) {
+		for (UINT32 i = 0; i < parts; i++) {
+			UINT32 offset = *(const UINT32*)(bytes + 32 + i * 4);
+			if (offset <= size - 4 && !memcmp(bytes + offset, "DXIL", 4))
+				found = true;
+		}
+	}
+	if (!found) { printf("converted container has no DXIL part\n"); ExitProcess(1); }
+	printf("DXBC converted to DXIL container (%u bytes)\n", size);
+	dxil->Release();
+	dxbc->Release();
+}
+
+static void convert_dxbc_file_to_dxil(const char *path)
+{
+	FILE *input = fopen(path, "rb");
+	if (!input) { printf("could not open %s\n", path); ExitProcess(1); }
+	fseek(input, 0, SEEK_END);
+	long size = ftell(input);
+	rewind(input);
+	if (size <= 0) ExitProcess(1);
+	ID3DBlob *dxbc = NULL;
+	CHECK(D3DCreateBlob(size, &dxbc));
+	if (fread(dxbc->GetBufferPointer(), 1, size, input) != (size_t)size) ExitProcess(1);
+	fclose(input);
+	ID3DBlob *dxil = convert_dxbc(dxbc);
+	FILE *output = fopen("converted.dxil", "wb");
+	if (!output || fwrite(dxil->GetBufferPointer(), 1, dxil->GetBufferSize(), output) != dxil->GetBufferSize()) ExitProcess(1);
+	fclose(output);
+	printf("converted %s to converted.dxil (%Iu bytes)\n", path, dxil->GetBufferSize());
+	dxil->Release();
+	dxbc->Release();
+}
+
+// Register a captured pixel shader with a compatible test pipeline. It is
+// never drawn; presents let the shim process it through its normal registry.
+static void register_probe_shader()
+{
+	static const char vs_source[] =
+		"struct O { float4 a:TEXCOORD0; float4 b:TEXCOORD1;"
+		"float3 c:TEXCOORD2; float f:TEXCOORD5; float3 d:TEXCOORD3; float3 e:TEXCOORD4;"
+		"float4 g:TEXCOORD6; float4 h:TEXCOORD7; float3 i:TEXCOORD8; float4 p:SV_Position; };"
+		"O vs(uint id:SV_VertexID) { O o; float v=(float)id;"
+		"o.p=float4(id==1?3:-1,id==2?3:-1,0.5,1); o.a=v; o.b=v;"
+		"o.c=v; o.d=v; o.e=v; o.f=v; o.g=v; o.h=v; o.i=v; return o; }";
+	FILE *input = fopen(probe_shader, "rb");
+	if (!input) { printf("could not open probe shader %s\n", probe_shader); ExitProcess(1); }
+	fseek(input, 0, SEEK_END);
+	long size = ftell(input);
+	if (size <= 0) { fclose(input); ExitProcess(1); }
+	rewind(input);
+	std::vector<char> bytes(size);
+	if (fread(bytes.data(), 1, bytes.size(), input) != bytes.size()) { fclose(input); ExitProcess(1); }
+	fclose(input);
+	D3D12_DESCRIPTOR_RANGE range = {};
+	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	range.NumDescriptors = 16;
+	D3D12_ROOT_PARAMETER params[4] = {};
+	for (UINT i = 0; i < 3; i++) {
+		params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+		params[i].Descriptor.ShaderRegister = i;
+		params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+	}
+	params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[3].DescriptorTable = { 1, &range };
+	params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_STATIC_SAMPLER_DESC samplers[4] = {};
+	for (UINT i = 0; i < 4; i++) {
+		samplers[i].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samplers[i].ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+		samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+		samplers[i].ShaderRegister = i;
+		samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	}
+	D3D12_ROOT_SIGNATURE_DESC root = { 4, params, 4, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+	ID3DBlob *serialized = NULL, *errors = NULL;
+	CHECK(D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors));
+	CHECK(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&probe_root)));
+	serialized->Release();
+	ID3DBlob *vs = compile_dxil(vs_source, "vs", "vs_5_0", 0);
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+	desc.pRootSignature = probe_root;
+	desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+	desc.PS = { bytes.data(), bytes.size() };
+	for (auto &target : desc.BlendState.RenderTarget) target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	desc.SampleMask = ~0u;
+	desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	desc.RasterizerState.DepthClipEnable = TRUE;
+	desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	desc.NumRenderTargets = 4;
+	desc.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	desc.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	desc.RTVFormats[2] = desc.RTVFormats[3] = DXGI_FORMAT_R10G10B10A2_UNORM;
+	desc.SampleDesc.Count = 1;
+	CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&probe_pipeline)));
+	vs->Release();
+	D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heap_desc.NumDescriptors = 16;
+	heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	CHECK(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&probe_srvs)));
+	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	heap_desc.NumDescriptors = 4;
+	heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+	CHECK(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&probe_rtvs)));
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC resource = {};
+	resource.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	resource.Width = resource.Height = 32;
+	resource.DepthOrArraySize = resource.MipLevels = 1;
+	resource.SampleDesc.Count = 1;
+	resource.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = probe_rtvs->GetCPUDescriptorHandleForHeapStart();
+	UINT rtv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	for (UINT i = 0; i < 4; i++) {
+		resource.Format = desc.RTVFormats[i];
+		CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &resource, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, IID_PPV_ARGS(&probe_targets[i])));
+		device->CreateRenderTargetView(probe_targets[i], NULL, rtv);
+		rtv.ptr += rtv_stride;
+	}
+	D3D12_CPU_DESCRIPTOR_HANDLE srv = probe_srvs->GetCPUDescriptorHandleForHeapStart();
+	UINT srv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+	for (UINT i = 0; i < 16; i++) {
+		if (i == 1) {
+			D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+			view.Buffer.NumElements = 256;
+			view.Buffer.StructureByteStride = 128;
+			device->CreateShaderResourceView(NULL, &view, srv);
+		} else {
+			D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
+			view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			view.Texture2D.MipLevels = 1;
+			device->CreateShaderResourceView(NULL, &view, srv);
+		}
+		srv.ptr += srv_stride;
+	}
+	probe_cb = create_buffer(3 * 4096, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+	void *mapped = NULL;
+	CHECK(probe_cb->Map(0, NULL, &mapped));
+	memset(mapped, 0, 3 * 4096);
+	probe_cb->Unmap(0, NULL);
+	printf("registered captured shader %s\n", probe_shader);
+}
+
+static void draw_probe_shader(ID3D12GraphicsCommandList *list)
+{
+	D3D12_VIEWPORT viewport = { 0, 0, 32, 32, 0, 1 };
+	D3D12_RECT scissor = { 0, 0, 32, 32 };
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = probe_rtvs->GetCPUDescriptorHandleForHeapStart();
+	D3D12_CPU_DESCRIPTOR_HANDLE clear_rtv = rtv;
+	const float clear[4] = {};
+	UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	for (UINT i = 0; i < 4; i++) {
+		list->ClearRenderTargetView(clear_rtv, clear, 0, NULL);
+		clear_rtv.ptr += stride;
+	}
+	list->SetDescriptorHeaps(1, &probe_srvs);
+	list->SetGraphicsRootSignature(probe_root);
+	list->SetPipelineState(probe_pipeline);
+	for (UINT i = 0; i < 3; i++)
+		list->SetGraphicsRootConstantBufferView(i, probe_cb->GetGPUVirtualAddress() + i * 4096);
+	list->SetGraphicsRootDescriptorTable(3, probe_srvs->GetGPUDescriptorHandleForHeapStart());
+	list->OMSetRenderTargets(4, &rtv, TRUE, NULL);
+	list->RSSetViewports(1, &viewport);
+	list->RSSetScissorRects(1, &scissor);
+	list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	list->DrawInstanced(3, 1, 0, 0);
+}
 
 static void create_pipelines()
 {
-	D3D12_DESCRIPTOR_RANGE range = {};
+	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+	D3D12_DESCRIPTOR_RANGE &range = ranges[0];
 	D3D12_ROOT_PARAMETER parameters[3] = {};
 	D3D12_STATIC_SAMPLER_DESC sampler = {};
 	D3D12_ROOT_SIGNATURE_DESC signature = {};
@@ -355,9 +655,16 @@ static void create_pipelines()
 	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 	range.NumDescriptors = TABLE;
 	parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-	parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-	parameters[1].DescriptorTable.pDescriptorRanges = &range;
+	parameters[1].DescriptorTable.NumDescriptorRanges = root_uav ? 2 : 1;
+	parameters[1].DescriptorTable.pDescriptorRanges = ranges;
 	parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	if (root_uav) {
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+		ranges[1].NumDescriptors = 1;
+		ranges[1].BaseShaderRegister = 4;
+		ranges[1].RegisterSpace = game_shader_uav_space1 ? 1 : 0;
+		ranges[1].OffsetInDescriptorsFromTableStart = TABLE;
+	}
 	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
 	sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
 	sampler.MaxLOD = D3D12_FLOAT32_MAX;
@@ -371,7 +678,51 @@ static void create_pipelines()
 	signature.NumStaticSamplers = 1;
 	signature.pStaticSamplers = &sampler;
 	signature.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-	CHECK(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
+	if (root_signature_11) {
+		D3D12_DESCRIPTOR_RANGE1 ranges1[2] = {};
+		D3D12_ROOT_PARAMETER1 parameters1[3] = {};
+		D3D12_STATIC_SAMPLER_DESC1 sampler1 = {};
+		D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};
+		ranges1[0].RangeType = range.RangeType;
+		ranges1[0].NumDescriptors = root_signature_gap ? 1 : range.NumDescriptors;
+		ranges1[0].BaseShaderRegister = range.BaseShaderRegister;
+		ranges1[0].RegisterSpace = range.RegisterSpace;
+		ranges1[0].OffsetInDescriptorsFromTableStart = range.OffsetInDescriptorsFromTableStart;
+		if (root_signature_gap) {
+			ranges1[1] = ranges1[0];
+			ranges1[1].BaseShaderRegister = 1;
+			ranges1[1].OffsetInDescriptorsFromTableStart = 3;
+		}
+		parameters1[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+		parameters1[0].ShaderVisibility = parameters[0].ShaderVisibility;
+		parameters1[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		parameters1[1].DescriptorTable.NumDescriptorRanges = root_signature_gap ? 2 : 1;
+		parameters1[1].DescriptorTable.pDescriptorRanges = ranges1;
+		parameters1[1].ShaderVisibility = parameters[1].ShaderVisibility;
+		parameters1[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		parameters1[2].Constants = parameters[2].Constants;
+		parameters1[2].ShaderVisibility = parameters[2].ShaderVisibility;
+		if (root_signature_12) {
+			static_assert(offsetof(D3D12_STATIC_SAMPLER_DESC1, Flags) == sizeof(D3D12_STATIC_SAMPLER_DESC), "sampler layouts");
+			memcpy(&sampler1, &sampler, sizeof(sampler));
+			versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+			versioned.Desc_1_2.NumParameters = signature.NumParameters;
+			versioned.Desc_1_2.pParameters = parameters1;
+			versioned.Desc_1_2.NumStaticSamplers = signature.NumStaticSamplers;
+			versioned.Desc_1_2.pStaticSamplers = &sampler1;
+			versioned.Desc_1_2.Flags = signature.Flags;
+		} else {
+			versioned.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+			versioned.Desc_1_1.NumParameters = signature.NumParameters;
+			versioned.Desc_1_1.pParameters = parameters1;
+			versioned.Desc_1_1.NumStaticSamplers = signature.NumStaticSamplers;
+			versioned.Desc_1_1.pStaticSamplers = signature.pStaticSamplers;
+			versioned.Desc_1_1.Flags = signature.Flags;
+		}
+		CHECK(D3D12SerializeVersionedRootSignature(&versioned, &blob, &errors));
+	} else {
+		CHECK(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors));
+	}
 	CHECK(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_signature)));
 
 	static const D3D12_INPUT_ELEMENT_DESC layout[] = {
@@ -383,7 +734,29 @@ static void create_pipelines()
 	for (i = 0; i < PIPELINES; i++) {
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
 		ID3DBlob *vs = compile(shader_source, "vs", "vs_5_0", i);
-		ID3DBlob *ps = compile(shader_source, "ps", "ps_5_0", i);
+		ID3DBlob *ps;
+		if (game_converted_ps) {
+			ID3DBlob *dxbc = NULL;
+			if (converted_ps_file) {
+				FILE *file = fopen(converted_ps_file, "rb");
+				if (!file) { printf("could not open %s\n", converted_ps_file); ExitProcess(1); }
+				fseek(file, 0, SEEK_END);
+				long size = ftell(file);
+				rewind(file);
+				if (size <= 0) ExitProcess(1);
+				CHECK(D3DCreateBlob(size, &dxbc));
+				if (fread(dxbc->GetBufferPointer(), 1, size, file) != (size_t)size) ExitProcess(1);
+				fclose(file);
+			} else {
+				use_dxil = false;
+				dxbc = compile(shader_source, "ps", "ps_5_0", i);
+				use_dxil = true;
+			}
+			ps = convert_dxbc(dxbc);
+			dxbc->Release();
+		} else {
+			ps = compile(shader_source, "ps", "ps_5_0", i);
+		}
 
 		desc.pRootSignature = root_signature;
 		desc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
@@ -468,7 +841,7 @@ static void create_scene(UINT mesh_count)
 	const UINT64 ib_bytes = INDICES * 2;
 	const UINT64 per_mesh = 1024;
 	// lowmip: TEST_LOWMIP_FULL is the size of five of the others
-	UINT64 upload_bytes = mesh_count * per_mesh + (UINT64)(TEXTURES + 4) * TEXTURE_SIZE * TEXTURE_SIZE * 4 + 65536;
+	UINT64 upload_bytes = mesh_count * per_mesh + (UINT64)(TEXTURES + 4) * TEXTURE_SIZE * TEXTURE_SIZE * 4 + 65536 + (root_uav ? WIDTH * HEIGHT * 4 : 0);
 	ID3D12Resource *upload = create_buffer(upload_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
 	ID3D12CommandAllocator *allocator = frames[0].allocators[0];
 	ID3D12GraphicsCommandList *list = lists[0];
@@ -623,6 +996,24 @@ static void create_scene(UINT mesh_count)
 
 	for (i = 0; i < DYNAMIC_UPLOADS; i++)
 		dynamic_buffers[i] = create_buffer(VERTICES * 12, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+	if (root_uav) {
+		D3D12_HEAP_PROPERTIES heap = {};
+		D3D12_RESOURCE_DESC desc = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		desc.Width = WIDTH * HEIGHT * 4;
+		desc.Height = 1;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.SampleDesc.Count = 1;
+		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+		CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&game_uav_buffer)));
+		for (UINT pixel = 0; pixel < WIDTH * HEIGHT; pixel++)
+			((UINT*)(data + at))[pixel] = 0x12345678;
+		list->CopyBufferRegion(game_uav_buffer, 0, upload, at, WIDTH * HEIGHT * 4);
+		transition(list, game_uav_buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+	}
 
 	CHECK(list->Close());
 	queue->ExecuteCommandLists(1, (ID3D12CommandList**)&list);
@@ -790,7 +1181,7 @@ static void report_appearances()
 int main(int argc, char **argv)
 {
 	UINT frame_count = 3000, mesh_count = 350, passes = 3, key = 0, key_frame = 0;
-	bool load_dll = true, profile = false, profile_present = false, threaded = false;
+	bool load_dll = true, profile = false, profile_present = false, threaded = false, debug = false, gpu_debug = false, dump_sampler = false, probe_converter = false;
 	const char *dump = NULL;
 	std::vector<UINT> capture_frames;
 	WNDCLASSW window_class = {};
@@ -855,7 +1246,23 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "nodll")) load_dll = false;
 		else if (!strcmp(argv[a], "video")) video = true;
 		else if (!strcmp(argv[a], "dxil")) use_dxil = true;
+		else if (!strcmp(argv[a], "debug")) debug = true;
+		else if (!strcmp(argv[a], "gpu-debug")) debug = gpu_debug = true;
+		else if (!strcmp(argv[a], "dump-sampler-dxil")) dump_sampler = true;
+		else if (!strcmp(argv[a], "no-srv")) no_srv = true;
+		else if (!strcmp(argv[a], "early-depth")) early_depth = true;
 		else if (!strcmp(argv[a], "rootconst")) root_constants = true;
+		else if (!strcmp(argv[a], "rootsig11")) root_signature_11 = true;
+		else if (!strcmp(argv[a], "rootsig12")) root_signature_11 = root_signature_12 = true;
+		else if (!strcmp(argv[a], "rootsig11-gap")) root_signature_11 = root_signature_gap = true;
+		else if (!strcmp(argv[a], "game-uav-root")) root_uav = true;
+		else if (!strcmp(argv[a], "game-shader-uav")) { root_uav = true; game_shader_uav = true; }
+		else if (!strcmp(argv[a], "game-shader-uav-space1")) { root_uav = true; game_shader_uav = game_shader_uav_space1 = true; }
+		else if (!strcmp(argv[a], "converted-ps")) { use_dxil = true; game_converted_ps = true; }
+		else if (!strncmp(argv[a], "converted-ps-file=", 18)) { use_dxil = true; game_converted_ps = true; converted_ps_file = argv[a] + 18; }
+		else if (!strcmp(argv[a], "probe-dxbc-conversion")) probe_converter = true;
+		else if (!strncmp(argv[a], "convert-dxbc-file=", 18)) convert_dxbc_path = argv[a] + 18;
+		else if (!strncmp(argv[a], "probe-shader=", 13)) probe_shader = argv[a] + 13;
 		else if (!strncmp(argv[a], "table=", 6)) TABLE = atoi(argv[a] + 6);
 		else if (!strncmp(argv[a], "heap=", 5)) GPU_HEAP_DESCRIPTORS = atoi(argv[a] + 5);
 		else if (!strcmp(argv[a], "profile")) profile = true;
@@ -875,6 +1282,18 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (probe_converter) {
+		probe_dxbc_conversion();
+		return 0;
+	}
+	if (convert_dxbc_path) {
+		convert_dxbc_file_to_dxil(convert_dxbc_path);
+		return 0;
+	}
+	if (dump_sampler) {
+		dump_sampler_dxil();
+		return 0;
+	}
 	std::sort(capture_frames.begin(), capture_frames.end());
 	if (!capture_frames.empty() && capture_frames.back() >= frame_count) {
 		printf("capture frames must be less than frames=%u\n", frame_count);
@@ -902,6 +1321,18 @@ int main(int argc, char **argv)
 			NULL, NULL, window_class.hInstance, NULL);
 	show_harness_window(hwnd);
 
+	if (debug) {
+		ID3D12Debug *layer = NULL;
+		CHECK(D3D12GetDebugInterface(IID_PPV_ARGS(&layer)));
+		layer->EnableDebugLayer();
+		if (gpu_debug) {
+			ID3D12Debug1 *gpu_layer = NULL;
+			CHECK(layer->QueryInterface(IID_PPV_ARGS(&gpu_layer)));
+			gpu_layer->SetEnableGPUBasedValidation(TRUE);
+			gpu_layer->Release();
+		}
+		layer->Release();
+	}
 	CHECK(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
 	CHECK(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
 	{
@@ -982,6 +1413,8 @@ int main(int argc, char **argv)
 	}
 
 	create_pipelines();
+	if (probe_shader)
+		register_probe_shader();
 	create_scene(mesh_count);
 	if (appear_frames) {
 		int groups = 0;
@@ -1495,15 +1928,25 @@ int main(int argc, char **argv)
 
 				// The views of the material, copied to where the
 				// shaders will find them
-				UINT cursor = (gpu_cursor.fetch_add(1) % (GPU_HEAP_DESCRIPTORS / TABLE)) * TABLE;
+				UINT span = TABLE + (root_uav ? 1 : 0);
+				UINT cursor = (gpu_cursor.fetch_add(1) % (GPU_HEAP_DESCRIPTORS / span)) * span;
 				dest.ptr = gpu_cpu_start.ptr + (SIZE_T)cursor * view_size;
 				table.ptr = gpu_start.ptr + (UINT64)cursor * view_size;
-				device->CopyDescriptorsSimple(2, dest, { cpu_start.ptr + (SIZE_T)(mesh->texture % (TEXTURES - 1)) * view_size },
+				device->CopyDescriptorsSimple(root_signature_gap ? 1 : 2, dest, { cpu_start.ptr + (SIZE_T)(mesh->texture % (TEXTURES - 1)) * view_size },
 					D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-				for (t = 2; t < TABLE; t++) {
+				if (root_signature_gap)
+					device->CopyDescriptorsSimple(1, { dest.ptr + 3 * (SIZE_T)view_size }, { cpu_start.ptr + (SIZE_T)(mesh->texture % (TEXTURES - 1) + 1) * view_size }, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+				for (t = 2; !root_signature_gap && t < TABLE; t++) {
 					device->CopyDescriptorsSimple(1, { dest.ptr + (SIZE_T)t * view_size },
 						{ cpu_start.ptr + (SIZE_T)((mesh->texture + t) % TEXTURES) * view_size },
 						D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+				}
+				if (root_uav) {
+					D3D12_UNORDERED_ACCESS_VIEW_DESC empty = {};
+					empty.Format = DXGI_FORMAT_R32_UINT;
+					empty.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+					empty.Buffer.NumElements = WIDTH * HEIGHT;
+					device->CreateUnorderedAccessView(game_uav_buffer, NULL, &empty, { dest.ptr + (SIZE_T)TABLE * view_size });
 				}
 
 				list->IASetVertexBuffers(0, 3, views);
@@ -1527,6 +1970,8 @@ int main(int argc, char **argv)
 				record_pass(pass);
 		}
 
+		if (probe_shader && f > 0)
+			draw_probe_shader(lists[1]);
 		transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 		CHECK(lists[0]->Close());
 		CHECK(lists[1]->Close());
@@ -1609,6 +2054,35 @@ int main(int argc, char **argv)
 	profiling = false;
 	stop_profile();
 	wait_for(signal());
+	if (probe_shader) {
+		D3D12_RESOURCE_DESC desc = probe_targets[0]->GetDesc();
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+		UINT rows = 0;
+		UINT64 row_bytes = 0, total = 0;
+		device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+		ID3D12Resource *readback = create_buffer(total, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+		ID3D12CommandAllocator *allocator = NULL;
+		ID3D12GraphicsCommandList *read_list = NULL;
+		CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+		CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, NULL, IID_PPV_ARGS(&read_list)));
+		transition(read_list, probe_targets[0], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+		dst.pResource = readback; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = footprint;
+		src.pResource = probe_targets[0]; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		read_list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+		CHECK(read_list->Close());
+		queue->ExecuteCommandLists(1, (ID3D12CommandList**)&read_list);
+		wait_for(signal());
+		BYTE *mapped = NULL;
+		CHECK(readback->Map(0, NULL, (void**)&mapped));
+		UINT64 checksum = 14695981039346656037ull;
+		for (UINT y = 0; y < rows; y++)
+			for (UINT64 x = 0; x < row_bytes; x++)
+				checksum = (checksum ^ mapped[footprint.Offset + y * footprint.Footprint.RowPitch + x]) * 1099511628211ull;
+		printf("captured shader output %016llx\n", checksum);
+		readback->Unmap(0, NULL);
+		readback->Release(); read_list->Release(); allocator->Release();
+	}
 	if (profile) {
 		report_profile();
 	}
@@ -1631,6 +2105,8 @@ int main(int argc, char **argv)
 		printf("  contend: %u rounds of making and releasing 80 MB\n", contend_rounds.load());
 	if (scene_failures)
 		printf("FAILED to give %u parts of the scene their hashes\n", scene_failures);
+	if (debug)
+		scene_failures += report_debug_errors();
 	fflush(stdout);
 	// The shim has threads of its own that are not worth shutting down
 	ExitProcess(scene_failures ? 1 : 0);

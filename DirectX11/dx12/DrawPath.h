@@ -163,6 +163,7 @@ void Dx12ScopeDraw(bool indexed, UINT count, UINT instances, UINT start, INT bas
 void Dx12ScopeUnsupported(const char *what);
 // For a ps-s0 = ... line of a mod, which only does something on D3D11 so far
 void Dx12SamplerBindingIgnored(const wchar_t *ini_line);
+bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot);
 // Once a dispatch of a mod made it to our list, or was dropped: only the
 // first leaves what Dx12ScopeWrittenBuffer gave out written
 void Dx12ScopeDispatched(bool recorded);
