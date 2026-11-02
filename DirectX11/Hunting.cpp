@@ -14,6 +14,7 @@
 #include "Input.h"
 #include "Globals.h"
 #include "IniHandler.h"
+#include "ByteCodeReader.h"
 #include "D3D_Shaders\stdafx.h"
 #include "CommandList.h"
 #include "profiling.h"
@@ -806,6 +807,7 @@ static bool ReloadShader(wchar_t *shaderPath, wchar_t *fileName, HackerDevice *d
 			if (FAILED(hr))
 				goto err;
 
+			note_replacement_srv_slots(replacement, pShaderBytecode->GetBufferPointer(), pShaderBytecode->GetBufferSize());
 
 			// If we have an older reloaded shader, let's release it to avoid a memory leak.  This only happens after 1st reload.
 			// New shader is loaded on GPU and ready to be used as override in VSSetShader or PSSetShader

@@ -4904,13 +4904,13 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		wanted.elements = layout->mElements.data();
 		wanted.element_count = (UINT)layout->mElements.size();
 	}
-	if (mod->blend) {
+	if (!scope->compute && mod->blend) {
 		copy_blend_state(&wanted.blend, &static_cast<const ShimBlendState*>(mod->blend)->mDesc);
 		wanted.blend_override = true;
 		wanted.sample_mask = mod->sample_mask;
 		wanted.sample_mask_override = true;
 	}
-	if (mod->depth_stencil) {
+	if (!scope->compute && mod->depth_stencil) {
 		copy_depth_stencil_state(&wanted.depth_stencil, &static_cast<const ShimDepthStencilState*>(mod->depth_stencil)->mDesc);
 		wanted.depth_stencil_override = true;
 	}

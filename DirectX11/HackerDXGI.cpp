@@ -70,6 +70,7 @@
 #include "IniHandler.h"
 #include "CommandList.h"
 #include "profiling.h"
+#include "GpuWatch.h"
 #include "ResourceLoading.h"
 #include "cursor.h" // For InstallHookLate
 #include "dx12/Bridge.h"
@@ -264,6 +265,9 @@ void HackerSwapChain::RunFrameActions()
 	// Regardless of log settings, since this runs every frame, let's flush the log
 	// so that the most lost will be one frame worth.  Tradeoff of performance to accuracy
 	if (LogFile) fflush(LogFile);
+
+	if (GpuWatch::enabled)
+		GpuWatch::frame(mHackerDevice->GetPassThroughOrigDevice1(), mHackerContext->GetPassThroughOrigContext1());
 
 	uint64_t system_tick_count = GetSystemTicks();
 
@@ -647,6 +651,7 @@ STDMETHODIMP HackerSwapChain::Present(THIS_
 		get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
 		hr = mOrigSwapChain1->Present(SyncInterval, Flags);
 		get_tls()->hooking_quirk_protection = false;
+		GpuWatch::after_present(hr);
 	}
 
 	if (!(Flags & DXGI_PRESENT_TEST)) {
@@ -963,6 +968,7 @@ STDMETHODIMP HackerSwapChain::Present1(THIS_
 		get_tls()->hooking_quirk_protection = true; // Present may call D3D11CreateDevice, which we may have hooked
 		hr = mOrigSwapChain1->Present1(SyncInterval, PresentFlags, pPresentParameters);
 		get_tls()->hooking_quirk_protection = false;
+		GpuWatch::after_present(hr);
 	}
 
 	if (!(PresentFlags & DXGI_PRESENT_TEST)) {

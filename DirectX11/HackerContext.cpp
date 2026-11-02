@@ -24,6 +24,7 @@
 #include "ShaderRegex.h"
 #include "FrameAnalysis.h"
 #include "profiling.h"
+#include "GpuWatch.h"
 
 // -----------------------------------------------------------------------------------------------
 
@@ -709,6 +710,7 @@ const HackerContext::ShaderHandleCacheEntry* HackerContext::LookupShaderHandle(I
 	entry->hash_found = i != G->mShaders.end();
 	entry->hash = entry->hash_found ? i->second : 0;
 	entry->reload_info = (j != G->mReloadedShaders.end()) ? &j->second : NULL;
+	entry->buffer_srv_slots_shader = NULL;
 	return entry;
 }
 
@@ -1173,8 +1175,20 @@ void HackerContext::BeforeDraw(DrawContext &data)
 	}
 
 out_profile:
+	if (!data.call_info.skip)
+		GuardShaderResources(false);
+
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::draw_overhead);
+}
+
+void HackerContext::GetShaderHashes(UINT64 hashes[5])
+{
+	hashes[0] = mCurrentVertexShader;
+	hashes[1] = mCurrentHullShader;
+	hashes[2] = mCurrentDomainShader;
+	hashes[3] = mCurrentGeometryShader;
+	hashes[4] = mCurrentPixelShader;
 }
 
 void HackerContext::AfterDraw(DrawContext &data)
@@ -1188,6 +1202,11 @@ void HackerContext::AfterDraw(DrawContext &data)
 
 	if (data.call_info.skip)
 		Profiling::skipped_draw_calls++;
+	else if (GpuWatch::enabled) {
+		UINT64 hashes[5];
+		GetShaderHashes(hashes);
+		GpuWatch::mark_call(mOrigContext1, data.call_info, hashes);
+	}
 
 	for (i = 0; i < 5; i++) {
 		if (data.post_commands[i]) {
@@ -1874,6 +1893,7 @@ STDMETHODIMP_(void) HackerContext::GSSetShaderResources(THIS_
 	/* [annotation] */
 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
+	ForgetCommandListSrvs(3, StartSlot, NumViews);
 	SetShaderResources<&ID3D11DeviceContext::GSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
 }
 
@@ -1936,8 +1956,10 @@ bool HackerContext::BeforeDispatch(DispatchContext *context)
 		}
 	}
 
-	if (!G->fix_enabled)
+	if (!G->fix_enabled) {
+		GuardShaderResources(true);
 		return true;
+	}
 
 	DeferredShaderReplacementBeforeDispatch();
 
@@ -1953,15 +1975,23 @@ bool HackerContext::BeforeDispatch(DispatchContext *context)
 			// compute shaders. The main thing we care
 			// about is the command list, so just run that:
 			RunCommandList(mHackerDevice, this, &shader_override->command_list, &context->call_info, false);
+			if (!context->call_info.skip)
+				GuardShaderResources(true);
 			return !context->call_info.skip;
 		}
 	}
 
+	GuardShaderResources(true);
 	return true;
 }
 
 void HackerContext::AfterDispatch(DispatchContext *context)
 {
+	if (GpuWatch::enabled && !context->call_info.skip) {
+		const UINT64 hashes[5] = { mCurrentComputeShader };
+		GpuWatch::mark_call(mOrigContext1, context->call_info, hashes);
+	}
+
 	if (context->post_commands)
 		RunCommandList(mHackerDevice, this, context->post_commands, &context->call_info, true);
 }
@@ -2370,8 +2400,11 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 	__in  ID3D11CommandList *pCommandList,
 	BOOL RestoreContextState)
 {
-	if (G->deferred_contexts_enabled)
+	if (G->deferred_contexts_enabled) {
 		mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
+		if (GpuWatch::enabled)
+			GpuWatch::mark_command_list(mOrigContext1);
+	}
 
 	if (!RestoreContextState) {
 		// This is equivalent to calling ClearState() afterwards, so we
@@ -2389,6 +2422,7 @@ STDMETHODIMP_(void) HackerContext::HSSetShaderResources(THIS_
 	/* [annotation] */
 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
+	ForgetCommandListSrvs(1, StartSlot, NumViews);
 	SetShaderResources<&ID3D11DeviceContext::HSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
 }
 
@@ -2438,6 +2472,7 @@ STDMETHODIMP_(void) HackerContext::DSSetShaderResources(THIS_
 	/* [annotation] */
 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
+	ForgetCommandListSrvs(2, StartSlot, NumViews);
 	SetShaderResources<&ID3D11DeviceContext::DSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
 }
 
@@ -2487,6 +2522,7 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
 	/* [annotation] */
 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
+	ForgetCommandListSrvs(5, StartSlot, NumViews);
 	SetShaderResources<&ID3D11DeviceContext::CSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
 }
 
@@ -2550,7 +2586,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 		// lookup/find takes measurable amounts of CPU time.
 		//
 		// grumble grumble this optimisation caught me out *TWICE* grumble grumble -DSS
-		if (!G->mShaderOverrideMap.empty() || shader_regex_d3d_groups || (G->hunting == HUNTING_MODE_ENABLED)) {
+		if (!G->mShaderOverrideMap.empty() || shader_regex_d3d_groups || (G->hunting == HUNTING_MODE_ENABLED) || GpuWatch::enabled) {
 			// Both this lookup and the one in mReloadedShaders below:
 			const ShaderHandleCacheEntry *entry = LookupShaderHandle(pShader);
 			reload_info = entry->reload_info;
@@ -3291,6 +3327,7 @@ STDMETHODIMP_(void) HackerContext::PSSetShaderResources(THIS_
 	/* [annotation] */
 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
+	ForgetCommandListSrvs(4, StartSlot, NumViews);
 	SetShaderResources<&ID3D11DeviceContext::PSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
 }
 
@@ -3429,6 +3466,7 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
 	/* [annotation] */
 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
+	ForgetCommandListSrvs(0, StartSlot, NumViews);
 	SetShaderResources<&ID3D11DeviceContext::VSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
 }
 

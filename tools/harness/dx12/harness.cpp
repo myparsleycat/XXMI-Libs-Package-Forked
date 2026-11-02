@@ -679,7 +679,8 @@ static void create_pipelines()
 	signature.pStaticSamplers = &sampler;
 	signature.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 	if (root_signature_11) {
-		D3D12_DESCRIPTOR_RANGE1 ranges1[2] = {};
+		D3D12_DESCRIPTOR_RANGE1 ranges1[3] = {};
+		UINT range_count = root_signature_gap ? 2 : 1;
 		D3D12_ROOT_PARAMETER1 parameters1[3] = {};
 		D3D12_STATIC_SAMPLER_DESC1 sampler1 = {};
 		D3D12_VERSIONED_ROOT_SIGNATURE_DESC versioned = {};
@@ -693,10 +694,18 @@ static void create_pipelines()
 			ranges1[1].BaseShaderRegister = 1;
 			ranges1[1].OffsetInDescriptorsFromTableStart = 3;
 		}
+		if (root_uav) {
+			D3D12_DESCRIPTOR_RANGE1 &uav = ranges1[range_count++];
+			uav.RangeType = ranges[1].RangeType;
+			uav.NumDescriptors = ranges[1].NumDescriptors;
+			uav.BaseShaderRegister = ranges[1].BaseShaderRegister;
+			uav.RegisterSpace = ranges[1].RegisterSpace;
+			uav.OffsetInDescriptorsFromTableStart = ranges[1].OffsetInDescriptorsFromTableStart;
+		}
 		parameters1[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
 		parameters1[0].ShaderVisibility = parameters[0].ShaderVisibility;
 		parameters1[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		parameters1[1].DescriptorTable.NumDescriptorRanges = root_signature_gap ? 2 : 1;
+		parameters1[1].DescriptorTable.NumDescriptorRanges = range_count;
 		parameters1[1].DescriptorTable.pDescriptorRanges = ranges1;
 		parameters1[1].ShaderVisibility = parameters[1].ShaderVisibility;
 		parameters1[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;

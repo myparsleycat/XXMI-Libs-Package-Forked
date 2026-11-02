@@ -1338,6 +1338,7 @@ HRESULT HackerDevice::ReplaceShaderFromShaderFixes(UINT64 hash,
 	}
 
 	CleanupShaderMaps(*ppShader);
+	note_replacement_srv_slots(*ppShader, replaceShader, replaceShaderSize);
 
 	LogInfo("    shader successfully replaced.\n");
 
@@ -1400,6 +1401,7 @@ HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 		return hr;
 
 	CleanupShaderMaps(*ppShader);
+	forget_replacement_srv_slots(*ppShader);
 
 	// When in hunting mode, make a copy of the original binary, regardless.  This can be replaced, but we'll at least
 	// have a copy for every shader seen. If we are performing any sort of deferred shader replacement, such as pipline

@@ -414,6 +414,9 @@ public:
 	// was there before.
 	UINT16 sampler_slots[6];
 
+	// See HackerContext::mCustomShaderSrvSlots
+	UINT64 buffer_srv_slots[6][2] = {};
+
 	D3D11_PRIMITIVE_TOPOLOGY topology;
 
 	CommandList command_list;
@@ -1938,6 +1941,9 @@ public:
 class IfCommand : public CommandListCommand {
 public:
 	CommandListExpression expression;
+	// What is left of expression to be a guard of, see
+	// CommandListOnlyChecksTextureOverrides()
+	CommandListExpression undecided_on_game_draw;
 	bool pre_finalised, post_finalised;
 	bool has_nested_else_if;
 	wstring section;
@@ -2264,8 +2270,12 @@ struct CommandListCheckedSlots {
 // texture slots, as long as the guards hold and its assignments are of the
 // values already in place (all added to slots). If none of those slots holds
 // something a TextureOverride section could match, running the list has no
-// effect: the D3D12 draw path uses this to skip draws of the game. Frame
-// analysis dumps count as nothing, which the caller has to make sure of.
+// effect: the D3D12 and Vulkan draw paths use this to skip draws of the game.
+// Frame analysis dumps count as nothing, which the caller has to make sure of.
+//
+// Only for a list of a game's draw on those: it takes render targets, the
+// depth target and pixel shader UAVs to be unbound (see
+// dx12_lists_see_game_targets), which does not hold under D3D11.
 //
 // A local variable given a value that comes of the draw alone counts as
 // nothing too. One the list reads before giving it a value in the same run is

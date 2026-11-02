@@ -15,6 +15,8 @@
 #include "D3D11Wrapper.h"
 #include "IniHandler.h"
 #include "profiling.h"
+#include "GpuWatch.h"
+#include "ByteCodeReader.h"
 #include "Hunting.h"
 #include "cursor.h"
 #include "dx12/Bridge.h"
@@ -1640,6 +1642,8 @@ static bool note_checked_slot(CheckTextureOverrideCommand *check, CommandListChe
 }
 
 static bool expression_is_stateless(CommandListEvaluatable *evaluatable, bool of_draw = false);
+static bool known_on_game_draw(CommandListEvaluatable *evaluatable, float *value);
+static const std::shared_ptr<CommandListEvaluatable>& undecided_on_game_draw(const std::shared_ptr<CommandListEvaluatable> &evaluatable);
 
 static bool note_assignment(CommandListVariable *var, int param_idx, float DirectX::XMFLOAT4::*param_component,
 		CommandListExpression *expression, float val, CommandListCheckedSlots *slots)
@@ -1664,20 +1668,20 @@ static bool note_assignment(CommandListVariable *var, int param_idx, float Direc
 	return true;
 }
 
-static bool note_guard(IfCommand *branch, bool nonzero, CommandListCheckedSlots *slots)
+static bool note_guard(CommandListExpression *expression, bool nonzero, CommandListCheckedSlots *slots)
 {
 	unsigned i;
 
-	if (!expression_is_stateless(branch->expression.evaluatable.get()))
+	if (!expression_is_stateless(expression->evaluatable.get()))
 		return false;
 
 	for (i = 0; i < slots->guard_count; i++) {
-		if (slots->guards[i].expression == &branch->expression)
+		if (slots->guards[i].expression == expression)
 			return slots->guards[i].nonzero == nonzero;
 	}
 	if (slots->guard_count == ARRAYSIZE(slots->guards))
 		return false;
-	slots->guards[slots->guard_count].expression = &branch->expression;
+	slots->guards[slots->guard_count].expression = expression;
 	slots->guards[slots->guard_count].nonzero = nonzero;
 	slots->guard_count++;
 	return true;
@@ -1697,6 +1701,22 @@ static bool branch_only_checks_texture_overrides(CommandList *pre, CommandList *
 
 static bool if_only_checks_texture_overrides(IfCommand *branch, CommandListCheckedSlots *slots, unsigned depth)
 {
+	// A list of a game's draw on D3D12 or Vulkan starts with no render
+	// target, depth target or pixel shader UAV bound, and only a command
+	// that binds one would change that, which is no check. So a list that
+	// gets to be judged as only checking finds them unbound, and only the
+	// branch a condition of nothing else would take can run, see
+	// dx12_lists_see_game_targets.
+	CommandListExpression *guard = &branch->expression;
+	float known;
+	if (known_on_game_draw(branch->expression.evaluatable.get(), &known)) {
+		if (known)
+			return branch_only_checks_texture_overrides(branch->true_commands_pre.get(),
+					branch->true_commands_post.get(), slots, depth + 1);
+		return branch_only_checks_texture_overrides(branch->false_commands_pre.get(),
+				branch->false_commands_post.get(), slots, depth + 1);
+	}
+
 	// Evaluating the condition changes nothing, and either branch may be
 	// the one that runs, unless only one of them will do and the condition
 	// is one that can be watched:
@@ -1707,7 +1727,15 @@ static bool if_only_checks_texture_overrides(IfCommand *branch, CommandListCheck
 
 	if (!if_true && !if_false)
 		return false;
-	return if_true == if_false || note_guard(branch, if_true, slots);
+	if (if_true == if_false)
+		return true;
+
+	const std::shared_ptr<CommandListEvaluatable> &undecided = undecided_on_game_draw(branch->expression.evaluatable);
+	if (undecided != branch->expression.evaluatable) {
+		branch->undecided_on_game_draw.evaluatable = undecided;
+		guard = &branch->undecided_on_game_draw;
+	}
+	return note_guard(guard, if_true, slots);
 }
 
 bool CommandListOnlyChecksTextureOverrides(CommandList *command_list, CommandListCheckedSlots *slots, unsigned depth)
@@ -1977,6 +2005,9 @@ void DrawCommand::run(CommandListState *state)
 	// Ensure IniParams are visible:
 	CommandListFlushState(state);
 
+	mHackerContext->GuardShaderResources(type == DrawCommandType::DISPATCH || type == DrawCommandType::DISPATCH_INDIRECT
+		|| (type == DrawCommandType::FROM_CALLER && info && (info->type == DrawCall::Dispatch || info->type == DrawCall::DispatchIndirect)));
+
 	Profiling::injected_draw_calls++;
 
 	switch (type) {
@@ -2105,6 +2136,12 @@ void DrawCommand::run(CommandListState *state)
 			else
 				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
 			break;
+	}
+
+	if (GpuWatch::enabled) {
+		UINT64 hashes[5];
+		state->mHackerContext->GetShaderHashes(hashes);
+		GpuWatch::mark_section(mOrigContext1, ini_section.c_str(), hashes);
 	}
 }
 
@@ -3081,6 +3118,13 @@ void CustomShader::add_dxil(ID3D11Device *mOrigDevice1)
 	compile_dxil('p', ps_source, compile_flags, ps);
 }
 
+static void note_buffer_srv_slots(ID3DBlob *bytecode, UINT64 slots[2])
+{
+	ShaderBindings bindings{};
+	if (get_shader_bindings_from_bytecode(bytecode->GetBufferPointer(), bytecode->GetBufferSize(), &bindings))
+		get_buffer_srv_slots(bindings, slots);
+}
+
 void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 {
 	if (substantiated) {
@@ -3090,36 +3134,42 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 	substantiated = true;
 
 	if (vs_bytecode) {
+		note_buffer_srv_slots(vs_bytecode, buffer_srv_slots[0]);
 		mOrigDevice1->CreateVertexShader(vs_bytecode->GetBufferPointer(), vs_bytecode->GetBufferSize(), NULL, &vs);
 		CleanupShaderMaps(vs);
 		vs_bytecode->Release();
 		vs_bytecode = NULL;
 	}
 	if (hs_bytecode) {
+		note_buffer_srv_slots(hs_bytecode, buffer_srv_slots[1]);
 		mOrigDevice1->CreateHullShader(hs_bytecode->GetBufferPointer(), hs_bytecode->GetBufferSize(), NULL, &hs);
 		CleanupShaderMaps(hs);
 		hs_bytecode->Release();
 		hs_bytecode = NULL;
 	}
 	if (ds_bytecode) {
+		note_buffer_srv_slots(ds_bytecode, buffer_srv_slots[2]);
 		mOrigDevice1->CreateDomainShader(ds_bytecode->GetBufferPointer(), ds_bytecode->GetBufferSize(), NULL, &ds);
 		CleanupShaderMaps(ds);
 		ds_bytecode->Release();
 		ds_bytecode = NULL;
 	}
 	if (gs_bytecode) {
+		note_buffer_srv_slots(gs_bytecode, buffer_srv_slots[3]);
 		mOrigDevice1->CreateGeometryShader(gs_bytecode->GetBufferPointer(), gs_bytecode->GetBufferSize(), NULL, &gs);
 		CleanupShaderMaps(gs);
 		gs_bytecode->Release();
 		gs_bytecode = NULL;
 	}
 	if (ps_bytecode) {
+		note_buffer_srv_slots(ps_bytecode, buffer_srv_slots[4]);
 		mOrigDevice1->CreatePixelShader(ps_bytecode->GetBufferPointer(), ps_bytecode->GetBufferSize(), NULL, &ps);
 		CleanupShaderMaps(ps);
 		ps_bytecode->Release();
 		ps_bytecode = NULL;
 	}
 	if (cs_bytecode) {
+		note_buffer_srv_slots(cs_bytecode, buffer_srv_slots[5]);
 		mOrigDevice1->CreateComputeShader(cs_bytecode->GetBufferPointer(), cs_bytecode->GetBufferSize(), NULL, &cs);
 		CleanupShaderMaps(cs);
 		cs_bytecode->Release();
@@ -3474,6 +3524,17 @@ void RunCustomShaderCommand::run(CommandListState *state)
 
 	saved_shader_inst vs_inst, hs_inst, ds_inst, gs_inst, ps_inst, cs_inst;
 
+	const UINT64 *saved_srv_slots[6];
+	const bool overrides[6] = {
+		custom_shader->vs_override, custom_shader->hs_override, custom_shader->ds_override,
+		custom_shader->gs_override, custom_shader->ps_override, custom_shader->cs_override,
+	};
+	for (int i = 0; i < 6; i++) {
+		saved_srv_slots[i] = state->mHackerContext->mCustomShaderSrvSlots[i];
+		if (overrides[i])
+			state->mHackerContext->mCustomShaderSrvSlots[i] = custom_shader->buffer_srv_slots[i];
+	}
+
 	// Assign custom shaders first before running the command lists, and
 	// restore them last. This is so that if someone was injecting a
 	// sequence of pixel shaders that all shared a common vertex shader
@@ -3545,6 +3606,9 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	_RunCommandList(&custom_shader->command_list, state);
 	state->post = true;
 	_RunCommandList(&custom_shader->post_command_list, state);
+
+	for (int i = 0; i < 6; i++)
+		state->mHackerContext->mCustomShaderSrvSlots[i] = saved_srv_slots[i];
 	state->post = saved_post;
 
 	// Finally restore the original shaders
@@ -5884,6 +5948,11 @@ DEFINE_OPERATOR(saturate_operator,      "saturate",  max(0.0, min(rhs, 1.0)));
 
 DEFINE_OPERATOR(random_operator,        "random",    random(rhs));
 
+static bool is_deterministic_operator(CommandListOperator *op)
+{
+	return op->rhs && !dynamic_cast<random_operatorT*>(op);
+}
+
 // Whether the value depends on nothing but IniParams and global variables, see
 // CommandListCheckedSlots. A local variable is as the command list that has it
 // left it, which is not for anything outside of that list to go by. of_draw
@@ -5891,7 +5960,7 @@ DEFINE_OPERATOR(random_operator,        "random",    random(rhs));
 static bool expression_is_stateless(CommandListEvaluatable *evaluatable, bool of_draw)
 {
 	if (CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable)) {
-		if (dynamic_cast<random_operatorT*>(op) || !op->rhs)
+		if (!is_deterministic_operator(op))
 			return false;
 		return (!op->lhs || expression_is_stateless(op->lhs.get(), of_draw)) && expression_is_stateless(op->rhs.get(), of_draw);
 	}
@@ -5964,6 +6033,86 @@ DEFINE_OPERATOR(and_operator,           "&&", (lhs && rhs));
 DEFINE_OPERATOR(or_operator,            "||", (lhs || rhs));
 
 // TODO: Ternary if operator
+
+static bool is_unbound_on_game_draw(const ResourceCopyTarget &target)
+{
+	if (target.type == ResourceCopyTargetType::EMPTY)
+		return true;
+	if (dx12_lists_see_game_targets || !is_static_pipeline_slot(target))
+		return false;
+	return target.type == ResourceCopyTargetType::RENDER_TARGET
+	    || target.type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET
+	    || (target.type == ResourceCopyTargetType::UNORDERED_ACCESS_VIEW && target.shader_type == L'p');
+}
+
+// What the expression evaluates to in a list of a game's draw before anything
+// is bound, where that does not depend on the draw or on variables, see
+// if_only_checks_texture_overrides
+static bool known_on_game_draw(CommandListEvaluatable *evaluatable, float *value)
+{
+	float lhs_value = std::numeric_limits<float>::quiet_NaN(), rhs_value = 0;
+	bool lhs_known, rhs_known;
+
+	if (!evaluatable)
+		return false;
+
+	if (CommandListOperand *operand = evaluatable->as_operand) {
+		switch (operand->type) {
+			case ParamOverrideType::VALUE:
+			case ParamOverrideType::DX12:
+			case ParamOverrideType::DLL_SAMPLER_SLOTS:
+				*value = operand->evaluate(NULL, dx12_shim->hacker_device);
+				return true;
+			case ParamOverrideType::TEXTURE:
+				if (operand->texture_filter_target.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE
+				    || !is_unbound_on_game_draw(operand->texture_filter_target))
+					return false;
+				// As process_texture_filter has it for no resource
+				*value = -0.0f;
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable);
+	if (!op || !is_deterministic_operator(op))
+		return false;
+
+	rhs_known = known_on_game_draw(op->rhs.get(), &rhs_value);
+	lhs_known = op->lhs && known_on_game_draw(op->lhs.get(), &lhs_value);
+
+	if (dynamic_cast<and_operatorT*>(op) && ((lhs_known && !lhs_value) || (rhs_known && !rhs_value))) {
+		*value = 0;
+		return true;
+	}
+	if (dynamic_cast<or_operatorT*>(op) && ((lhs_known && lhs_value) || (rhs_known && rhs_value))) {
+		*value = 1;
+		return true;
+	}
+
+	if (!rhs_known || (op->lhs && !lhs_known))
+		return false;
+	*value = op->evaluate(lhs_value, rhs_value);
+	return true;
+}
+
+// For an expression known_on_game_draw does not know: the part of it that tells
+// whether it is zero there, which is less than all of it where a side of && or
+// || is known, as that side cannot be the one that decides.
+static const std::shared_ptr<CommandListEvaluatable>& undecided_on_game_draw(const std::shared_ptr<CommandListEvaluatable> &evaluatable)
+{
+	CommandListOperator *op = dynamic_cast<CommandListOperator*>(evaluatable.get());
+	float known;
+
+	if (!dynamic_cast<and_operatorT*>(op) && !dynamic_cast<or_operatorT*>(op))
+		return evaluatable;
+	if (known_on_game_draw(op->lhs.get(), &known))
+		return undecided_on_game_draw(op->rhs);
+	if (known_on_game_draw(op->rhs.get(), &known))
+		return undecided_on_game_draw(op->lhs);
+	return evaluatable;
+}
 
 static CommandListOperatorFactoryBase *unary_operators[] = {
 	&unary_not_operator,
@@ -11237,6 +11386,7 @@ void ResourceCopyTarget::SetResource(
 
 	case ResourceCopyTargetType::SHADER_RESOURCE:
 		resource_view = (ID3D11ShaderResourceView*)view;
+		state->mHackerContext->NoteCommandListSrv(shader_type, slot, resource_view != NULL);
 		switch(shader_type) {
 		case L'v':
 			mOrigContext1->VSSetShaderResources(slot, 1, &resource_view);
@@ -14081,11 +14231,116 @@ void ShaderResourceBindBatch::run(CommandListState *state)
 	SetShaderResourcesBatch(state->mOrigContext1, shader_type, first_slot, count, views);
 
 	for (unsigned i = 0; i < count; i++) {
+		state->mHackerContext->NoteCommandListSrv(shader_type, first_slot + i, views[i] != NULL);
 		if (views[i])
 			views[i]->Release();
 	}
 
 	COMMAND_LIST_LOG(state, "%s\n", "}");
+}
+
+static int srv_stage(wchar_t shader_type)
+{
+	switch (shader_type) {
+		case L'v': return 0;
+		case L'h': return 1;
+		case L'd': return 2;
+		case L'g': return 3;
+		case L'p': return 4;
+		case L'c': return 5;
+	}
+	return -1;
+}
+
+void HackerContext::NoteCommandListSrv(wchar_t shader_type, UINT slot, bool bound)
+{
+	int stage = srv_stage(shader_type);
+	if (stage < 0 || slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT || dx12_shim)
+		return;
+	if (bound)
+		mCommandListSrvSlots[stage][slot >> 6] |= 1ull << (slot & 63);
+	else
+		mCommandListSrvSlots[stage][slot >> 6] &= ~(1ull << (slot & 63));
+}
+
+// What is in the slot may have changed without the context knowing, so only the
+// view there now decides. A buffer view is left alone, and needs no second look
+// until a command list binds this slot again.
+static void unbind_texture_over_buffer(ID3D11DeviceContext1 *context, wchar_t shader_type, UINT slot, UINT64 shader_hash)
+{
+	ID3D11ShaderResourceView *view = NULL;
+	GetShaderResourcesBatch(context, shader_type, slot, 1, &view);
+	if (!view)
+		return;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+	view->GetDesc(&desc);
+	view->Release();
+	if (desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+		return;
+
+	ID3D11ShaderResourceView *no_view = NULL;
+	SetShaderResourcesBatch(context, shader_type, slot, 1, &no_view);
+
+	static std::unordered_set<UINT64> reported;
+	EnterCriticalSectionPretty(&G->mShaderBindingsLock);
+	const bool first = reported.insert(shader_hash * 31 + (UINT64)shader_type * 257 + slot).second;
+	LeaveCriticalSection(&G->mShaderBindingsLock);
+	if (first)
+		LogInfo("Unbound the texture in %lcs-t%u (view dimension %d, format %d): shader %016llx declares that slot as a structured or raw buffer\n",
+			shader_type, slot, desc.ViewDimension, desc.Format, shader_hash);
+}
+
+void HackerContext::GuardShaderResources(bool compute)
+{
+	static const wchar_t shader_types[] = L"vhdgpc";
+	ID3D11DeviceChild *const handles[6] = {
+		mCurrentVertexShaderHandle, mCurrentHullShaderHandle, mCurrentDomainShaderHandle,
+		mCurrentGeometryShaderHandle, mCurrentPixelShaderHandle, mCurrentComputeShaderHandle,
+	};
+
+	for (int stage = compute ? 5 : 0; stage < (compute ? 6 : 5); stage++) {
+		UINT64 *bound = mCommandListSrvSlots[stage];
+		if (!(bound[0] | bound[1]))
+			continue;
+
+		const UINT64 *declared = mCustomShaderSrvSlots[stage];
+		UINT64 shader_hash = 0;
+		if (!declared) {
+			if (!handles[stage])
+				continue;
+			ShaderHandleCacheEntry *entry = const_cast<ShaderHandleCacheEntry*>(LookupShaderHandle(handles[stage]));
+			ID3D11DeviceChild *running = (entry->reload_info && entry->reload_info->replacement) ? entry->reload_info->replacement : handles[stage];
+			if (entry->buffer_srv_slots_shader != running) {
+				entry->buffer_srv_slots[0] = entry->buffer_srv_slots[1] = 0;
+				EnterCriticalSectionPretty(&G->mShaderBindingsLock);
+				auto replaced = G->mReplacementBufferSrvSlots.find(running);
+				if (replaced != G->mReplacementBufferSrvSlots.end()) {
+					entry->buffer_srv_slots[0] = replaced->second[0];
+					entry->buffer_srv_slots[1] = replaced->second[1];
+				} else if (entry->hash_found) {
+					auto it = G->mShaderBindingsCache.find(entry->hash);
+					if (it != G->mShaderBindingsCache.end())
+						get_buffer_srv_slots(it->second, entry->buffer_srv_slots);
+				}
+				LeaveCriticalSection(&G->mShaderBindingsLock);
+				entry->buffer_srv_slots_shader = running;
+			}
+			declared = entry->buffer_srv_slots;
+			shader_hash = entry->hash;
+		}
+
+		for (int word = 0; word < 2; word++) {
+			UINT64 candidates = bound[word] & declared[word];
+			bound[word] &= ~candidates;
+			while (candidates) {
+				unsigned long bit;
+				_BitScanForward64(&bit, candidates);
+				candidates &= candidates - 1;
+				unbind_texture_over_buffer(mOrigContext1, shader_types[stage], word * 64 + bit, shader_hash);
+			}
+		}
+	}
 }
 
 void ShaderResourceFetchBatch::run(CommandListState *state)

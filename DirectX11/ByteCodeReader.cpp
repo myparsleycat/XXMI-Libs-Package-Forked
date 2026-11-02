@@ -1,5 +1,6 @@
 #include "d3d11TokenizedProgramFormat.hpp"
 #include "globals.h"
+#include "ByteCodeReader.h"
 
 static D3D_SRV_DIMENSION dxbc_dimension_to_srv(D3D10_SB_RESOURCE_DIMENSION d)
 {
@@ -26,6 +27,37 @@ static uint32_t read_u32(const uint8_t* ptr)
 	uint32_t value;
 	std::memcpy(&value, ptr, sizeof(value));
 	return value;
+}
+
+void get_buffer_srv_slots(const ShaderBindings& bindings, uint64_t slots[2])
+{
+	slots[0] = slots[1] = 0;
+	for (size_t i = 0; i < bindings.resources.size(); i++) {
+		const ShaderResourceType type = bindings.resources[i].type;
+		if (type == ShaderResourceType::STRUCTURED || type == ShaderResourceType::RAW)
+			slots[i >> 6] |= 1ull << (i & 63);
+	}
+}
+
+void forget_replacement_srv_slots(ID3D11DeviceChild* shader)
+{
+	EnterCriticalSectionPretty(&G->mShaderBindingsLock);
+	G->mReplacementBufferSrvSlots.erase(shader);
+	LeaveCriticalSection(&G->mShaderBindingsLock);
+}
+
+void note_replacement_srv_slots(ID3D11DeviceChild* shader, const void* bytecode, size_t size)
+{
+	ShaderBindings bindings{};
+	if (!get_shader_bindings_from_bytecode(bytecode, size, &bindings)) {
+		forget_replacement_srv_slots(shader);
+		return;
+	}
+	uint64_t slots[2];
+	get_buffer_srv_slots(bindings, slots);
+	EnterCriticalSectionPretty(&G->mShaderBindingsLock);
+	G->mReplacementBufferSrvSlots[shader] = { slots[0], slots[1] };
+	LeaveCriticalSection(&G->mShaderBindingsLock);
 }
 
 bool get_shader_bindings_from_bytecode(const void* data, size_t size, ShaderBindings* out)

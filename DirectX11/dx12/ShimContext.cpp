@@ -543,6 +543,7 @@ void STDMETHODCALLTYPE ShimContext::OMSetRenderTargetsAndUnorderedAccessViews(UI
 
 void STDMETHODCALLTYPE ShimContext::OMGetRenderTargets(UINT NumViews, ID3D11RenderTargetView **ppRenderTargetViews, ID3D11DepthStencilView **ppDepthStencilView)
 {
+	static_assert(!dx12_lists_see_game_targets, "Showing the game's targets here needs this set and this line gone");
 	UINT i;
 
 	for (i = 0; i < NumViews && ppRenderTargetViews; i++)

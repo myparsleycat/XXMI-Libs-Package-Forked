@@ -211,6 +211,10 @@ private:
 		struct OriginalShaderInfo *reload_info;
 		unsigned generation;
 		bool hash_found;
+		// Filled in by GuardShaderResources() when it first needs them, of the
+		// shader that really runs in place of this one, which reloading changes:
+		ID3D11DeviceChild *buffer_srv_slots_shader;
+		UINT64 buffer_srv_slots[2];
 	} mShaderHandleCache[1 << SHADER_HANDLE_CACHE_BITS];
 	const ShaderHandleCacheEntry* LookupShaderHandle(ID3D11DeviceChild *shader);
 
@@ -370,6 +374,7 @@ public:
 	void InitIniParams();
 	ID3D11DeviceContext1* GetPossiblyHookedOrigContext1();
 	ID3D11DeviceContext1* GetPassThroughOrigContext1();
+	void GetShaderHashes(UINT64 hashes[5]);
 	void HookContext();
 
 	// public to allow CommandList access
@@ -456,6 +461,27 @@ public:
 	void DeferInputLayoutOverride(HackerInputLayout* pInputLayout);
 	void OverrideInputLayout();
 	void RestoreInputLayout();
+
+	// t slots a command list bound a view to and the game has not bound since,
+	// one bit a slot for each stage (vs, hs, ds, gs, ps, cs). The driver reads a
+	// texture in a slot the shader declares as a structured or raw buffer as
+	// memory from the texture's address on, with no bounds check, which faults
+	// the GPU if that address is not mapped. These slots get checked before a
+	// draw or dispatch.
+	UINT64 mCommandListSrvSlots[6][2] = {};
+	// While a custom shader runs: what its shaders of the stages it replaces
+	// declare (CustomShader::buffer_srv_slots), which the current handles do not say.
+	const UINT64 *mCustomShaderSrvSlots[6] = {};
+	void NoteCommandListSrv(wchar_t shader_type, UINT slot, bool bound);
+	void GuardShaderResources(bool compute);
+	void ForgetCommandListSrvs(int stage, UINT first, UINT count)
+	{
+		UINT64 *slots = mCommandListSrvSlots[stage];
+		if (!(slots[0] | slots[1]))
+			return;
+		for (UINT i = first; i < first + count && i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
+			slots[i >> 6] &= ~(1ull << (i & 63));
+	}
 
 	// These are the shaders the game has set, which may be different from
 	// the ones we have bound to the pipeline:

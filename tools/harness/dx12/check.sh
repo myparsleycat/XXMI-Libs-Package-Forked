@@ -1,13 +1,16 @@
 #!/bin/bash
-# check.sh [test] [move] [lowmip] [ref] [dxil-iniparams]: checks of the D3D12 shim, in the
-# run folder setup.sh makes (default: test move lowmip). Exits with 1 when one
-# fails.
+# check.sh [test] [fold] [move] [lowmip] [ref]: the checks of the D3D12 shim, in
+# the run folder setup.sh makes (default: test fold move lowmip). Exits with 1
+# when one fails.
 #   test   matching by hash (case/test.ini): which watched meshes are hidden
+#   fold   conditions on targets in a list of a game's draw: which meshes each
+#          form leaves hidden
 #   move   hashes carried along GPU copies, frame by frame (harness.cpp, move)
 #   lowmip a copy of a texture without its top mip level, with
 #          track_texture_updates = 1 and match_lower_mip_textures off and on
 #   ref    the pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
+#   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
 #   dxil-iniparams  a DXIL patch reads a 1D IniParams texture on a game draw
 #   dxil-iniparams-no-srv  the same patch on a shader without any SRV declarations
 #   dxil-uav-blocked  an ordinary build must refuse a writable DXIL UAV patch
@@ -105,6 +108,152 @@ run_null_ib() {
 		ok=0
 	fi
 }
+
+fold_form() {
+	# fold_form <name> <hidden|drawn> <lines>: the state of the meshes CommandListSkin
+	# hides with <lines> in place of the line of harness.ini that runs it
+	local name=$1 state=$2 want out status got
+	want="A=$state B=$state C=drawn control=drawn"
+	python -I - case/Mods/harness.ini run/Mods/harness.ini "$3" <<'EOF'
+import sys
+source, target, body = sys.argv[1:]
+text = open(source, encoding="utf-8", newline="").read()
+assert "run = CommandListSkin" in text
+text = text.replace("run = CommandListSkin", body, 1).replace("[Constants]", "[Constants]\nglobal $fold_flip = 0", 1)
+common = """
+[Present]
+$fold_flip = 1
+
+[ResourceFoldCopy]
+
+[ResourceBound]
+type = Texture2D
+width = 16
+height = 16
+array = 1
+mips = 1
+msaa = 1
+format = R8G8B8A8_UNORM
+
+[ResourceDepthBound]
+type = Texture2D
+width = 16
+height = 16
+array = 1
+mips = 1
+msaa = 1
+format = D32_FLOAT
+"""
+open(target, "w", encoding="utf-8", newline="").write(text + common)
+EOF
+	out=$(cd run && ./harness.exe frames=900 test dump=fold.bmp 2>&1); status=$?
+	got=$(echo "$out" | watched | cut -d' ' -f1-4)
+	if [ $status != 0 ] || [ "$got" != "$want" ]; then
+		echo "  $name: exit $status, expected $want, got $got"
+		return 1
+	fi
+}
+
+# Conditions on targets, which a list of a game's draw finds as mods bound them.
+# The forms that bind first show that a list does see a bound target.
+run_fold() {
+	local bad=0
+	local skin='run = CommandListSkin'
+	local work='ResourceFoldCopy = copy vs-cb0'
+	cp case/test.ini run/Mods/test.ini
+	fold_form plain hidden "$skin" || bad=1
+	fold_form dx12 hidden "if dx12
+$skin
+endif" || bad=1
+	fold_form not_dx12 drawn "if !dx12
+$skin
+endif" || bad=1
+	fold_form sampler_slots drawn "if dll_sampler_slots
+$skin
+endif" || bad=1
+	fold_form unbound_target drawn "if o3 !== null
+$skin
+endif" || bad=1
+	fold_form unbound_is_null hidden "if o3 === null
+$skin
+endif" || bad=1
+	fold_form unbound_depth drawn "if od !== null
+$skin
+endif" || bad=1
+	fold_form unbound_uav drawn "if ps-u1 !== null
+$skin
+endif" || bad=1
+	fold_form else_runs hidden "if o3 !== null
+$work
+else
+$skin
+endif" || bad=1
+	fold_form elif_runs hidden "if o3 !== null
+$work
+elif o2 === null
+$skin
+endif" || bad=1
+	fold_form no_match drawn "if od == 924172 && DRAW_TYPE % 2 == 0
+$skin
+endif" || bad=1
+	fold_form not_equal hidden "if od != 924172
+$skin
+endif" || bad=1
+	fold_form or_variable_set drawn "if o3 !== null || \$costume_mods
+$work
+else
+$skin
+endif" || bad=1
+	fold_form or_variable_clear hidden "if o3 !== null || !\$costume_mods
+$work
+else
+$skin
+endif" || bad=1
+	fold_form and_variable_set hidden "if o3 === null && \$costume_mods
+$skin
+else
+$work
+endif" || bad=1
+	fold_form and_variable_clear drawn "if o3 === null && !\$costume_mods
+$skin
+else
+$work
+endif" || bad=1
+	# The variable changes after the filter was worked out
+	fold_form guard_flips hidden "if o3 !== null || \$fold_flip
+$work
+$skin
+endif" || bad=1
+	fold_form bound_target hidden "o3 = ResourceBound
+if o3 !== null
+$skin
+endif" || bad=1
+	fold_form bound_depth hidden "od = ResourceDepthBound
+if od !== null
+$skin
+endif" || bad=1
+	fold_form bound_under_condition hidden "if \$costume_mods
+o3 = ResourceBound
+endif
+if o3 !== null
+$skin
+endif" || bad=1
+	fold_form bound_in_called_list hidden "run = CommandListFoldBind
+if o3 !== null
+$skin
+endif
+
+[CommandListFoldBind]
+o3 = ResourceBound" || bad=1
+	fold_form bound_other_slot drawn "o2 = ResourceBound
+if o3 !== null
+$skin
+endif" || bad=1
+	rm -f run/Mods/test.ini
+	cp case/Mods/harness.ini run/Mods/harness.ini
+	[ $bad = 0 ] && echo "fold: OK" || { echo "fold: FAILED"; ok=0; }
+}
+
 run_move() {
 	local bad=0
 	cp case/test.ini run/Mods/test.ini
@@ -158,6 +307,20 @@ compare() {
 	else
 		echo "ref $1: DIFFERENT"; echo "$a"; echo "$b"; ok=0
 	fi
+}
+
+run_root_uav() {
+	local signature shader status
+	for signature in rootsig11 rootsig12 rootsig11-gap; do
+		for shader in game-uav-root game-shader-uav game-shader-uav-space1; do
+			(cd run && ./harness.exe nodll dxil gpu-debug "$signature" "$shader" frames=4 >root-uav.log 2>&1); status=$?
+			if [ "$status" != 0 ]; then
+				echo "root-uav: FAILED ($signature $shader, exit $status)"
+				cat run/root-uav.log; ok=0; return
+			fi
+		done
+	done
+	echo 'root-uav: OK (9 combinations, GPU validation)'
 }
 
 run_dxil_iniparams() {
@@ -229,7 +392,8 @@ run_dxil_captured_shader() {
 	sed -i 's/^;dx12_dump_hashes = 1/dx12_dump_hashes = 1/' run/d3dx.ini
 	cp "$DX12_PROBE_SHADER" run/probe-ps.dxil
 	cp case/dxil-iniparams.ini run/Mods/dxil-iniparams.ini
-	sed -i 's/@ps/@toonFragment/' run/Mods/dxil-iniparams.ini
+	# Match the supplied shader's entry regardless of its name.
+	sed -i 's/@ps/@[^ (]+/' run/Mods/dxil-iniparams.ini
 	(cd run && ./harness.exe dxil gpu-debug frames=4 probe-shader=probe-ps.dxil >dxil-probe.log 2>&1); status=$?
 	cp "$report" run/dxil-probe-report.txt
 	rm -f run/Mods/dxil-iniparams.ini
@@ -239,12 +403,12 @@ run_dxil_captured_shader() {
 	rm -f run/probe-ps.dxil
 	mv run/d3dx.ini.probe-backup run/d3dx.ini
 	if [ "$status" = 0 ] && [ "$baseline" = 0 ] && [ -n "$on_sum" ] && [ -n "$off_sum" ] && [ "$on_sum" != "$off_sum" ] \
-	   && grep -q 'DXIL ShaderRegex patch succeeded for e51d9ac06684c0e9' run/dxil-probe-report.txt; then
+	   && grep -Eq 'DXIL ShaderRegex patch succeeded for [[:xdigit:]]{16}' run/dxil-probe-report.txt; then
 		echo "dxil-captured-shader: OK"
 	else
 		echo "dxil-captured-shader: FAILED (exit $status, $baseline; output $on_sum, $off_sum)"; ok=0
 		grep -E 'FAILED|D3D12 debug error' run/dxil-probe.log | head -5
-		grep 'DXIL ShaderRegex patch failed for e51d9ac06684c0e9' run/dxil-probe-report.txt | head -1
+		grep 'DXIL ShaderRegex patch failed for ' run/dxil-probe-report.txt | head -1
 	fi
 }
 
@@ -469,12 +633,14 @@ run_ref() {
 	compare mod 1300 "" mod.bmp
 }
 
-for what in ${@:-test move lowmip}; do
+for what in ${@:-test fold move lowmip}; do
 	case $what in
 	test) run_test; run_null_ib ;;
+	fold) run_fold ;;
 	move) run_move ;;
 	lowmip) run_lowmip ;;
 	ref) run_ref ;;
+	root-uav) run_root_uav ;;
 	dxil-iniparams) run_dxil_iniparams '' ;;
 	dxil-iniparams-no-srv) run_dxil_iniparams no-srv ;;
 	dxil-failures) run_dxil_failures ;;
@@ -495,7 +661,7 @@ for what in ${@:-test move lowmip}; do
 	dxil-sampler-switch) run_dxil_sampler_states switch ;;
 	dxil-sampler-existing) run_dxil_sampler_existing ;;
 	custom-sampler-restore) run_custom_sampler_restore ;;
-	*) sed -n '2,9p' "$0"; exit 1 ;;
+	*) sed -n '2,/^[^#]/{ /^[^#]/!p; }' "$here/check.sh"; exit 1 ;;
 	esac
 done
 [ $ok = 1 ] && echo "CHECK OK" || { echo "CHECK FAILED"; exit 1; }
