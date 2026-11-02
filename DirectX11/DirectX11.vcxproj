@@ -70,6 +70,7 @@
     <ClCompile Include="dx12\DeviceRemoved.cpp" />
     <ClCompile Include="dx12\DrawPath.cpp" />
     <ClCompile Include="dx12\Dxc.cpp" />
+    <ClCompile Include="dx12\DxilPatch.cpp" />
     <ClCompile Include="dx12\DxilMetadata.cpp" />
     <ClCompile Include="dx12\PresentPass.cpp" />
     <ClCompile Include="dx12\ShimContext.cpp" />
@@ -140,6 +141,7 @@
     <ClInclude Include="dx12\DeviceRemoved.h" />
     <ClInclude Include="dx12\DrawPath.h" />
     <ClInclude Include="dx12\Dxc.h" />
+    <ClInclude Include="dx12\DxilPatch.h" />
     <ClInclude Include="dx12\DxilMetadata.h" />
     <ClInclude Include="dx12\PresentPass.h" />
     <ClInclude Include="dx12\ShimContext.h" />

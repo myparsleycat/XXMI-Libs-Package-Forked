@@ -137,10 +137,10 @@ public:
 
 	bool compile(std::string *pattern);
 	bool named_group_overlaps(ShaderRegexTemps &other_set);
-	bool matches(std::string *asm_text);
+	bool matches(std::string *asm_text) const;
 	bool patch(std::string *asm_text, ShaderRegexTemps *temp_regs, unsigned dcl_temps);
 	// With the temps already substituted in that
-	bool patch_with(std::string *asm_text, const std::string &replace);
+	bool patch_with(std::string *asm_text, const std::string &replace) const;
 };
 
 // $temp and ${temp} in a replacement
@@ -167,6 +167,17 @@ struct SpirvDeclaration {
 // A line of InsertDeclarations, as a D3D11 shader would have it
 bool parse_spirv_declaration(const std::string &line, int ini_params_reg, SpirvDeclaration *declaration);
 
+// Resources DXIL shader patterns may add in register space 0. The patcher
+// creates their DXIL metadata and handles.
+struct DxilDeclaration {
+	unsigned reg;
+	unsigned dimension;
+	bool uav;
+	bool sampler;
+};
+
+bool parse_dxil_declaration(const std::string &line, DxilDeclaration *declaration);
+
 class ShaderRegexGroup {
 public:
 	std::wstring ini_section;
@@ -180,6 +191,11 @@ public:
 	// alone.
 	ShaderRegexPatterns spirv_patterns;
 	std::vector<SpirvDeclaration> spirv_declarations;
+
+	// DxilPattern* subsections rewrite the DXC disassembly of a D3D12 game's
+	// DXIL shader. InsertDeclarations may add texture1d or texture2d tN.
+	ShaderRegexPatterns dxil_patterns;
+	std::vector<DxilDeclaration> dxil_declarations;
 
 	ShaderRegexDeclarations declarations;
 	ShaderRegexModels shader_models;
@@ -204,6 +220,7 @@ public:
 	std::shared_ptr<RunLinkedCommandList> post_link;
 
 	bool spirv() const { return !spirv_patterns.empty(); }
+	bool dxil() const { return !dxil_patterns.empty(); }
 	void apply_regex_patterns(std::string *asm_text, bool *match, bool *patch);
 	void link_command_lists_and_filter_index(UINT64 shader_hash);
 	bool dx12_matches(const Dx12ShaderInfo *shader) const;
@@ -225,6 +242,7 @@ extern ShaderRegexGroups shader_regex_groups;
 // Whether any of them is for D3D11 or D3D12 shaders: those with SpirvPattern
 // subsections are not
 extern bool shader_regex_d3d_groups;
+extern bool shader_regex_dxil_groups;
 extern std::vector<ShaderRegexGroup*> shader_regex_group_index;
 
 // This hash is of all ShaderRegex sections and is used to determine if a

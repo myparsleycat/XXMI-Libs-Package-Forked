@@ -14,6 +14,7 @@
 #include "Bridge.h"
 #include "BufferHash.h"
 #include "Dxc.h"
+#include "DxilPatch.h"
 #include "FrameDump.h"
 #include "HashDump.h"
 #include "ShimContext.h"
@@ -1782,6 +1783,8 @@ struct Dx12DrawScope {
 	UINT vbs_changed;
 	bool ib_changed;
 	bool topology_changed;
+	bool blend_factor_changed;
+	bool stencil_ref_changed;
 	// The game's pipeline made again with the input layout or the shaders
 	// of a mod, if that is what the list has set, see apply_pipeline
 	ID3D12PipelineState *variant;
@@ -1846,7 +1849,7 @@ void Dx12SamplerBindingIgnored(const wchar_t *ini_line)
 	static std::atomic<bool> reported;
 
 	if (!reported.exchange(true))
-		Dx12DumpNote("*** Mods bind samplers (%S), which only works with Direct3D 11 games yet. Ignored.\n", ini_line);
+		Dx12DumpNote("*** A mod binds a sampler (%S) that this draw cannot replace yet. Ignored.\n", ini_line);
 }
 
 // The buffers Dx12ScopeWrittenBuffer gave out for the dispatch being prepared
@@ -2361,6 +2364,12 @@ static void restore_overrides()
 	if (scope->topology_changed)
 		list->IASetPrimitiveTopology(game->topology);
 	scope->topology_changed = false;
+	if (scope->blend_factor_changed)
+		list->OMSetBlendFactor(game->blend_factor);
+	scope->blend_factor_changed = false;
+	if (scope->stencil_ref_changed)
+		list->OMSetStencilRef(game->stencil_ref);
+	scope->stencil_ref_changed = false;
 }
 
 // Sets the game's heaps on the list again in place of the side heap. With
@@ -2415,6 +2424,44 @@ static void restore_list()
 static const Dx12ShaderStage graphics_stages[] = { DX12_STAGE_VS, DX12_STAGE_PS, DX12_STAGE_GS, DX12_STAGE_HS, DX12_STAGE_DS };
 static const Dx12ShaderStage compute_stages[] = { DX12_STAGE_CS };
 
+static void copy_blend_state(D3D12_BLEND_DESC *dst, const D3D11_BLEND_DESC *src)
+{
+	dst->AlphaToCoverageEnable = src->AlphaToCoverageEnable;
+	dst->IndependentBlendEnable = src->IndependentBlendEnable;
+	for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+		const D3D11_RENDER_TARGET_BLEND_DESC &from = src->RenderTarget[i];
+		D3D12_RENDER_TARGET_BLEND_DESC &to = dst->RenderTarget[i];
+		to.BlendEnable = from.BlendEnable;
+		to.LogicOpEnable = FALSE;
+		to.SrcBlend = (D3D12_BLEND)from.SrcBlend;
+		to.DestBlend = (D3D12_BLEND)from.DestBlend;
+		to.BlendOp = (D3D12_BLEND_OP)from.BlendOp;
+		to.SrcBlendAlpha = (D3D12_BLEND)from.SrcBlendAlpha;
+		to.DestBlendAlpha = (D3D12_BLEND)from.DestBlendAlpha;
+		to.BlendOpAlpha = (D3D12_BLEND_OP)from.BlendOpAlpha;
+		to.LogicOp = D3D12_LOGIC_OP_NOOP;
+		to.RenderTargetWriteMask = from.RenderTargetWriteMask;
+	}
+}
+
+static void copy_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC *dst, const D3D11_DEPTH_STENCIL_DESC *src)
+{
+	dst->DepthEnable = src->DepthEnable;
+	dst->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)src->DepthWriteMask;
+	dst->DepthFunc = (D3D12_COMPARISON_FUNC)src->DepthFunc;
+	dst->StencilEnable = src->StencilEnable;
+	dst->StencilReadMask = src->StencilReadMask;
+	dst->StencilWriteMask = src->StencilWriteMask;
+	dst->FrontFace.StencilFailOp = (D3D12_STENCIL_OP)src->FrontFace.StencilFailOp;
+	dst->FrontFace.StencilDepthFailOp = (D3D12_STENCIL_OP)src->FrontFace.StencilDepthFailOp;
+	dst->FrontFace.StencilPassOp = (D3D12_STENCIL_OP)src->FrontFace.StencilPassOp;
+	dst->FrontFace.StencilFunc = (D3D12_COMPARISON_FUNC)src->FrontFace.StencilFunc;
+	dst->BackFace.StencilFailOp = (D3D12_STENCIL_OP)src->BackFace.StencilFailOp;
+	dst->BackFace.StencilDepthFailOp = (D3D12_STENCIL_OP)src->BackFace.StencilDepthFailOp;
+	dst->BackFace.StencilPassOp = (D3D12_STENCIL_OP)src->BackFace.StencilPassOp;
+	dst->BackFace.StencilFunc = (D3D12_COMPARISON_FUNC)src->BackFace.StencilFunc;
+}
+
 // The highest register of a range that any of the shaders declares, as a
 // number of registers from the first of the range. 0 if none does.
 static UINT declared_in_range(const Dx12RootRange *range, const Dx12ShaderInfo *const *shaders, size_t shader_count)
@@ -2441,7 +2488,7 @@ static UINT declared_in_range(const Dx12RootRange *range, const Dx12ShaderInfo *
 // the game set it: the registers the shaders of the pipeline state declare, or
 // where they do not tell, up to the end of the furthest range of the root
 // signature. False if that has no end.
-static bool table_size(UINT parameter, UINT *size)
+static bool table_size(UINT parameter, UINT *size, UINT *static_end)
 {
 	static const D3D12_SHADER_VISIBILITY visibilities[DX12_STAGE_COUNT] = {
 		D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_GEOMETRY,
@@ -2456,6 +2503,7 @@ static bool table_size(UINT parameter, UINT *size)
 	size_t i, shader_count = 0;
 
 	*size = 0;
+	*static_end = 0;
 	if (!signature || parameter >= signature->parameters.size())
 		return false;
 	const Dx12RootParameter &table = signature->parameters[parameter];
@@ -2476,6 +2524,11 @@ static bool table_size(UINT parameter, UINT *size)
 	declared = declared && visible;
 
 	for (const Dx12RootRange &range : table.ranges) {
+		if (!(range.flags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE)) {
+			if (range.count == UINT_MAX || range.offset > UINT_MAX - range.count)
+				return false;
+			*static_end = max(*static_end, range.offset + range.count);
+		}
 		if (range.count == UINT_MAX)
 			bounded = false;
 		else
@@ -2493,7 +2546,7 @@ static bool table_size(UINT parameter, UINT *size)
 
 	if (!declared && !bounded)
 		return false;
-	*size = declared ? read : whole;
+	*size = max(declared ? read : whole, *static_end);
 	return true;
 }
 
@@ -2576,7 +2629,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE* table_descriptor(const Dx12RegisterLocation 
 	Dx12DescriptorHeap *heap = game->view_heap;
 	ChangedParameter changed = {};
 	UINT64 base, first;
-	UINT size;
+	UINT size, static_end;
 
 	for (const ChangedParameter &existing : scope->parameters) {
 		if (existing.parameter == location->parameter) {
@@ -2591,7 +2644,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE* table_descriptor(const Dx12RegisterLocation 
 		return NULL;
 	}
 
-	if (!table_size(location->parameter, &size)) {
+	if (!table_size(location->parameter, &size, &static_end)) {
 		stats.table_unbounded++;
 		log_once(&unbounded, "A mod replaces something the game binds through a descriptor table without an end. Ignored.");
 		return NULL;
@@ -2599,7 +2652,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE* table_descriptor(const Dx12RegisterLocation 
 	// The game need not have a whole table's worth of descriptors where
 	// it pointed the table, if its shaders do not read that far
 	first = (base - heap->mGpuStart) / heap->mIncrement;
-	if (location->offset >= size || first + location->offset >= heap->mCount)
+	if (location->offset >= size || first + location->offset >= heap->mCount || static_end > heap->mCount - first)
 		return NULL;
 	size = (UINT)min((UINT64)size, heap->mCount - first);
 
@@ -2637,7 +2690,7 @@ static bool prepare_side_tables()
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
 	Dx12DescriptorHeap *heap = game->view_heap;
 	ID3D12DescriptorHeap *heaps[ARRAYSIZE(game->heaps)];
-	UINT sizes[DX12_MAX_ROOT_ARGUMENTS];
+	UINT sizes[DX12_MAX_ROOT_ARGUMENTS], static_ends[DX12_MAX_ROOT_ARGUMENTS];
 	UINT64 base, first;
 	// An untracked heap cannot be replaced without its tables.
 	bool found = !heap && game->heap_count == (game->sampler_heap ? 1u : 0u);
@@ -2656,7 +2709,8 @@ static bool prepare_side_tables()
 		if (heap)
 			first = base >= heap->mGpuStart ? (base - heap->mGpuStart) / heap->mIncrement : heap->mCount;
 		// A table none of the shaders read has nothing to copy
-		if (!table_size((UINT)i, &sizes[i]) || (sizes[i] && (!heap || first >= heap->mCount))) {
+		if (!table_size((UINT)i, &sizes[i], &static_ends[i]) || (sizes[i] && (!heap || first >= heap->mCount))
+		    || (heap && first < heap->mCount && static_ends[i] > heap->mCount - first)) {
 			if (!no_switch) {
 				Dx12DumpNote("  (%s parameter %zu of %u descriptors is set to %llu descriptors into a heap of %u)\n",
 					scope->compute ? "compute" : "graphics", i, sizes[i], first, heap ? heap->mCount : 0);
@@ -2738,14 +2792,14 @@ static bool grow_side_tables()
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu;
 	UINT64 first;
-	UINT size;
+	UINT size, static_end;
 	size_t i, count = signature ? min(signature->parameters.size(), (size_t)DX12_MAX_ROOT_ARGUMENTS) : 0;
 
 	for (i = 0; i < count; i++) {
 		if (signature->parameters[i].type != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE || !(arguments->set & (1ull << i))
 		    || is_sampler_table(signature, i))
 			continue;
-		if (!table_size((UINT)i, &size)) {
+		if (!table_size((UINT)i, &size, &static_end)) {
 			stats.table_unbounded++;
 			return false;
 		}
@@ -2755,7 +2809,7 @@ static bool grow_side_tables()
 			return false;
 		first = arguments->values[i] >= heap->mGpuStart ? (arguments->values[i] - heap->mGpuStart) / heap->mIncrement : heap->mCount;
 		// Not in the heap that is known, so nothing to copy it from
-		if (first >= heap->mCount)
+		if (first >= heap->mCount || static_end > heap->mCount - first)
 			return false;
 		size = (UINT)min((UINT64)size, heap->mCount - first);
 		if (size <= scope->side_size[i])
@@ -2918,6 +2972,30 @@ static const ShimShader* mod_shader_form(const ShimState *mod, Dx12ShaderStage s
 	return shader;
 }
 
+bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot)
+{
+	Dx12ShaderStage stage;
+	Dx12RegisterLocation location;
+	if (!scope || scope->compute || !scope->signature || slot >= SHIM_SAMPLER_SLOTS)
+		return false;
+	switch (shader_type) {
+	case L'v': stage = DX12_STAGE_VS; break;
+	case L'p': stage = DX12_STAGE_PS; break;
+	case L'g': stage = DX12_STAGE_GS; break;
+	case L'h': stage = DX12_STAGE_HS; break;
+	case L'd': stage = DX12_STAGE_DS; break;
+	default: return false;
+	}
+	if (Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, slot, &location)
+	    || Dx12HasStaticSampler(scope->signature, stage, slot))
+		return false;
+	const ShimShader *mod_shader = mod_shader_form(dx12_shim->shim_context->mState, stage);
+	if (mod_shader && (mod_shader->sampler_used & 1u << slot))
+		return true;
+	const Dx12ShaderInfo *patched = DxilGameShader(scope->pipeline->shaders[stage], false, NULL);
+	return patched && (patched->samplers & 1u << slot);
+}
+
 // A shader of the mod's reads zeros where the mod set none, as under D3D11,
 // and not the game's texture the table has there. Only for those: the game's
 // shaders keep their own textures where a mod sets none.
@@ -3025,16 +3103,22 @@ static bool write_extra_tables(const ShimState *mod, D3D12_GPU_DESCRIPTOR_HANDLE
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
 	UINT size, reg;
 
+	// A null UAV is safe on a game list. A bound one is not yet: its
+	// writes and subsequent shim commands need to be ordered together.
+	for (Dx12ShaderStage stage : graphics_stages) {
+		for (reg = 0; reg < 64; reg++) {
+			if ((extension->extra.uav[stage] & 1ull << reg) && reg < SHIM_UAV_SLOTS && mod->om_uavs[reg])
+				return false;
+		}
+	}
+
 	for (Dx12ShaderStage stage : graphics_stages) {
 		const ShimStageState *bound = &mod->stages[stage];
-		const ShimShader *shader;
-
 		if (extension->parameters[stage] < 0)
 			continue;
-		shader = mod_shader_form(mod, stage);
 
 		size = count_bits(extension->extra.cbv[stage]) + count_bits(extension->extra.srv[stage][0])
-			+ count_bits(extension->extra.srv[stage][1]);
+			+ count_bits(extension->extra.srv[stage][1]) + count_bits(extension->extra.uav[stage]);
 		if (!table_room(size, extension->parameters[stage], &cpu, &tables[stage]))
 			return false;
 
@@ -3058,8 +3142,16 @@ static bool write_extra_tables(const ShimState *mod, D3D12_GPU_DESCRIPTOR_HANDLE
 				view = ShimViewOf(bound->srvs[reg]);
 			if (view && !view->resource->foreign && view->handle.ptr && Dx12ShimUseOnGameList(view->resource, scope->list))
 				dx12_shim->device->CopyDescriptorsSimple(1, cpu, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-			else
-				Dx12ShimNullSrv(shader->srv_dimension[reg], cpu);
+			else {
+				BYTE dimension = scope->shaders[stage] ? scope->shaders[stage]->srv_dimension[reg] : D3D_SRV_DIMENSION_TEXTURE2D;
+				Dx12ShimNullSrv(dimension ? dimension : D3D_SRV_DIMENSION_TEXTURE2D, cpu);
+			}
+			cpu.ptr += dx12_shim_view_increment;
+		}
+		for (reg = 0; reg < 64; reg++) {
+			if (!(extension->extra.uav[stage] & 1ull << reg))
+				continue;
+			Dx12ShimNullUav(scope->shaders[stage] ? scope->shaders[stage]->uav_dimension[reg] : 0, cpu);
 			cpu.ptr += dx12_shim_view_increment;
 		}
 	}
@@ -4598,8 +4690,11 @@ static void shader_info_of_mod(const ShimShader *shader, Dx12ShaderInfo *info)
 	info->reflected = shader->reflected;
 	info->srv[0] = shader->srv_used[0];
 	info->srv[1] = shader->srv_used[1];
+	memcpy(info->srv_dimension, shader->srv_dimension, sizeof(info->srv_dimension));
 	info->cbv = shader->cbv_used;
 	info->uav = shader->uav_used;
+	info->samplers = shader->sampler_used;
+	memcpy(info->uav_dimension, shader->uav_dimension, min(sizeof(info->uav_dimension), sizeof(shader->uav_dimension)));
 	info->targets = shader->targets;
 	info->bytecode = shader->bytecode.data();
 }
@@ -4669,10 +4764,53 @@ static void note_custom_shader_failure(UINT stages, const char *why)
 	Dx12DumpNote("%s\n", text);
 }
 
+static bool extra_sampler(Dx12ShaderStage stage, UINT reg, D3D12_STATIC_SAMPLER_DESC *out)
+{
+	static const D3D12_SHADER_VISIBILITY visibility[] = {
+		D3D12_SHADER_VISIBILITY_VERTEX, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_GEOMETRY,
+		D3D12_SHADER_VISIBILITY_HULL, D3D12_SHADER_VISIBILITY_DOMAIN,
+	};
+	const ShimState *mod = dx12_shim->shim_context->mState;
+	const ShimSamplerState *sampler = reg < SHIM_SAMPLER_SLOTS ? static_cast<const ShimSamplerState*>(mod->stages[stage].samplers[reg]) : NULL;
+	D3D11_SAMPLER_DESC desc = {};
+	if (sampler) {
+		desc = sampler->mDesc;
+	} else {
+		desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		desc.AddressU = desc.AddressV = desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		desc.MaxAnisotropy = 1;
+		desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		desc.BorderColor[0] = desc.BorderColor[1] = desc.BorderColor[2] = desc.BorderColor[3] = 1.0f;
+		desc.MinLOD = -FLT_MAX;
+		desc.MaxLOD = FLT_MAX;
+	}
+	*out = {};
+	out->Filter = (D3D12_FILTER)desc.Filter;
+	out->AddressU = (D3D12_TEXTURE_ADDRESS_MODE)desc.AddressU;
+	out->AddressV = (D3D12_TEXTURE_ADDRESS_MODE)desc.AddressV;
+	out->AddressW = (D3D12_TEXTURE_ADDRESS_MODE)desc.AddressW;
+	out->MipLODBias = desc.MipLODBias;
+	out->MaxAnisotropy = desc.MaxAnisotropy;
+	out->ComparisonFunc = (D3D12_COMPARISON_FUNC)desc.ComparisonFunc;
+	if (desc.BorderColor[0] == 0 && desc.BorderColor[1] == 0 && desc.BorderColor[2] == 0 && desc.BorderColor[3] == 0)
+		out->BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+	else if (desc.BorderColor[0] == 0 && desc.BorderColor[1] == 0 && desc.BorderColor[2] == 0 && desc.BorderColor[3] == 1)
+		out->BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+	else if (desc.BorderColor[0] == 1 && desc.BorderColor[1] == 1 && desc.BorderColor[2] == 1 && desc.BorderColor[3] == 1)
+		out->BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+	else if (desc.AddressU == D3D11_TEXTURE_ADDRESS_BORDER || desc.AddressV == D3D11_TEXTURE_ADDRESS_BORDER || desc.AddressW == D3D11_TEXTURE_ADDRESS_BORDER)
+		return false;
+	out->MinLOD = desc.MinLOD;
+	out->MaxLOD = desc.MaxLOD;
+	out->ShaderRegister = reg;
+	out->ShaderVisibility = visibility[stage];
+	return true;
+}
+
 // The game's root signature extended for the registers of the mod's shaders of
 // the stages that it has nothing for, made once for each set of shaders. NULL
 // if it has something for all of them, or it cannot be extended for them.
-static const Dx12ExtendedSignature* extension_for(const ShimState *mod, UINT stages)
+static const Dx12ExtendedSignature* extension_for(const Dx12PipelineVariantDesc *variant, UINT stages)
 {
 	static bool too_many;
 	std::vector<Dx12ExtendedSignature> *extended = &scope->signature->extended;
@@ -4683,8 +4821,19 @@ static const Dx12ExtendedSignature* extension_for(const ShimState *mod, UINT sta
 	UINT reg;
 
 	for (Dx12ShaderStage stage : graphics_stages) {
-		if (stages & 1u << stage)
-			key = (key ^ stage) * 0x9e3779b97f4a7c15ull ^ scope->mod_shaders[stage].hash;
+		if (stages & 1u << stage) {
+			key = (key ^ stage) * 0x9e3779b97f4a7c15ull ^ variant->shaders[stage]->hash;
+			for (reg = 0; reg < SHIM_SAMPLER_SLOTS; reg++) {
+				D3D12_STATIC_SAMPLER_DESC sampler;
+				if (!(variant->shaders[stage]->samplers & 1u << reg)
+				    || Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, reg, &location))
+					continue;
+				if (!extra_sampler(stage, reg, &sampler))
+					return NULL;
+				entry.samplers.push_back(sampler);
+				key = (key * 0x9e3779b97f4a7c15ull) ^ fnv_64_buf(&sampler, sizeof(sampler));
+			}
+		}
 	}
 	for (const Dx12ExtendedSignature &existing : *extended) {
 		if (existing.key == key)
@@ -4697,26 +4846,29 @@ static const Dx12ExtendedSignature* extension_for(const ShimState *mod, UINT sta
 
 	entry.key = key;
 	for (Dx12ShaderStage stage : graphics_stages) {
-		const ShimShader *shader = stages & 1u << stage ? mod_shader_form(mod, stage) : NULL;
+		const Dx12ShaderInfo *shader = stages & 1u << stage ? variant->shaders[stage] : NULL;
 
 		if (!shader)
 			continue;
 		if (!shader->reflected)
 			goto unextended;
 		for (reg = 0; reg < 64; reg++) {
-			// UAVs are not given a table of their own
-			if (shader->uav_used & 1ull << reg && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, reg, &location))
-				goto unextended;
-			if (reg < 32 && shader->cbv_used & 1u << reg && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, reg, &location))
+			if (shader->uav & 1ull << reg && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, reg, &location)) {
+				// A patched game shader has no UAV dimension information yet.
+				if (!shader->uav_dimension[reg])
+					goto unextended;
+				entry.extra.uav[stage] |= 1ull << reg;
+			}
+			if (shader->cbv & 1ull << reg && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, reg, &location))
 				entry.extra.cbv[stage] |= 1ull << reg;
 		}
 		for (reg = 0; reg < 128; reg++) {
-			if (shader->srv_used[reg / 64] & 1ull << reg % 64 && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, reg, &location))
+			if (shader->srv[reg / 64] & 1ull << reg % 64 && !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, reg, &location))
 				entry.extra.srv[stage][reg / 64] |= 1ull << reg % 64;
 		}
-		missing |= entry.extra.cbv[stage] || entry.extra.srv[stage][0] || entry.extra.srv[stage][1];
+		missing |= entry.extra.cbv[stage] || entry.extra.srv[stage][0] || entry.extra.srv[stage][1] || entry.extra.uav[stage];
 	}
-	if (missing)
+	if (missing || !entry.samplers.empty())
 		Dx12ExtendRootSignature(scope->signature, dx12_shim->device, &entry);
 unextended:
 	extended->push_back(entry);
@@ -4737,7 +4889,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	ID3D12PipelineState *variant = NULL;
 	Dx12PipelineVariantDesc wanted = {};
 	const char *why = NULL;
-	UINT stages = 0;
+	UINT stages = 0, patched_stages = 0, variant_stages;
 
 	if (scope->game_layout && mod->input_layout && mod->input_layout != scope->game_layout) {
 		const ShimInputLayout *layout = static_cast<const ShimInputLayout*>(mod->input_layout);
@@ -4752,18 +4904,46 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		wanted.elements = layout->mElements.data();
 		wanted.element_count = (UINT)layout->mElements.size();
 	}
+	if (!scope->compute && mod->blend) {
+		copy_blend_state(&wanted.blend, &static_cast<const ShimBlendState*>(mod->blend)->mDesc);
+		wanted.blend_override = true;
+		wanted.sample_mask = mod->sample_mask;
+		wanted.sample_mask_override = true;
+	}
+	if (!scope->compute && mod->depth_stencil) {
+		copy_depth_stencil_state(&wanted.depth_stencil, &static_cast<const ShimDepthStencilState*>(mod->depth_stencil)->mDesc);
+		wanted.depth_stencil_override = true;
+	}
 	if (mod_draw && !scope->compute && !scope->skin) {
 		for (Dx12ShaderStage stage : graphics_stages) {
 			const ShimShader *shader = mod_shader_form(mod, stage);
 
 			if (!shader) {
-				if (mod->stages[stage].shader_unbound && scope->pipeline->shaders[stage])
+				if (mod->stages[stage].shader_unbound && scope->pipeline->shaders[stage]) {
 					wanted.removed_stages |= 1u << stage;
+					continue;
+				}
+				// A mod draw can keep a game's shader for a stage it does not
+				// replace. Apply DXIL ShaderRegex patches to that stage too.
+				const Dx12ShaderInfo *patched = DxilGameShader(scope->pipeline->shaders[stage], false, NULL);
+				if (patched) {
+					wanted.shaders[stage] = patched;
+					patched_stages |= 1u << stage;
+				}
 				continue;
 			}
 			shader_info_of_mod(shader, &scope->mod_shaders[stage]);
 			wanted.shaders[stage] = &scope->mod_shaders[stage];
 			stages |= 1u << stage;
+		}
+	} else if (!scope->compute && !scope->skin) {
+		for (Dx12ShaderStage stage : graphics_stages) {
+			const Dx12ShaderInfo *patched = DxilGameShader(scope->pipeline->shaders[stage], false, NULL);
+
+			if (!patched)
+				continue;
+			wanted.shaders[stage] = patched;
+			patched_stages |= 1u << stage;
 		}
 	}
 	// A pixel shader of a mod reads what the stage before it wrote in the
@@ -4792,12 +4972,13 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		}
 	}
 
-	if (stages && extend && scope->signature)
-		extension = extension_for(mod, stages);
+	variant_stages = stages | patched_stages;
+	if (variant_stages && extend && scope->signature)
+		extension = extension_for(&wanted, variant_stages);
 	if (extension)
 		wanted.root_signature = extension->signature;
 
-	if (wanted.elements || stages || wanted.removed_stages)
+	if (wanted.elements || variant_stages || wanted.removed_stages || wanted.blend_override || wanted.depth_stencil_override)
 		variant = Dx12PipelineVariant(scope->pipeline, dx12_shim->device, &wanted, &why);
 	if (variant && extension)
 		scope->extension = *extension;
@@ -4819,6 +5000,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		scope->custom_failed = true;
 		if (G->dx12_dump_hashes)
 			note_custom_shader_failure(stages, why);
+	}
+	if (patched_stages && !variant && G->dx12_dump_hashes) {
+		static bool noted;
+		log_once(&noted, why ? why : "A patched DXIL shader's pipeline variant could not be made. The original shader was used.");
 	}
 
 	if (G->dx12_dump_hashes && mod->input_layout && mod->input_layout != scope->game_layout)
@@ -4854,10 +5039,18 @@ static void apply_overrides(bool mod_draw)
 	// Before the bindings, which go by the shaders of the draw
 	scope->custom_failed = false;
 	apply_pipeline(mod, mod_draw, true);
+	if (!scope->compute && mod->blend) {
+		list->OMSetBlendFactor(mod->blend_factor);
+		scope->blend_factor_changed = true;
+	}
+	if (!scope->compute && mod->depth_stencil) {
+		list->OMSetStencilRef(mod->stencil_ref);
+		scope->stencil_ref_changed = true;
+	}
 	if (scope->extension.signature && !write_extra_tables(mod, extra_tables)) {
 		static bool no_room;
 
-		log_once(&no_room, "No room for the descriptors of registers of a mod's shaders the game's root signature has nothing for. The draw was made with the game's shaders.");
+		log_once(&no_room, "Descriptors for registers of a mod's shaders the game's root signature has nothing for were unavailable, or a writable UAV was bound. The draw was made with the game's shaders.");
 		stats.custom_draws--;
 		stats.custom_extended--;
 		apply_pipeline(mod, mod_draw, false);
@@ -5195,6 +5388,8 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	opened->vbs_changed = 0;
 	opened->ib_changed = false;
 	opened->topology_changed = false;
+	opened->blend_factor_changed = false;
+	opened->stencil_ref_changed = false;
 	opened->variant = NULL;
 	opened->game_layout = NULL;
 	opened->parameters.clear();
@@ -5376,10 +5571,10 @@ static bool register_guard(CommandListExpression *expression, const CommandListC
 // With the lock held
 // The hashes are of the shaders the engine is told of, by stage and 0 for
 // none
-static void work_out_filter(Dx12DrawFilter *filter, const UINT64 *hashes)
+static void work_out_filter(Dx12DrawFilter *filter, const UINT64 *hashes, bool patched_shader = false)
 {
 	CommandListCheckedSlots slots = {};
-	bool only_checks = true;
+	bool only_checks = !patched_shader;
 	Dx12ShaderStage stage;
 	unsigned i, guard;
 
@@ -5387,6 +5582,8 @@ static void work_out_filter(Dx12DrawFilter *filter, const UINT64 *hashes)
 
 	// The shaders HackerContext::BeforeDraw looks up
 	for (Dx12ShaderStage graphics_stage : graphics_stages) {
+		if (!only_checks)
+			break;
 		if (!hashes[graphics_stage] && graphics_stage != DX12_STAGE_VS && graphics_stage != DX12_STAGE_PS)
 			continue;
 		auto found = lookup_shaderoverride(hashes[graphics_stage]);
@@ -5448,10 +5645,15 @@ static void work_out_filter(Dx12DrawFilter *filter, const UINT64 *hashes)
 static void work_out_filter(const Dx12PipelineInfo *pipeline, const Dx12ShaderInfo *const *shaders)
 {
 	UINT64 hashes[DX12_STAGE_COUNT] = {};
+	bool patched_shader = false;
 
-	for (Dx12ShaderStage stage : graphics_stages)
+	for (Dx12ShaderStage stage : graphics_stages) {
 		hashes[stage] = shaders[stage] ? shaders[stage]->hash : 0;
-	work_out_filter(&pipeline->filter, hashes);
+		if (!pipeline->shaders[DX12_STAGE_CS] && shader_regex_dxil_groups && shaders[stage]
+		    && DxilGameShader(shaders[stage], false, NULL))
+			patched_shader = true;
+	}
+	work_out_filter(&pipeline->filter, hashes, patched_shader);
 }
 
 void Dx12WorkOutFilter(Dx12DrawFilter *filter, const UINT64 *shader_hashes)
@@ -6434,7 +6636,7 @@ static void link_shader_regex()
 
 	Dx12GetShaders(regex_linked_shaders, &found);
 	regex_linked_shaders += found.size();
-	if (!shader_regex_d3d_groups)
+	if (!shader_regex_d3d_groups && !shader_regex_dxil_groups)
 		return;
 
 	for (const Dx12ShaderInfo *shader : found) {

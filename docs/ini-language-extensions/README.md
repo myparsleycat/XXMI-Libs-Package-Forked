@@ -12,4 +12,5 @@
 * [Pools](pools/README.md) — indexed storage for resources and variables
 * [Input Layouts](input-layouts/README.md) — vertex input layout overrides
 * [SPIR-V Shader Regex](spirv-shader-regex/README.md) — ShaderRegex patches for Vulkan vertex and pixel shaders
+* [DXIL Shader Regex](dxil-shader-regex/README.md) — ShaderRegex patches for Direct3D 12 shaders
 * [Examples](examples/README.md) — practical scripts combining the extensions above

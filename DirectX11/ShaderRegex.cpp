@@ -4,6 +4,8 @@
 #include "log.h"
 #include "Overlay.h"
 #include "dx12/PipelineRegistry.h"
+#include "dx12/DxilPatch.h"
+#include "dx12/HashDump.h"
 #include "ByteCodeReader.h"
 
 #include <algorithm>
@@ -12,9 +14,11 @@
 #include <iterator>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 ShaderRegexGroups shader_regex_groups;
 bool shader_regex_d3d_groups;
+bool shader_regex_dxil_groups;
 std::vector<ShaderRegexGroup*> shader_regex_group_index;
 uint32_t shader_regex_hash;
 
@@ -219,7 +223,7 @@ bool ShaderRegexPattern::named_group_overlaps(ShaderRegexTemps &other_set)
 	return intersection.size() != 0;
 }
 
-bool ShaderRegexPattern::matches(std::string *asm_text)
+bool ShaderRegexPattern::matches(std::string *asm_text) const
 {
 	pcre2_match_data *match_data = NULL;
 	bool match = false;
@@ -291,7 +295,7 @@ bool ShaderRegexPattern::patch(std::string *asm_text, ShaderRegexTemps *temp_reg
 	return patch_with(asm_text, replace_copy);
 }
 
-bool ShaderRegexPattern::patch_with(std::string *asm_text, const std::string &replace_copy)
+bool ShaderRegexPattern::patch_with(std::string *asm_text, const std::string &replace_copy) const
 {
 	pcre2_match_data *match_data = NULL;
 	PCRE2_SIZE est_size, output_size;
@@ -380,6 +384,61 @@ bool parse_spirv_declaration(const std::string &line, int ini_params_reg, SpirvD
 		return true;
 	}
 	return false;
+}
+
+bool parse_dxil_declaration(const std::string &line, DxilDeclaration *declaration)
+{
+	const char *reg_text = NULL;
+	size_t reg_pos;
+	declaration->sampler = false;
+	if (!_strnicmp(line.c_str(), "dcl_sampler ", 12)) {
+		unsigned reg;
+		int len = 0;
+		const char *text = line.c_str() + 12;
+		if (sscanf_s(text, "s%u, mode_default%n", &reg, &len) != 1 || (size_t)len != strlen(text) || reg >= 16)
+			return false;
+		declaration->reg = reg;
+		declaration->dimension = 0;
+		declaration->uav = false;
+		declaration->sampler = true;
+		return true;
+	}
+	if (!_strnicmp(line.c_str(), "dcl_uav_raw ", 12)) {
+		unsigned reg;
+		int len = 0;
+		const char *text = line.c_str() + 12;
+		if (sscanf_s(text, "u%u%n", &reg, &len) != 1 || (size_t)len != strlen(text) || reg >= 64)
+			return false;
+		declaration->reg = reg;
+		declaration->dimension = D3D11_UAV_DIMENSION_BUFFER;
+		declaration->uav = true;
+		return true;
+	}
+	declaration->uav = false;
+	unsigned reg;
+	int len = 0;
+
+	bool one_dimensional = !_strnicmp(line.c_str(), "texture1d ", 10)
+		|| !_strnicmp(line.c_str(), "dcl_resource_texture1d ", 23);
+	if (one_dimensional || !_strnicmp(line.c_str(), "texture2d ", 10)
+	    || !_strnicmp(line.c_str(), "dcl_resource_texture2d ", 23)) {
+		declaration->dimension = one_dimensional ? D3D_SRV_DIMENSION_TEXTURE1D : D3D_SRV_DIMENSION_TEXTURE2D;
+	} else {
+		return false;
+	}
+	if (!_strnicmp(line.c_str(), "texture1d ", 10) || !_strnicmp(line.c_str(), "texture2d ", 10)) {
+		reg_text = line.c_str() + 10;
+	} else {
+		reg_pos = line.rfind(" t");
+		if (reg_pos == std::string::npos)
+			return false;
+		reg_text = line.c_str() + reg_pos + 1;
+	}
+
+	if (sscanf_s(reg_text, "t%u%n", &reg, &len) != 1 || (size_t)len != strlen(reg_text) || reg >= 128)
+		return false;
+	declaration->reg = reg;
+	return true;
 }
 
 void ShaderRegexGroup::apply_regex_patterns(std::string *asm_text, bool *match, bool *patch)
@@ -506,14 +565,31 @@ bool ShaderRegexGroup::dx12_matches(const Dx12ShaderInfo *shader) const
 
 bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
 {
+	static uint32_t reported_hash;
+	static std::unordered_set<std::wstring> reported_legacy;
+	static std::mutex reported_mutex;
 	const char *shader_type = dx12_stage_names[shader->stage];
 	size_t length = strlen(shader_type);
 	bool linked = false;
+	std::unique_lock<std::mutex> report_guard(reported_mutex, std::defer_lock);
+	if (G->dx12_dump_hashes && shader->dxil)
+		report_guard.lock();
+	if (report_guard.owns_lock() && reported_hash != shader_regex_hash) {
+		reported_hash = shader_regex_hash;
+		reported_legacy.clear();
+	}
 
 	for (auto &entry : shader_regex_groups) {
 		ShaderRegexGroup *group = &entry.second;
+		if (report_guard.owns_lock() && !group->spirv() && !group->dxil() && !group->patterns.empty()) {
+			bool stage_matches = std::any_of(group->shader_models.begin(), group->shader_models.end(), [&](const std::string &model) {
+				return model.size() > length && model.compare(0, length, shader_type) == 0 && model[length] == '_';
+			});
+			if (stage_matches && reported_legacy.insert(group->ini_section).second)
+				Dx12DumpNote("DXIL does not apply legacy Pattern/Replace in [%S]; a DxilPattern is required for shader changes.\n", group->ini_section.c_str());
+		}
 
-		if (group->spirv() || (group->dx12_match ? !group->dx12_matches(shader) : !group->patterns.empty()))
+		if (group->spirv() || group->dxil() || (group->dx12_match ? !group->dx12_matches(shader) : !group->patterns.empty()))
 			continue;
 		if (group->command_list.noop() && group->post_command_list.noop() && group->filter_index == FLT_MAX)
 			continue;
@@ -526,6 +602,7 @@ bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
 			break;
 		}
 	}
+	DxilGameShader(shader, true, NULL);
 
 	return linked;
 }
@@ -539,7 +616,8 @@ bool link_shader_regex_groups_declared(const char *shader_type, UINT64 hash, std
 		ShaderRegexGroup *group = &entry.second;
 		bool match = true;
 
-		if (group->patterns.empty() || group->dx12_match || !group->declarations.empty() || group->spirv())
+		if (group->patterns.empty() || group->dx12_match || !group->declarations.empty() || group->spirv()
+		    || (group->dxil() && group->patterns.empty()))
 			continue;
 		if (group->command_list.noop() && group->post_command_list.noop() && group->filter_index == FLT_MAX)
 			continue;
@@ -878,7 +956,7 @@ static void link_shader_regex_groups_without_patterns(const wchar_t* shader_type
 		ShaderRegexGroup* group = &i->second;
 
 		// Skip group without matching shader model, and those for SPIR-V.
-		if (!group->shader_models.count(*shader_model) || group->spirv()) {
+		if (!group->shader_models.count(*shader_model) || group->spirv() || (group->dxil() && group->patterns.empty())) {
 			continue;
 		}
 
@@ -925,7 +1003,7 @@ bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type
 		group = &i->second;
 
 		// Skip group without matching shader model, and those for SPIR-V.
-		if (!group->shader_models.count(*shader_model) || group->spirv()) {
+		if (!group->shader_models.count(*shader_model) || group->spirv() || (group->dxil() && group->patterns.empty())) {
 			continue;
 		}
 

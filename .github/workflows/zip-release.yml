@@ -47,6 +47,13 @@ jobs:
       run: |
         $dll_files = Get-ChildItem -Path './x64/Zip Release' -Filter '*.dll'
         Compress-Archive -Path $dll_files.FullName -DestinationPath './LibrariesTemp.zip'
+
+    - name: Zip ZZMI DX12 RabbitFX adapter
+      shell: pwsh
+      run: |
+        Compress-Archive `
+          -Path './Mods/ZZMI DX12 Compatibility' `
+          -DestinationPath './zzmi-dx12-rabbitfx-7.10.zip'
         
     - name: Create GitHub Release
       id: create_release
@@ -64,6 +71,16 @@ jobs:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
         asset_path: './LibrariesTemp.zip'
         asset_name: XXMI-PACKAGE-${{ github.ref_name }}.zip
+        asset_content_type: application/zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload ZZMI DX12 RabbitFX adapter
+      uses: actions/upload-release-asset@v1
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: './zzmi-dx12-rabbitfx-7.10.zip'
+        asset_name: zzmi-dx12-rabbitfx-7.10.zip
         asset_content_type: application/zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

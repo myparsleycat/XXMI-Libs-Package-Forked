@@ -46,10 +46,17 @@ struct Dx12ShaderInfo {
 	// A view register the masks below have no bit for: of another space
 	// than 0, or past what they reach
 	bool unmasked;
+	// A UAV in any register space, including one outside the mask below.
+	bool has_uav;
 	// Registers of space 0 the shader declares: t0-t127, b0-b63, u0-u63
 	UINT64 srv[2];
+	// The dimensions of SRVs added to a patched DXIL shader, and of SRVs in
+	// a mod shader, for a null descriptor where the draw binds nothing.
+	BYTE srv_dimension[128] = {};
 	UINT64 cbv;
 	UINT64 uav;
+	UINT samplers;
+	BYTE uav_dimension[64] = {};
 	// How many bytes the shader declares for the constant buffers b0-b15 of
 	// space 0, which is all that tells where a buffer bound by address
 	// ends. 0 where it has none or that could not be read.
@@ -68,6 +75,7 @@ struct Dx12RootRange {
 	// UINT_MAX if unbounded
 	UINT count;
 	UINT space;
+	D3D12_DESCRIPTOR_RANGE_FLAGS flags;
 	// In descriptors from the start of the table
 	UINT offset;
 };
@@ -87,14 +95,16 @@ struct Dx12RootParameter {
 struct Dx12ExtraRegisters {
 	UINT64 srv[DX12_STAGE_COUNT][2];
 	UINT64 cbv[DX12_STAGE_COUNT];
+	UINT64 uav[DX12_STAGE_COUNT];
 };
 
 // The game's root signature with a descriptor table more for each stage that
 // has extra registers: the b registers of the stage in ascending order, then
-// its t registers, one descriptor each
+// its t registers, then its u registers, one descriptor each
 struct Dx12ExtendedSignature {
 	UINT64 key;
 	Dx12ExtraRegisters extra;
+	std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
 	// NULL where none is needed or it could not be made. Referenced.
 	ID3D12RootSignature *signature;
 	// The root parameter of the table of each stage, -1 for none
@@ -109,6 +119,8 @@ struct Dx12RootSignatureInfo {
 	// something for, with the register it was worked out for. 0 if it
 	// has not been.
 	mutable volatile LONG ini_params = 0;
+	mutable bool static_samplers_read = false;
+	mutable UINT static_samplers[DX12_STAGE_COUNT] = {};
 	// For DrawPath, with its lock held: what Dx12ExtendRootSignature made
 	// of it, by the key DrawPath makes of the shaders of the mod
 	mutable std::vector<Dx12ExtendedSignature> extended;
@@ -121,6 +133,7 @@ struct Dx12RootSignatureInfo {
 // list does not record and so cannot be set again after the root signature
 // is changed, or where D3D12 refuses it.
 bool Dx12ExtendRootSignature(const Dx12RootSignatureInfo *info, ID3D12Device *device, Dx12ExtendedSignature *extended);
+bool Dx12HasStaticSampler(const Dx12RootSignatureInfo *info, Dx12ShaderStage stage, UINT reg);
 
 struct Dx12InputElement {
 	std::string semantic;
@@ -187,9 +200,9 @@ struct Dx12PipelineInfo {
 	~Dx12PipelineInfo();
 };
 
-// Set by whatever needs the shaders of the game's pipelines kept as the game
-// gave them (Dx12ShaderInfo::bytecode) without hunting being on. Goes for the
-// shaders seen from then on.
+// Set by whatever needs DXBC shaders of the game's pipelines kept as the game
+// gave them (Dx12ShaderInfo::bytecode) without hunting being on. DXIL is always
+// retained so ShaderRegex rules added by an F10 reload can patch existing shaders.
 extern volatile bool dx12_keep_shader_bytecode;
 
 // For the methods creating these objects, on success. ppv is what the game
@@ -214,6 +227,13 @@ struct Dx12PipelineVariantDesc {
 	// In place of the game's root signature, for registers of the mod's
 	// shaders the game's has nothing for (Dx12ExtendRootSignature)
 	ID3D12RootSignature *root_signature;
+	// Output-merger state set by a CustomShader on the shim context
+	bool blend_override;
+	D3D12_BLEND_DESC blend;
+	bool sample_mask_override;
+	UINT sample_mask;
+	bool depth_stencil_override;
+	D3D12_DEPTH_STENCIL_DESC depth_stencil;
 };
 
 // The game's pipeline made again with that. Not referenced: it lives as long
@@ -223,6 +243,9 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		const char **why_failed);
 const Dx12ShaderInfo* Dx12FindShader(UINT64 hash);
 bool Dx12BytecodeIsDxil(const void *bytecode, size_t size);
+// Reads resource metadata from a shader container without registering it.
+// Returns false when neither PSV0 nor RDEF can be read completely.
+bool Dx12ReflectShaderResources(const void *bytecode, size_t size, Dx12ShaderInfo *info);
 
 // An element of the input or output signature of a shader
 struct Dx12SignatureElement {

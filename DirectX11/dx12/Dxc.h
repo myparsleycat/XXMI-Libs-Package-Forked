@@ -13,6 +13,11 @@
 
 bool Dx12DxcAvailable();
 
+// Disassemble and assemble a DXIL container for ShaderRegex patches, then
+// validate and sign the assembled container for D3D12.
+bool Dx12DxcDisassemble(const void *bytecode, size_t size, std::string *text, std::string *errors);
+bool Dx12DxcAssemble(const std::string &text, std::vector<BYTE> *bytecode, std::string *errors);
+
 // Compiles HLSL to DXIL for the shader model 6.0 profile of the stage (the
 // first letter of the target, as D3DCompile takes it) with the same macros and
 // compile flags as D3DCompile would, as far as the compiler has them. What
