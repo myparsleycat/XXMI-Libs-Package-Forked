@@ -4,7 +4,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*-nhd.*'
   # Builds without creating a release
   workflow_dispatch:
 
@@ -33,6 +33,7 @@ jobs:
       run: >
         msbuild StereoVisionHacks.sln
         -target:DirectX11:Rebuild
+        -maxCpuCount
         -property:Configuration=Release
         -property:Platform=x64
         -verbosity:minimal
@@ -40,14 +41,14 @@ jobs:
     - name: Upload DLL and symbols
       uses: actions/upload-artifact@v4
       with:
-        name: d3d11-${{ github.ref_name }}
+        name: d3d11-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
         path: |
           x64/Release/d3d11.dll
           x64/Release/d3d11.pdb
         if-no-files-found: error
 
     - name: Create draft release
-      if: github.ref_type == 'tag'
+      if: github.event_name == 'push' && github.ref_type == 'tag'
       shell: pwsh
       env:
         GH_TOKEN: ${{ github.token }}
@@ -58,8 +59,23 @@ jobs:
         $assets = @(./tools/release-assets.ps1)
 
         # The package zips are not built here; every release carries over the previous release's
-        $previous = gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName
-        gh release download $previous -R $env:GITHUB_REPOSITORY -p '*.zip' -D carry
-        $assets += @(Get-ChildItem carry -Filter *.zip | ForEach-Object FullName)
+        $previous = gh release view -R $env:GITHUB_REPOSITORY --json tagName,assets | ConvertFrom-Json
+        if ($previous.assets.name -like '*.zip') {
+          gh release download $previous.tagName -R $env:GITHUB_REPOSITORY -p '*.zip' -D carry
+          $assets += @(Get-ChildItem carry -Filter *.zip | ForEach-Object FullName)
+        } else {
+          Write-Warning "$($previous.tagName) has no zip assets to carry over"
+        }
 
-        gh release create $env:TAG -R $env:GITHUB_REPOSITORY --draft --verify-tag --title $env:TAG --notes '' @assets
+        # A re-run fills the draft the failed run left instead of making a second one.
+        # Listing (drafts included) keeps "no release" apart from a failed request,
+        # which gh release view <tag> reports with the same exit code.
+        $existing = gh release list -R $env:GITHUB_REPOSITORY --json tagName,isDraft | ConvertFrom-Json | Where-Object tagName -eq $env:TAG
+        if ($existing | Where-Object { -not $_.isDraft }) {
+          throw "$env:TAG is already published; not replacing its assets"
+        }
+        if ($existing) {
+          gh release upload $env:TAG -R $env:GITHUB_REPOSITORY --clobber @assets
+        } else {
+          gh release create $env:TAG -R $env:GITHUB_REPOSITORY --draft --verify-tag --title $env:TAG --notes '' @assets
+        }

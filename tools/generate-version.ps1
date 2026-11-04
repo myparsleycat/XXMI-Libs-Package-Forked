@@ -101,6 +101,12 @@ else {
 # Version tag
 # ---------------------------------------------------------------------------
 
+# The build runs this without -Tag. On a GitHub Actions tag build, take the tag
+# that started it; git describe could pick another tag on the same commit.
+if ([string]::IsNullOrWhiteSpace($Tag) -and $env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v\d') {
+    $Tag = $env:GITHUB_REF_NAME
+}
+
 if ([string]::IsNullOrWhiteSpace($Tag)) {
     try {
         $Tag = Invoke-Git @(
