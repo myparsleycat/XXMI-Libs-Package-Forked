@@ -1,12 +1,13 @@
-name: Zip Release
+name: Release
 
 
 on:
   push:
     tags:
-      # Trigger on tags (i.e. v1.0.0, v2.1.0, etc)
       - 'v*'
-      
+  # Builds without creating a release
+  workflow_dispatch:
+
 
 permissions:
   contents: write
@@ -20,50 +21,45 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
+        # generate-version.ps1, which the build runs, reads the version from the tags
         fetch-depth: 0
-
-    - name: Generate version header
-      shell: pwsh
-      run: |
-        .\tools\generate-version.ps1 `
-          -VersionFile .\version.h `
-          -OutputFile .\version.generated.h `
-          -Tag "${{ github.ref_name }}"
 
     - name: Add MSBuild for VS2022 to PATH
       uses: microsoft/setup-msbuild@v2
       with:
         vs-version: '[17.0,18.0)'
 
-    - name: Build solution
+    - name: Build d3d11.dll
       run: >
         msbuild StereoVisionHacks.sln
-        -property:Configuration="Zip Release"
+        -target:DirectX11:Rebuild
+        -property:Configuration=Release
         -property:Platform=x64
-        -target:rebuild
         -verbosity:minimal
 
-    - name: Zip DLLs
-      run: |
-        $dll_files = Get-ChildItem -Path './x64/Zip Release' -Filter '*.dll'
-        Compress-Archive -Path $dll_files.FullName -DestinationPath './LibrariesTemp.zip'
-        
-    - name: Create GitHub Release
-      id: create_release
-      uses: actions/create-release@v1
+    - name: Upload DLL and symbols
+      uses: actions/upload-artifact@v4
       with:
-        tag_name: ${{ github.ref_name }}
-        release_name: ${{ github.ref_name }}
-        prerelease: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: d3d11-${{ github.ref_name }}
+        path: |
+          x64/Release/d3d11.dll
+          x64/Release/d3d11.pdb
+        if-no-files-found: error
 
-    - name: Upload Zip as Release Asset
-      uses: actions/upload-release-asset@v1
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: './LibrariesTemp.zip'
-        asset_name: XXMI-PACKAGE-${{ github.ref_name }}.zip
-        asset_content_type: application/zip
+    - name: Create draft release
+      if: github.ref_type == 'tag'
+      shell: pwsh
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        $assets = @(./tools/release-assets.ps1)
+
+        # The package zips are not built here; every release carries over the previous release's
+        $previous = gh release view -R $env:GITHUB_REPOSITORY --json tagName -q .tagName
+        gh release download $previous -R $env:GITHUB_REPOSITORY -p '*.zip' -D carry
+        $assets += @(Get-ChildItem carry -Filter *.zip | ForEach-Object FullName)
+
+        gh release create $env:TAG -R $env:GITHUB_REPOSITORY --draft --verify-tag --title $env:TAG --notes '' @assets
