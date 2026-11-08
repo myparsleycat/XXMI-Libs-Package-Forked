@@ -272,11 +272,6 @@ static void emit_ini_warning_tone()
 		BeepFailure();
 }
 
-inline wchar_t ascii_tolower(wchar_t c)
-{
-	return (c >= L'A' && c <= L'Z') ? c + (L'a' - L'A') : c;
-}
-
 static bool get_namespaced_section_name(const wstring *section, const wstring *ini_namespace, wstring *ret)
 {
 	const wchar_t *section_prefix = SectionPrefix(section->c_str());
