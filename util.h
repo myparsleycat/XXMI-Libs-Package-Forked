@@ -1022,7 +1022,7 @@ struct OMState {
 	ID3D11DepthStencilView *dsv;
 	UINT UAVStartSlot;
 	UINT NumUAVs;
-	ID3D11UnorderedAccessView *uavs[D3D11_PS_CS_UAV_REGISTER_COUNT];
+	ID3D11UnorderedAccessView *uavs[D3D11_1_UAV_SLOT_COUNT];
 #endif // MIGOTO_DX
 };
 

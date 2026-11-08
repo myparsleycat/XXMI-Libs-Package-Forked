@@ -376,6 +376,28 @@ static bool get_namespaced_section_path(const wchar_t *section, wstring *ret)
 	return _get_namespaced_section_path(&ini_sections, section, ret);
 }
 
+void GetSectionOrigin(const wchar_t *section, wstring *name, wstring *ini_path)
+{
+	const wchar_t *prefix = SectionPrefix(section);
+	wchar_t migoto_path[MAX_PATH];
+
+	*name = section;
+	ini_path->clear();
+
+	IniSections::iterator entry = ini_sections.find(section);
+	if (entry == ini_sections.end())
+		return;
+	if (prefix)
+		*name = wstring(prefix) + (section + get_section_namespace_endpos(section));
+
+	// A section without a prefix may have lines from any file
+	if (!prefix || !GetModuleFileName(migoto_handle, migoto_path, MAX_PATH))
+		return;
+	wcsrchr(migoto_path, L'\\')[1] = 0;
+	const wstring &rel_path = entry->second.ini_path.empty() ? entry->second.ini_namespace : entry->second.ini_path;
+	*ini_path = wstring(migoto_path) + (rel_path.empty() ? wstring(INI_FILENAME) : rel_path);
+}
+
 // Returns the section name re-namespaced with the path of the ini file that
 // declared it, lower cased. Only succeeds for sections of files that overrode
 // their namespace, since the result would otherwise equal the section name.

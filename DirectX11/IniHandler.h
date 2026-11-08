@@ -95,6 +95,10 @@ inline wchar_t ascii_tolower(wchar_t c);
 bool get_namespaced_section_name_lower(const wstring *section, const wstring *ini_namespace, wstring *ret);
 bool get_section_namespace(const wchar_t *section, wstring *ret);
 wstring get_namespaced_var_name_lower(const wstring& low_name, const wstring* ini_namespace);
+// A section of the loaded config as its file names it, without the namespace,
+// and the absolute path of that file. The path is empty for a section that is
+// not known or has no prefix, which any file may add lines to.
+void GetSectionOrigin(const wchar_t *section, wstring *name, wstring *ini_path);
 
 // A [ShaderRegex...] group of the loaded config as it is written, for
 // vk/SpirvConvert.cpp to make SPIR-V versions of D3D11 patches with

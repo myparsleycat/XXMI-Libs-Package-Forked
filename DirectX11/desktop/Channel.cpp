@@ -7,8 +7,12 @@
 #include <deque>
 #include <mutex>
 
+#include "Pick.h"
+
 #include "../CommandList.h"
 #include "../globals.h"
+#include "../HackerDXGI.h"
+#include "../input.h"
 #include "../IniHandler.h"
 #include "../log.h"
 #include "../Overlay.h"
@@ -35,6 +39,7 @@ struct Inbound {
 	uint32_t request_id;
 	GetVars get_vars;
 	SetVars set_vars;
+	PickArm pick_arm;
 };
 
 // Shared by the render thread and the pipe thread. The render thread only
@@ -44,6 +49,8 @@ SRWLOCK queue_lock = SRWLOCK_INIT;
 std::deque<Inbound> inbound;
 std::deque<std::vector<uint8_t>> replies;
 std::deque<std::vector<uint8_t>> events;
+std::vector<uint8_t> result;
+bool has_result;
 uint32_t queue_connection;
 // Includes accepted requests still in inbound, render-thread work or pending.
 size_t reserved_replies;
@@ -58,6 +65,9 @@ HelloReply hello_info;
 std::mutex frame_lock;
 bool started;
 uint8_t started_api;
+HackerSwapChain *driving_swap_chain;
+HWND driving_window;
+bool key_pick;
 struct Outbound {
 	DesktopSend kind;
 	std::vector<uint8_t> frame;
@@ -113,6 +123,10 @@ void flush_pending()
 					events.pop_front();
 				events.push_back(std::move(p.frame));
 				break;
+			case DesktopSend::RESULT:
+				result = std::move(p.frame);
+				has_result = true;
+				break;
 			}
 		}
 	}
@@ -167,6 +181,23 @@ void set_vars(const Inbound &in)
 		applied.values.push_back(v);
 	}
 	queue_message(DesktopSend::REPLY, MessageType::VarsApplied, in.request_id, applied, in.connection);
+}
+
+void pick_arm(const Inbound &in)
+{
+	uint64_t id = DesktopPickArm(TRIGGER_DESKTOP, in.pick_arm.cursor == 1, in.pick_arm.x, in.pick_arm.y, in.connection);
+	if (!id) {
+		queue_error(in.request_id, "BUSY", "", in.connection);
+		return;
+	}
+	PickArmed armed;
+	armed.capture_id = id;
+	queue_message(DesktopSend::REPLY, MessageType::PickArmed, in.request_id, armed, in.connection);
+}
+
+void inspect_key_down(HackerDevice*, void*)
+{
+	key_pick = true;
 }
 
 // ----------------------------------------------------------- the pipe thread
@@ -284,7 +315,13 @@ bool handle_frame(uint32_t connection, const FrameHeader &h, const uint8_t *payl
 			return write_error(h.request_id, "RESPONSE_TOO_LARGE", "request fewer variables");
 		break;
 	case MessageType::PickArm:
-		return write_error(h.request_id, "UNSUPPORTED", "picking is not available");
+		if (!decode(h, payload, &in.pick_arm) || in.pick_arm.cursor > 1) {
+			write_error(h.request_id, "MALFORMED", "PickArm");
+			return false;
+		}
+		if (!(hello_info.capabilities & CAPABILITY_PICK_D3D11))
+			return write_error(h.request_id, "UNSUPPORTED", "picking needs D3D11");
+		break;
 	default:
 		// Pong, Error, and types of later revisions
 		return true;
@@ -327,6 +364,10 @@ bool send_queued(bool hello_done)
 		out.push_back(std::move(events.front()));
 		events.pop_front();
 	}
+	if (has_result) {
+		out.push_back(std::move(result));
+		has_result = false;
+	}
 	ReleaseSRWLockExclusive(&queue_lock);
 
 	if (!hello_done)
@@ -345,6 +386,8 @@ void clear_queues(uint32_t connection)
 	replies.clear();
 	reserved_replies = 0;
 	events.clear();
+	result.clear();
+	has_result = false;
 	queue_connection = connection;
 	ReleaseSRWLockExclusive(&queue_lock);
 }
@@ -493,7 +536,7 @@ void start(uint8_t render_api)
 	hello_info.exe_path = DesktopUtf8(exe.c_str());
 	hello_info.importer_folder = DesktopUtf8(module_folder(migoto_handle).c_str());
 	hello_info.render_api = render_api;
-	hello_info.capabilities = CAPABILITY_VARS;
+	hello_info.capabilities = CAPABILITY_VARS | (render_api == RENDER_D3D11 ? CAPABILITY_PICK_D3D11 : 0);
 
 	wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 	read_event = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -538,21 +581,37 @@ void ParseDesktopSection()
 
 	LogInfo("[Desktop]\n");
 	channel = GetIniBool(L"Desktop", L"channel", false, NULL);
-	// The pipe thread runs until the process ends once it has started
+	// Shaders are noted for picking as they are created, so the channel
+	// cannot start partway through a game
 	if (!loaded)
 		desktop_channel_enabled = channel;
 	else if (channel != desktop_channel_enabled)
 		LogOverlay(LOG_INFO, "[Desktop] channel takes effect at the next game start\n");
 	loaded = true;
+
+	if (desktop_channel_enabled)
+		RegisterIniKeyBinding(L"Desktop", L"inspect_key", inspect_key_down, NULL, 0, NULL);
 }
 
-void DesktopChannelFrame(uint8_t render_api)
+void DesktopChannelFrame(HackerDevice *device, HackerContext *hacker_context, uint8_t render_api,
+	HackerSwapChain *swap_chain)
 {
 	std::lock_guard<std::mutex> lock(frame_lock);
 	std::deque<Inbound> work;
 
 	if (started && render_api != started_api)
 		return;
+	if (render_api == RENDER_D3D11) {
+		if (!swap_chain || (driving_swap_chain && driving_swap_chain != swap_chain))
+			return;
+		if (!driving_swap_chain) {
+			DXGI_SWAP_CHAIN_DESC desc;
+			if (FAILED(swap_chain->GetDesc(&desc)))
+				return;
+			driving_swap_chain = swap_chain;
+			driving_window = desc.OutputWindow;
+		}
+	}
 	if (!started)
 		start(render_api);
 
@@ -570,10 +629,36 @@ void DesktopChannelFrame(uint8_t render_api)
 		case MessageType::SetVars:
 			set_vars(in);
 			break;
+		case MessageType::PickArm:
+			pick_arm(in);
+			break;
 		}
 	}
 
+	if (key_pick) {
+		key_pick = false;
+		if (!DesktopChannelConnected())
+			LogOverlay(LOG_INFO, "Hash inspector: Nahida Desktop is not connected to this game\n");
+		else
+			DesktopPickArm(TRIGGER_KEY, false, 0, 0, DesktopChannelConnection());
+	}
+
+	if (render_api == RENDER_D3D11)
+		DesktopPickFrame(device, hacker_context, driving_window);
+	else
+		DesktopPickFrame(NULL, NULL, NULL);
+
 	flush_pending();
+}
+
+void DesktopChannelSwapChainReleased(HackerSwapChain *swap_chain)
+{
+	std::lock_guard<std::mutex> lock(frame_lock);
+	if (swap_chain != driving_swap_chain)
+		return;
+	driving_swap_chain = NULL;
+	driving_window = NULL;
+	DesktopPickCancel();
 }
 
 void DesktopChannelReloaded()

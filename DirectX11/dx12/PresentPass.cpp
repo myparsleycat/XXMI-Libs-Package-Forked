@@ -311,7 +311,7 @@ static void frame_actions()
 	Profiling::Spike::sample_mod_state();
 
 	if (desktop_channel_enabled)
-		DesktopChannelFrame(vk_mods_active ? DesktopProtocol::RENDER_VULKAN : DesktopProtocol::RENDER_D3D12);
+		DesktopChannelFrame(device, NULL, vk_mods_active ? DesktopProtocol::RENDER_VULKAN : DesktopProtocol::RENDER_D3D12);
 
 	if (!G->suppress_overlay)
 		Dx12DrawOverlay();

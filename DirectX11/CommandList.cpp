@@ -27,6 +27,8 @@
 #include "dx12/PresentPass.h"
 #include "dx12/ShimDevice.h"
 #include "vk/VkScope.h"
+#include "desktop/Pick.h"
+#include "desktop/Protocol.h"
 
 #include <D3DCompiler.h>
 
@@ -1585,6 +1587,10 @@ void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOve
 				_RunCommandList(&matches[i]->command_list, state);
 		}
 	}
+	if (desktop_pick_capturing && (run_pre_and_post_together || !state->post)) {
+		for (i = 0; i < matches.size(); i++)
+			DesktopPickNoteOverride(state->mHackerContext, DesktopProtocol::OVERRIDE_TEXTURE, matches[i]->ini_section);
+	}
 	state->this_target = saved_this;
 }
 
@@ -1967,6 +1973,16 @@ void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
 
 	COMMAND_LIST_LOG(state, "[%S] %s(%p, %u)\n", ini_section.c_str(), name, resource, arg);
 
+	if (desktop_pick_capturing && (type == DrawCommandType::DRAW_INDEXED_INSTANCED_INDIRECT
+			|| type == DrawCommandType::DRAW_INSTANCED_INDIRECT)) {
+		DesktopPickDraw pick = {};
+		pick.call = type == DrawCommandType::DRAW_INDEXED_INSTANCED_INDIRECT
+			? DesktopProtocol::CALL_DRAW_INDEXED_INSTANCED_INDIRECT : DesktopProtocol::CALL_DRAW_INSTANCED_INDIRECT;
+		pick.args = (ID3D11Buffer*)resource;
+		pick.args_offset = arg;
+		DesktopPickCommandDraw(state, ini_section, ini_line, pick);
+	}
+
 	(state->mOrigContext1->*IndirectDrawCall)((ID3D11Buffer*)resource, arg);
 
 	resource->Release();
@@ -2014,25 +2030,35 @@ void DrawCommand::run(CommandListState *state)
 		case DrawCommandType::DRAW:
 			eval_args(2, eargs, state);
 			COMMAND_LIST_LOG(state, "[%S] Draw(%u, %u)\n", ini_section.c_str(), eargs[0], eargs[1]);
+			if (desktop_pick_capturing)
+				DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW, (UINT)eargs[0], 1, (UINT)eargs[1], 0, 0, NULL, 0 });
 			mOrigContext1->Draw(eargs[0], eargs[1]);
 			break;
 		case DrawCommandType::DRAW_AUTO:
 			COMMAND_LIST_LOG(state, "[%S] DrawAuto()\n", ini_section.c_str());
+			if (desktop_pick_capturing)
+				DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW_AUTO });
 			mOrigContext1->DrawAuto();
 			break;
 		case DrawCommandType::DRAW_INDEXED:
 			eval_args(3, eargs, state);
 			COMMAND_LIST_LOG(state, "[%S] DrawIndexed(%u, %u, %i)\n", ini_section.c_str(), eargs[0], eargs[1], (INT)eargs[2]);
+			if (desktop_pick_capturing)
+				DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW_INDEXED, (UINT)eargs[0], 1, (UINT)eargs[1], eargs[2], 0, NULL, 0 });
 			mOrigContext1->DrawIndexed(eargs[0], eargs[1], (INT)eargs[2]);
 			break;
 		case DrawCommandType::DRAW_INDEXED_INSTANCED:
 			eval_args(5, eargs, state);
 			COMMAND_LIST_LOG(state, "[%S] DrawIndexedInstanced(%u, %u, %u, %i, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2], (INT)eargs[3], eargs[4]);
+			if (desktop_pick_capturing)
+				DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW_INDEXED_INSTANCED, (UINT)eargs[0], (UINT)eargs[1], (UINT)eargs[2], eargs[3], (UINT)eargs[4], NULL, 0 });
 			mOrigContext1->DrawIndexedInstanced(eargs[0], eargs[1], eargs[2], (INT)eargs[3], eargs[4]);
 			break;
 		case DrawCommandType::DRAW_INSTANCED:
 			eval_args(4, eargs, state);
 			COMMAND_LIST_LOG(state, "[%S] DrawInstanced(%u, %u, %u, %u)\n", ini_section.c_str(), eargs[0], eargs[1], eargs[2], eargs[3]);
+			if (desktop_pick_capturing)
+				DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW_INSTANCED, (UINT)eargs[0], (UINT)eargs[1], (UINT)eargs[2], 0, (UINT)eargs[3], NULL, 0 });
 			mOrigContext1->DrawInstanced(eargs[0], eargs[1], eargs[2], eargs[3]);
 			break;
 		case DrawCommandType::DISPATCH:
@@ -2054,6 +2080,8 @@ void DrawCommand::run(CommandListState *state)
 				COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> NO ACTIVE DRAW CALL\n", ini_section.c_str());
 				break;
 			}
+			if (desktop_pick_capturing)
+				DesktopPickCommandDraw(state, ini_section, ini_line, DesktopPickDrawOf(*info));
 			switch (info->type) {
 				case DrawCall::DrawIndexedInstanced:
 					COMMAND_LIST_LOG(state, "[%S] Draw = from_caller -> DrawIndexedInstanced(%u, %u, %u, %i, %u)\n", ini_section.c_str(), info->IndexCount, info->InstanceCount, info->FirstIndex, info->FirstVertex, info->FirstInstance);
@@ -2111,17 +2139,21 @@ void DrawCommand::run(CommandListState *state)
 		case DrawCommandType::AUTO_VERTEX_COUNT:
 			auto_count = get_vertex_count_from_current_vb(mOrigContext1);
 			COMMAND_LIST_LOG(state, "[%S] draw = auto -> Draw(%u, 0)\n", ini_section.c_str(), auto_count);
-			if (auto_count)
+			if (auto_count) {
+				if (desktop_pick_capturing)
+					DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW, auto_count, 1, 0, 0, 0, NULL, 0 });
 				mOrigContext1->Draw(auto_count, 0);
-			else
+			} else
 				COMMAND_LIST_LOG(state, "  Unable to determine vertex count\n");
 			break;
 		case DrawCommandType::AUTO_INDEX_COUNT:
 			auto_count = get_index_count_from_current_ib(mOrigContext1);
 			COMMAND_LIST_LOG(state, "[%S] drawindexed = auto -> DrawIndexed(%u, 0, 0)\n", ini_section.c_str(), auto_count);
-			if (auto_count)
+			if (auto_count) {
+				if (desktop_pick_capturing)
+					DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW_INDEXED, auto_count, 1, 0, 0, 0, NULL, 0 });
 				mOrigContext1->DrawIndexed(auto_count, 0, 0);
-			else
+			} else
 				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
 			break;
 		case DrawCommandType::AUTO_INDEX_INSTANCE_COUNT:
@@ -2131,9 +2163,11 @@ void DrawCommand::run(CommandListState *state)
 			}
 			auto_count = get_index_count_from_current_ib(mOrigContext1);
 			COMMAND_LIST_LOG(state, "[%S] drawindexedinstanced = auto -> DrawIndexedInstanced(%u, %u, 0, 0, %u)\n", ini_section.c_str(), auto_count, info->InstanceCount, info->FirstInstance);
-			if (auto_count)
+			if (auto_count) {
+				if (desktop_pick_capturing)
+					DesktopPickCommandDraw(state, ini_section, ini_line, { DesktopProtocol::CALL_DRAW_INDEXED_INSTANCED, auto_count, info->InstanceCount, 0, 0, info->FirstInstance, NULL, 0 });
 				mOrigContext1->DrawIndexedInstanced(auto_count, info->InstanceCount, 0, 0, info->FirstInstance);
-			else
+			} else
 				COMMAND_LIST_LOG(state, "  Unable to determine index count\n");
 			break;
 	}
@@ -3137,6 +3171,7 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 		note_buffer_srv_slots(vs_bytecode, buffer_srv_slots[0]);
 		mOrigDevice1->CreateVertexShader(vs_bytecode->GetBufferPointer(), vs_bytecode->GetBufferSize(), NULL, &vs);
 		CleanupShaderMaps(vs);
+		DesktopNoteShader(vs, vs_bytecode->GetBufferPointer(), vs_bytecode->GetBufferSize(), false);
 		vs_bytecode->Release();
 		vs_bytecode = NULL;
 	}
@@ -3144,6 +3179,7 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 		note_buffer_srv_slots(hs_bytecode, buffer_srv_slots[1]);
 		mOrigDevice1->CreateHullShader(hs_bytecode->GetBufferPointer(), hs_bytecode->GetBufferSize(), NULL, &hs);
 		CleanupShaderMaps(hs);
+		DesktopNoteShader(hs, hs_bytecode->GetBufferPointer(), hs_bytecode->GetBufferSize(), false);
 		hs_bytecode->Release();
 		hs_bytecode = NULL;
 	}
@@ -3151,6 +3187,7 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 		note_buffer_srv_slots(ds_bytecode, buffer_srv_slots[2]);
 		mOrigDevice1->CreateDomainShader(ds_bytecode->GetBufferPointer(), ds_bytecode->GetBufferSize(), NULL, &ds);
 		CleanupShaderMaps(ds);
+		DesktopNoteShader(ds, ds_bytecode->GetBufferPointer(), ds_bytecode->GetBufferSize(), false);
 		ds_bytecode->Release();
 		ds_bytecode = NULL;
 	}
@@ -3158,6 +3195,7 @@ void CustomShader::substantiate(ID3D11Device *mOrigDevice1)
 		note_buffer_srv_slots(gs_bytecode, buffer_srv_slots[3]);
 		mOrigDevice1->CreateGeometryShader(gs_bytecode->GetBufferPointer(), gs_bytecode->GetBufferSize(), NULL, &gs);
 		CleanupShaderMaps(gs);
+		DesktopNoteShader(gs, gs_bytecode->GetBufferPointer(), gs_bytecode->GetBufferSize(), false);
 		gs_bytecode->Release();
 		gs_bytecode = NULL;
 	}

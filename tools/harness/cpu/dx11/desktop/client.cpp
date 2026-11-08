@@ -9,6 +9,8 @@
 // Without a pid it takes the first nahida-migoto-<pid> pipe there is, waiting
 // for one. Commands, one a line:
 //
+//   (empty) or pick     pick under the mouse cursor
+//   pick <x> <y>        pick at a normalized position of the window
 //   get <name> ...      GetVars, for example get $\Mods\a\mod.ini\swap
 //   set <name> <value>  SetVars
 //   ping
@@ -30,6 +32,7 @@ static CRITICAL_SECTION print_lock;
 static HANDLE pipe = INVALID_HANDLE_VALUE;
 static HANDLE write_event;
 static volatile LONG next_id = 1;
+static volatile double pick_sent;
 static volatile bool ready;
 
 static void print(const char *fmt, ...)
@@ -132,6 +135,16 @@ static DWORD WINAPI reader(LPVOID)
 		case MessageType::VarsReply: ok = show<VarsReply>("VarsReply", h, payload); break;
 		case MessageType::VarsApplied: ok = show<VarsApplied>("VarsApplied", h, payload); break;
 		case MessageType::Event: ok = show<Event>("Event", h, payload); break;
+		case MessageType::PickArmed: ok = show<PickArmed>("PickArmed", h, payload); break;
+		case MessageType::PickFailed: ok = show<PickFailed>("PickFailed", h, payload); break;
+		case MessageType::PickResult: {
+			double sent = pick_sent;
+			ok = show<PickResult>("PickResult", h, payload);
+			if (sent)
+				print("  %u bytes, %.1f ms after the PickArm\n", h.payload_size, now_ms() - sent);
+			pick_sent = 0;
+			break;
+		}
 		default:
 			print("type 0x%04x, %u bytes\n", h.type, h.payload_size);
 		}
@@ -252,8 +265,16 @@ static DWORD WINAPI commands(LPVOID)
 			continue;
 		}
 		bool ok = true;
-		if (cmd.empty()) {
-			continue;
+		if (cmd.empty() || cmd == "pick") {
+			PickArm arm;
+			float x, y;
+			if (in >> x >> y) {
+				arm.cursor = 1;
+				arm.x = x;
+				arm.y = y;
+			}
+			pick_sent = now_ms();
+			ok = send(MessageType::PickArm, arm);
 		} else if (cmd == "get") {
 			GetVars get;
 			std::string n;
@@ -273,7 +294,7 @@ static DWORD WINAPI commands(LPVOID)
 		} else if (cmd == "quit") {
 			ExitProcess(0);
 		} else {
-			print("commands: get <name> ..., set <name> <value>, ping, quit\n");
+			print("commands: pick [x y], get <name> ..., set <name> <value>, ping, quit\n");
 		}
 		if (!ok)
 			print("send failed (%lu)\n", GetLastError());

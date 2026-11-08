@@ -25,6 +25,10 @@
 #include "FrameAnalysis.h"
 #include "profiling.h"
 #include "GpuWatch.h"
+#include "desktop/Pick.h"
+#include "desktop/Protocol.h"
+
+#include <algorithm>
 
 // -----------------------------------------------------------------------------------------------
 
@@ -502,6 +506,17 @@ void HackerContext::ProcessShaderOverride(ShaderOverride *shaderOverride, bool i
 	bool use_orig = false;
 
 	LogDebug("  override found for shader\n");
+
+	if (desktop_pick_capturing) {
+		wstring section = shaderOverride->first_ini_section;
+		// A ShaderRegex match makes an override with no section of its own
+		if (section.empty()) {
+			section = shaderOverride->command_list.ini_section;
+			if (section.size() > 6 && !section.compare(section.size() - 6, 6, L".Match"))
+				section.resize(section.size() - 6);
+		}
+		DesktopPickNoteOverride(this, DesktopProtocol::OVERRIDE_SHADER, section);
+	}
 
 	// We really want to start deprecating all the old filters and switch
 	// to using the command list for much greater flexibility. This if()
@@ -981,6 +996,10 @@ void HackerContext::BeforeDraw(DrawContext &data)
 		b.is_explicit = false;
 	}
 
+	// The game's bindings, before any command list rebinds them
+	if (desktop_pick_capturing)
+		DesktopPickBeforeDraw(this, data);
+
 	// If we are not hunting shaders, we should skip all of this shader management for a performance bump.
 	if (G->hunting == HUNTING_MODE_ENABLED)
 	{
@@ -1177,6 +1196,8 @@ void HackerContext::BeforeDraw(DrawContext &data)
 out_profile:
 	if (!data.call_info.skip)
 		GuardShaderResources(false);
+	if (desktop_pick_capturing)
+		DesktopPickGameDraw(this, data);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::draw_overhead);
@@ -1213,6 +1234,9 @@ void HackerContext::AfterDraw(DrawContext &data)
 			RunCommandList(mHackerDevice, this, data.post_commands[i], &data.call_info, true);
 		}
 	}
+
+	if (desktop_pick_capturing)
+		DesktopPickAfterDrawEnd(this);
 
 	// The bindings are the game's to change again from here:
 	mCheckTextureOverrideResultCount = 0;
@@ -1854,6 +1878,19 @@ STDMETHODIMP_(void) HackerContext::Begin(THIS_
 	__in  ID3D11Asynchronous *pAsync)
 {
 	mOrigContext1->Begin(pAsync);
+	if (desktop_channel_enabled && pAsync) {
+		ID3D11Query *query = NULL;
+		if (SUCCEEDED(pAsync->QueryInterface(__uuidof(ID3D11Query), (void**)&query))) {
+			D3D11_QUERY_DESC desc;
+			query->GetDesc(&desc);
+			query->Release();
+			// A timestamp disjoint query does not count draws and often spans the whole frame.
+			if (desc.Query == D3D11_QUERY_TIMESTAMP_DISJOINT)
+				return;
+		}
+		if (std::find(mDesktopActiveQueries.begin(), mDesktopActiveQueries.end(), pAsync) == mDesktopActiveQueries.end())
+			mDesktopActiveQueries.push_back(pAsync);
+	}
 }
 
 STDMETHODIMP_(void) HackerContext::End(THIS_
@@ -1861,6 +1898,11 @@ STDMETHODIMP_(void) HackerContext::End(THIS_
 	__in  ID3D11Asynchronous *pAsync)
 {
 	 mOrigContext1->End(pAsync);
+	if (desktop_channel_enabled) {
+		auto query = std::find(mDesktopActiveQueries.begin(), mDesktopActiveQueries.end(), pAsync);
+		if (query != mDesktopActiveQueries.end())
+			mDesktopActiveQueries.erase(query);
+	}
 }
 
 STDMETHODIMP HackerContext::GetData(THIS_
@@ -2401,6 +2443,8 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 	BOOL RestoreContextState)
 {
 	if (G->deferred_contexts_enabled) {
+		if (desktop_pick_capturing)
+			DesktopPickExecuteCommandList(this);
 		mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
 		if (GpuWatch::enabled)
 			GpuWatch::mark_command_list(mOrigContext1);
