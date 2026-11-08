@@ -68,8 +68,8 @@ All integers are little-endian. A frame is:
 | `0x0004` | Pong | either | `u64 nonce`, copied from the Ping |
 | `0x00FF` | Error | either | `str code`, `str detail` |
 
-- **Handshake.** Hello is the first frame on a connection, and the server answers
-  nothing else before it.
+- **Handshake.** Hello is the first frame on a connection. Before it, the server
+  answers any other request with Error `NOT_READY` and sends nothing on its own.
   - If the version ranges overlap, the server answers HelloReply with the highest
     common version.
   - Otherwise it answers Error `UNSUPPORTED_VERSION`, with the detail
@@ -104,7 +104,8 @@ All integers are little-endian. A frame is:
 - The server reads GetVars values on the render thread at the next `Present`.
 - SetVars is applied there too. VarsApplied then reports the frame and each
   variable's resulting value. A variable that does not exist is reported with
-  `exists = 0` and is not created.
+  `exists = 0` and is not created. A variable declared `locked` is not changed
+  and is reported with `exists = 1` and its current value.
 - If the request or reply queue is full, the server rejects the request with
   Error `BUSY` and the same `request_id` before processing it. A rejected SetVars
   changes no variables.
@@ -121,6 +122,11 @@ All integers are little-endian. A frame is:
 `kind`:
 - 1 `RELOADED`: the INI files were reloaded.
 - 2 `SHUTDOWN`: the DLL is unloading.
+
+Events, VarsReply and VarsApplied arrive in the order the server produced them
+at `Present`. A `RELOADED` therefore precedes the replies to requests applied
+after that reload. Pong and Error can arrive before earlier replies; a client
+matches replies by `request_id`.
 
 ### Picking
 

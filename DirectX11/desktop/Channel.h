@@ -28,8 +28,9 @@ void DesktopChannelDetach(bool process_terminating);
 
 bool DesktopChannelConnected();
 uint32_t DesktopChannelConnection();
-// Queues a frame for the client
 enum class DesktopSend { REPLY, EVENT };
+// Queues a frame for the client. Only from code that DesktopChannelFrame() or
+// DesktopChannelReloaded() runs, which hold the lock that guards the queue.
 void DesktopChannelQueue(DesktopSend kind, std::vector<uint8_t> &&frame, uint32_t connection);
 
 std::string DesktopUtf8(const wchar_t *text, size_t length = (size_t)-1);

@@ -42,10 +42,18 @@ struct Inbound {
 // moving queue entries.
 SRWLOCK queue_lock = SRWLOCK_INIT;
 std::deque<Inbound> inbound;
-std::deque<std::vector<uint8_t>> replies;
-std::deque<std::vector<uint8_t>> events;
+struct Queued {
+	DesktopSend kind;
+	std::vector<uint8_t> frame;
+};
+// Replies and events in the order the render thread made them, so that an
+// event is not overtaken by replies to requests carried out after it
+std::deque<Queued> out_queue;
+size_t queued_events;
 uint32_t queue_connection;
-// Includes accepted requests still in inbound, render-thread work or pending.
+// One per accepted request until its reply leaves out_queue, whether the
+// request is still in inbound, in render-thread work, or its reply in pending
+// or out_queue. Every REPLY in out_queue must hold one.
 size_t reserved_replies;
 
 std::atomic<uint32_t> connection_id;
@@ -104,16 +112,14 @@ void flush_pending()
 		for (auto &p : pending) {
 			if (p.connection != queue_connection)
 				continue;
-			switch (p.kind) {
-			case DesktopSend::REPLY:
-				replies.push_back(std::move(p.frame));
-				break;
-			case DesktopSend::EVENT:
-				if (events.size() >= MAX_EVENTS)
-					events.pop_front();
-				events.push_back(std::move(p.frame));
-				break;
+			if (p.kind == DesktopSend::EVENT) {
+				if (queued_events < MAX_EVENTS)
+					queued_events++;
+				else
+					out_queue.erase(std::find_if(out_queue.begin(), out_queue.end(),
+						[](const Queued &q) { return q.kind == DesktopSend::EVENT; }));
 			}
+			out_queue.push_back({ p.kind, std::move(p.frame) });
 		}
 	}
 	ReleaseSRWLockExclusive(&queue_lock);
@@ -126,7 +132,8 @@ CommandListVariable* find_variable(const std::string &name)
 	int n = MultiByteToWideChar(CP_UTF8, 0, name.data(), (int)name.size(), NULL, 0);
 	std::wstring wide(n, L'\0');
 	MultiByteToWideChar(CP_UTF8, 0, name.data(), (int)name.size(), &wide[0], n);
-	std::transform(wide.begin(), wide.end(), wide.begin(), ::towlower);
+	for (wchar_t &c : wide)
+		c = ascii_tolower(c);
 	auto found = command_list_globals.find(wide);
 	return found == command_list_globals.end() ? NULL : &found->second;
 }
@@ -318,21 +325,18 @@ bool handle_input(uint32_t connection, std::vector<uint8_t> &input, bool *hello_
 // the client asked for, and nothing it would accept, so it is dropped.
 bool send_queued(bool hello_done)
 {
-	std::deque<std::vector<uint8_t>> out;
+	std::deque<Queued> out;
 
 	AcquireSRWLockExclusive(&queue_lock);
-	reserved_replies -= replies.size();
-	out.swap(replies);
-	while (!events.empty()) {
-		out.push_back(std::move(events.front()));
-		events.pop_front();
-	}
+	reserved_replies -= out_queue.size() - queued_events;
+	queued_events = 0;
+	out.swap(out_queue);
 	ReleaseSRWLockExclusive(&queue_lock);
 
 	if (!hello_done)
 		return true;
-	for (auto &frame : out) {
-		if (!write_frame(frame))
+	for (auto &q : out) {
+		if (!write_frame(q.frame))
 			return false;
 	}
 	return true;
@@ -342,9 +346,9 @@ void clear_queues(uint32_t connection)
 {
 	AcquireSRWLockExclusive(&queue_lock);
 	inbound.clear();
-	replies.clear();
+	out_queue.clear();
+	queued_events = 0;
 	reserved_replies = 0;
-	events.clear();
 	queue_connection = connection;
 	ReleaseSRWLockExclusive(&queue_lock);
 }

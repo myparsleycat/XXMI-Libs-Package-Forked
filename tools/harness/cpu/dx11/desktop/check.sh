@@ -12,7 +12,7 @@ python desktop/vectors.py ./bin/vectors.exe ../../../../testdata/desktop-channel
 dir=bin/channel-run
 rm -rf "$dir"
 ../../common/install_dll.sh "$dir" ${1:+"$1"} || exit 1
-python ../../common/make_ini.py "$dir/d3dx.ini" Desktop.channel=1 || exit 1
+python ../../common/make_ini.py "$dir/d3dx.ini" Desktop.channel=1 System.config_initialization_delay=3 || exit 1
 ./bin/channel.exe "$(cygpath -aw "$dir")"
 result=$?
 [ $result = 0 ] || status=$result

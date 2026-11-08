@@ -198,12 +198,15 @@ the codec of `DirectX11/desktop/Protocol.h` against
 with `[Desktop] channel = 1`. `channel.exe` presents a cleared WARP swap chain
 while a client thread checks the handshake, a refused second client, Ping,
 GetVars and SetVars on a mod's global variables, and that PickArm is refused
-as `UNSUPPORTED`. It then disconnects during large variable requests and
-checks that their responses cannot reach the next connection, sends 512
-GetVars and SetVars requests interleaved with unknown frames and checks that
-each receives one matching reply or `BUSY` and that only acknowledged SetVars
-change variables, and checks variable responses at exactly 4 MiB and one byte
-over the limit.
+as `UNSUPPORTED`. It holds presents after the first one until the first
+configuration reload (`config_initialization_delay = 3`) is due, holds the pipe
+thread with unread Pongs, and checks that a SetVars carried out at the Present
+of the reload is answered after the `RELOADED` event. It then disconnects
+during large variable requests and checks that their responses cannot reach
+the next connection, sends 512 GetVars and SetVars requests interleaved with
+unknown frames and checks that each receives one matching reply or `BUSY` and
+that only acknowledged SetVars change variables, and checks variable responses
+at exactly 4 MiB and one byte over the limit.
 
 `bin/client.exe [pid]` is a console client for checking a game by hand. It
 connects to the game's pipe and prints every frame as JSON to the console and

@@ -5,6 +5,9 @@
 // handshake, a refused second client, Ping, GetVars and SetVars, the refusal
 // of PickArm, then:
 //
+//   reload order  a SetVars carried out at the Present of the first
+//                 configuration reload; RELOADED must leave before its
+//                 VarsApplied
 //   reconnect     disconnects during large variable requests; their responses
 //                 must not reach the next connection
 //   backpressure  512 GetVars and SetVars requests interleaved with unknown
@@ -40,6 +43,13 @@ static const char *TEST_VARIABLE = "$\\Mods\\channel\\mod.ini\\test";
 static volatile LONG failures;
 static volatile bool client_done;
 static std::string run_folder;
+// config_initialization_delay of the run folder's d3dx.ini
+static DWORD reload_delay_ms;
+static DWORD launch_tick, first_present_ms;
+// After the first Present, which starts the channel, presents wait until the
+// client lets them go on, so that the first configuration reload runs when
+// the client chooses
+static volatile LONG hold_present = 1, frames_presented;
 
 static void expect(const char *what, bool ok)
 {
@@ -325,6 +335,75 @@ static void check_reply_backpressure(HANDLE h)
 	expect("only acknowledged SetVars requests change variables under backpressure", ok);
 }
 
+// The pipe thread answers each Ping with a Pong of this size, written as it
+// reads. Once the Pongs waiting in the pipe stop growing short of one per Ping
+// sent, the pipe thread is waiting in a write for the client to read.
+static bool pipe_thread_held(HANDLE h, unsigned pings)
+{
+	const DWORD PONG_SIZE = HEADER_SIZE + 8;
+	DWORD last = MAXDWORD;
+	int stable = 0;
+
+	for (int i = 0; i < 500 && stable < 5; i++) {
+		DWORD available = 0;
+		if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL) || available == pings * PONG_SIZE)
+			return false;
+		stable = available == last ? stable + 1 : 0;
+		last = available;
+		Sleep(10);
+	}
+	return stable >= 5;
+}
+
+// The first configuration reload and a SetVars carried out at the same
+// Present, while the pipe thread is held writing Pongs the client has not read
+// yet, so that RELOADED and VarsApplied are both queued before it sends either
+static void check_reload_order(HANDLE h)
+{
+	while (!frames_presented)
+		Sleep(1);
+	expect("config_initialization_delay leaves time for the first Present", first_present_ms < reload_delay_ms);
+	while (GetTickCount() - launch_tick < reload_delay_ms + 1000)
+		Sleep(10);
+
+	SetVars set;
+	set.vars = { { "$\\global\\missing", 1 } };
+	bool ok = send(h, MessageType::SetVars, 7, set), held = false;
+	unsigned pings = 0;
+	while (ok && !held && pings < (1u << 20)) {
+		std::vector<uint8_t> batch, frame;
+		for (unsigned i = 0; ok && i < 64; i++, pings++) {
+			Ping ping;
+			ping.nonce = pings;
+			ok = EncodeFrame(MessageType::Ping, 8, ping, &frame);
+			batch.insert(batch.end(), frame.begin(), frame.end());
+		}
+		ok = ok && write_all(h, batch);
+		held = ok && pipe_thread_held(h, pings);
+	}
+	expect("the pipe thread is held writing Pongs", held);
+
+	LONG frames = frames_presented;
+	InterlockedExchange(&hold_present, 0);
+	while (frames_presented == frames)
+		Sleep(1);
+
+	int event_at = -1, applied_at = -1;
+	Event e;
+	VarsApplied applied;
+	for (unsigned i = 0; ok && i < pings + 2; i++) {
+		Received r;
+		ok = receive(h, &r);
+		if (ok && r.header.type == (uint16_t)MessageType::Event)
+			event_at = DecodePayload(r.payload.data(), r.payload.size(), &e) && e.kind == EVENT_RELOADED ? i : -1;
+		else if (ok && r.header.type == (uint16_t)MessageType::VarsApplied && r.header.request_id == 7)
+			applied_at = DecodePayload(r.payload.data(), r.payload.size(), &applied) ? i : -1;
+	}
+	expect("the reload ran at the Present that carried out the SetVars",
+		ok && event_at >= 0 && applied_at >= 0 && e.frame == applied.frame);
+	expect("RELOADED leaves before the VarsApplied of the same Present", ok && event_at >= 0 && applied_at > event_at);
+}
+
 static DWORD WINAPI client(LPVOID)
 {
 	HANDLE h = INVALID_HANDLE_VALUE;
@@ -367,8 +446,7 @@ static DWORD WINAPI client(LPVOID)
 	expect("Ping is answered with its nonce", send(h, MessageType::Ping, 2, ping) && receive_as(h, MessageType::Pong, 2, &pong)
 		&& pong.nonce == ping.nonce);
 
-	// Let the mods load at the first configuration reload
-	Sleep(1000);
+	check_reload_order(h);
 
 	GetVars get;
 	get.names = { TEST_VARIABLE, "$\\global\\missing" };
@@ -429,7 +507,12 @@ int main(int argc, char **argv)
 		run_folder.pop_back();
 	DWORD idle_ms = argc > 3 && !strcmp(argv[2], "idle") ? (DWORD)(atof(argv[3]) * 1000) : 0;
 	write_mod_ini(run_folder);
+	reload_delay_ms = GetPrivateProfileIntA("System", "config_initialization_delay", 0,
+			(run_folder + "\\d3dx.ini").c_str()) * 1000;
+	if (idle_ms)
+		hold_present = 0;
 
+	launch_tick = GetTickCount();
 	HMODULE lib = LoadLibraryA((run_folder + "\\d3d11.dll").c_str());
 	if (!lib) {
 		printf("cannot load the DLL: %lu\n", GetLastError());
@@ -481,9 +564,16 @@ int main(int argc, char **argv)
 		MSG msg;
 		while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
 			DispatchMessageW(&msg);
+		if (hold_present && frames_presented) {
+			Sleep(1);
+			continue;
+		}
 		ctx->OMSetRenderTargets(1, &rtv, NULL);
 		ctx->ClearRenderTargetView(rtv, color);
 		swap->Present(0, 0);
+		if (!frames_presented)
+			first_present_ms = GetTickCount() - launch_tick;
+		InterlockedIncrement(&frames_presented);
 		Sleep(5);
 	}
 	rtv->Release();
