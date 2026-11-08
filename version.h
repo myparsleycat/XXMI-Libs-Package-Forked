@@ -36,6 +36,12 @@
 #define VER_COMMENTS_STR            ""
 #endif
 
+// The release tag without its v, with what git describe adds for a build of
+// a later commit, e.g. 1.2.2-nhd.24-6-g567d82c5
+#ifndef VERSION_TAG_STR
+#define VERSION_TAG_STR             "0.0.0"
+#endif
+
 #define STRINGIZE2(s) #s
 #define STRINGIZE(s) STRINGIZE2(s)
 

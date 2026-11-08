@@ -19,6 +19,7 @@ to apply this behavior there; the DLL does not need rebuilding.
 | `skin` | D3D12 GPU skinning with character mods (`make_mod.py` modes), queue and device lifetimes with D3D11On12 |
 | `sampler` | `type = SamplerState` resources and `ps-s0` bindings on D3D11 |
 | `cpu` | The CPU work of the DLL on the configuration of an installed importer: call-for-call equality and frame time against a reference DLL |
+| `cpu/dx11/desktop` | The Nahida Desktop channel: the codec against the shared vectors and the pipe server with INI variables on D3D11 |
 | `cache` | CPU data-cache snapshots, shared views, bounded lazy reads and allocation reuse, without a GPU |
 | `etw` | Not a check: where the threads of a running game spend their time, by CPU samples with stacks |
 
@@ -188,6 +189,27 @@ and `copy cs-cb1->Region(256, 256)` of a constant buffer.
 To compare with a package DLL from before sampler slots, or with the upstream
 DLL, run `run.sh old` or `run.sh stock` with `XXMI_PACKAGES` set to the
 launcher's packages folder. The checks are expected to fail with those DLLs.
+
+### cpu/dx11/desktop
+
+Run `cpu/dx11/build.bat`, then `bash cpu/dx11/desktop/check.sh`. It checks
+the codec of `DirectX11/desktop/Protocol.h` against
+`testdata/desktop-channel/v1`, then runs `channel.exe` in `cpu/dx11/bin/channel-run`
+with `[Desktop] channel = 1`. `channel.exe` presents a cleared WARP swap chain
+while a client thread checks the handshake, a refused second client, Ping,
+GetVars and SetVars on a mod's global variables, and that PickArm is refused
+as `UNSUPPORTED`. It then disconnects during large variable requests and
+checks that their responses cannot reach the next connection, sends 512
+GetVars and SetVars requests interleaved with unknown frames and checks that
+each receives one matching reply or `BUSY` and that only acknowledged SetVars
+change variables, and checks variable responses at exactly 4 MiB and one byte
+over the limit.
+
+`bin/client.exe [pid]` is a console client for checking a game by hand. It
+connects to the game's pipe and prints every frame as JSON to the console and
+`bin/client.log`; `get <name> ...` and `set <name> <value>` send GetVars and
+SetVars. `channel.exe <run folder> idle <seconds>` presents without its own
+client, so that `client.exe` can connect.
 
 ### cpu
 
