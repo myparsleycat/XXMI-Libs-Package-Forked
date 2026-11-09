@@ -18,6 +18,7 @@ to apply this behavior there; the DLL does not need rebuilding.
 | `vk` | The Vulkan path: the test inis of `vk/case/tests` against an older DLL, `[Present]` on frame generation presents |
 | `skin` | D3D12 GPU skinning with character mods (`make_mod.py` modes), queue and device lifetimes with D3D11On12 |
 | `sampler` | `type = SamplerState` resources and `ps-s0` bindings on D3D11 |
+| `shader-scope` | Synthetic D3D11/D3D12 WARP checks for shader callback order, replacement draw ranges, and `CustomShader` scope |
 | `cpu` | The CPU work of the DLL on the configuration of an installed importer: call-for-call equality and frame time against a reference DLL |
 | `cpu/dx11/desktop` | The Nahida Desktop channel: the codec against the shared vectors and the pipe server with INI variables on D3D11 |
 | `cache` | CPU data-cache snapshots, shared views, bounded lazy reads and allocation reuse, without a GPU |
