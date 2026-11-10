@@ -12,6 +12,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <cstring>
+#include <memory>
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
 static void check(HRESULT hr) { if (FAILED(hr)) throw std::runtime_error("HRESULT " + std::to_string((unsigned)hr)); }
@@ -62,10 +63,12 @@ static Pixels dx12(HWND w, const fs::path &dir) {
     ComPtr<ID3D12Device> d; check(D3D12CreateDevice(a.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d)));
     D3D12_COMMAND_QUEUE_DESC qd = {}; ComPtr<ID3D12CommandQueue> q; check(d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)));
     ComPtr<ID3D12Fence> fence; check(d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr); if (!event) throw std::runtime_error("event"); UINT64 tick = 0;
+    auto close_event = [](HANDLE handle) { CloseHandle(handle); };
+    std::unique_ptr<void, decltype(close_event)> event(CreateEventW(nullptr, FALSE, FALSE, nullptr), close_event);
+    if (!event) throw std::runtime_error("event"); UINT64 tick = 0;
     DXGI_SWAP_CHAIN_DESC1 sd = {}; sd.Width = sd.Height = 32; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     ComPtr<IDXGISwapChain1> swap; check(f->CreateSwapChainForHwnd(q.Get(), w, &sd, nullptr, nullptr, &swap));
-    check(swap->Present(0, 0)); wait(q.Get(), fence.Get(), ++tick, event);
+    check(swap->Present(0, 0)); wait(q.Get(), fence.Get(), ++tick, event.get());
     D3D12_ROOT_SIGNATURE_DESC rd = {}; rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> sig, error; check(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &error));
     ComPtr<ID3D12RootSignature> root; check(d->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root)));
@@ -92,9 +95,9 @@ static Pixels dx12(HWND w, const fs::path &dir) {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT foot = {}; UINT64 bytes = 0; d->GetCopyableFootprints(&tr, 0, 1, 0, &foot, nullptr, nullptr, &bytes);
     auto rb = buffer(d.Get(), bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {}; src.pResource = target.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.pResource = rb.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = foot; l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    check(l->Close()); ID3D12CommandList *lists[] = {l.Get()}; q->ExecuteCommandLists(1, lists); wait(q.Get(), fence.Get(), ++tick, event); check(d->GetDeviceRemovedReason());
+    check(l->Close()); ID3D12CommandList *lists[] = {l.Get()}; q->ExecuteCommandLists(1, lists); wait(q.Get(), fence.Get(), ++tick, event.get()); check(d->GetDeviceRemovedReason());
     void *mapped; D3D12_RANGE range = {0, (SIZE_T)bytes}; check(rb->Map(0, &range, &mapped)); Pixels result = pixels((unsigned char *)mapped + foot.Offset, foot.Footprint.RowPitch); D3D12_RANGE empty = {}; rb->Unmap(0, &empty);
-    check(swap->Present(0, 0)); wait(q.Get(), fence.Get(), ++tick, event); CloseHandle(event); return result;
+    check(swap->Present(0, 0)); wait(q.Get(), fence.Get(), ++tick, event.get()); return result;
 }
 static Pixels dx11(HWND w, const fs::path &dir) {
     DXGI_SWAP_CHAIN_DESC sd = {}; sd.BufferDesc.Width = sd.BufferDesc.Height = 32; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.OutputWindow = w; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;

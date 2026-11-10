@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -30,6 +31,21 @@ def execute(exe, arguments, directory):
     if result.returncode:
         raise RuntimeError(f"{directory.name}: exit {result.returncode}; see stderr.log")
     return result.stdout
+
+
+def check_late_draw_order(api, log, notes):
+    if api == "dx11":
+        draws = [match.group(1) for line in log.splitlines()
+                 if (match := re.search(r"3DMigoto\s+\[[^\]]+\] (Draw.*)$", line))]
+        expected = ["DrawIndexed(3, 0, 0)",
+                    "Draw = from_caller -> DrawIndexedInstanced(3, 1, 3, 0, 0)"]
+    else:
+        draws = [line.partition(",")[0] for line in notes]
+        expected = ["Mod draw: 3 from 0 indexed", "Mod draw: 3 from 3 indexed"]
+    if draws != expected:
+        raise AssertionError(
+            f"{api}/late: expected replacement draw before parent replay; got {draws!r}")
+    return draws
 
 
 def main():
@@ -68,7 +84,7 @@ def main():
 target = {exe.name}
 require_admin = false
 [Logging]
-log_level = info
+log_level = {'debug' if api == 'dx11' and mode == 'late' else 'info'}
 [System]
 skip_early_includes_load = false
 [Include]
@@ -118,14 +134,11 @@ ib = ResourceMesh
             if api == "dx12" and mode != "native":
                 notes = [line for line in (directory / "dx12_report.txt").read_text(
                     encoding="utf-8", errors="replace").splitlines() if line.startswith("Mod draw:")]
-                if mode == "late":
-                    if not any("3 from 0 indexed" in line for line in notes):
-                        raise AssertionError("replacement mesh was not drawn")
-                    if not any("3 from 3 indexed" in line for line in notes):
-                        raise AssertionError("from_caller did not retain the parent first index")
                 if mode == "scoped" and (not notes or any("3 from 3 indexed" in line for line in notes)):
                     raise AssertionError("scoped shader unexpectedly replayed the parent draw")
-            cases.append(dict(api=api, mode=mode, pixels=actual, notes=notes, passed=True))
+            late_draws = check_late_draw_order(api, log, notes) if mode == "late" else []
+            cases.append(dict(api=api, mode=mode, pixels=actual, notes=notes,
+                              late_draws=late_draws, passed=True))
             print(f"{api}/{mode}: PASS {actual}", flush=True)
     summary = dict(passed=True, dll_sha256=hashlib.sha256(dll.read_bytes()).hexdigest(),
                    vs_hash=vs, ps_hash=ps, cases=cases)

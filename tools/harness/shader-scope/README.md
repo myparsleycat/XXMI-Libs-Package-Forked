@@ -38,9 +38,19 @@ In `late`, `draw = from_caller` submits the parent parameters (first index 3)
 with the currently bound replacement buffer, not a replay of its earlier
 first-index-0 draw. It cannot turn that red draw green. The test explicitly
 checks this result; it is **not** a failing test for a DX12-only regression.
-Both APIs must agree. `scoped` verifies the shader itself works and there is
+Both APIs must agree. The D3D11 debug log and D3D12 draw notes must contain
+exactly one replacement draw followed by one parent-range replay. Reversed,
+missing, or repeated draws fail even when the final pixels remain red.
+The ordered draws are also retained in `results.json`.
+`scoped` verifies the shader itself works and there is
 no extra parent-range redraw. DX12 draw notes and per-case logs are retained.
 
 This is a narrow direct indexed-draw contract test. It does not cover
 bundles, indirect or mesh draws, multi-queue recording, arbitrary state
 overrides, capture hotkeys, config hot-reload, or any real game's rendering.
+
+Run the draw-order checker tests without a DLL or graphics runtime:
+
+```bat
+python -m unittest discover -s tools/harness/shader-scope -p test_check.py
+```
