@@ -18,6 +18,8 @@
 #   dxil-direct-heap-blocked  refuse quoted direct descriptor-heap handles
 #   dxil-sampler  add a sampler to a game DXIL shader
 #   dxil-texture-sampler  add a 2D SRV and sampler to a game DXIL shader
+#   dxil-texture-table  the same with t60 inside the game's table (table=128)
+#   dxil-texture-unbound  that patch with nothing bound at t60 leaves the picture as it was
 #   dxil-sampler-states  change its sampler state between runs
 #   dxil-sampler-switch  change the sampler state between draws in a run
 #   dxil-sampler-existing  an unsupported replacement of a game static sampler stays unchanged
@@ -536,7 +538,7 @@ run_dxil_existing_space_uav_blocked() {
 }
 
 run_dxil_sampler() {
-	local a b debug="" frames=60 args=""
+	local a b same debug="" frames=60 args="" name="dxil-${1:+$1-}sampler"
 	[ "${DX12_DEBUG:-0}" = 1 ] && debug=debug
 	if [ "${DX12_GPU_DEBUG:-0}" = 1 ]; then debug=gpu-debug; frames=4; fi
 	[ "${DX12_ROOTSIG11:-0}" = 1 ] && args=rootsig11
@@ -544,19 +546,30 @@ run_dxil_sampler() {
 	[ "${DX12_ROOTSIG12:-0}" = 1 ] && args=rootsig12
 	[ "${DX12_HEAP_FULL:-0}" = 1 ] && args="$args heap=1000000"
 	cp case/dxil-sampler.ini run/Mods/dxil-sampler.ini || { ok=0; return; }
-	if [ "$1" = texture ]; then
-		sed -i '/^dx12_match_registers = /a ps-t60 = ResourceDxilTexture' run/Mods/dxil-sampler.ini
+	if [ -n "$1" ]; then
+		[ "$1" = unbound ] || sed -i '/^dx12_match_registers = /a ps-t60 = ResourceDxilTexture' run/Mods/dxil-sampler.ini
 		sed -i '/^dcl_sampler s15, mode_default$/a dcl_resource_texture2d (float,float,float,float) t60' run/Mods/dxil-sampler.ini
 		sed -i '/^%zz_sample = /s/${texture}/%zz_d3dmigoto_t60/' run/Mods/dxil-sampler.ini
 		printf '\n[ResourceDxilTexture]\nfilename = mod/test.dds\n' >> run/Mods/dxil-sampler.ini
 	fi
+	# The game's table then covers t60 and has textures of its own there; a
+	# heap that holds a frame of such tables before the harness reuses them
+	if [ "$1" = table ] || [ "$1" = unbound ]; then
+		args="table=128 heap=262144 $args"
+		name="dxil-texture-$1"
+	fi
 	(cd run && ./harness.exe dxil $debug $args frames=$frames dump=dxil-sampler-on.bmp >dxil-sampler-debug.log 2>&1); a=$?
 	rm -f run/Mods/dxil-sampler.ini
 	(cd run && ./harness.exe dxil $debug $args frames=$frames dump=dxil-sampler-off.bmp >>dxil-sampler-debug.log 2>&1); b=$?
-	if [ "$a" = 0 ] && [ "$b" = 0 ] && python check_dxil_iniparams.py run/dxil-sampler-on.bmp run/dxil-sampler-off.bmp; then
-		echo "dxil-${1:+$1-}sampler: OK"
+	if [ "$1" = unbound ]; then
+		cmp -s run/dxil-sampler-on.bmp run/dxil-sampler-off.bmp; same=$?
 	else
-		echo "dxil-${1:+$1-}sampler: FAILED (exit $a, $b)"; ok=0
+		python check_dxil_iniparams.py run/dxil-sampler-on.bmp run/dxil-sampler-off.bmp; same=$?
+	fi
+	if [ "$a" = 0 ] && [ "$b" = 0 ] && [ "$same" = 0 ]; then
+		echo "$name: OK"
+	else
+		echo "$name: FAILED (exit $a, $b)"; ok=0
 		grep '^D3D12 debug error:' run/dxil-sampler-debug.log | head -5
 	fi
 }
@@ -657,6 +670,8 @@ for what in ${@:-test fold move lowmip}; do
 	dxil-existing-space-uav-blocked) run_dxil_existing_space_uav_blocked ;;
 	dxil-sampler) run_dxil_sampler '' ;;
 	dxil-texture-sampler) run_dxil_sampler texture ;;
+	dxil-texture-table) run_dxil_sampler table ;;
+	dxil-texture-unbound) run_dxil_sampler unbound ;;
 	dxil-sampler-states) run_dxil_sampler_states '' ;;
 	dxil-sampler-switch) run_dxil_sampler_states switch ;;
 	dxil-sampler-existing) run_dxil_sampler_existing ;;

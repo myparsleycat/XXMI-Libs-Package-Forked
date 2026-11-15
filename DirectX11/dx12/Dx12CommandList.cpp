@@ -511,13 +511,14 @@ void STDMETHODCALLTYPE Dx12GraphicsCommandList::OMSetBlendFactor(const FLOAT Ble
 
 void STDMETHODCALLTYPE Dx12GraphicsCommandList::OMSetStencilRef(UINT StencilRef)
 {
-	mState.stencil_ref = StencilRef;
+	mState.stencil_ref = mState.back_stencil_ref = StencilRef;
 	mOrig->OMSetStencilRef(StencilRef);
 }
 
 void STDMETHODCALLTYPE Dx12GraphicsCommandList::OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef)
 {
 	mState.stencil_ref = FrontStencilRef;
+	mState.back_stencil_ref = BackStencilRef;
 	mOrig->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef);
 }
 

@@ -27,5 +27,10 @@ DxilPatchOutcome DxilPatchShader(const Dx12ShaderInfo *shader, const std::vector
 
 // The patched shader for a game draw, if a matching DXIL group made one.
 // With link_groups, its successful groups also add their command lists and
-// filter_index to the original shader's ShaderOverride.
-const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_groups, const char **why);
+// filter_index to the original shader's ShaderOverride. added_srv gets the
+// SRV registers t0-t127 the patch declared that the original shader has not.
+const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_groups, const char **why,
+		const UINT64 **added_srv = NULL);
+// Frees the patches of earlier configurations. With the shim lock held and
+// no draw scope open, which is all that holds them.
+void DxilForgetOldPatches();

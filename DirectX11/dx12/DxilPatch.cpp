@@ -517,14 +517,16 @@ struct CacheEntry {
 	bool processed = false;
 	DxilPatchOutcome outcome = DxilPatchOutcome::NO_MATCH;
 	Dx12ShaderInfo shader = {};
+	UINT64 added_srv[2] = {};
 	std::vector<BYTE> bytecode;
 	std::vector<std::wstring> groups;
 	std::string why;
 };
 
+// Keyed by the ShaderRegex hash as well: a draw may hold an entry of the
+// configuration before a reload until DxilForgetOldPatches
 static std::map<std::pair<UINT64, uint32_t>, CacheEntry> cache;
 static std::mutex cache_mutex;
-static uint32_t cache_hash;
 
 } // namespace
 
@@ -672,7 +674,20 @@ DxilPatchOutcome DxilPatchShader(const Dx12ShaderInfo *shader, const std::vector
 	return DxilPatchOutcome::PATCHED;
 }
 
-const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_groups, const char **why)
+void DxilForgetOldPatches()
+{
+	std::lock_guard<std::mutex> guard(cache_mutex);
+
+	for (auto i = cache.begin(); i != cache.end();) {
+		if (i->first.second != shader_regex_hash)
+			i = cache.erase(i);
+		else
+			++i;
+	}
+}
+
+const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_groups, const char **why,
+		const UINT64 **added_srv)
 {
 	std::pair<UINT64, uint32_t> key;
 	CacheEntry *entry;
@@ -683,10 +698,6 @@ const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_gro
 	if (!shader_regex_dxil_groups || !shader || !shader->dxil)
 		return NULL;
 	std::lock_guard<std::mutex> guard(cache_mutex);
-	if (cache_hash != shader_regex_hash) {
-		cache.clear();
-		cache_hash = shader_regex_hash;
-	}
 	key = std::make_pair(shader->hash, shader_regex_hash);
 	entry = &cache[key];
 	if (!entry->processed) {
@@ -716,6 +727,9 @@ const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_gro
 			entry->shader.bytecode = entry->bytecode.data();
 			entry->shader.uav |= patched.uav;
 			entry->shader.samplers |= patched.samplers;
+			// A declaration of a register the game's shader has only names it
+			entry->added_srv[0] = patched.srv[0] & ~shader->srv[0];
+			entry->added_srv[1] = patched.srv[1] & ~shader->srv[1];
 			for (UINT reg = 0; reg < 64; reg++)
 				if (patched.uav & 1ull << reg)
 					entry->shader.uav_dimension[reg] = D3D12_UAV_DIMENSION_BUFFER;
@@ -737,5 +751,7 @@ const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_gro
 	}
 	if (entry->outcome == DxilPatchOutcome::FAILED && why)
 		*why = entry->why.c_str();
+	if (added_srv)
+		*added_srv = entry->added_srv;
 	return entry->outcome == DxilPatchOutcome::PATCHED ? &entry->shader : NULL;
 }

@@ -51,6 +51,8 @@ struct Dx12CmdState {
 	UINT scissor_count;
 	FLOAT blend_factor[4];
 	UINT stencil_ref;
+	// Other than stencil_ref only after OMSetFrontAndBackStencilRef
+	UINT back_stencil_ref;
 };
 
 void Dx12ResetCmdState(Dx12CmdState *state, ID3D12PipelineState *pipeline);

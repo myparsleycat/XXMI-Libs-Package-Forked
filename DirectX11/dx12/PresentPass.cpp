@@ -307,6 +307,9 @@ static void frame_actions()
 		VkModsConfigReloaded();
 		Dx12WatchDevice(dx12_shim->device);
 	}
+	// Only once ReloadConfig has parsed the mods' ShaderRegex sections
+	if (G->gConfigInitialized)
+		dx12_config_loaded = true;
 
 	Profiling::Spike::sample_mod_state();
 

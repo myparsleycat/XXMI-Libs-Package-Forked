@@ -166,6 +166,8 @@ struct Dx12DrawFilter {
 	// Bits of the conditions DrawPath watches: the ones that have to be
 	// false and the ones that have to be true for only_checks to hold
 	UINT64 guards_zero, guards_nonzero;
+	// Bit per stage whose shader has a DXIL ShaderRegex patch
+	UINT dxil_patched_stages;
 };
 
 struct Dx12PipelineInfo {
@@ -200,10 +202,11 @@ struct Dx12PipelineInfo {
 	~Dx12PipelineInfo();
 };
 
-// Set by whatever needs DXBC shaders of the game's pipelines kept as the game
-// gave them (Dx12ShaderInfo::bytecode) without hunting being on. DXIL is always
-// retained so ShaderRegex rules added by an F10 reload can patch existing shaders.
+// Set by whatever needs shaders of the game's pipelines kept as the game gave
+// them (Dx12ShaderInfo::bytecode) without hunting being on. DXIL shaders are
+// also kept until the mods have first been loaded, dx12_config_loaded.
 extern volatile bool dx12_keep_shader_bytecode;
+extern volatile bool dx12_config_loaded;
 
 // For the methods creating these objects, on success. ppv is what the game
 // asked for, which may be nothing at all.
@@ -234,6 +237,8 @@ struct Dx12PipelineVariantDesc {
 	UINT sample_mask;
 	bool depth_stencil_override;
 	D3D12_DEPTH_STENCIL_DESC depth_stencil;
+	// No note in dx12_report.txt if it cannot be made
+	bool quiet;
 };
 
 // The game's pipeline made again with that. Not referenced: it lives as long

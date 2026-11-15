@@ -22,6 +22,7 @@ static SRWLOCK pipeline_lock = SRWLOCK_INIT;
 static std::unordered_map<ID3D12PipelineState*, Dx12PipelineInfo*> pipelines;
 
 volatile bool dx12_keep_shader_bytecode;
+volatile bool dx12_config_loaded;
 static volatile bool graphics_dxil;
 
 static SRWLOCK signature_lock = SRWLOCK_INIT;
@@ -373,9 +374,10 @@ static const Dx12ShaderInfo* shader_info(Dx12ShaderStage stage, const D3D12_SHAD
 	}
 	Dx12ReflectShaderResources(bytecode->pShaderBytecode, bytecode->BytecodeLength, info);
 
-	// DXIL ShaderRegex rules can be added or changed by an F10 reload after a
-	// shader was first seen, so its original bytecode must remain available.
-	if (info->dxil || G->hunting || dx12_keep_shader_bytecode) {
+	// DXIL ShaderRegex groups patch shaders the game made before the mods
+	// were loaded, at the first present. A group added by a later reload only
+	// reaches those made after.
+	if ((info->dxil && !dx12_config_loaded) || G->hunting || dx12_keep_shader_bytecode) {
 		copy = (BYTE*)malloc(info->size);
 		if (copy)
 			memcpy(copy, bytecode->pShaderBytecode, info->size);
@@ -1307,7 +1309,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 			device2->Release();
 	}
 
-	if (!pipeline && reported < 16) {
+	if (!pipeline && !variant->quiet && reported < 16) {
 		reported++;
 		if (!changed_stages && changed_states && failed)
 			Dx12DumpNote("*** A mod's blend or depth/stencil state cannot be applied to the game's pipeline: %s. The game's state is used.\n", failed);

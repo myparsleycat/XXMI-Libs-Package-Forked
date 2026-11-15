@@ -1770,6 +1770,10 @@ struct Dx12DrawScope {
 	Dx12ShaderInfo mod_shaders[DX12_STAGE_COUNT];
 	// Bit per stage of those that is the mod's
 	UINT custom_stages;
+	// Bit per stage of those that is a DXIL ShaderRegex patch of the game's,
+	// and the SRVs but IniParams that each patch added
+	UINT patched_stages;
+	UINT64 patched_srvs[DX12_STAGE_COUNT][2];
 	// A mod's shaders could not be given to the draw being applied
 	bool custom_failed;
 	// The game's root signature extended for the registers of those that it
@@ -1785,6 +1789,9 @@ struct Dx12DrawScope {
 	bool topology_changed;
 	bool blend_factor_changed;
 	bool stencil_ref_changed;
+	// Whether the pipeline set has the mod's blend or depth-stencil state
+	bool blend_overridden;
+	bool depth_stencil_overridden;
 	// The game's pipeline made again with the input layout or the shaders
 	// of a mod, if that is what the list has set, see apply_pipeline
 	ID3D12PipelineState *variant;
@@ -2367,7 +2374,9 @@ static void restore_overrides()
 	if (scope->blend_factor_changed)
 		list->OMSetBlendFactor(game->blend_factor);
 	scope->blend_factor_changed = false;
-	if (scope->stencil_ref_changed)
+	if (scope->stencil_ref_changed && game->back_stencil_ref != game->stencil_ref)
+		scope->list->mOrig->OMSetFrontAndBackStencilRef(game->stencil_ref, game->back_stencil_ref);
+	else if (scope->stencil_ref_changed)
 		list->OMSetStencilRef(game->stencil_ref);
 	scope->stencil_ref_changed = false;
 }
@@ -2524,11 +2533,11 @@ static bool table_size(UINT parameter, UINT *size, UINT *static_end)
 	declared = declared && visible;
 
 	for (const Dx12RootRange &range : table.ranges) {
-		if (!(range.flags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE)) {
-			if (range.count == UINT_MAX || range.offset > UINT_MAX - range.count)
-				return false;
+		// One without an end is left to what the shaders declare, as a
+		// volatile one is
+		if (!(range.flags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE) && range.count != UINT_MAX
+		    && range.offset <= UINT_MAX - range.count)
 			*static_end = max(*static_end, range.offset + range.count);
-		}
 		if (range.count == UINT_MAX)
 			bounded = false;
 		else
@@ -2972,6 +2981,44 @@ static const ShimShader* mod_shader_form(const ShimState *mod, Dx12ShaderStage s
 	return shader;
 }
 
+// The SRVs a DXIL ShaderRegex patch added but IniParams, which is bound for
+// every draw. False for none.
+static bool patch_added_textures(const UINT64 *added, UINT64 *textures)
+{
+	int ini_params = G->IniParamsReg;
+
+	textures[0] = added[0];
+	textures[1] = added[1];
+	if (ini_params >= 0 && ini_params < 128)
+		textures[ini_params / 64] &= ~(1ull << (ini_params % 64));
+	return textures[0] || textures[1];
+}
+
+// The patch of the game's shader of the stage that the draw is made with, or
+// NULL, and the SRVs it added. One that adds textures is only used where the
+// mod binds one of them. Unbound, they read zeros on D3D11, for which such a
+// patch has to give the game's result, and the draws no mod looks at keep
+// going through the filter.
+static const Dx12ShaderInfo* patched_game_shader(const ShimState *mod, Dx12ShaderStage stage, UINT64 *textures)
+{
+	const ShimStageState *bound = &mod->stages[stage];
+	const Dx12ShaderInfo *patched;
+	const UINT64 *added;
+	UINT word;
+
+	textures[0] = textures[1] = 0;
+	if (!(scope->pipeline->filter.dxil_patched_stages & 1u << stage))
+		return NULL;
+	patched = DxilGameShader(scope->pipeline->shaders[stage], false, NULL, &added);
+	if (!patched || !patch_added_textures(added, textures))
+		return patched;
+	for (word = 0; word < ARRAYSIZE(bound->srv_mask); word++) {
+		if (bound->srv_mask[word] & (UINT)(textures[word / 2] >> (word % 2 * 32)))
+			return patched;
+	}
+	return NULL;
+}
+
 bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot)
 {
 	Dx12ShaderStage stage;
@@ -2997,8 +3044,9 @@ bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot)
 }
 
 // A shader of the mod's reads zeros where the mod set none, as under D3D11,
-// and not the game's texture the table has there. Only for those: the game's
-// shaders keep their own textures where a mod sets none.
+// and not the game's texture the table has there. Only for those and the
+// registers patches added: the game's shaders keep their own textures where a
+// mod sets none.
 static void apply_unbound_shader_resources(const ShimState *mod)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
@@ -3019,6 +3067,24 @@ static void apply_unbound_shader_resources(const ShimState *mod)
 				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
 				    && table_descriptor(&location, &descriptor))
 					Dx12ShimNullSrv(shader->srv_dimension[slot], descriptor);
+			}
+		}
+	}
+
+	// Registers a patch added that the game's table covers hold whatever
+	// the game's heap has there. Those the mod bound nothing to read zeros.
+	for (Dx12ShaderStage stage : graphics_stages) {
+		const UINT64 *textures = scope->patched_srvs[stage];
+
+		if (!(scope->patched_stages & 1u << stage))
+			continue;
+		for (word = 0; word < ARRAYSIZE(mod->stages[stage].srv_mask); word++) {
+			mask = (UINT)(textures[word / 2] >> (word % 2 * 32)) & ~mod->stages[stage].srv_mask[word];
+			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
+				slot = word * 32 + bit;
+				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
+				    && table_descriptor(&location, &descriptor))
+					Dx12ShimNullSrv(scope->shaders[stage]->srv_dimension[slot], descriptor);
 			}
 		}
 	}
@@ -4925,7 +4991,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 				}
 				// A mod draw can keep a game's shader for a stage it does not
 				// replace. Apply DXIL ShaderRegex patches to that stage too.
-				const Dx12ShaderInfo *patched = DxilGameShader(scope->pipeline->shaders[stage], false, NULL);
+				const Dx12ShaderInfo *patched = patched_game_shader(mod, stage, scope->patched_srvs[stage]);
 				if (patched) {
 					wanted.shaders[stage] = patched;
 					patched_stages |= 1u << stage;
@@ -4938,7 +5004,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		}
 	} else if (!scope->compute && !scope->skin) {
 		for (Dx12ShaderStage stage : graphics_stages) {
-			const Dx12ShaderInfo *patched = DxilGameShader(scope->pipeline->shaders[stage], false, NULL);
+			const Dx12ShaderInfo *patched = patched_game_shader(mod, stage, scope->patched_srvs[stage]);
 
 			if (!patched)
 				continue;
@@ -4978,8 +5044,24 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	if (extension)
 		wanted.root_signature = extension->signature;
 
+	// A state the game's pipeline cannot be made with costs the mod its
+	// states, not its shaders or layout. Only the second try's failure is
+	// noted, as that is the shaders' or layout's.
+	wanted.quiet = (wanted.blend_override || wanted.depth_stencil_override)
+		&& (wanted.elements || variant_stages || wanted.removed_stages);
 	if (wanted.elements || variant_stages || wanted.removed_stages || wanted.blend_override || wanted.depth_stencil_override)
 		variant = Dx12PipelineVariant(scope->pipeline, dx12_shim->device, &wanted, &why);
+	if (!variant && wanted.quiet) {
+		wanted.blend_override = wanted.sample_mask_override = wanted.depth_stencil_override = false;
+		wanted.quiet = false;
+		variant = Dx12PipelineVariant(scope->pipeline, dx12_shim->device, &wanted, &why);
+		if (variant) {
+			static bool noted;
+			log_once(&noted, "A mod's blend or depth/stencil state cannot be applied to the game's pipeline. The draw uses the mod's shaders with the game's state.");
+		}
+	}
+	scope->blend_overridden = variant && wanted.blend_override;
+	scope->depth_stencil_overridden = variant && wanted.depth_stencil_override;
 	if (variant && extension)
 		scope->extension = *extension;
 	else
@@ -4992,6 +5074,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 			scope->shaders[stage] = variant && wanted.shaders[stage] ? wanted.shaders[stage] : scope->pipeline->shaders[stage];
 	}
 	scope->custom_stages = variant ? stages : 0;
+	scope->patched_stages = variant ? patched_stages : 0;
 	if (stages && variant) {
 		stats.custom_draws++;
 		stats.custom_extended += scope->extension.signature != NULL;
@@ -5039,11 +5122,11 @@ static void apply_overrides(bool mod_draw)
 	// Before the bindings, which go by the shaders of the draw
 	scope->custom_failed = false;
 	apply_pipeline(mod, mod_draw, true);
-	if (!scope->compute && mod->blend) {
+	if (scope->blend_overridden) {
 		list->OMSetBlendFactor(mod->blend_factor);
 		scope->blend_factor_changed = true;
 	}
-	if (!scope->compute && mod->depth_stencil) {
+	if (scope->depth_stencil_overridden) {
 		list->OMSetStencilRef(mod->stencil_ref);
 		scope->stencil_ref_changed = true;
 	}
@@ -5086,7 +5169,7 @@ static void apply_overrides(bool mod_draw)
 		for (mask = bound->cb_mask; _BitScanForward(&bit, mask); mask &= mask - 1)
 			apply_constant_buffer(stages[i], bit, bound);
 	}
-	if (scope->custom_stages)
+	if (scope->custom_stages || scope->patched_stages)
 		apply_unbound_shader_resources(mod);
 	bind_changed_tables();
 
@@ -5382,6 +5465,7 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	opened->signature = Dx12ListRootSignature(list, compute);
 	memcpy(opened->shaders, pipeline->shaders, sizeof(opened->shaders));
 	opened->custom_stages = 0;
+	opened->patched_stages = 0;
 	opened->custom_failed = false;
 	opened->extension.signature = NULL;
 	opened->root_signature = NULL;
@@ -5390,6 +5474,8 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	opened->topology_changed = false;
 	opened->blend_factor_changed = false;
 	opened->stencil_ref_changed = false;
+	opened->blend_overridden = false;
+	opened->depth_stencil_overridden = false;
 	opened->variant = NULL;
 	opened->game_layout = NULL;
 	opened->parameters.clear();
@@ -5644,14 +5730,19 @@ static void work_out_filter(Dx12DrawFilter *filter, const UINT64 *hashes, bool p
 // are not the pipeline's, see Dx12Dispatch
 static void work_out_filter(const Dx12PipelineInfo *pipeline, const Dx12ShaderInfo *const *shaders)
 {
-	UINT64 hashes[DX12_STAGE_COUNT] = {};
+	UINT64 hashes[DX12_STAGE_COUNT] = {}, textures[2];
+	const UINT64 *added;
 	bool patched_shader = false;
 
+	pipeline->filter.dxil_patched_stages = 0;
 	for (Dx12ShaderStage stage : graphics_stages) {
 		hashes[stage] = shaders[stage] ? shaders[stage]->hash : 0;
-		if (!pipeline->shaders[DX12_STAGE_CS] && shader_regex_dxil_groups && shaders[stage]
-		    && DxilGameShader(shaders[stage], false, NULL))
-			patched_shader = true;
+		if (pipeline->shaders[DX12_STAGE_CS] || !shader_regex_dxil_groups || !shaders[stage]
+		    || !DxilGameShader(shaders[stage], false, NULL, &added))
+			continue;
+		pipeline->filter.dxil_patched_stages |= 1u << stage;
+		// One that adds no texture changes every draw of the shader
+		patched_shader |= !patch_added_textures(added, textures);
 	}
 	work_out_filter(&pipeline->filter, hashes, patched_shader);
 }
@@ -6564,6 +6655,7 @@ static size_t regex_linked_shaders;
 void Dx12DrawPathConfigReloaded()
 {
 	regex_linked_shaders = 0;
+	DxilForgetOldPatches();
 	forget_unpacked_buffers();
 	forget_rigid_weights_copies();
 	// What the mods wrote before is not what the ones there now would
