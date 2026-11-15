@@ -1,5 +1,8 @@
 # Command Lists
 
+See [Shader callbacks and draw scope](shader-draw-scope.md) before combining
+mesh overrides with a custom shader invoked by a later shader callback.
+
 ## Recursion Limit
 
 The command-list recursion limit is increased to **256**, from the original 3DMigoto limit of **64**.

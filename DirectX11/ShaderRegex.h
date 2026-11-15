@@ -54,6 +54,27 @@ struct ShaderResource
 	int32_t set = -1;
 };
 
+struct ShaderSlotRange
+{
+	uint32_t first = 0;
+	uint32_t last = 0;
+	uint32_t count = 0;
+
+	void include(uint32_t slot) noexcept
+	{
+		if (count == 0)
+			first = last = slot;
+
+		if (slot < first)
+			first = slot;
+
+		if (slot > last)
+			last = slot;
+
+		++count;
+	}
+};
+
 struct ShaderBindings
 {
 	std::array<ShaderConstantBuffer, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> constant_buffers{};
@@ -61,6 +82,9 @@ struct ShaderBindings
 	// The registers of the textures the code samples, in the order it first
 	// does. Only known of a Vulkan shader.
 	std::vector<uint8_t> sampled;
+
+	ShaderSlotRange constant_buffer_slots{};
+	ShaderSlotRange resource_slots{};
 };
 
 struct OriginalShaderInfo;

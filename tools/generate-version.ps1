@@ -101,6 +101,12 @@ else {
 # Version tag
 # ---------------------------------------------------------------------------
 
+# The build runs this without -Tag. On a GitHub Actions tag build, take the tag
+# that started it; git describe could pick another tag on the same commit.
+if ([string]::IsNullOrWhiteSpace($Tag) -and $env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v\d') {
+    $Tag = $env:GITHUB_REF_NAME
+}
+
 if ([string]::IsNullOrWhiteSpace($Tag)) {
     try {
         $Tag = Invoke-Git @(
@@ -167,8 +173,16 @@ $shortCommit = Invoke-Git @(
 
 $commitDisplay = $shortCommit
 
+# The tag as git describe would print it, without the leading v
+$versionTag = $Tag -replace '^v', ''
+
+if (-not $isRelease) {
+    $versionTag += "-$commitsSinceTag-g$shortCommit"
+}
+
 if ($isDirty) {
     $commitDisplay += "-dirty"
+    $versionTag += "-dirty"
 }
 
 # ---------------------------------------------------------------------------
@@ -225,6 +239,7 @@ $comments = $repoUrl
 # Escape characters which could break the generated C/C++ string.
 $companyName = $companyName.Replace('\', '\\').Replace('"', '\"')
 $comments = $comments.Replace('\', '\\').Replace('"', '\"')
+$versionTag = $versionTag.Replace('\', '\\').Replace('"', '\"')
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +254,7 @@ $content = @"
 
 #define VER_COMPANYNAME_STR         "$companyName"
 #define VER_COMMENTS_STR            "$comments"
+#define VERSION_TAG_STR             "$versionTag"
 
 "@
 

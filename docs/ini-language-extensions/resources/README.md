@@ -9,3 +9,4 @@
 * [Resource Regions](resource-regions.md) — existing buffer regions and explicit regions for `copy` and `ref` operations
 * [Slot Indexing](slot-indexing.md) — dynamic slot indices and slot ranges
 * [Sampler States](sampler-states.md) — sampler state resources bound to `ps-s0` and the other sampler slots
+* [Stream Output](stream-output.md) — binding `so0`–`so3`, the bind flags they need, and what D3D11 does not report back

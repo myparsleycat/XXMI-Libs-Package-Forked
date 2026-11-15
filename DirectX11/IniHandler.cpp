@@ -19,6 +19,7 @@
 #include "cursor.h"
 #include "dx12/Bridge.h"
 #include "dx12/PipelineRegistry.h"
+#include "desktop/Channel.h"
 #include <chrono>
 #include <mutex>
 #include <atomic>
@@ -73,6 +74,7 @@ static Section RegularSections[] = {
 	{L"Include", true}, // Prefix so that it may be namespaced to allow included files to include more files with relative paths
 	{L"Preset", true},
 	{L"Hunting", false},
+	{L"Desktop", false},
 	{L"Logging", false},
 	{L"System", false},
 	{L"Input", false},
@@ -268,11 +270,6 @@ static void emit_ini_warning_tone()
 	ini_warned = false;
 	if (G->gShowWarnings)
 		BeepFailure();
-}
-
-inline wchar_t ascii_tolower(wchar_t c)
-{
-	return (c >= L'A' && c <= L'Z') ? c + (L'a' - L'A') : c;
 }
 
 static bool get_namespaced_section_name(const wstring *section, const wstring *ini_namespace, wstring *ret)
@@ -5282,6 +5279,8 @@ void LoadConfigFile()
 	// [Hunting]
 	ParseHuntingSection();
 
+	ParseDesktopSection();
+
 	// Must be done prior to parsing any command list sections, as every
 	// section registered in this set will be a candidate for optimisation:
 	registered_command_lists.clear();
@@ -5867,6 +5866,8 @@ void ReloadConfig(HackerDevice *device)
 	std::chrono::duration<float> duration = stop - start;
 
 	LogOverlayW(LOG_INFO, L"> Reloaded config in %.3fs\n", duration.count());
+
+	DesktopChannelReloaded();
 }
 
 // With skip_early_includes_load the mods are only loaded by the reload at the

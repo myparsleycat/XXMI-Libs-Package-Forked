@@ -24,7 +24,9 @@
 #include "../input.h"
 #include "../Overlay.h"
 #include "../Override.h"
+#include "../vk/VkDrawPath.h"
 #include "../vk/VkScope.h"
+#include "../desktop/Channel.h"
 
 // Frame actions are run for one swap chain at a time, the first one that
 // presents. Another only gets its turn when that one is gone.
@@ -307,6 +309,9 @@ static void frame_actions()
 	}
 
 	Profiling::Spike::sample_mod_state();
+
+	if (desktop_channel_enabled)
+		DesktopChannelFrame(vk_mods_active ? DesktopProtocol::RENDER_VULKAN : DesktopProtocol::RENDER_D3D12);
 
 	if (!G->suppress_overlay)
 		Dx12DrawOverlay();

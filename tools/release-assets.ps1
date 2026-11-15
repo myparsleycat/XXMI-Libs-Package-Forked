@@ -1,8 +1,8 @@
 # Lists the files a release uploads as assets: d3d11.dll, d3dx.ini,
 # runtime-dependencies.json and every library that names, after checking it
 # against the rules of docs/runtime-dependencies.md. Fails if a file is missing.
-#
-#   gh release create <tag> -R myparsleycat/XXMI-Libs-Package-Forked --latest @(./tools/release-assets.ps1)
+# .github/workflows/zip-release.yml uploads these to the draft release it
+# creates for a pushed tag.
 param(
 	[string]$Dll = 'x64/Release/d3d11.dll'
 )

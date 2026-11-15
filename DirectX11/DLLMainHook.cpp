@@ -7,6 +7,7 @@
 #include "dx12/Bridge.h"
 #include "dx12/Dx12Hooks.h"
 #include "vk/VkHooks.h"
+#include "desktop/Channel.h"
 
 HINSTANCE migoto_handle;
 
@@ -373,6 +374,7 @@ BOOL WINAPI DllMain(
 
 		case DLL_PROCESS_DETACH:
 			dx12_unloading = true;
+			DesktopChannelDetach(lpvReserved != NULL);
 			VkUnwatchUnloads();
 			RemoveHooks();
 			if (tls_idx != TLS_OUT_OF_INDEXES) {
