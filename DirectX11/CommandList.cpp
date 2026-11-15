@@ -4057,6 +4057,34 @@ float CommandListOperand::evaluate_shader_bindings(CommandListState *state, cons
 
 		return (float)t.dimension;
 	}
+	case ShaderTargetEvaluationMode::DCL_CB_SLOT_COUNT:
+	{
+		return (float)bindings.constant_buffer_slots.count;
+	}
+	case ShaderTargetEvaluationMode::DCL_CB_FIRST_SLOT:
+	{
+		const auto& range = bindings.constant_buffer_slots;
+		return range.count ? (float)range.first : -1.0f;
+	}
+	case ShaderTargetEvaluationMode::DCL_CB_LAST_SLOT:
+	{
+		const auto& range = bindings.constant_buffer_slots;
+		return range.count ? (float)range.last : -1.0f;
+	}
+	case ShaderTargetEvaluationMode::DCL_SRV_SLOT_COUNT:
+	{
+		return (float)bindings.resource_slots.count;
+	}
+	case ShaderTargetEvaluationMode::DCL_SRV_FIRST_SLOT:
+	{
+		const auto& range = bindings.resource_slots;
+		return range.count ? (float)range.first : -1.0f;
+	}
+	case ShaderTargetEvaluationMode::DCL_SRV_LAST_SLOT:
+	{
+		const auto& range = bindings.resource_slots;
+		return range.count ? (float)range.last : -1.0f;
+	}
 	}
 	
 	return 0.0;
@@ -9322,9 +9350,15 @@ IniParserResult ShaderTarget::ParseTargetMember(
 		{ L"->srv_sampled",    13, ShaderTargetEvaluationMode::DCL_SRV_SAMPLED, {{
 			MemberArg::Type::Unsigned, // Place in the order the code samples its textures
 		}} },
+		{ L"->cb_last_slot",   14, ShaderTargetEvaluationMode::DCL_CB_LAST_SLOT },
 		{ L"->srv_dimension",  15, ShaderTargetEvaluationMode::DCL_SRV_DIMENSION, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
+		{ L"->cb_slot_count",  15, ShaderTargetEvaluationMode::DCL_CB_SLOT_COUNT },
+		{ L"->cb_first_slot",  15, ShaderTargetEvaluationMode::DCL_CB_FIRST_SLOT },
+		{ L"->srv_last_slot",  15, ShaderTargetEvaluationMode::DCL_SRV_LAST_SLOT },
+		{ L"->srv_slot_count", 16, ShaderTargetEvaluationMode::DCL_SRV_SLOT_COUNT },
+		{ L"->srv_first_slot", 16, ShaderTargetEvaluationMode::DCL_SRV_FIRST_SLOT },
 		{ L"->srv_original_format", 21, ShaderTargetEvaluationMode::DCL_SRV_ORIGINAL_FORMAT, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
