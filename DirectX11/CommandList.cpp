@@ -3967,7 +3967,18 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 			return -0.0;  // Negative zero means no shader bound.
 		if (shader_target.evaluation_mode != ShaderTargetEvaluationMode::SHADER) {
 			const ShaderBindings *declared = mHackerContext->Dx12CurrentShaderBindings(shader_target.shader_type);
-			return declared ? evaluate_shader_bindings(state, *declared) : 0.0f;
+			if (declared)
+				return evaluate_shader_bindings(state, *declared);
+			switch (shader_target.evaluation_mode) {
+			case ShaderTargetEvaluationMode::DCL_CB_FIRST_SLOT:
+			case ShaderTargetEvaluationMode::DCL_CB_LAST_SLOT:
+			case ShaderTargetEvaluationMode::DCL_SRV_FIRST_SLOT:
+			case ShaderTargetEvaluationMode::DCL_SRV_LAST_SLOT:
+				// 0 would name a real slot
+				return -1.0f;
+			default:
+				return 0.0f;
+			}
 		}
 
 		ShaderOverrideMap::iterator override = lookup_shaderoverride(hash);

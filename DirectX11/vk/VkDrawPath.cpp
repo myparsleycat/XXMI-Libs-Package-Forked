@@ -6435,6 +6435,7 @@ const ShaderBindings* VkScopeShaderBindings(int stage)
 		declared->constant_buffers[i].type = ShaderConstantBufferType::IMMEDIATE_INDEXED;
 		// In vectors of four, as a D3D11 shader declares it
 		declared->constant_buffers[i].size = (shader->cbs[i].bytes + 15) / 16;
+		declared->constant_buffer_slots.include((uint32_t)i);
 	}
 	for (i = 0; i < shader->views.size() && i < declared->resources.size(); i++) {
 		const SpirvBinding *view = &shader->views[i];
@@ -6443,6 +6444,7 @@ const ShaderBindings* VkScopeShaderBindings(int stage)
 		declared->resources[i].dimension = view_dimension(view);
 		declared->resources[i].stride = view->kind == SPIRV_SSBO ? view->stride : 0;
 		declared->resources[i].set = view->set;
+		declared->resource_slots.include((uint32_t)i);
 	}
 	declared->sampled = shader->sampled;
 	shader->declared = declared;
