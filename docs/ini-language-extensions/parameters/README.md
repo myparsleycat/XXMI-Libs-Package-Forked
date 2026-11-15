@@ -69,7 +69,7 @@ else if ps == $shader_id
 endif
 ```
 
-A `[ShaderRegex]` pattern cannot match or rewrite the DXIL shaders of a Direct3D 12 game. A group is linked to such a shader (its command list and `filter_index` apply) if it names a shader model of the shader's type and either has no pattern or states what the shader has to declare:
+A legacy `[ShaderRegex].Pattern` cannot match or rewrite a Direct3D 12 game's DXIL. Use [`DxilPattern`](../dxil-shader-regex/README.md) for DXIL matching and rewriting. A group without either pattern type can still match a shader by its declarations and run its command list and `filter_index`:
 
 ```ini
 [ShaderRegexMain]

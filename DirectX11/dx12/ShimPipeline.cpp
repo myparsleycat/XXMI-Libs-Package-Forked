@@ -260,7 +260,7 @@ void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 	dx12_shim->device->CreateShaderResourceView(NULL, &desc, handle);
 }
 
-static void null_uav(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+void Dx12ShimNullUav(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
 
@@ -321,7 +321,7 @@ static bool write_uav(ID3D11UnorderedAccessView *uav, BYTE dimension, D3D12_CPU_
 	ShimView *view = ShimViewOf(uav);
 
 	if (!view || !Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
-		null_uav(dimension, handle);
+		Dx12ShimNullUav(dimension, handle);
 		return !view || !ShimNotReady(view->resource);
 	}
 

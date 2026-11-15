@@ -78,3 +78,4 @@ D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimDefaultSampler();
 
 // A view of nothing, of the dimension a shader declares (ShimShader::srv_dimension)
 void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+void Dx12ShimNullUav(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle);

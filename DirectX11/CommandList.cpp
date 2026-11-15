@@ -3400,16 +3400,12 @@ void CustomShader::find_sampler_slots()
 
 // Which sampler slots running the custom shader has to save and restore, false
 // if none
-static bool sampler_slots_to_save(CustomShader *custom_shader, ID3D11Device *device, UINT16 slots[6])
+static bool sampler_slots_to_save(CustomShader *custom_shader, UINT16 slots[6])
 {
 	bool any = false;
 	int stage;
 
-	// SamplerBindCommand ignores the *-s# lines on D3D12 and Vulkan
-	if (is_shim_device(device))
-		memset(slots, 0, sizeof(custom_shader->sampler_slots));
-	else
-		memcpy(slots, custom_shader->sampler_slots, sizeof(custom_shader->sampler_slots));
+	memcpy(slots, custom_shader->sampler_slots, sizeof(custom_shader->sampler_slots));
 
 	// What sampler = ... has always done
 	if (custom_shader->sampler_override)
@@ -3524,7 +3520,7 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	}
 
 	custom_shader->substantiate(mOrigDevice1);
-	save_samplers = sampler_slots_to_save(custom_shader, mOrigDevice1, sampler_slots);
+	save_samplers = sampler_slots_to_save(custom_shader, sampler_slots);
 
 	saved_shader_inst vs_inst, hs_inst, ds_inst, gs_inst, ps_inst, cs_inst;
 
@@ -3673,7 +3669,7 @@ void SamplerBindCommand::run(CommandListState *state)
 
 	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
 
-	if (is_shim_device(state->mOrigDevice1)) {
+	if (is_shim_device(state->mOrigDevice1) && !Dx12ScopeCanBindSampler(shader_type, slot)) {
 		Dx12SamplerBindingIgnored(ini_line.c_str());
 		return;
 	}
