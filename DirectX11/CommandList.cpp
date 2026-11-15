@@ -14368,6 +14368,13 @@ static void unbind_texture_over_buffer(ID3D11DeviceContext1 *context, wchar_t sh
 			shader_type, slot, desc.ViewDimension, desc.Format, shader_hash);
 }
 
+ID3D11DeviceChild* HackerContext::RunningShader(ID3D11DeviceChild *handle)
+{
+	const ShaderHandleCacheEntry *entry = LookupShaderHandle(handle);
+
+	return (entry->reload_info && entry->reload_info->replacement) ? entry->reload_info->replacement : handle;
+}
+
 void HackerContext::GuardShaderResources(bool compute)
 {
 	static const wchar_t shader_types[] = L"vhdgpc";
@@ -14387,7 +14394,7 @@ void HackerContext::GuardShaderResources(bool compute)
 			if (!handles[stage])
 				continue;
 			ShaderHandleCacheEntry *entry = const_cast<ShaderHandleCacheEntry*>(LookupShaderHandle(handles[stage]));
-			ID3D11DeviceChild *running = (entry->reload_info && entry->reload_info->replacement) ? entry->reload_info->replacement : handles[stage];
+			ID3D11DeviceChild *running = RunningShader(handles[stage]);
 			if (entry->buffer_srv_slots_shader != running) {
 				entry->buffer_srv_slots[0] = entry->buffer_srv_slots[1] = 0;
 				EnterCriticalSectionPretty(&G->mShaderBindingsLock);

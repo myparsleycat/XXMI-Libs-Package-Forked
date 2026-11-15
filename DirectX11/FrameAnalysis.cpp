@@ -2625,9 +2625,20 @@ void FrameAnalysisContext::DumpTextures(bool compute)
 		}
 		if (mCurrentPixelShader) {
 			ShaderBindings* bindings = nullptr;
-			auto it = G->mShaderBindingsCache.find(mCurrentPixelShader);
-			if (it != G->mShaderBindingsCache.end())
-				bindings = &it->second;
+			if (mCurrentPixelShaderHandle) {
+				ID3D11DeviceChild *running = RunningShader(mCurrentPixelShaderHandle);
+
+				// Shaders created on other threads insert into these maps.
+				// Its elements stay where they are, so the pointer outlives the lock:
+				CriticalSectionGuard(&G->mShaderBindingsLock);
+				// The bindings are cached of the original's bytecode, and a
+				// replacement can declare slots the original does not:
+				if (G->mReplacementBufferSrvSlots.find(running) == G->mReplacementBufferSrvSlots.end()) {
+					auto it = G->mShaderBindingsCache.find(mCurrentPixelShader);
+					if (it != G->mShaderBindingsCache.end())
+						bindings = &it->second;
+				}
+			}
 			GetPassThroughOrigContext1()->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, views);
 			_DumpTextures('p', compute, views, bindings);
 		}

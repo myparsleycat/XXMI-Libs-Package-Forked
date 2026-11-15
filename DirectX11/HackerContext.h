@@ -346,6 +346,10 @@ protected:
 	UINT64 mCurrentPixelShader;
 	UINT64 mCurrentComputeShader;
 
+	// A live reloaded or ShaderRegex replacement runs in place of the handle
+	// the game bound:
+	ID3D11DeviceChild* RunningShader(ID3D11DeviceChild *handle);
+
 public:
 	// On D3D12 there are no Draw* and Dispatch methods of ours for the
 	// game to call: dx12/DrawPath.cpp tells us of the game's calls with
