@@ -7,8 +7,11 @@
 #include <deque>
 #include <mutex>
 
+#include "DesktopOverlay.h"
+
 #include "../CommandList.h"
 #include "../globals.h"
+#include "../HackerDXGI.h"
 #include "../IniHandler.h"
 #include "../log.h"
 #include "../Overlay.h"
@@ -25,6 +28,7 @@ namespace {
 const size_t MAX_INBOUND = 16;
 const size_t MAX_REPLIES = 64;
 const size_t MAX_EVENTS = 32;
+const size_t MAX_INPUTS = 1024;
 const DWORD PIPE_BUFFER = 64 * 1024;
 const DWORD WRITE_TIMEOUT_MS = 5000;
 
@@ -35,22 +39,33 @@ struct Inbound {
 	uint32_t request_id;
 	GetVars get_vars;
 	SetVars set_vars;
+	OverlaySetTexture set_texture;
+	OverlayCapture capture;
 };
 
-// Shared by the render thread and the pipe thread. The render thread only
-// ever tries to take the lock, and the pipe thread holds it for no more than
+// Shared by the render thread and the pipe thread. The render thread mostly
+// only tries to take the lock, and the pipe thread holds it for no more than
 // moving queue entries.
 SRWLOCK queue_lock = SRWLOCK_INIT;
 std::deque<Inbound> inbound;
+// What a full input queue gives up first: moves, then wheel turns, characters
+// and presses. A lost release leaves a key or button held on the client, so
+// one is dropped only when the queue holds nothing else, and the capture ends.
+enum InputRank : uint8_t { RANK_NONE, RANK_MOVE, RANK_DATA, RANK_RELEASE };
 struct Queued {
 	DesktopSend kind;
 	std::vector<uint8_t> frame;
+	InputRank rank;
 };
 // Replies and events in the order the render thread made them, so that an
 // event is not overtaken by replies to requests carried out after it
 std::deque<Queued> out_queue;
 size_t queued_events;
+size_t queued_inputs;
 uint32_t queue_connection;
+// The connection that captures input. Checked when an input is queued, so that
+// no input follows the capture's end in out_queue.
+uint32_t input_connection;
 // One per accepted request until its reply leaves out_queue, whether the
 // request is still in inbound, in render-thread work, or its reply in pending
 // or out_queue. Every REPLY in out_queue must hold one.
@@ -66,6 +81,11 @@ HelloReply hello_info;
 std::mutex frame_lock;
 bool started;
 uint8_t started_api;
+HackerSwapChain *driving_swap_chain;
+// Presents of other swap chains since the driving one last presented. Its
+// last Release may bypass HackerSwapChain, or it may stop presenting.
+unsigned other_presents;
+const unsigned TAKEOVER_PRESENTS = 120;
 struct Outbound {
 	DesktopSend kind;
 	std::vector<uint8_t> frame;
@@ -85,28 +105,16 @@ std::wstring module_folder(HMODULE module)
 	return path;
 }
 
-template <class M> void queue_message(DesktopSend kind, MessageType type, uint32_t request_id, M &message, uint32_t connection)
-{
-	std::vector<uint8_t> frame;
-	if (EncodeFrame(type, request_id, message, &frame))
-		DesktopChannelQueue(kind, std::move(frame), connection);
-	else
-		LogInfo("Desktop channel: message 0x%04x does not encode\n", (unsigned)type);
-}
-
-void queue_error(uint32_t request_id, const char *code, const std::string &detail, uint32_t connection)
-{
-	Error e;
-	e.code = code;
-	e.detail = detail;
-	queue_message(DesktopSend::REPLY, MessageType::Error, request_id, e, connection);
-}
-
 // Moves what the render thread queued to the pipe thread, unless that thread
-// holds the lock right now, in which case it is tried again next time
-void flush_pending()
+// holds the lock right now and wait is false, in which case it is tried again
+// next time
+void flush_pending(bool wait = false)
 {
-	if (pending.empty() || !TryAcquireSRWLockExclusive(&queue_lock))
+	if (pending.empty())
+		return;
+	if (wait)
+		AcquireSRWLockExclusive(&queue_lock);
+	else if (!TryAcquireSRWLockExclusive(&queue_lock))
 		return;
 	if (queue_connection && connection_id.load() == queue_connection) {
 		for (auto &p : pending) {
@@ -118,8 +126,11 @@ void flush_pending()
 				else
 					out_queue.erase(std::find_if(out_queue.begin(), out_queue.end(),
 						[](const Queued &q) { return q.kind == DesktopSend::EVENT; }));
+			} else if (p.kind == DesktopSend::INPUT) {
+				queued_inputs++;
 			}
-			out_queue.push_back({ p.kind, std::move(p.frame) });
+			// The render thread queues no input but the end of a capture
+			out_queue.push_back({ p.kind, std::move(p.frame), p.kind == DesktopSend::INPUT ? RANK_RELEASE : RANK_NONE });
 		}
 	}
 	ReleaseSRWLockExclusive(&queue_lock);
@@ -150,7 +161,7 @@ void get_vars(const Inbound &in)
 		}
 		reply.values.push_back(v);
 	}
-	queue_message(DesktopSend::REPLY, MessageType::VarsReply, in.request_id, reply, in.connection);
+	DesktopChannelQueueMessage(DesktopSend::REPLY, MessageType::VarsReply, in.request_id, reply, in.connection);
 }
 
 void set_vars(const Inbound &in)
@@ -173,7 +184,7 @@ void set_vars(const Inbound &in)
 		}
 		applied.values.push_back(v);
 	}
-	queue_message(DesktopSend::REPLY, MessageType::VarsApplied, in.request_id, applied, in.connection);
+	DesktopChannelQueueMessage(DesktopSend::REPLY, MessageType::VarsApplied, in.request_id, applied, in.connection);
 }
 
 // ----------------------------------------------------------- the pipe thread
@@ -251,6 +262,10 @@ bool handle_frame(uint32_t connection, const FrameHeader &h, const uint8_t *payl
 		reply.version = version;
 		if (!write_message(MessageType::HelloReply, h.request_id, reply))
 			return false;
+		OverlaySurface surface;
+		if ((hello_info.capabilities & CAPABILITY_OVERLAY) && DesktopOverlaySurface(&surface)
+				&& !write_message(MessageType::OverlaySurface, 0, surface))
+			return false;
 		LogInfo("Desktop channel: %s connected\n", hello.client.c_str());
 		*hello_done = true;
 		return true;
@@ -292,6 +307,33 @@ bool handle_frame(uint32_t connection, const FrameHeader &h, const uint8_t *payl
 		break;
 	case MessageType::PickArm:
 		return write_error(h.request_id, "UNSUPPORTED", "picking is not available");
+	case MessageType::OverlaySetTexture:
+		if (!decode(h, payload, &in.set_texture) || in.set_texture.kind > OVERLAY_SECTION) {
+			write_error(h.request_id, "MALFORMED", "OverlaySetTexture");
+			return false;
+		}
+		if (!(hello_info.capabilities & CAPABILITY_OVERLAY))
+			return write_error(h.request_id, "UNSUPPORTED", "the overlay needs D3D11");
+		break;
+	case MessageType::OverlayFrame: {
+		OverlayFrame frame;
+		if (!decode(h, payload, &frame)) {
+			write_error(h.request_id, "MALFORMED", "OverlayFrame");
+			return false;
+		}
+		// No reply, not even an error
+		if (hello_info.capabilities & CAPABILITY_OVERLAY)
+			DesktopOverlayNoteFrame(frame.seq);
+		return true;
+	}
+	case MessageType::OverlayCapture:
+		if (!decode(h, payload, &in.capture)) {
+			write_error(h.request_id, "MALFORMED", "OverlayCapture");
+			return false;
+		}
+		if (!(hello_info.capabilities & CAPABILITY_OVERLAY))
+			return write_error(h.request_id, "UNSUPPORTED", "the overlay needs D3D11");
+		break;
 	default:
 		// Pong, Error, and types of later revisions
 		return true;
@@ -328,8 +370,9 @@ bool send_queued(bool hello_done)
 	std::deque<Queued> out;
 
 	AcquireSRWLockExclusive(&queue_lock);
-	reserved_replies -= out_queue.size() - queued_events;
+	reserved_replies -= out_queue.size() - queued_events - queued_inputs;
 	queued_events = 0;
+	queued_inputs = 0;
 	out.swap(out_queue);
 	ReleaseSRWLockExclusive(&queue_lock);
 
@@ -348,8 +391,10 @@ void clear_queues(uint32_t connection)
 	inbound.clear();
 	out_queue.clear();
 	queued_events = 0;
+	queued_inputs = 0;
 	reserved_replies = 0;
 	queue_connection = connection;
+	input_connection = 0;
 	ReleaseSRWLockExclusive(&queue_lock);
 }
 
@@ -497,7 +542,7 @@ void start(uint8_t render_api)
 	hello_info.exe_path = DesktopUtf8(exe.c_str());
 	hello_info.importer_folder = DesktopUtf8(module_folder(migoto_handle).c_str());
 	hello_info.render_api = render_api;
-	hello_info.capabilities = CAPABILITY_VARS;
+	hello_info.capabilities = CAPABILITY_VARS | (render_api == RENDER_D3D11 ? CAPABILITY_OVERLAY : 0);
 
 	wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 	read_event = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -550,13 +595,26 @@ void ParseDesktopSection()
 	loaded = true;
 }
 
-void DesktopChannelFrame(uint8_t render_api)
+void DesktopChannelFrame(HackerDevice *device, HackerContext *hacker_context, uint8_t render_api,
+	HackerSwapChain *swap_chain)
 {
 	std::lock_guard<std::mutex> lock(frame_lock);
 	std::deque<Inbound> work;
 
 	if (started && render_api != started_api)
 		return;
+	if (render_api == RENDER_D3D11) {
+		if (!swap_chain)
+			return;
+		if (driving_swap_chain && driving_swap_chain != swap_chain) {
+			if (++other_presents < TAKEOVER_PRESENTS)
+				return;
+			LogInfo("Desktop channel: swap chain %p takes over from %p\n", swap_chain, driving_swap_chain);
+			DesktopOverlaySwapChainReleased(connection_id.load());
+		}
+		other_presents = 0;
+		driving_swap_chain = swap_chain;
+	}
 	if (!started)
 		start(render_api);
 
@@ -564,8 +622,17 @@ void DesktopChannelFrame(uint8_t render_api)
 		work.swap(inbound);
 		ReleaseSRWLockExclusive(&queue_lock);
 	}
+	// Read after the swap: a request in work was queued while connection_id
+	// already held its connection. The overlay and the requests use this one
+	// value, or the overlay would clear what a newer connection just set.
+	uint32_t connection = connection_id.load();
+
+	bool overlay = render_api == RENDER_D3D11 && device && hacker_context;
+	if (overlay)
+		DesktopOverlayBegin(device, hacker_context, swap_chain, connection);
+
 	for (const Inbound &in : work) {
-		if (in.connection != connection_id.load())
+		if (in.connection != connection)
 			continue;
 		switch (in.type) {
 		case MessageType::GetVars:
@@ -574,9 +641,35 @@ void DesktopChannelFrame(uint8_t render_api)
 		case MessageType::SetVars:
 			set_vars(in);
 			break;
+		case MessageType::OverlaySetTexture:
+			if (overlay)
+				DesktopOverlaySetTexture(in.set_texture, in.request_id, in.connection);
+			else
+				DesktopChannelQueueError(in.request_id, "UNSUPPORTED", "no D3D11 device", in.connection);
+			break;
+		case MessageType::OverlayCapture:
+			if (overlay)
+				DesktopOverlayCapture(in.capture, in.request_id, in.connection);
+			else
+				DesktopChannelQueueError(in.request_id, "UNSUPPORTED", "no D3D11 device", in.connection);
+			break;
 		}
 	}
 
+	// Before 3DMigoto's own overlay, which the caller draws next
+	if (overlay)
+		DesktopOverlayEnd(swap_chain);
+
+	flush_pending();
+}
+
+void DesktopChannelSwapChainReleased(HackerSwapChain *swap_chain)
+{
+	std::lock_guard<std::mutex> lock(frame_lock);
+	if (!swap_chain || swap_chain != driving_swap_chain)
+		return;
+	driving_swap_chain = NULL;
+	DesktopOverlaySwapChainReleased(connection_id.load());
 	flush_pending();
 }
 
@@ -588,7 +681,7 @@ void DesktopChannelReloaded()
 	Event e;
 	e.kind = EVENT_RELOADED;
 	e.frame = G->frame_no;
-	queue_message(DesktopSend::EVENT, MessageType::Event, 0, e, DesktopChannelConnection());
+	DesktopChannelQueueMessage(DesktopSend::EVENT, MessageType::Event, 0, e, DesktopChannelConnection());
 	flush_pending();
 }
 
@@ -621,4 +714,81 @@ void DesktopChannelQueue(DesktopSend kind, std::vector<uint8_t> &&frame, uint32_
 {
 	pending.push_back({ kind, std::move(frame), connection });
 	flush_pending();
+}
+
+void DesktopChannelEncodeFailed(MessageType type)
+{
+	LogInfo("Desktop channel: message 0x%04x does not encode\n", (unsigned)type);
+}
+
+void DesktopChannelQueueError(uint32_t request_id, const char *code, const std::string &detail, uint32_t connection)
+{
+	Error e;
+	e.code = code;
+	e.detail = detail;
+	DesktopChannelQueueMessage(DesktopSend::REPLY, MessageType::Error, request_id, e, connection);
+}
+
+void DesktopChannelSetInputConnection(uint32_t connection)
+{
+	// What the render thread queued, such as the reply that starts the
+	// capture, goes ahead of the capture's input
+	flush_pending(true);
+	AcquireSRWLockExclusive(&queue_lock);
+	input_connection = connection;
+	ReleaseSRWLockExclusive(&queue_lock);
+}
+
+bool DesktopChannelSendInput(OverlayInput &input, uint32_t connection)
+{
+	std::vector<uint8_t> frame;
+	bool queued = false, lost = false;
+
+	if (!EncodeFrame(MessageType::OverlayInput, 0, input, &frame)) {
+		DesktopChannelEncodeFailed(MessageType::OverlayInput);
+		return true;
+	}
+	InputRank rank = RANK_DATA;
+	if (input.kind == INPUT_MOVE)
+		rank = RANK_MOVE;
+	else if (input.kind == INPUT_CAPTURE_ENDED || ((input.kind == INPUT_KEY || input.kind == INPUT_BUTTON) && !input.down))
+		rank = RANK_RELEASE;
+
+	AcquireSRWLockExclusive(&queue_lock);
+	if (connection && connection == input_connection && connection == queue_connection
+			&& connection_id.load() == connection) {
+		// A client that stops reading loses input rather than memory. Capture
+		// ended comes once per capture and is what tells the client to drop
+		// the input state it holds, so it is never lost.
+		if (queued_inputs < MAX_INPUTS || input.kind == INPUT_CAPTURE_ENDED) {
+			out_queue.push_back({ DesktopSend::INPUT, std::move(frame), rank });
+			queued_inputs++;
+			queued = true;
+			if (input.kind == INPUT_CAPTURE_ENDED)
+				input_connection = 0;
+		} else if (rank == RANK_MOVE && out_queue.back().rank == RANK_MOVE) {
+			// Only the last frame, so that the position does not pass a later input
+			out_queue.back().frame = std::move(frame);
+			queued = true;
+		} else {
+			auto lower = [&](InputRank below) {
+				return std::find_if(out_queue.begin(), out_queue.end(),
+					[below](const Queued &q) { return q.rank != RANK_NONE && q.rank < below; });
+			};
+			auto dropped = lower(RANK_DATA);
+			if (dropped == out_queue.end())
+				dropped = lower(rank);
+			if (dropped != out_queue.end()) {
+				out_queue.erase(dropped);
+				out_queue.push_back({ DesktopSend::INPUT, std::move(frame), rank });
+				queued = true;
+			} else {
+				lost = rank == RANK_RELEASE;
+			}
+		}
+	}
+	ReleaseSRWLockExclusive(&queue_lock);
+	if (queued)
+		SetEvent(wake_event);
+	return !lost;
 }

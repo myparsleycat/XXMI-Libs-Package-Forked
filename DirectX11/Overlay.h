@@ -45,6 +45,9 @@ private:
 	HackerContext* mHackerContext;
 
 	DirectX::XMUINT2 mResolution;
+	DXGI_FORMAT mBackBufferFormat;
+	Microsoft::WRL::ComPtr<ID3D11PixelShader> mLinearTextureShader;
+	bool mLinearTextureShaderFailed = false;
 	std::unique_ptr<DirectX::SpriteBatch> mSpriteBatch;
 	std::unique_ptr<DirectX::CommonStates> mStates;
 	std::unique_ptr<DirectX::BasicEffect> mEffect;
@@ -85,6 +88,16 @@ private:
 		UINT PSNumClassInstances;
 		ID3D11Buffer *pPSConstantBuffers[1];
 
+		ID3D11GeometryShader *pGeometryShader;
+		ID3D11ClassInstance *pGSClassInstances[256];
+		UINT GSNumClassInstances;
+		ID3D11HullShader *pHullShader;
+		ID3D11ClassInstance *pHSClassInstances[256];
+		UINT HSNumClassInstances;
+		ID3D11DomainShader *pDomainShader;
+		ID3D11ClassInstance *pDSClassInstances[256];
+		UINT DSNumClassInstances;
+
 		ID3D11Buffer *pVertexBuffers[1];
 		UINT Strides[1];
 		UINT Offsets[1];
@@ -94,6 +107,9 @@ private:
 		UINT Offset;
 
 		ID3D11ShaderResourceView *pShaderResourceViews[1];
+
+		ID3D11Predicate *pPredicate;
+		BOOL PredicateValue;
 	} state;
 
 	void SaveState();
@@ -105,6 +121,7 @@ private:
 	void DrawProfiling(float *y);
 	void DrawRectangle(float x, float y, float w, float h, float r, float g, float b, float opacity);
 	void DrawOutlinedString(DirectX::SpriteFont *font, wchar_t const *text, DirectX::XMFLOAT2 const &position, DirectX::FXMVECTOR color);
+	ID3D11PixelShader *LinearTextureShader();
 
 public:
 	std::unique_ptr<DirectX::SpriteFont> mFont;
@@ -116,6 +133,10 @@ public:
 
 	// False if nothing was drawn
 	bool DrawOverlay(void);
+	// Draws a texture of sRGB pixels with premultiplied alpha unscaled at the
+	// top left of the back buffer. A back buffer whose render target encodes
+	// again (_SRGB) or holds linear light (float) gets them decoded.
+	bool DrawTexture(ID3D11ShaderResourceView *view);
 };
 
 bool OverlayHasAnythingToDraw();

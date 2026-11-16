@@ -12,6 +12,7 @@ public:
 
 	void u8(const char *name, uint8_t v) { number(name, std::to_string(v)); }
 	void u16(const char *name, uint16_t v) { number(name, std::to_string(v)); }
+	void i16(const char *name, int16_t v) { number(name, std::to_string(v)); }
 	void u32(const char *name, uint32_t v) { number(name, std::to_string(v)); }
 	void u64(const char *name, uint64_t v) { number(name, std::to_string(v)); }
 	void i32(const char *name, int32_t v) { number(name, std::to_string(v)); }

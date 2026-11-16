@@ -29,6 +29,8 @@
 // implementation) asks for it.
 
 HCURSOR current_cursor = NULL;
+static HCURSOR invisible_cursor = NULL;
+static bool set_cursor_hooked = false;
 
 typedef LRESULT(WINAPI *lpfnDefWindowProc)(_In_ HWND hWnd,
 	_In_ UINT Msg, _In_ WPARAM wParam, _In_ LPARAM lParam);
@@ -49,7 +51,7 @@ static BOOL(WINAPI* trampoline_GetClientRect)(_In_ HWND hWnd, _Out_ LPRECT lpRec
 // is called.
 static HCURSOR InvisibleCursor()
 {
-	static HCURSOR cursor = NULL;
+	HCURSOR &cursor = invisible_cursor;
 	int width, height;
 	unsigned pitch, size;
 	char *and, *xor;
@@ -343,7 +345,8 @@ void InstallMouseHooks(bool hide)
 		SetCursor(InvisibleCursor());
 
 	hUser32 = NktHookLibHelpers::GetModuleBaseAddress(L"User32.dll");
-	fail |= InstallHookLate(hUser32, "SetCursor", (void**)&trampoline_SetCursor, Hooked_SetCursor);
+	set_cursor_hooked = !InstallHookLate(hUser32, "SetCursor", (void**)&trampoline_SetCursor, Hooked_SetCursor);
+	fail |= !set_cursor_hooked;
 	fail |= InstallHookLate(hUser32, "GetCursor", (void**)&trampoline_GetCursor, Hooked_GetCursor);
 	fail |= InstallHookLate(hUser32, "GetCursorInfo", (void**)&trampoline_GetCursorInfo, Hooked_GetCursorInfo);
 	fail |= InstallHookLate(hUser32, "DefWindowProcA", (void**)&trampoline_DefWindowProcA, Hooked_DefWindowProcA);
@@ -359,4 +362,27 @@ void InstallMouseHooks(bool hide)
 	}
 
 	LogInfo("Successfully hooked mouse cursor functions for hide_cursor\n");
+}
+
+HCURSOR CursorBypass_SetCursor(HCURSOR cursor)
+{
+	return trampoline_SetCursor(cursor);
+}
+
+BOOL CursorBypass_GetCursorInfo(PCURSORINFO pci)
+{
+	return trampoline_GetCursorInfo(pci);
+}
+
+bool CursorIsHidden(HCURSOR cursor)
+{
+	return !cursor || (invisible_cursor && cursor == invisible_cursor);
+}
+
+bool CursorRestoreGame()
+{
+	if (!set_cursor_hooked)
+		return false;
+	Hooked_SetCursor(current_cursor);
+	return true;
 }

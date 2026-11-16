@@ -97,6 +97,13 @@ int main(int argc, char **argv)
 			CASE(PickArmed, "PickArmed");
 			CASE(PickResult, "PickResult");
 			CASE(PickFailed, "PickFailed");
+			CASE(OverlaySurface, "OverlaySurface");
+			CASE(OverlaySetTexture, "OverlaySetTexture");
+			CASE(OverlayTextureSet, "OverlayTextureSet");
+			CASE(OverlayFrame, "OverlayFrame");
+			CASE(OverlayCapture, "OverlayCapture");
+			CASE(OverlayCaptured, "OverlayCaptured");
+			CASE(OverlayInput, "OverlayInput");
 #undef CASE
 		default:
 			printf("FAIL %s: type 0x%04x unknown\n", name, header.type);

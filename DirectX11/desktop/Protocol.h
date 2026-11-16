@@ -31,6 +31,13 @@ enum class MessageType : uint16_t {
 	PickArmed   = 0x0101,
 	PickResult  = 0x0102,
 	PickFailed  = 0x0103,
+	OverlaySurface    = 0x0200,
+	OverlaySetTexture = 0x0201,
+	OverlayTextureSet = 0x0202,
+	OverlayFrame      = 0x0203,
+	OverlayCapture    = 0x0204,
+	OverlayCaptured   = 0x0205,
+	OverlayInput      = 0x0206,
 };
 
 enum RenderApi : uint8_t {
@@ -41,6 +48,7 @@ enum RenderApi : uint8_t {
 
 const uint64_t CAPABILITY_VARS       = 1ull << 0;
 const uint64_t CAPABILITY_PICK_D3D11 = 1ull << 1;
+const uint64_t CAPABILITY_OVERLAY    = 1ull << 2;
 
 enum EventKind : uint16_t {
 	EVENT_RELOADED = 1,
@@ -71,6 +79,48 @@ enum DrawCallType : uint8_t {
 
 const uint8_t OVERRIDE_TEXTURE = 1;
 const uint8_t OVERRIDE_SHADER  = 2;
+
+enum OverlayTextureKind : uint8_t {
+	OVERLAY_NONE    = 0,
+	OVERLAY_KMT     = 1,
+	OVERLAY_SECTION = 2,
+};
+
+// The header of an OVERLAY_SECTION mapping: u64 seq, u32 width, u32 height,
+// u32 stride, then the rows
+const uint32_t OVERLAY_SECTION_HEADER = 20;
+
+enum OverlayCursor : uint8_t {
+	CURSOR_ARROW       = 0,
+	CURSOR_IBEAM       = 1,
+	CURSOR_HAND        = 2,
+	CURSOR_SIZE_WE     = 3,
+	CURSOR_SIZE_NS     = 4,
+	CURSOR_NOT_ALLOWED = 5,
+	CURSOR_WAIT        = 6,
+};
+
+enum OverlayInputKind : uint8_t {
+	INPUT_MOVE          = 1,
+	INPUT_BUTTON        = 2,
+	INPUT_WHEEL         = 3,
+	INPUT_KEY           = 4,
+	INPUT_CHAR          = 5,
+	INPUT_CAPTURE_ENDED = 6,
+};
+
+enum OverlayButton : uint8_t {
+	BUTTON_LEFT    = 1,
+	BUTTON_RIGHT   = 2,
+	BUTTON_MIDDLE  = 3,
+	BUTTON_BACK    = 4,
+	BUTTON_FORWARD = 5,
+};
+
+const uint32_t MOD_SHIFT_BIT = 1 << 0;
+const uint32_t MOD_CTRL_BIT  = 1 << 1;
+const uint32_t MOD_ALT_BIT   = 1 << 2;
+const uint32_t MOD_WIN_BIT   = 1 << 3;
 
 struct Hello {
 	std::string client;
@@ -223,6 +273,41 @@ struct PickResult {
 	std::vector<Record> records;
 };
 
+struct OverlaySurface {
+	uint32_t hwnd = 0, width = 0, height = 0, dpi = 0;
+	uint32_t luid_low = 0;
+	int32_t luid_high = 0;
+};
+
+struct OverlaySetTexture {
+	uint8_t kind = 0;
+	uint32_t handle = 0;
+	std::string section;
+	uint32_t width = 0, height = 0;
+};
+
+struct OverlayTextureSet {};
+
+struct OverlayFrame { uint64_t seq = 0; };
+
+struct OverlayCapture {
+	bool capture = false;
+	uint8_t cursor = 0;
+};
+
+struct OverlayCaptured {};
+
+struct OverlayInput {
+	uint8_t kind = 0;
+	int32_t x = 0, y = 0;
+	uint8_t button = 0;
+	bool down = false;
+	int16_t delta = 0;
+	uint16_t vk = 0, scan = 0;
+	uint32_t mods = 0;
+	uint32_t rune = 0;
+};
+
 // Encodes payloads. The first value that cannot be encoded (a string over
 // 65535 bytes or not UTF-8, a list over its count's width) makes failed stick.
 class Writer {
@@ -232,6 +317,7 @@ public:
 
 	void u8(const char*, uint8_t v) { buf.push_back(v); }
 	void u16(const char*, uint16_t v) { put(&v, 2); }
+	void i16(const char*, int16_t v) { put(&v, 2); }
 	void u32(const char*, uint32_t v) { put(&v, 4); }
 	void u64(const char*, uint64_t v) { put(&v, 8); }
 	void i32(const char*, int32_t v) { put(&v, 4); }
@@ -296,6 +382,7 @@ public:
 
 	void u8(const char*, uint8_t &v) { take(&v, 1); }
 	void u16(const char*, uint16_t &v) { take(&v, 2); }
+	void i16(const char*, int16_t &v) { take(&v, 2); }
 	void u32(const char*, uint32_t &v) { take(&v, 4); }
 	void u64(const char*, uint64_t &v) { take(&v, 8); }
 	void i32(const char*, int32_t &v) { take(&v, 4); }
@@ -556,6 +643,51 @@ template <class S> void Serialize(S &s, PickResult &m)
 	s.list("records", 2, 85, m.records, [&](Record &r) {
 		s.object(NULL, [&] { SerializeRecord(s, r); });
 	});
+}
+
+template <class S> void Serialize(S &s, OverlaySurface &m)
+{
+	s.u32("hwnd", m.hwnd);
+	s.u32("width", m.width);
+	s.u32("height", m.height);
+	s.u32("dpi", m.dpi);
+	s.u32("luidLow", m.luid_low);
+	s.i32("luidHigh", m.luid_high);
+}
+
+template <class S> void Serialize(S &s, OverlaySetTexture &m)
+{
+	s.u8("kind", m.kind);
+	s.u32("handle", m.handle);
+	s.str("section", m.section);
+	s.u32("width", m.width);
+	s.u32("height", m.height);
+}
+
+template <class S> void Serialize(S&, OverlayTextureSet&) {}
+
+template <class S> void Serialize(S &s, OverlayFrame &m) { s.u64("seq", m.seq); }
+
+template <class S> void Serialize(S &s, OverlayCapture &m)
+{
+	s.boolean("capture", m.capture);
+	s.u8("cursor", m.cursor);
+}
+
+template <class S> void Serialize(S&, OverlayCaptured&) {}
+
+template <class S> void Serialize(S &s, OverlayInput &m)
+{
+	s.u8("kind", m.kind);
+	s.i32("x", m.x);
+	s.i32("y", m.y);
+	s.u8("button", m.button);
+	s.boolean("down", m.down);
+	s.i16("delta", m.delta);
+	s.u16("vk", m.vk);
+	s.u16("scan", m.scan);
+	s.u32("mods", m.mods);
+	s.u32("rune", m.rune);
 }
 
 // A whole frame of a message. False if the message cannot be encoded or the

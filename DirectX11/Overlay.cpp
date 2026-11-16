@@ -20,6 +20,8 @@
 #include "dx12/PresentPass.h"
 
 #include <stdexcept>
+#include <functional>
+#include <D3Dcompiler.h>
 
 #define MAX_SIMULTANEOUS_NOTICES 10
 
@@ -241,6 +243,19 @@ void Overlay::SaveState()
 	mOrigContext->VSGetConstantBuffers(0, 1, state.pVSConstantBuffers);
 	mOrigContext->PSGetConstantBuffers(0, 1, state.pPSConstantBuffers);
 	mOrigContext->PSGetShaderResources(0, 1, state.pShaderResourceViews);
+	// SpriteBatch sets only the vertex and pixel shaders: a geometry or
+	// tessellation shader the game left bound would take its draws
+	state.GSNumClassInstances = state.HSNumClassInstances = state.DSNumClassInstances = 256;
+	mOrigContext->GSGetShader(&state.pGeometryShader, state.pGSClassInstances, &state.GSNumClassInstances);
+	mOrigContext->HSGetShader(&state.pHullShader, state.pHSClassInstances, &state.HSNumClassInstances);
+	mOrigContext->DSGetShader(&state.pDomainShader, state.pDSClassInstances, &state.DSNumClassInstances);
+	mOrigContext->GSSetShader(NULL, NULL, 0);
+	mOrigContext->HSSetShader(NULL, NULL, 0);
+	mOrigContext->DSSetShader(NULL, NULL, 0);
+	// A predicate the game left set could skip every overlay draw
+	mOrigContext->GetPredication(&state.pPredicate, &state.PredicateValue);
+	if (state.pPredicate)
+		mOrigContext->SetPredication(NULL, FALSE);
 }
 
 void Overlay::RestoreState()
@@ -285,6 +300,24 @@ void Overlay::RestoreState()
 	for (i = 0; i < state.PSNumClassInstances; i++)
 		state.pPSClassInstances[i]->Release();
 
+	mOrigContext->GSSetShader(state.pGeometryShader, state.pGSClassInstances, state.GSNumClassInstances);
+	if (state.pGeometryShader)
+		state.pGeometryShader->Release();
+	for (i = 0; i < state.GSNumClassInstances; i++)
+		state.pGSClassInstances[i]->Release();
+
+	mOrigContext->HSSetShader(state.pHullShader, state.pHSClassInstances, state.HSNumClassInstances);
+	if (state.pHullShader)
+		state.pHullShader->Release();
+	for (i = 0; i < state.HSNumClassInstances; i++)
+		state.pHSClassInstances[i]->Release();
+
+	mOrigContext->DSSetShader(state.pDomainShader, state.pDSClassInstances, state.DSNumClassInstances);
+	if (state.pDomainShader)
+		state.pDomainShader->Release();
+	for (i = 0; i < state.DSNumClassInstances; i++)
+		state.pDSClassInstances[i]->Release();
+
 	mOrigContext->IASetVertexBuffers(0, 1, state.pVertexBuffers, state.Strides, state.Offsets);
 	if (state.pVertexBuffers[0])
 		state.pVertexBuffers[0]->Release();
@@ -304,6 +337,11 @@ void Overlay::RestoreState()
 	mOrigContext->PSSetShaderResources(0, 1, state.pShaderResourceViews);
 	if (state.pShaderResourceViews[0])
 		state.pShaderResourceViews[0]->Release();
+
+	if (state.pPredicate) {
+		mOrigContext->SetPredication(state.pPredicate, state.PredicateValue);
+		state.pPredicate->Release();
+	}
 }
 
 #ifdef NTDDI_WIN10
@@ -479,6 +517,7 @@ HRESULT Overlay::InitDrawState()
 	D3D11_TEXTURE2D_DESC description;
 	pBackBuffer->GetDesc(&description);
 	mResolution = DirectX::XMUINT2(description.Width, description.Height);
+	mBackBufferFormat = description.Format;
 
 	// use the back buffer address to create the render target
 	ID3D11RenderTargetView *backbuffer;
@@ -861,6 +900,83 @@ fail_restore:
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::overlay_overhead);
+
+	return SUCCEEDED(hr);
+}
+
+static bool linear_render_target(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+// SpriteBatch's pixel shader for premultiplied sRGB pixels drawn to a linear
+// render target. An _SRGB view would decode the premultiplied value, which
+// darkens every pixel that is not opaque: the alpha comes off first.
+static const char linear_texture_hlsl[] =
+	"Texture2D<float4> Texture : register(t0);\n"
+	"sampler TextureSampler : register(s0);\n"
+	"float4 main(float4 color : COLOR0, float2 texCoord : TEXCOORD0) : SV_Target0\n"
+	"{\n"
+	"	float4 c = Texture.Sample(TextureSampler, texCoord);\n"
+	"	float3 s = c.a > 0 ? saturate(c.rgb / c.a) : 0;\n"
+	"	float3 l = s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4);\n"
+	"	return float4(l * c.a, c.a) * color;\n"
+	"}\n";
+
+ID3D11PixelShader *Overlay::LinearTextureShader()
+{
+	if (mLinearTextureShader || mLinearTextureShaderFailed)
+		return mLinearTextureShader.Get();
+
+	mLinearTextureShaderFailed = true;
+	ID3DBlob *blob = NULL, *errors = NULL;
+	HRESULT hr = D3DCompile(linear_texture_hlsl, sizeof(linear_texture_hlsl) - 1, "OverlayLinearTexture", NULL, NULL,
+		"main", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors);
+	if (SUCCEEDED(hr)) {
+		hr = mOrigDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL,
+			&mLinearTextureShader);
+		CleanupShaderMaps(mLinearTextureShader.Get());
+	}
+	if (FAILED(hr))
+		LogInfo("Overlay: linear texture shader 0x%08x %s\n", (unsigned)hr,
+			errors ? (const char*)errors->GetBufferPointer() : "");
+	else
+		mLinearTextureShaderFailed = false;
+	if (blob)
+		blob->Release();
+	if (errors)
+		errors->Release();
+	return mLinearTextureShader.Get();
+}
+
+bool Overlay::DrawTexture(ID3D11ShaderResourceView *view)
+{
+	HRESULT hr;
+
+	SaveState();
+	hr = InitDrawState();
+	if (SUCCEEDED(hr)) {
+		ID3D11PixelShader *shader = linear_render_target(mBackBufferFormat) ? LinearTextureShader() : NULL;
+		std::function<void()> set_shader;
+		if (shader)
+			set_shader = [this, shader] { mOrigContext->PSSetShader(shader, NULL, 0); };
+		// SpriteBatch's AlphaBlend is the premultiplied blend
+		mSpriteBatch->Begin(DirectX::SpriteSortMode_Deferred, mStates->AlphaBlend(), mStates->PointClamp(),
+			mStates->DepthNone(), mStates->CullNone(), set_shader);
+		mSpriteBatch->Draw(view, DirectX::XMFLOAT2(0, 0));
+		mSpriteBatch->End();
+	}
+	RestoreState();
+
+	flush_d3d11on12(mOrigDevice, mOrigContext);
 
 	return SUCCEEDED(hr);
 }

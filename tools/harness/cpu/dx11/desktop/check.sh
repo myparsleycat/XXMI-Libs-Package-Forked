@@ -1,7 +1,8 @@
 #!/bin/bash
 # check.sh [d3d11.dll]: the desktop channel. The codec against the shared
 # vectors of testdata/desktop-channel, then channel.exe in a fresh run folder
-# with [Desktop] channel = 1 (default DLL x64/Release/d3d11.dll). Exits with
+# with [Desktop] channel = 1 (default DLL x64/Release/d3d11.dll), once more
+# with a _SRGB back buffer for the overlay only. Exits with
 # 2 when a check fails. Build with ../build.bat first.
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here/.." || exit 1
@@ -14,6 +15,16 @@ rm -rf "$dir"
 ../../common/install_dll.sh "$dir" ${1:+"$1"} || exit 1
 python ../../common/make_ini.py "$dir/d3dx.ini" Desktop.channel=1 System.config_initialization_delay=3 || exit 1
 ./bin/channel.exe "$(cygpath -aw "$dir")"
+result=$?
+[ $result = 0 ] || status=$result
+[ $result = 0 ] || echo "log: $dir/d3d11_log.txt"
+
+# The overlay on a _SRGB back buffer
+dir=bin/channel-srgb-run
+rm -rf "$dir"
+../../common/install_dll.sh "$dir" ${1:+"$1"} || exit 1
+python ../../common/make_ini.py "$dir/d3dx.ini" Desktop.channel=1 || exit 1
+./bin/channel.exe "$(cygpath -aw "$dir")" srgb
 result=$?
 [ $result = 0 ] || status=$result
 [ $result = 0 ] || echo "log: $dir/d3d11_log.txt"

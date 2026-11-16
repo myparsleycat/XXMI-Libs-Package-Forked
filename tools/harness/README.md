@@ -20,7 +20,7 @@ to apply this behavior there; the DLL does not need rebuilding.
 | `sampler` | `type = SamplerState` resources and `ps-s0` bindings on D3D11 |
 | `shader-scope` | Synthetic D3D11/D3D12 WARP checks for shader callback order, replacement draw ranges, and `CustomShader` scope |
 | `cpu` | The CPU work of the DLL on the configuration of an installed importer: call-for-call equality and frame time against a reference DLL |
-| `cpu/dx11/desktop` | The Nahida Desktop channel: the codec against the shared vectors and the pipe server with INI variables on D3D11 |
+| `cpu/dx11/desktop` | The Nahida Desktop channel: the codec against the shared vectors and the pipe server with INI variables and the overlay on D3D11 |
 | `cache` | CPU data-cache snapshots, shared views, bounded lazy reads and allocation reuse, without a GPU |
 | `etw` | Not a check: where the threads of a running game spend their time, by CPU samples with stacks |
 
@@ -208,6 +208,23 @@ the next connection, sends 512 GetVars and SetVars requests interleaved with
 unknown frames and checks that each receives one matching reply or `BUSY` and
 that only acknowledged SetVars change variables, and checks variable responses
 at exactly 4 MiB and one byte over the limit.
+
+Last, it checks the overlay. A second WARP device stands in for the desktop: its
+keyed-mutex texture has to appear in the presented frame with premultiplied
+alpha, a new OverlayFrame has to replace it, and while the client holds the key
+the game has to keep presenting the previous picture, and an occlusion predicate
+left set at `Present` must not hide the overlay. A shared memory section
+has to be drawn the same way, and a handle that does not open has to leave no
+overlay. During a capture, posted mouse, key and character messages have to
+arrive as OverlayInput and not reach the harness's window procedure, while the
+release of a key pressed before the capture has to reach it, the character
+`TranslateMessage` makes of its repeat must not be forwarded, and the
+`SetCursor(NULL)` cursor of the window's thread has to come back when the
+capture ends; a
+`WM_KILLFOCUS`, OverlayCapture 0 and a reconnect each have to give input back
+and restore the window procedure. The reconnect also has to drop the overlay
+and receive OverlaySurface right after HelloReply. The swap chain keeps one
+`SEQUENTIAL` buffer so that the client can read back presented pixels.
 
 `bin/client.exe [pid]` is a console client for checking a game by hand. It
 connects to the game's pipe and prints every frame as JSON to the console and
