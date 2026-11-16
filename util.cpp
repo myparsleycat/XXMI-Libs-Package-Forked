@@ -144,7 +144,7 @@ errno_t wfopen_ensuring_access(FILE** pFile, const wchar_t *filename, const wcha
 	return 0;
 }
 
-void set_file_last_write_time(wchar_t *path, FILETIME *ftWrite, DWORD flags)
+void set_file_last_write_time(const wchar_t *path, FILETIME *ftWrite, DWORD flags)
 {
 	HANDLE f;
 

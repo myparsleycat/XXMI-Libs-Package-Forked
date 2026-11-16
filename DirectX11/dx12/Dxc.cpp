@@ -214,14 +214,6 @@ static std::string narrow(const std::wstring &text)
 	return utf8;
 }
 
-static std::wstring full_path(const std::wstring &path)
-{
-	wchar_t full[MAX_PATH];
-	DWORD length = GetFullPathNameW(path.c_str(), MAX_PATH, full, NULL);
-
-	return length && length < MAX_PATH ? std::wstring(full, length) : path;
-}
-
 // What the preprocessor takes for space within a directive
 static size_t skip_blank(const char *text, size_t pos, size_t size)
 {
@@ -277,8 +269,8 @@ static std::string resolve_includes(const char *text, size_t size, const std::ws
 		if (file[0] == L'\\' || file[0] == L'/' || (file.size() > 1 && file[1] == L':'))
 			continue;
 		found = dir + file;
-		if (working_dir && GetFileAttributesW(found.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES)
-			found = full_path(file);
+		if (working_dir && GetFileAttributesW(long_path_for_open(found).c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES)
+			found = full_path_name(file);
 
 		// Quoted, for the compiler to take the path as it is
 		resolved.append(text + copied, name - 1 - copied);
@@ -328,7 +320,7 @@ public:
 		HRESULT hr;
 
 		*source = NULL;
-		if (_wfopen_s(&file, filename, L"rb") || !file)
+		if (_wfopen_s(&file, long_path_for_open(filename).c_str(), L"rb") || !file)
 			return E_FAIL;
 		fseek(file, 0, SEEK_END);
 		size = ftell(file);
@@ -354,7 +346,7 @@ bool Dx12DxcCompile(const char *source, size_t size, const wchar_t *path, const 
 {
 	std::vector<std::wstring> owned;
 	std::vector<const wchar_t*> args;
-	std::wstring file = full_path(path);
+	std::wstring file = full_path_name(path);
 	// -1 is D3DCompile's own include handler, which looks where 0 does
 	IncludeHandler includes(dir_of(file), G->recursive_include > 0);
 	std::string resolved = includes.resolve(source, size, file);

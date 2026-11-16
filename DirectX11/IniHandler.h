@@ -97,6 +97,11 @@ inline wchar_t ascii_tolower(wchar_t c)
 }
 bool get_namespaced_section_name_lower(const wstring *section, const wstring *ini_namespace, wstring *ret);
 bool get_section_namespace(const wchar_t *section, wstring *ret);
+// A file named in a section: relative to the directory of the ini that declared
+// it when it exists there, else relative to the 3DMigoto directory. A path of
+// MAX_PATH or more is given in the \\?\ form. False when the 3DMigoto
+// directory is unknown.
+bool ResolveConfigFilePath(const wstring &namespace_path, const wchar_t *filename, wstring *path);
 wstring get_namespaced_var_name_lower(const wstring& low_name, const wstring* ini_namespace);
 
 // A [ShaderRegex...] group of the loaded config as it is written, for

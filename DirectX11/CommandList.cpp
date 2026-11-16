@@ -2790,7 +2790,19 @@ CustomShader::~CustomShader()
 		sampler_state->Release();
 }
 
-static bool load_cached_shader(FILETIME hlsl_timestamp, wchar_t *cache_path, ID3DBlob **ppBytecode)
+static wstring shader_cache_path(const wstring &source, const wchar_t *target, D3DCompileFlags compile_flags)
+{
+	size_t ext = source.rfind(L'.');
+	size_t dir = source.rfind(L'\\');
+	wchar_t suffix[64];
+
+	if (ext == wstring::npos || (dir != wstring::npos && ext < dir))
+		ext = source.size();
+	swprintf_s(suffix, L".%ls.%x.bin", target, (UINT)compile_flags);
+	return long_path_for_open(source.substr(0, ext) + suffix);
+}
+
+static bool load_cached_shader(FILETIME hlsl_timestamp, const wchar_t *cache_path, ID3DBlob **ppBytecode)
 {
 	FILETIME cache_timestamp;
 	HANDLE f_cache;
@@ -2841,8 +2853,8 @@ static const D3D_SHADER_MACRO cs_macros[] = { "COMPUTE_SHADER", "", NULL, NULL }
 // get it's own function for now - TODO: Refactor out the common code
 bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, const wstring *namespace_path)
 {
-	wchar_t wpath[MAX_PATH], cache_path[MAX_PATH];
-	char apath[MAX_PATH];
+	wstring wpath, cache_path;
+	string apath;
 	HANDLE f;
 	DWORD srcDataSize, readSize;
 	vector<char> srcData;
@@ -2852,7 +2864,6 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	ID3DBlob *pErrorMsgs = NULL;
 	const D3D_SHADER_MACRO *macros = NULL;
 	wstring *source = NULL;
-	bool found = false;
 	FILETIME timestamp;
 
 	LogInfo("  %cs=%S\n", type, filename);
@@ -2907,27 +2918,14 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	// If this section was not in the main d3dx.ini, look
 	// for a file relative to the config it came from
 	// first, then try relative to the 3DMigoto directory:
-	found = false;
-	if (!namespace_path->empty()) {
-		GetModuleFileName(migoto_handle, wpath, MAX_PATH);
-		wcsrchr(wpath, L'\\')[1] = 0;
-		wcscat(wpath, namespace_path->c_str());
-		wcscat(wpath, filename);
-		if (GetFileAttributes(wpath) != INVALID_FILE_ATTRIBUTES)
-			found = true;
-	}
-	if (!found) {
-		if (!GetModuleFileName(migoto_handle, wpath, MAX_PATH)) {
-			LogOverlay(LOG_DIRE, "CustomShader::compile: GetModuleFileName failed\n");
-			goto err;
-		}
-		wcsrchr(wpath, L'\\')[1] = 0;
-		wcscat(wpath, filename);
+	if (!ResolveConfigFilePath(*namespace_path, filename, &wpath)) {
+		LogOverlay(LOG_DIRE, "CustomShader::compile: cannot find the 3DMigoto directory\n");
+		goto err;
 	}
 
-	f = CreateFile(wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	f = CreateFile(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (f == INVALID_HANDLE_VALUE) {
-		LogOverlayW(LOG_WARNING, L"Shader not found: %ls\n", wpath);
+		LogOverlayW(LOG_WARNING, L"Shader not found: %ls\n", strip_long_path_prefix(wpath).c_str());
 		goto err;
 	}
 	*source = wpath;
@@ -2939,14 +2937,10 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	// XXX: If we allow the compilation to be customised further (e.g. with
 	// addition preprocessor defines), make the cache filename unique for
 	// each possible combination
-	wchar_t *ext = wcsrchr(wpath, L'.');
-	if (ext > wcsrchr(wpath, L'\\'))
-		swprintf_s(cache_path, MAX_PATH, L"%.*s.%S.%x.bin", (int)(ext - wpath), wpath, shaderModel, (UINT)compile_flags);
-	else
-		swprintf_s(cache_path, MAX_PATH, L"%s.%S.%x.bin", wpath, shaderModel, (UINT)compile_flags);
+	cache_path = shader_cache_path(wpath, wstring(shaderModel, shaderModel + strlen(shaderModel)).c_str(), compile_flags);
 
 	GetFileTime(f, NULL, NULL, &timestamp);
-	if (load_cached_shader(timestamp, cache_path, ppBytecode)) {
+	if (load_cached_shader(timestamp, cache_path.c_str(), ppBytecode)) {
 		CloseHandle(f);
 		return false;
 	}
@@ -2969,11 +2963,14 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	// #include will work with a relative path from the shader itself.
 	// Later we could add a custom include handler to track dependencies so
 	// that we can make reloading work better when using includes:
-	wcstombs(apath, wpath, MAX_PATH);
+	// The include handler adds the \\?\ form back when it opens a file. The
+	// standard one cannot open files next to a source of MAX_PATH or more,
+	// so such a source uses ours, which then searches like recursive_include = 1:
+	apath = to_utf8(strip_long_path_prefix(wpath));
 	{
-		MigotoIncludeHandler include_handler(apath);
-		hr = D3DCompile(srcData.data(), srcDataSize, apath, macros,
-			G->recursive_include == -1 ? D3D_COMPILE_STANDARD_FILE_INCLUDE : &include_handler,
+		MigotoIncludeHandler include_handler(apath.c_str());
+		hr = D3DCompile(srcData.data(), srcDataSize, apath.c_str(), macros,
+			G->recursive_include == -1 && wpath.size() < MAX_PATH ? D3D_COMPILE_STANDARD_FILE_INCLUDE : &include_handler,
 			"main", shaderModel, (UINT)compile_flags, 0, ppBytecode, &pErrorMsgs);
 	}
 
@@ -2987,22 +2984,22 @@ bool CustomShader::compile(char type, wchar_t *filename, const wstring *wname, c
 	}
 
 	if (FAILED(hr)) {
-		LogOverlayW(LOG_WARNING, L"Error compiling custom shader %ls\n", wpath);
+		LogOverlayW(LOG_WARNING, L"Error compiling custom shader %ls\n", strip_long_path_prefix(wpath).c_str());
 		goto err;
 	}
 
 	if (G->CACHE_SHADERS) {
 		FILE *fw;
 
-		wfopen_ensuring_access(&fw, cache_path, L"wb");
+		wfopen_ensuring_access(&fw, cache_path.c_str(), L"wb");
 		if (fw) {
-			LogInfo("    Storing compiled shader to %S\n", cache_path);
+			LogInfo("    Storing compiled shader to %S\n", cache_path.c_str());
 			fwrite((*ppBytecode)->GetBufferPointer(), 1, (*ppBytecode)->GetBufferSize(), fw);
 			fclose(fw);
 
-			set_file_last_write_time(cache_path, &timestamp);
+			set_file_last_write_time(cache_path.c_str(), &timestamp);
 		} else
-			LogInfo("    Error writing compiled shader to %S\n", cache_path);
+			LogInfo("    Error writing compiled shader to %S\n", cache_path.c_str());
 	}
 
 	return false;
@@ -3027,8 +3024,8 @@ static void compile_dxil(char type, const wstring &source, D3DCompileFlags compi
 		{ 'v', L"vs_6_0", vs_macros }, { 'h', L"hs_6_0", hs_macros }, { 'd', L"ds_6_0", ds_macros },
 		{ 'g', L"gs_6_0", gs_macros }, { 'p', L"ps_6_0", ps_macros }, { 'c', L"cs_6_0", cs_macros },
 	};
-	wchar_t cache_path[MAX_PATH];
-	const wchar_t *target = NULL, *ext;
+	wstring cache_path;
+	const wchar_t *target = NULL;
 	const D3D_SHADER_MACRO *macros = NULL;
 	vector<char> src;
 	DWORD size, read;
@@ -3049,13 +3046,9 @@ static void compile_dxil(char type, const wstring &source, D3DCompileFlags compi
 	f = CreateFile(source.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (f == INVALID_HANDLE_VALUE)
 		return;
-	ext = wcsrchr(source.c_str(), L'.');
-	if (ext > wcsrchr(source.c_str(), L'\\'))
-		swprintf_s(cache_path, MAX_PATH, L"%.*s.%s.%x.bin", (int)(ext - source.c_str()), source.c_str(), target, (UINT)compile_flags);
-	else
-		swprintf_s(cache_path, MAX_PATH, L"%s.%s.%x.bin", source.c_str(), target, (UINT)compile_flags);
+	cache_path = shader_cache_path(source, target, compile_flags);
 	GetFileTime(f, NULL, NULL, &timestamp);
-	if (load_cached_shader(timestamp, cache_path, &dxil)) {
+	if (load_cached_shader(timestamp, cache_path.c_str(), &dxil)) {
 		CloseHandle(f);
 		Dx12DxcRemember(dxil->GetBufferPointer(), dxil->GetBufferSize(), source.c_str(), target, macros, (UINT)compile_flags);
 		ShimSetShaderDxil(shader, dxil->GetBufferPointer(), dxil->GetBufferSize());
@@ -3078,7 +3071,7 @@ static void compile_dxil(char type, const wstring &source, D3DCompileFlags compi
 		LogInfo("---------------------------------------------- END ----------------------------------------------\n");
 	}
 	if (!dxil) {
-		LogOverlayW(LOG_WARNING, L"Error compiling custom shader %ls as %ls\n", source.c_str(), target);
+		LogOverlayW(LOG_WARNING, L"Error compiling custom shader %ls as %ls\n", strip_long_path_prefix(source).c_str(), target);
 		Dx12DumpNote("*** %S could not be compiled as %S, so it stays DXBC: %s\n", source.c_str(), target, errors.c_str());
 		return;
 	}
@@ -3088,11 +3081,11 @@ static void compile_dxil(char type, const wstring &source, D3DCompileFlags compi
 	if (G->CACHE_SHADERS) {
 		FILE *fw;
 
-		wfopen_ensuring_access(&fw, cache_path, L"wb");
+		wfopen_ensuring_access(&fw, cache_path.c_str(), L"wb");
 		if (fw) {
 			fwrite(dxil->GetBufferPointer(), 1, dxil->GetBufferSize(), fw);
 			fclose(fw);
-			set_file_last_write_time(cache_path, &timestamp);
+			set_file_last_write_time(cache_path.c_str(), &timestamp);
 		}
 	}
 
@@ -7608,11 +7601,11 @@ void CustomResource::LoadBufferFromFile(ID3D11Device *mOrigDevice1)
 	FileContents file(filename.c_str());
 
 	if (!file.valid()) {
-		LogOverlayW(LOG_WARNING, L"Failed to load custom buffer resource %ls: %d\n", filename.c_str(), file.error);
+		LogOverlayW(LOG_WARNING, L"Failed to load custom buffer resource %ls: %d\n", strip_long_path_prefix(filename).c_str(), file.error);
 		return;
 	}
 	if (file.size > UINT_MAX) {
-		LogOverlayW(LOG_WARNING, L"Custom buffer resource %ls is too large\n", filename.c_str());
+		LogOverlayW(LOG_WARNING, L"Custom buffer resource %ls is too large\n", strip_long_path_prefix(filename).c_str());
 		return;
 	}
 	RecordResourceFileUse(filename);
@@ -7702,7 +7695,7 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 
 	FileContents file(filename.c_str());
 	if (!file.valid()) {
-		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: %d\n", filename.c_str(), file.error);
+		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: %d\n", strip_long_path_prefix(filename).c_str(), file.error);
 		return;
 	}
 	RecordResourceFileUse(filename);
@@ -7751,7 +7744,7 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 		// TODO:
 		// format = ...
 	} else
-		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: 0x%x\n", filename.c_str(), hr);
+		LogOverlayW(LOG_WARNING, L"Failed to load custom texture resource %ls: 0x%x\n", strip_long_path_prefix(filename).c_str(), hr);
 }
 
 void CustomResource::SubstantiateBuffer(ID3D11Device *mOrigDevice1, const void *data, DWORD size, const FileContents *share_file)

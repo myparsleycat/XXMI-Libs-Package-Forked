@@ -31,6 +31,49 @@ static std::string to_utf8(const std::wstring &wstr)
 	return utf8;
 }
 
+static std::wstring strip_long_path_prefix(const std::wstring &path)
+{
+	if (!path.compare(0, 8, L"\\\\?\\UNC\\"))
+		return L"\\\\" + path.substr(8);
+	if (!path.compare(0, 4, L"\\\\?\\"))
+		return path.substr(4);
+	return path;
+}
+
+// The full path with backslashes and no . or .. components, without the \\?\
+// form, of any length. The path without that form when it cannot be made.
+static std::wstring full_path_name(const std::wstring &path)
+{
+	std::wstring plain = strip_long_path_prefix(path), full;
+	DWORD len, got;
+
+	len = GetFullPathNameW(plain.c_str(), 0, NULL, NULL);
+	if (!len)
+		return plain;
+	full.resize(len);
+	got = GetFullPathNameW(plain.c_str(), len, &full[0], NULL);
+	if (!got || got >= len)
+		return plain;
+	full.resize(got);
+	return full;
+}
+
+// A path of MAX_PATH or more characters only opens in the \\?\ form, which
+// takes a full path with backslashes and no . or .. components
+static std::wstring long_path_for_open(const std::wstring &path)
+{
+	std::wstring full;
+
+	if (path.size() < MAX_PATH)
+		return path;
+	full = full_path_name(path);
+	if (full.size() < MAX_PATH)
+		return full;
+	if (!full.compare(0, 2, L"\\\\"))
+		return L"\\\\?\\UNC\\" + full.substr(2);
+	return L"\\\\?\\" + full;
+}
+
 #if MIGOTO_DX == 11
 #include "DirectX11\HookedDevice.h"
 #include "DirectX11\HookedContext.h"
@@ -990,7 +1033,7 @@ static bool ParseIniParamName(const wchar_t *name, int *idx, float DirectX::XMFL
 
 BOOL CreateDirectoryEnsuringAccess(LPCWSTR path);
 errno_t wfopen_ensuring_access(FILE** pFile, const wchar_t *filename, const wchar_t *mode);
-void set_file_last_write_time(wchar_t *path, FILETIME *ftWrite, DWORD flags=0);
+void set_file_last_write_time(const wchar_t *path, FILETIME *ftWrite, DWORD flags=0);
 void touch_file(wchar_t *path, DWORD flags=0);
 #define touch_dir(path) touch_file(path, FILE_FLAG_BACKUP_SEMANTICS)
 

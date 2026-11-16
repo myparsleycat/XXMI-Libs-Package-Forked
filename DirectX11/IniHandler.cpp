@@ -371,6 +371,37 @@ static bool get_namespaced_section_path(const wchar_t *section, wstring *ret)
 	return _get_namespaced_section_path(&ini_sections, section, ret);
 }
 
+static const wstring &migoto_directory()
+{
+	static const wstring dir = [] {
+		vector<wchar_t> buf(32768);
+		DWORD len = GetModuleFileName(migoto_handle, buf.data(), (DWORD)buf.size());
+		wstring path(buf.data(), len < buf.size() ? len : 0);
+		size_t slash = path.rfind(L'\\');
+
+		return slash == wstring::npos ? wstring() : path.substr(0, slash + 1);
+	}();
+	return dir;
+}
+
+bool ResolveConfigFilePath(const wstring &namespace_path, const wchar_t *filename, wstring *path)
+{
+	const wstring &dir = migoto_directory();
+
+	path->clear();
+	if (dir.empty())
+		return false;
+
+	if (!namespace_path.empty()) {
+		*path = long_path_for_open(dir + namespace_path + filename);
+		if (GetFileAttributes(path->c_str()) != INVALID_FILE_ATTRIBUTES)
+			return true;
+	}
+
+	*path = long_path_for_open(dir + filename);
+	return true;
+}
+
 // Returns the section name re-namespaced with the path of the ini file that
 // declared it, lower cased. Only succeeds for sections of files that overrode
 // their namespace, since the result would otherwise equal the section name.
@@ -687,7 +718,7 @@ static void ParseIniExcerpt(const wchar_t *excerpt)
 // it, make sure you delay calling it until after the log file has been opened!
 static void ParseNamespacedIniFile(const wchar_t *ini, const wstring *ini_namespace)
 {
-	wifstream f(ini, ios::in, _SH_DENYNO);
+	wifstream f(long_path_for_open(ini).c_str(), ios::in, _SH_DENYNO);
 	if (!f) {
 		LogOverlay(LOG_WARNING, "  Error opening %S\n", ini);
 		return;
@@ -815,7 +846,7 @@ static void ParseIniFilesRecursive(wchar_t *migoto_path, const wstring &rel_path
 	// in a case insensitive manner, then process the matching files &
 	// directories in the same order every time
 
-	hFind = FindFirstFile(search_path.c_str(), &find_data);
+	hFind = FindFirstFile(long_path_for_open(search_path).c_str(), &find_data);
 	if (hFind == INVALID_HANDLE_VALUE) {
 		LogInfo("    Recursive include path \"%S\" not found\n", search_path.c_str());
 		return;
@@ -2082,24 +2113,12 @@ static CustomResource* ParseResourceSection(const wchar_t* section_name, const w
 		// If this section was not in the main d3dx.ini, look
 		// for a file relative to the config it came from
 		// first, then try relative to the 3DMigoto directory:
-		wstring namespace_path;
+		wstring namespace_path, path;
 		get_namespaced_section_path(section_name, &namespace_path);
-		bool found = false;
-		wchar_t path[MAX_PATH];
-		if (!namespace_path.empty()) {
-			GetModuleFileName(migoto_handle, path, MAX_PATH);
-			wcsrchr(path, L'\\')[1] = 0;
-			wcscat(path, namespace_path.c_str());
-			wcscat(path, setting);
-			if (GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES)
-				found = true;
-		}
-		if (!found) {
-			GetModuleFileName(migoto_handle, path, MAX_PATH);
-			wcsrchr(path, L'\\')[1] = 0;
-			wcscat(path, setting);
-		}
-		custom_resource->filename = path;
+		if (ResolveConfigFilePath(namespace_path, setting, &path))
+			custom_resource->filename = path;
+		else
+			LogOverlay(LOG_DIRE, "ParseResourceSection: cannot find the 3DMigoto directory\n");
 	}
 
 	custom_resource->override_type = GetIniEnumClass(section_name, L"type", CustomResourceType::INVALID, NULL, CustomResourceTypeNames);

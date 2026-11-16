@@ -582,14 +582,15 @@ void RecordResourceFileUse(const std::wstring &path)
 	if (!G->prefetch_resource_files)
 		return;
 
+	std::wstring plain = strip_long_path_prefix(path);
 	std::lock_guard<std::mutex> lock(file_log_lock);
 
-	if (file_log == INVALID_HANDLE_VALUE || recorded_files.count(path))
+	if (file_log == INVALID_HANDLE_VALUE || recorded_files.count(plain))
 		return;
 
 	// A file that could not be recorded is tried again on its next load:
-	if (AppendToFileLog(path, 0))
-		recorded_files.insert(path);
+	if (AppendToFileLog(plain, 0))
+		recorded_files.insert(plain);
 }
 
 // Fallback for systems without PrefetchVirtualMemory:
@@ -621,14 +622,15 @@ static void PrefetchFiles(const ResourceFileLog &log)
 		if (prefetch_stop)
 			break;
 
+		std::wstring path = long_path_for_open(entry.first);
 		if (scratch.empty()) {
-			MappedFile file(entry.first.c_str());
+			MappedFile file(path.c_str());
 			if (!file.valid())
 				continue;
 			file.prefetch();
 			bytes += file.size;
 		} else {
-			ReadFileIntoCache(entry.first.c_str(), scratch);
+			ReadFileIntoCache(path.c_str(), scratch);
 		}
 		files++;
 	}
