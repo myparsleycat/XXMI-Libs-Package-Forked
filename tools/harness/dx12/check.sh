@@ -5,7 +5,8 @@
 #   test   matching by hash (case/test.ini): which watched meshes are hidden
 #   fold   conditions on targets in a list of a game's draw: which meshes each
 #          form leaves hidden
-#   move   hashes carried along GPU copies, frame by frame (harness.cpp, move)
+#   move   hashes carried along GPU copies, frame by frame (harness.cpp, move),
+#          also with every upload hash deferred (dx12_defer_upload_hash = 2)
 #   lowmip a copy of a texture without its top mip level, with
 #          track_texture_updates = 1 and match_lower_mip_textures off and on
 #   ref    the pictures of test and of the mod in case/Mods against those of
@@ -261,6 +262,13 @@ run_move() {
 	cp case/test.ini run/Mods/test.ini
 	check_move_frames "$expect_move" "" || bad=1
 	check_move_frames "$expect_move_one_pass" passes=1 || bad=1
+	# Every upload hashed from a GPU copy some frames later, so that copies
+	# take ranges whose hash is pending. The one-pass cases need the hash
+	# in the frame of the upload, which a deferred hash is not.
+	cp run/d3dx.ini run/d3dx.ini.keep
+	sed -i 's/^;\?dx12_defer_upload_hash *=.*/dx12_defer_upload_hash = 2/' run/d3dx.ini
+	check_move_frames "$expect_move" "" || { echo "  (with dx12_defer_upload_hash = 2)"; bad=1; }
+	mv run/d3dx.ini.keep run/d3dx.ini
 	rm -f run/Mods/test.ini
 	[ $bad = 0 ] && echo "move: OK" || { echo "move: FAILED"; ok=0; }
 }

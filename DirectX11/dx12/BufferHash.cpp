@@ -6,6 +6,8 @@
 
 #include "Dx12CommandQueue.h"
 #include "HashDump.h"
+#include "TextureHash.h"
+#include "../globals.h"
 #include "../profiling.h"
 
 Dx12BufferStats dx12_buffer_stats;
@@ -26,12 +28,31 @@ struct BufferRange {
 	// until then: a copy from the range copies what was there before.
 	ID3D12CommandQueue *queue;
 	UINT64 order;
+	// Its hash is being worked out from a GPU copy, see Dx12BufferUpload,
+	// or comes with that of a pending range a copy took it from. It may
+	// still have the one of an earlier execution of the write. check is
+	// the result it waits for: an execution of the write later than the
+	// one being checked replaces it, so that an older result is not taken.
+	bool pending;
+	UINT64 check;
 };
 
 static SRWLOCK lock = SRWLOCK_INIT;
 // Ranges of one resource by their offset. They do not overlap.
 static std::unordered_map<ID3D12Resource*, std::map<UINT64, BufferRange>> ranges;
 static UINT64 range_versions;
+
+// Handed out to pending ranges, see BufferRange::check
+static UINT64 check_serial;
+
+// What copies from the GPU's memory put in place from pending ranges, by the
+// check of the source range when the copy was executed: the range that gets
+// the hash of that check
+struct MovedRange {
+	ID3D12Resource *resource;
+	UINT64 offset, version, check;
+};
+static std::multimap<UINT64, MovedRange> pending_moves;
 
 // See Dx12BufferHashStamp. A counter per 64 KiB of a resource that is counted
 // up by what is written there, shared with whatever else hashes to it, and
@@ -164,6 +185,8 @@ static bool write_range(ID3D12Resource *resource, UINT64 offset, UINT64 bytes, b
 	range.bytes = bytes;
 	range.frame = frame;
 	range.valid = false;
+	range.pending = false;
+	range.check = 0;
 	range.unmapped = unmapped;
 	range.version = *version = ++range_versions;
 	range.queue = NULL;
@@ -199,7 +222,7 @@ static void note_move(Dx12BufferWrite *write)
 	if (source != ranges.end()) {
 		const std::map<UINT64, BufferRange> &map = source->second;
 		for (auto i = map.lower_bound(write->src_offset); i != map.end() && i->first + i->second.bytes <= write->src_offset + write->bytes; ++i) {
-			if (i->second.valid)
+			if (i->second.valid || i->second.pending)
 				write->ranges.push_back({ i->first, i->second.bytes, i->second.data_hash, i->second.version });
 		}
 	}
@@ -230,7 +253,8 @@ static bool write_placed(const Dx12BufferWrite *write, ID3D12CommandQueue *queue
 	return true;
 }
 
-// With the lock held: whether a range the write overlaps has a hash
+// With the lock held: whether a range the write overlaps has a hash or is to
+// get one
 static bool hash_under(const Dx12BufferWrite *write)
 {
 	auto map = ranges.find(write->dst);
@@ -240,21 +264,24 @@ static bool hash_under(const Dx12BufferWrite *write)
 	auto i = map->second.lower_bound(write->dst_offset);
 	if (i != map->second.begin()) {
 		auto previous = std::prev(i);
-		if (previous->first + previous->second.bytes > write->dst_offset && previous->second.valid)
+		if (previous->first + previous->second.bytes > write->dst_offset && (previous->second.valid || previous->second.pending))
 			return true;
 	}
 	for (; i != map->second.end() && i->first < write->dst_offset + write->bytes; ++i) {
-		if (i->second.valid)
+		if (i->second.valid || i->second.pending)
 			return true;
 	}
 	return false;
 }
 
 // With the lock held: whether the source of a copy from the GPU's memory has
-// hashed ranges it takes whole, as they were when it was recorded, written by
-// lists the GPU gets through before the copy executed on the queue now. Lists
-// executed on another queue before it may still run after it.
-static bool source_kept(const Dx12BufferWrite *write, ID3D12CommandQueue *queue)
+// hashed or pending ranges it takes whole, as they were when it was recorded,
+// written by lists the GPU gets through before the copy executed on the queue
+// now. Lists executed on another queue before it may still run after it. The
+// ranges of the write get the hashes and checks they have now, and *changed is
+// set if those differ from what the write had of them: an upload executed again
+// changes its range's hash or check without a new version.
+static bool source_kept(Dx12BufferWrite *write, ID3D12CommandQueue *queue, bool *changed)
 {
 	auto map = ranges.find(write->src);
 
@@ -262,7 +289,7 @@ static bool source_kept(const Dx12BufferWrite *write, ID3D12CommandQueue *queue)
 		return false;
 	for (const Dx12BufferWrite::Range &range : write->ranges) {
 		auto i = map->second.find(range.offset);
-		if (i == map->second.end() || !i->second.valid || !i->second.order || i->second.version != range.version)
+		if (i == map->second.end() || !(i->second.valid || i->second.pending) || !i->second.order || i->second.version != range.version)
 			return false;
 	}
 	for (const Dx12BufferWrite::Range &range : write->ranges) {
@@ -270,22 +297,47 @@ static bool source_kept(const Dx12BufferWrite *write, ID3D12CommandQueue *queue)
 		if (kept.queue != queue && !Dx12QueueAfter(queue, kept.queue, kept.order))
 			return false;
 	}
+	for (Dx12BufferWrite::Range &range : write->ranges) {
+		const BufferRange &kept = map->second.find(range.offset)->second;
+		bool pending = kept.pending && kept.check;
+
+		if (range.data_hash != kept.data_hash || range.valid != kept.valid || range.pending != pending || range.check != kept.check)
+			*changed = true;
+		range.data_hash = kept.data_hash;
+		range.valid = kept.valid;
+		range.pending = pending;
+		range.check = kept.check;
+	}
 	return true;
 }
 
-// What the GPU copies is what the upload buffer holds when the list is
-// executed. False if it cannot be read.
-static bool hash_upload(Dx12BufferWrite *write)
+// Without the lock: hashes what the upload buffer holds for the write from the
+// start, which is what the GPU copies when the list is executed. With
+// dx12_defer_upload_hash only as far as the frame's budget goes, leaving the
+// rest to a GPU copy (deferred). Neither hashed nor deferred if the upload
+// buffer cannot be read.
+static void hash_upload(Dx12BufferWrite *write)
 {
+	bool defer = G->dx12_defer_upload_hash != 0;
 	BYTE *data = NULL;
 
-	Profiling::Spike::Scope spike(Profiling::Spike::DX12_BUFFER_HASH, L"bytes", write->bytes);
-
+	write->hashed = false;
+	write->deferred = false;
+	write->partial = 0;
+	write->partial_crc = 0;
+	if (defer && !Dx12HashBudgetLeft()) {
+		write->deferred = true;
+		return;
+	}
 	if (FAILED(write->upload->Map(0, NULL, (void**)&data)) || !data)
-		return false;
-	write->data_hash = Dx12Crc32cWriteCombined(0, data + write->src_offset, (size_t)write->bytes);
+		return;
+	if (Dx12HashUploadBytes(data + write->src_offset, write->bytes, &write->partial, &write->partial_crc, true, defer)) {
+		write->hashed = true;
+		write->data_hash = write->partial_crc;
+	} else {
+		write->deferred = true;
+	}
 	write->upload->Unmap(0, NULL);
-	return true;
 }
 
 struct MovedHash {
@@ -296,7 +348,9 @@ struct MovedHash {
 
 // With the lock held: puts what the write writes in place, with hashes or
 // without, all in ranges of one version, and adds the hashes a copy from the
-// GPU's memory moved to moved
+// GPU's memory moved to moved. An upload is pending if deferred. A copy from
+// the GPU's memory has the source's pending ranges pending as well, which get
+// their hashes when those do.
 static void place_write(Dx12BufferWrite *write, bool hashed, ID3D12CommandQueue *queue, UINT64 order, std::vector<MovedHash> *moved)
 {
 	std::map<UINT64, BufferRange> &map = ranges_of(write->dst);
@@ -310,7 +364,7 @@ static void place_write(Dx12BufferWrite *write, bool hashed, ID3D12CommandQueue 
 		UINT hot = same != map.end() && same->second.bytes == write->bytes ? same->second.hot : 0;
 
 		erase_overlaps(map, write->dst_offset, write->bytes, false);
-		map[write->dst_offset] = { write->bytes, write->data_hash, hashed, false, write->frame, hot, version, queue, order };
+		map[write->dst_offset] = { write->bytes, write->data_hash, hashed, false, write->frame, hot, version, queue, order, write->deferred };
 	} else {
 		erase_overlaps(map, write->dst_offset, write->bytes, false);
 		if (hashed) {
@@ -321,8 +375,17 @@ static void place_write(Dx12BufferWrite *write, bool hashed, ID3D12CommandQueue 
 				// apart for the report
 				if (offset > at)
 					map[at] = { offset - at, 0, false, true, frame, 0, version, queue, order };
-				map[offset] = { range.bytes, range.data_hash, true, true, frame, 0, version, queue, order };
-				moved->push_back({ write->dst, offset, { range.bytes, range.data_hash, frame } });
+				if (range.pending) {
+					UINT64 check = ++check_serial;
+
+					map[offset] = { range.bytes, range.data_hash, range.valid, true, frame, 0, version, queue, order, true, check };
+					pending_moves.insert({ range.check, { write->dst, offset, version, check } });
+					InterlockedIncrement64(&dx12_buffer_stats.copy_deferred);
+				} else {
+					map[offset] = { range.bytes, range.data_hash, true, true, frame, 0, version, queue, order };
+				}
+				if (range.valid && !range.pending)
+					moved->push_back({ write->dst, offset, { range.bytes, range.data_hash, frame } });
 				at = offset + range.bytes;
 			}
 		}
@@ -334,22 +397,68 @@ static void place_write(Dx12BufferWrite *write, bool hashed, ID3D12CommandQueue 
 	write->placed_hashed = hashed;
 }
 
-// Without the lock
-static void rehash_upload(Dx12BufferWrite *write, std::vector<MovedHash> *rehashed)
+// For the hash dump: each hash an upload comes to once, not again for every
+// execution that comes to the same
+static void note_dump(Dx12BufferWrite *write, std::vector<MovedHash> *dumps, UINT frame)
 {
-	uint32_t recorded = write->data_hash;
+	if (write->dumped && write->dumped_hash == write->data_hash)
+		return;
+	write->dumped = true;
+	write->dumped_hash = write->data_hash;
+	dumps->push_back({ write->dst, write->dst_offset, { write->bytes, write->data_hash, frame } });
+}
 
-	// If it cannot be read, what is in place with a hash is replaced by
-	// the same without
-	write->hashed = hash_upload(write);
-	// What is in place has the hash from before
-	if (write->hashed && write->data_hash != recorded) {
-		write->placed_hashed = false;
-		rehashed->push_back({ write->dst, write->dst_offset, { write->bytes, write->data_hash, dx12_frame } });
+// With the lock held: the range the upload put in place when the list was
+// executed before, which nothing has written over since
+static BufferRange* upload_in_place(const Dx12BufferWrite *write)
+{
+	auto map = ranges.find(write->dst);
+
+	if (map == ranges.end())
+		return NULL;
+	auto i = map->second.find(write->dst_offset);
+	if (i == map->second.end() || i->second.version != write->version || i->second.bytes != write->bytes)
+		return NULL;
+	return &i->second;
+}
+
+// With the lock held: leaves the rest of the upload's hash to a GPU copy made
+// when the list is executed now
+static void defer_upload(const Dx12BufferWrite *write, std::vector<Dx12BufferUpload> *deferred)
+{
+	BufferRange *range = upload_in_place(write);
+	UINT64 check = ++check_serial;
+
+	if (range) {
+		range->pending = true;
+		range->check = check;
+	}
+	deferred->push_back({ write->dst, write->dst_offset, write->bytes, write->version, check, write->upload, write->src_offset,
+		write->partial, write->partial_crc });
+	InterlockedIncrement64(&dx12_buffer_stats.deferred);
+}
+
+// The time is left out of DX12_EXECUTE by the caller of
+// Dx12BufferWritesExecuted, as the two categories are not nested
+static void hash_upload_scoped(Dx12BufferWrite *write, INT64 *hash_ticks)
+{
+	LARGE_INTEGER start = {}, end;
+
+	if (Profiling::Spike::threshold)
+		QueryPerformanceCounter(&start);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_BUFFER_HASH, L"bytes", write->bytes);
+
+		hash_upload(write);
+	}
+	if (start.QuadPart) {
+		QueryPerformanceCounter(&end);
+		*hash_ticks += end.QuadPart - start.QuadPart;
 	}
 }
 
-void Dx12BufferWritesExecuted(Dx12ListBufferWrites *list, ID3D12CommandQueue *queue, UINT64 order)
+void Dx12BufferWritesExecuted(Dx12ListBufferWrites *list, ID3D12CommandQueue *queue, UINT64 order, std::vector<Dx12BufferUpload> *deferred,
+		INT64 *hash_ticks)
 {
 	std::vector<Dx12BufferWrite> *writes = &list->writes;
 	std::vector<MovedHash> moved, rehashed;
@@ -357,34 +466,66 @@ void Dx12BufferWritesExecuted(Dx12ListBufferWrites *list, ID3D12CommandQueue *qu
 	if (writes->empty())
 		return;
 
-	// Without the lock, before any of them is put in place
+	// Without the lock, before any of them is put in place: an upload is
+	// hashed again each time the list is executed again, as the game may
+	// have written to the upload buffer since
 	for (Dx12BufferWrite &write : *writes) {
-		if (write.upload && write.hashed && write.executed)
-			rehash_upload(&write, &rehashed);
+		if (write.upload && write.executed && (write.hashed || write.deferred))
+			hash_upload_scoped(&write, hash_ticks);
 	}
 
 	AcquireSRWLockExclusive(&lock);
 	for (Dx12BufferWrite &write : *writes) {
-		bool hashed = write.src ? source_kept(&write, queue) : write.hashed;
-		bool first = !write.executed;
+		bool first = !write.executed, hashed, changed = false;
 
 		write.executed = true;
-		if (write_placed(&write, queue, order) && write.placed_hashed == hashed)
-			continue;
+		if (write.src) {
+			hashed = source_kept(&write, queue, &changed);
+			if (write_placed(&write, queue, order) && write.placed_hashed == hashed && !changed)
+				continue;
+		} else if (write_placed(&write, queue, order)) {
+			// What it put there before stays while the hash of what
+			// it writes now is worked out
+			BufferRange *range = upload_in_place(&write);
+
+			if (write.deferred && range) {
+				defer_upload(&write, deferred);
+				continue;
+			}
+			if (write.hashed && range) {
+				if (!range->valid || range->data_hash != write.data_hash) {
+					range->data_hash = write.data_hash;
+					range->valid = true;
+					stamp_write(write.dst, write.dst_offset, write.bytes);
+					note_dump(&write, &rehashed, range->frame);
+				}
+				range->pending = false;
+				range->check = 0;
+				write.placed_hashed = true;
+				continue;
+			}
+			if (range && !range->valid && !range->pending)
+				continue;
+		}
 		// Another write was put there since this one was recorded, which
 		// may have been from the same upload buffer written again since:
 		// what the GPU copies is what it holds now
-		if (first && write.upload && write.hashed) {
+		if (first && write.upload && (write.hashed || write.deferred)) {
 			ReleaseSRWLockExclusive(&lock);
-			rehash_upload(&write, &rehashed);
+			hash_upload_scoped(&write, hash_ticks);
 			AcquireSRWLockExclusive(&lock);
-			hashed = write.hashed;
 		}
+		if (!write.src)
+			hashed = write.hashed;
 		// Where the write has no hash and nothing it overlaps has one,
 		// there is nothing to take back
-		if (!hashed && !hash_under(&write))
+		if (!hashed && !write.deferred && !hash_under(&write))
 			continue;
 		place_write(&write, hashed, queue, order, &moved);
+		if (write.deferred)
+			defer_upload(&write, deferred);
+		else if (write.upload && hashed)
+			note_dump(&write, &rehashed, dx12_frame);
 	}
 	ReleaseSRWLockExclusive(&lock);
 
@@ -393,6 +534,89 @@ void Dx12BufferWritesExecuted(Dx12ListBufferWrites *list, ID3D12CommandQueue *qu
 		Dx12DumpBuffer(hash.resource, hash.offset, &hash.hash);
 	for (const MovedHash &hash : rehashed)
 		Dx12DumpBuffer(hash.resource, hash.offset, &hash.hash);
+}
+
+void Dx12BufferHashDone(const Dx12BufferUpload *upload, const uint32_t *data_hash)
+{
+	std::vector<MovedRange> work = { { upload->dst, upload->dst_offset, upload->version, upload->check } };
+	std::vector<MovedHash> done;
+	bool copy = false, first_hash = false;
+
+	AcquireSRWLockExclusive(&lock);
+	while (!work.empty()) {
+		MovedRange at = work.back();
+		auto map = ranges.find(at.resource);
+		BufferRange *range = NULL;
+
+		work.pop_back();
+		if (map != ranges.end()) {
+			auto i = map->second.find(at.offset);
+			if (i != map->second.end() && i->second.version == at.version && i->second.check == at.check)
+				range = &i->second;
+		}
+		if (range) {
+			range->pending = false;
+			range->check = 0;
+			if (!copy && data_hash && !range->valid)
+				first_hash = true;
+			if (data_hash && (!range->valid || range->data_hash != *data_hash)) {
+				range->data_hash = *data_hash;
+				range->valid = true;
+				stamp_write(at.resource, at.offset, range->bytes);
+				done.push_back({ at.resource, at.offset, { range->bytes, *data_hash, range->frame } });
+			}
+		} else if (!copy && data_hash) {
+			InterlockedIncrement64(&dx12_buffer_stats.deferred_superseded);
+		}
+
+		// What was copied from the range has the contents the hash is
+		// of, even when the range has been written again since
+		if (at.check) {
+			auto moves = pending_moves.equal_range(at.check);
+			for (auto i = moves.first; i != moves.second; ++i)
+				work.push_back(i->second);
+			pending_moves.erase(moves.first, moves.second);
+		}
+		copy = true;
+	}
+	ReleaseSRWLockExclusive(&lock);
+
+	// Not for the checks of executions after the first, which are not
+	// counted without dx12_defer_upload_hash either
+	if (first_hash) {
+		InterlockedIncrement64(&dx12_buffer_stats.hashed);
+		InterlockedAdd64(&dx12_buffer_stats.hashed_bytes, upload->bytes);
+	}
+	for (const MovedHash &hash : done)
+		Dx12DumpBuffer(hash.resource, hash.offset, &hash.hash);
+}
+
+void Dx12HashBufferUploadNow(const Dx12BufferUpload *upload)
+{
+	Dx12BufferUpload rest = *upload;
+	BYTE *data = NULL;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_BUFFER_HASH, L"bytes", upload->bytes - upload->hashed);
+
+	if (FAILED(rest.upload->Map(0, NULL, (void**)&data)) || !data) {
+		InterlockedIncrement64(&dx12_buffer_stats.not_mappable);
+		Dx12BufferHashDone(&rest, NULL);
+		return;
+	}
+	Dx12HashUploadBytes(data + rest.src_offset, rest.bytes, &rest.hashed, &rest.crc, true, false);
+	rest.upload->Unmap(0, NULL);
+	Dx12BufferHashDone(&rest, &rest.crc);
+}
+
+void Dx12AbandonBufferWrites(Dx12ListBufferWrites *writes)
+{
+	for (const Dx12BufferWrite &write : writes->writes) {
+		if (!write.deferred || write.executed)
+			continue;
+		InterlockedIncrement64(&dx12_buffer_stats.deferred_abandoned);
+		Dx12BufferUpload upload = { write.dst, write.dst_offset, write.bytes, write.version, 0 };
+		Dx12BufferHashDone(&upload, NULL);
+	}
 }
 
 // What the list's draws recorded after it read there, see Dx12ListBufferWrites
@@ -424,8 +648,7 @@ void Dx12CopyBufferRegion(Dx12ListBufferWrites *writes, ID3D12Resource *dst, UIN
 	Dx12ResourceInfo dst_info, src_info;
 	Dx12BufferWrite write = { dst, dst_offset, bytes, NULL, src_offset, dx12_frame };
 	uint32_t hash;
-	BYTE *data = NULL;
-	bool placed = false;
+	bool placed = false, hashed;
 
 	if (!dst || !src || !bytes)
 		return;
@@ -463,35 +686,45 @@ void Dx12CopyBufferRegion(Dx12ListBufferWrites *writes, ID3D12Resource *dst, UIN
 		add_write(writes, &write);
 		return;
 	}
-	if (FAILED(src->Map(0, NULL, (void**)&data)) || !data) {
+	write.upload = src;
+	hash_upload(&write);
+	if (!write.hashed && !write.deferred) {
 		InterlockedIncrement64(&dx12_buffer_stats.not_mappable);
+		write.upload = NULL;
 		add_write(writes, &write);
 		return;
 	}
-	hash = Dx12Crc32cWriteCombined(0, data + src_offset, (size_t)bytes);
-	src->Unmap(0, NULL);
 
 	AcquireSRWLockExclusive(&lock);
 	auto resource = ranges.find(dst);
 	if (resource != ranges.end()) {
 		auto range = resource->second.find(dst_offset);
 		if (range != resource->second.end() && range->second.version == write.version) {
-			range->second.data_hash = hash;
-			range->second.valid = true;
-			stamp_write(dst, dst_offset, bytes);
-			placed = true;
+			if (write.hashed) {
+				range->second.data_hash = write.data_hash;
+				range->second.valid = true;
+				stamp_write(dst, dst_offset, bytes);
+				placed = true;
+			} else {
+				range->second.pending = true;
+			}
 		}
 	}
 	ReleaseSRWLockExclusive(&lock);
 
-	write.upload = src;
-	write.data_hash = hash;
-	write.hashed = true;
 	write.placed_hashed = placed;
+	hashed = write.hashed;
+	hash = write.data_hash;
+	write.dumped = hashed;
+	write.dumped_hash = hash;
 	add_write(writes, &write);
+	if (!hashed)
+		return;
 
 	InterlockedIncrement64(&dx12_buffer_stats.hashed);
 	InterlockedAdd64(&dx12_buffer_stats.hashed_bytes, bytes);
+	if (G->dx12_defer_upload_hash)
+		InterlockedIncrement64(&dx12_buffer_stats.hashed_at_once);
 
 	Dx12BufferHash result = { bytes, hash, dx12_frame };
 	Dx12DumpBuffer(dst, dst_offset, &result);
@@ -596,6 +829,8 @@ void Dx12DescribeBufferRange(ID3D12Resource *resource, UINT64 offset, char *text
 					r.data_hash, r.bytes, r.frame);
 			else if (r.valid)
 				_snprintf_s(text, size, _TRUNCATE, "hashed %08x, %llu bytes copied at frame %u", r.data_hash, r.bytes, r.frame);
+			else if (r.pending)
+				_snprintf_s(text, size, _TRUNCATE, "%llu bytes copied at frame %u, hashed from a GPU copy some frames later", r.bytes, r.frame);
 			else if (r.unmapped)
 				_snprintf_s(text, size, _TRUNCATE, "%llu bytes copied at frame %u from memory that is not mappable", r.bytes, r.frame);
 			else if (r.hot >= DX12_HOT_LIMIT)

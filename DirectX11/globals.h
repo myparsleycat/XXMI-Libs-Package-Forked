@@ -525,6 +525,7 @@ struct Globals
 	bool dx12_evict_idle;
 	UINT dx12_evict_idle_seconds;
 	UINT dx12_evict_budget_percent;
+	UINT dx12_defer_upload_hash;
 	bool vk_dump_hashes;
 	bool vk_buffers_first;
 	bool vk_cache_patched_shaders;
@@ -792,6 +793,7 @@ struct Globals
 		dx12_evict_idle(true),
 		dx12_evict_idle_seconds(10),
 		dx12_evict_budget_percent(75),
+		dx12_defer_upload_hash(1),
 		vk_dump_hashes(false),
 		vk_buffers_first(false),
 		vk_cache_patched_shaders(true),

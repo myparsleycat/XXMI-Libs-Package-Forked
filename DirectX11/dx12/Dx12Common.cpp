@@ -9,6 +9,7 @@
 
 #include "Bridge.h"
 #include "HashDump.h"
+#include "UploadHashReadback.h"
 
 Dx12Stats dx12_stats;
 Dx12Memory dx12_memory;
@@ -69,6 +70,7 @@ void Dx12FramePresented()
 	LONG64 draws, dispatches, closed, executed, calls, blas, rays;
 
 	dx12_frame++;
+	Dx12FinishUploadHashes();
 	Dx12DumpFramePresented();
 
 	// Without the shim there is no engine to load the mods, but what the

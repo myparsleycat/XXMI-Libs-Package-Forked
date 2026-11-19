@@ -10,6 +10,7 @@
 #include "Dx12CommandList.h"
 #include "Dx12Device.h"
 #include "ResourceTracker.h"
+#include "UploadHashReadback.h"
 #include "../profiling.h"
 
 // {1B67B403-353E-45FD-B468-760207CA7886}
@@ -127,11 +128,18 @@ HRESULT STDMETHODCALLTYPE Dx12CommandQueue::GetDevice(REFIID riid, void **ppvDev
 
 void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandLists, ID3D12CommandList *const *ppCommandLists)
 {
-	ID3D12CommandList *stack[64], **lists = stack;
+	ID3D12CommandList *stack[65], **lists = stack + 1;
 	std::vector<ID3D12CommandList*> large;
 	std::vector<IUnknown*> pins, first;
+	std::vector<Dx12GraphicsCommandList*> texture_uploads;
+	std::vector<Dx12TextureUpload> on_cpu;
+	std::vector<Dx12BufferUpload> buffer_uploads, buffers_on_cpu;
+	ID3D12CommandList *upload_list = NULL;
+	void *upload_context = NULL;
 	UINT64 needed = 0, order;
-	bool buffer_writes = false;
+	INT64 hash_ticks = 0;
+	size_t upload_count;
+	bool buffer_writes = false, locked;
 	UINT i;
 
 	if (!ppCommandLists) {
@@ -143,9 +151,10 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 	if (Profiling::Spike::threshold)
 		QueryPerformanceCounter(&start);
 
-	if (NumCommandLists > ARRAYSIZE(stack)) {
-		large.resize(NumCommandLists);
-		lists = large.data();
+	// One more in front for a list of ours, see Dx12UploadHashesExecuting
+	if (NumCommandLists > ARRAYSIZE(stack) - 1) {
+		large.resize(NumCommandLists + 1);
+		lists = large.data() + 1;
 	}
 
 	// What the mods had done for the draws of these lists comes first, and
@@ -183,6 +192,8 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 		if (!proxy->mExecuted) {
 			proxy->mExecuted = true;
 			first.insert(first.end(), proxy->mPins.begin(), proxy->mPins.end());
+			if (!proxy->mTextureUploads.empty())
+				texture_uploads.push_back(proxy);
 		}
 	}
 
@@ -197,25 +208,50 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 	if (!pins.empty())
 		Dx12ShimResidencyWait(mOrig);
 
-	if (buffer_writes) {
+	locked = buffer_writes || !texture_uploads.empty();
+	if (locked)
 		Dx12QueueLock(mOrig);
+	if (buffer_writes) {
 		order = Dx12QueueExecutes(mOrig);
 		for (i = 0; i < NumCommandLists; i++) {
 			if (lists[i] == ppCommandLists[i])
 				continue;
 			Dx12GraphicsCommandList *proxy = static_cast<Dx12GraphicsCommandList*>(ppCommandLists[i]);
 			if (!proxy->mBufferWrites.empty())
-				Dx12BufferWritesExecuted(&proxy->mBufferWrites, mOrig, order);
+				Dx12BufferWritesExecuted(&proxy->mBufferWrites, mOrig, order, &buffer_uploads, &hash_ticks);
 		}
 	}
-
 	if (start.QuadPart)
-		Profiling::Spike::add(Profiling::Spike::DX12_EXECUTE, start.QuadPart, L"before", 0);
+		Profiling::Spike::add(Profiling::Spike::DX12_EXECUTE, start.QuadPart + hash_ticks, L"before", 0);
+	if (!texture_uploads.empty() || !buffer_uploads.empty()) {
+		upload_count = buffer_uploads.size();
+		for (Dx12GraphicsCommandList *proxy : texture_uploads)
+			upload_count += proxy->mTextureUploads.size();
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_HASH_COPY, L"uploads", upload_count);
+		upload_list = Dx12UploadHashesExecuting(mOrig, texture_uploads.data(), texture_uploads.size(), buffer_uploads,
+				&on_cpu, &buffers_on_cpu, &upload_context);
+	}
+	// Outside the above, as hashing on the CPU has a category of its own
+	for (const Dx12TextureUpload &upload : on_cpu) {
+		InterlockedIncrement64(&dx12_texture_stats.deferred_on_cpu);
+		Dx12HashTextureUploadNow(&upload);
+	}
+	for (const Dx12BufferUpload &upload : buffers_on_cpu) {
+		InterlockedIncrement64(&dx12_buffer_stats.deferred_on_cpu);
+		Dx12HashBufferUploadNow(&upload);
+	}
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE_DRIVER, L"lists", NumCommandLists);
-		mOrig->ExecuteCommandLists(NumCommandLists, lists);
+		if (upload_list) {
+			lists[-1] = upload_list;
+			mOrig->ExecuteCommandLists(NumCommandLists + 1, lists - 1);
+		} else {
+			mOrig->ExecuteCommandLists(NumCommandLists, lists);
+		}
 	}
-	if (buffer_writes)
+	if (upload_context)
+		Dx12UploadHashesSubmitted(mOrig, upload_context);
+	if (locked)
 		Dx12QueueUnlock(mOrig);
 
 	if (!pins.empty()) {

@@ -107,6 +107,10 @@ ULONG STDMETHODCALLTYPE Dx12GraphicsCommandList::Release()
 	}
 
 	Dx12ShimPinsAbandoned(&mPins, mExecuted);
+	if (!mExecuted) {
+		Dx12AbandonTextureUploads(&mTextureUploads);
+		Dx12AbandonBufferWrites(&mBufferWrites);
+	}
 	delete this;
 	orig->Release();
 	device->Release();
@@ -153,7 +157,12 @@ HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Reset(ID3D12CommandAllocator 
 	Dx12ResetCmdState(&mState, pInitialState);
 	ForgetInfo();
 	mTransitions.clear();
+	if (!mExecuted) {
+		Dx12AbandonTextureUploads(&mTextureUploads);
+		Dx12AbandonBufferWrites(&mBufferWrites);
+	}
 	mBufferWrites.clear();
+	mTextureUploads.clear();
 	if (!mPins.empty())
 		Dx12ShimPinsAbandoned(&mPins, mExecuted);
 	memset(mPinned, 0, sizeof(mPinned));
@@ -569,7 +578,7 @@ void STDMETHODCALLTYPE Dx12GraphicsCommandList::Barrier(UINT32 NumBarrierGroups,
 // so this is where they are hashed: see TextureHash.h and BufferHash.h.
 void STDMETHODCALLTYPE Dx12GraphicsCommandList::CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION *pDst, UINT DstX, UINT DstY, UINT DstZ, const D3D12_TEXTURE_COPY_LOCATION *pSrc, const D3D12_BOX *pSrcBox)
 {
-	Dx12CopyTextureRegion(pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
+	Dx12CopyTextureRegion(&mTextureUploads, pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
 	mOrig->CopyTextureRegion(pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
 }
 

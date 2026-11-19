@@ -435,9 +435,14 @@ void Dx12HashReport(bool info)
 	REPORT("  Texture uploads: %lld hashed (%.1f MB). Not hashed: %lld lower mips or array slices, %lld partial, %lld updates, %lld dynamic, %lld not 2D, %lld unknown format, %lld untracked texture, %lld source not mappable, %lld out of bounds. Copies: %lld propagated a hash, %lld not of a whole top mip\n",
 		t->hashed, t->hashed_bytes / 1048576.0, t->other_subresource, t->partial, t->update_ignored, t->dynamic, t->not_2d,
 		t->unknown_format, t->untracked, t->not_mappable, t->out_of_bounds, t->copy_propagated, t->copy_partial);
+	REPORT("  Deferred texture hashes: %lld uploads and %lld copies, %lld uploads hashed at once, %lld hashed on the CPU at execution, %lld results superseded, %lld uploads of lists never executed\n",
+		t->deferred, t->copy_deferred, t->hashed_at_once, t->deferred_on_cpu, t->deferred_superseded, t->deferred_abandoned);
 
 	REPORT("  Buffer uploads: %lld hashed (%.1f MB). Not hashed: %lld dynamic, %lld source not mappable, %lld untracked, %lld out of bounds. Copies: %lld moved a hash\n",
 		b->hashed, b->hashed_bytes / 1048576.0, b->dynamic, b->not_mappable, b->untracked, b->out_of_bounds, b->copy_propagated);
+	REPORT("  Deferred buffer hashes: %lld uploads and %lld moved ranges, %lld uploads hashed at once, %lld hashed on the CPU at execution, %lld results superseded, %lld uploads of lists never executed\n",
+		b->deferred, b->copy_deferred, b->hashed_at_once, b->deferred_on_cpu, b->deferred_superseded, b->deferred_abandoned);
+	REPORT("  Readback buffers for deferred hashes: %lld of %.0f MB\n", t->readback_rings, t->readback_bytes / 1048576.0);
 
 	REPORT("  TextureOverride hashes: %Iu in the configuration, %Iu distinct texture and %Iu buffer hashes seen\n",
 		G->mTextureOverrideMap.size(), texture_hashes[DEFAULT_FORMAT_RULE].size(), buffer_hashes[0].size());

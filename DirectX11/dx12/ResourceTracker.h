@@ -38,6 +38,12 @@ struct Dx12ResourceInfo {
 	// D3D11, see TextureHash.h
 	bool has_data_hash;
 	uint32_t data_hash;
+	// Textures: a hash of an upload or copy is being worked out elsewhere,
+	// see Dx12BeginTextureHash. Changes with every write to the top mip
+	// that sets or clears the hash, and only the result of the latest one
+	// is taken.
+	bool hash_pending;
+	UINT hash_generation;
 	// D3D12 does not tell a cube map from a 2D array until a view is made
 	bool cube;
 	// Textures: see Dx12NoteTopMipUpload
@@ -122,7 +128,15 @@ void Dx12TakeExpiredEvictions(ULONGLONG read_before, bool (*reached)(UINT64 fenc
 // subresource is as in D3D12_RESOURCE_TRANSITION_BARRIER.
 void Dx12ApplyTransition(ID3D12Resource *resource, UINT subresource, LONG state);
 
+// Supersedes a hash that is still pending
 void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32_t data_hash);
+// For a write to the top mip whose hash comes later: marks it pending until
+// Dx12FinishTextureHash with what this returns, 0 for an untracked texture.
+// The hash the texture had stays until then.
+UINT Dx12BeginTextureHash(ID3D12Resource *resource, UINT64 *serial);
+// False if the texture is gone or was written again since that Begin.
+// data_hash NULL keeps the hash the texture had.
+bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generation, const uint32_t *data_hash);
 void Dx12MarkCubeTexture(ID3D12Resource *resource);
 // For a copy that writes a texture's whole top mip: false while the game keeps
 // writing it, by the DX12_HOT_FRAMES and DX12_HOT_TEXTURE_LIMIT rule

@@ -130,6 +130,7 @@ namespace Profiling {
 			DX12_PIPELINE_DRIVER,
 			DX12_TEXTURE_HASH,
 			DX12_BUFFER_HASH,
+			DX12_UPLOAD_HASH_COPY,
 			// Nested inside the above (or inside each other):
 			RESOURCE_LOAD,
 			SHADER_CREATE_DRIVER,
@@ -154,6 +155,8 @@ namespace Profiling {
 			RESOURCE_FILE_READ,
 			RESOURCE_FILE_SHARE,
 			DX12_UPLOAD_COPY,
+			DX12_UPLOAD_HASH_FINISH,
+			DX12_UPLOAD_HASH_RING,
 			VK_DRAW,
 			VK_TEXTURE_IMAGE,
 			VK_TEXTURE_COPY,

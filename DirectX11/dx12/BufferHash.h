@@ -40,11 +40,23 @@ struct Dx12BufferHash {
 // then the hashes of the source's ranges it copies whole if the source still
 // has those ranges as recorded and the lists that wrote them were executed
 // before it on the GPU (see Dx12QueueAfter), otherwise none.
+//
+// With dx12_defer_upload_hash, hashing an upload stops once the frame has spent
+// its budget for hashing uploads, see Dx12HashBudgetLeft, at recording and at
+// each execution alike. The rest is then hashed from a GPU copy made when the
+// list is executed, see Dx12BufferUpload, and the range is pending until then.
+// A range that already had a hash from an earlier execution of the same write
+// keeps it meanwhile. A copy from the GPU's memory that takes a pending range
+// gets its hash when the range does.
 struct Dx12BufferWrite {
 	struct Range {
 		UINT64 offset, bytes;
 		uint32_t data_hash;
 		UINT64 version;
+		// As the source range has them, see BufferRange
+		bool valid;
+		bool pending;
+		UINT64 check;
 	};
 	ID3D12Resource *dst;
 	UINT64 dst_offset, bytes;
@@ -58,6 +70,14 @@ struct Dx12BufferWrite {
 	ID3D12Resource *upload;
 	uint32_t data_hash;
 	bool hashed;
+	// Of an upload whose hash is left to a GPU copy: the bytes hashed so
+	// far and what they came to
+	bool deferred;
+	UINT64 partial;
+	uint32_t partial_crc;
+	// The hash last written to the hash dump for it
+	bool dumped;
+	uint32_t dumped_hash;
 	// Whether the list has been executed with it before
 	bool executed;
 	// Of a copy from the GPU's memory: the source's hashed ranges it takes
@@ -88,6 +108,18 @@ struct Dx12ListBufferWrites {
 	void clear() { writes.clear(); recorded.clear(); }
 };
 
+// What is left to hash of an upload when its list is executed, see
+// Dx12BufferWrite. The hash is for the range of that version, if this is still
+// the check it waits for.
+struct Dx12BufferUpload {
+	ID3D12Resource *dst;
+	UINT64 dst_offset, bytes, version, check;
+	ID3D12Resource *upload;
+	UINT64 src_offset;
+	UINT64 hashed;
+	uint32_t crc;
+};
+
 // For the command list proxy, before it forwards the call. Adds what it
 // records to the list's writes.
 void Dx12CopyBufferRegion(Dx12ListBufferWrites *writes, ID3D12Resource *dst, UINT64 dst_offset, ID3D12Resource *src,
@@ -95,8 +127,20 @@ void Dx12CopyBufferRegion(Dx12ListBufferWrites *writes, ID3D12Resource *dst, UIN
 // Likewise for CopyResource, which does nothing unless both are buffers
 void Dx12CopyBuffer(Dx12ListBufferWrites *writes, ID3D12Resource *dst, ID3D12Resource *src);
 // For the queue proxy, for each list it executes, in order, every time, with
-// the order Dx12QueueExecutes gave the execution
-void Dx12BufferWritesExecuted(Dx12ListBufferWrites *writes, ID3D12CommandQueue *queue, UINT64 order);
+// the order Dx12QueueExecutes gave the execution. Adds the uploads whose hash
+// is left to a GPU copy to deferred, and the QueryPerformanceCounter ticks
+// spent hashing uploads to *hash_ticks while the spike log is on.
+void Dx12BufferWritesExecuted(Dx12ListBufferWrites *writes, ID3D12CommandQueue *queue, UINT64 order, std::vector<Dx12BufferUpload> *deferred,
+		INT64 *hash_ticks);
+// Hashes the rest of the upload from the upload buffer, which has to be alive
+// and hold what the copy reads: when the list is executed and no GPU copy can
+// be made
+void Dx12HashBufferUploadNow(const Dx12BufferUpload *upload);
+// Sets the hash a deferred upload came to, data_hash NULL for none, and the
+// same for what copies from the GPU's memory took of it meanwhile
+void Dx12BufferHashDone(const Dx12BufferUpload *upload, const uint32_t *data_hash);
+// For a list reset or released without having been executed
+void Dx12AbandonBufferWrites(Dx12ListBufferWrites *writes);
 
 bool Dx12FindBufferHash(ID3D12Resource *resource, UINT64 offset, Dx12BufferHash *hash);
 // The same for a draw recorded to a list with these writes, or NULL. *own is
@@ -132,5 +176,16 @@ struct Dx12BufferStats {
 	volatile LONG64 out_of_bounds;
 	// Hashed ranges moved by those not mappable, see Dx12BufferWrite
 	volatile LONG64 copy_propagated;
+	// dx12_defer_upload_hash: hashes left to a GPU copy at execution,
+	// ranges moved while pending, uploads hashed in full at recording
+	// although the option is on, those hashed from the upload heap at
+	// execution after all, results for ranges written over before they
+	// came, and uploads of lists never executed
+	volatile LONG64 deferred;
+	volatile LONG64 copy_deferred;
+	volatile LONG64 hashed_at_once;
+	volatile LONG64 deferred_on_cpu;
+	volatile LONG64 deferred_superseded;
+	volatile LONG64 deferred_abandoned;
 };
 extern Dx12BufferStats dx12_buffer_stats;

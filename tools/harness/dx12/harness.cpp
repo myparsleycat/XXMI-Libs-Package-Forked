@@ -6,7 +6,9 @@
 //
 // harness.exe [frames=3000] [nodll] [meshes=350] [passes=3] [dump=file.bmp]
 //             [key=VK] [keyframe=N] [uploads=60] [churn=1] [table=4] [heap=N]
-//             [video] [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend]
+//             [video] [planes=N] [streaming=N [streaming-count=K]] [buffers=N [buffer-count=K] [buffer-bytes=B]]
+//             [gpu-upload] [upload-queue=copy]
+//             [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend]
 //             [profile | profile=present] [test [move | evict [evictstop=N] | lowmip]]
 //             [scene=file [slot=vb0] [appear=N]]
 // Prints the average frame time of the frames after the first 300, in blocks.
@@ -16,6 +18,15 @@
 //   uploads, churn the buffers handed out from the upload ring each frame
 //   table=N        SRVs in the pixel shaders' table; heap=N its shader visible heap
 //   video          a 1080p texture written whole every frame
+//   planes=N       new textures for the Y, U and V planes of a video (A8, 800x600
+//                  and twice 400x300) every N frames, uploaded whole once each
+//   streaming=N    a new 2048x2048 BC7 texture every N frames, uploaded whole once;
+//                  streaming-count=K makes it K of them
+//   buffers=N      K (buffer-count, 16) new ranges of B bytes (buffer-bytes, 262144)
+//                  of a pool buffer uploaded every N frames, each with other contents
+//   gpu-upload     the upload buffers of planes, streaming and buffers in CPU-visible video
+//                  memory (D3D12_HEAP_TYPE_GPU_UPLOAD, needs Resizable BAR)
+//   upload-queue=copy  the copies of planes, streaming and buffers on a copy queue
 //   dxil           the game's shaders compiled to DXIL (dxcompiler.dll next to it)
 //   rootconst      root constants in the root signature
 //   threads=1      passes after the first recorded on a thread of their own
@@ -35,6 +46,7 @@
 #include <d3dcompiler.h>
 #include <dxcapi.h>
 #include <dbghelp.h>
+#include <deque>
 #include <map>
 #include <string>
 #include <stdio.h>
@@ -219,14 +231,44 @@ static bool video;
 static const UINT VIDEO_WIDTH = 1920, VIDEO_HEIGHT = 1080;
 static ID3D12Resource *video_texture, *video_uploads[3];
 static BYTE *video_data[3];
+static UINT planes_every, streaming_every, streaming_count = 1;
+static bool gpu_upload;
+// upload-queue=copy: their copies on a copy queue the direct queue waits for
+static bool copy_queue_uploads;
+static ID3D12CommandQueue *copy_queue;
+static ID3D12Fence *copy_fence;
+static UINT64 copy_fence_value;
+static ID3D12GraphicsCommandList *copy_list;
+// Room for the new textures of a frame, set from planes and streaming
+static UINT64 NEW_TEXTURE_UPLOAD_BYTES;
+static UINT64 new_texture_count, new_texture_bytes, new_texture_ticks;
+// buffers=N: a pool the new ranges are written to one after another, wrapping
+// around, as a game streaming in meshes does. Big enough that a range is not
+// written again within DX12_HOT_FRAMES at the default sizes, which the shim
+// would take for dynamic.
+static UINT buffers_every, buffer_count = 16, buffer_bytes = 256 << 10;
+static const UINT64 BUFFER_POOL_BYTES = 256ull << 20;
+static ID3D12Resource *buffer_pool;
+static UINT64 buffer_pool_at, new_buffer_count, new_buffer_bytes, new_buffer_ticks;
 
 struct Frame {
 	ID3D12CommandAllocator *allocators[2];
 	ID3D12Resource *ring;
 	BYTE *ring_data;
 	UINT64 fence;
+	ID3D12Resource *new_texture_upload;
+	BYTE *new_texture_data;
+	ID3D12Resource *new_buffer_upload;
+	BYTE *new_buffer_data;
+	ID3D12CommandAllocator *copy_allocator;
 };
 static Frame frames[BACK_BUFFERS];
+// The textures of planes and streaming by the frame they were made in, kept
+// for NEW_TEXTURE_FRAMES so that a hash worked out some frames later still
+// finds them
+static std::deque<std::pair<UINT, ID3D12Resource*>> new_textures;
+static const UINT NEW_TEXTURE_FRAMES = 30;
+static UINT current_frame;
 static ID3D12GraphicsCommandList *lists[2];
 static const UINT64 RING_BYTES = 8 << 20;
 static UINT GPU_HEAP_DESCRIPTORS = 65536;
@@ -268,6 +310,77 @@ static void transition(ID3D12GraphicsCommandList *list, ID3D12Resource *resource
 	barrier.Transition.StateBefore = before;
 	barrier.Transition.StateAfter = after;
 	list->ResourceBarrier(1, &barrier);
+}
+
+// For planes and streaming: a texture made and filled whole from the frame's
+// upload buffer at *at, never drawn with, its first bytes set to marker
+static void upload_new_texture(ID3D12GraphicsCommandList *list, Frame *frame, UINT64 *at, UINT width, UINT height, DXGI_FORMAT format, UINT marker)
+{
+	D3D12_HEAP_PROPERTIES heap = {};
+	D3D12_RESOURCE_DESC desc = {};
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+	UINT rows = 0;
+	UINT64 row_bytes = 0, total = 0;
+	ID3D12Resource *texture;
+	LARGE_INTEGER t0, t1;
+
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = width;
+	desc.Height = height;
+	desc.DepthOrArraySize = 1;
+	desc.MipLevels = 1;
+	desc.Format = format;
+	desc.SampleDesc.Count = 1;
+	// A copy queue takes a texture in COMMON, which it promotes to COPY_DEST
+	CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+			copy_queue_uploads ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&texture)));
+
+	device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+	*at = (*at + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) & ~(UINT64)(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+	if (*at + total > NEW_TEXTURE_UPLOAD_BYTES) {
+		printf("FAILED: the new textures of a frame need more than %llu bytes of upload buffer\n", NEW_TEXTURE_UPLOAD_BYTES);
+		ExitProcess(1);
+	}
+	footprint.Offset = *at;
+	*(UINT*)(frame->new_texture_data + *at) = marker;
+
+	dst.pResource = texture;
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src.pResource = frame->new_texture_upload;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	src.PlacedFootprint = footprint;
+	QueryPerformanceCounter(&t0);
+	list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+	QueryPerformanceCounter(&t1);
+
+	new_texture_ticks += t1.QuadPart - t0.QuadPart;
+	new_texture_bytes += row_bytes * rows;
+	new_texture_count++;
+	*at += total;
+	new_textures.push_back({ current_frame, texture });
+}
+
+// For buffers: the k-th new range of the frame, its first bytes set to the
+// frame and k so that no two have the same contents
+static void upload_new_buffer(ID3D12GraphicsCommandList *list, Frame *frame, UINT f, UINT k)
+{
+	UINT64 src = (UINT64)k * buffer_bytes;
+	LARGE_INTEGER t0, t1;
+	UINT marker[2] = { f, k };
+
+	if (buffer_pool_at + buffer_bytes > BUFFER_POOL_BYTES)
+		buffer_pool_at = 0;
+	memcpy(frame->new_buffer_data + src, marker, sizeof(marker));
+	QueryPerformanceCounter(&t0);
+	list->CopyBufferRegion(buffer_pool, buffer_pool_at, frame->new_buffer_upload, src, buffer_bytes);
+	QueryPerformanceCounter(&t1);
+
+	new_buffer_ticks += t1.QuadPart - t0.QuadPart;
+	new_buffer_bytes += buffer_bytes;
+	new_buffer_count++;
+	buffer_pool_at += (buffer_bytes + 255) & ~255ull;
 }
 
 static void wait_for(UINT64 value)
@@ -1254,6 +1367,14 @@ int main(int argc, char **argv)
 		else if (!strncmp(argv[a], "churn=", 6)) churn = atoi(argv[a] + 6);
 		else if (!strcmp(argv[a], "nodll")) load_dll = false;
 		else if (!strcmp(argv[a], "video")) video = true;
+		else if (!strncmp(argv[a], "planes=", 7)) planes_every = atoi(argv[a] + 7);
+		else if (!strncmp(argv[a], "streaming=", 10)) streaming_every = atoi(argv[a] + 10);
+		else if (!strncmp(argv[a], "streaming-count=", 16)) streaming_count = max(1, atoi(argv[a] + 16));
+		else if (!strncmp(argv[a], "buffers=", 8)) buffers_every = atoi(argv[a] + 8);
+		else if (!strncmp(argv[a], "buffer-count=", 13)) buffer_count = max(1, atoi(argv[a] + 13));
+		else if (!strncmp(argv[a], "buffer-bytes=", 13)) buffer_bytes = max(16, atoi(argv[a] + 13));
+		else if (!strcmp(argv[a], "gpu-upload")) gpu_upload = true;
+		else if (!strcmp(argv[a], "upload-queue=copy")) copy_queue_uploads = true;
 		else if (!strcmp(argv[a], "dxil")) use_dxil = true;
 		else if (!strcmp(argv[a], "debug")) debug = true;
 		else if (!strcmp(argv[a], "gpu-debug")) debug = gpu_debug = true;
@@ -1358,6 +1479,19 @@ int main(int argc, char **argv)
 	D3D12_COMMAND_QUEUE_DESC queue_desc = {};
 	queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 	CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
+	if (copy_queue_uploads) {
+		D3D12_COMMAND_QUEUE_DESC copy_desc = {};
+		copy_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+		CHECK(device->CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy_queue)));
+		CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_fence)));
+	}
+	if (gpu_upload) {
+		D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16 = {};
+		if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &options16, sizeof(options16))) || !options16.GPUUploadHeapSupported) {
+			printf("gpu-upload: the device has no GPU upload heaps (Resizable BAR off or not supported)\n");
+			return 1;
+		}
+	}
 
 	swap_desc.Width = WIDTH;
 	swap_desc.Height = HEIGHT;
@@ -1401,6 +1535,32 @@ int main(int argc, char **argv)
 			CHECK(video_uploads[i]->Map(0, NULL, (void**)&video_data[i]));
 			memset(video_data[i], 0x40 + i, (size_t)VIDEO_WIDTH * VIDEO_HEIGHT * 4);
 		}
+		if (planes_every || streaming_every) {
+			// The planes take 2 MiB with their row pitch, a 2048x2048 BC7 texture 4 MiB
+			NEW_TEXTURE_UPLOAD_BYTES = (planes_every ? 2 << 20 : 0) + (streaming_every ? (UINT64)streaming_count << 22 : 0);
+			frames[i].new_texture_upload = create_buffer(NEW_TEXTURE_UPLOAD_BYTES,
+					gpu_upload ? D3D12_HEAP_TYPE_GPU_UPLOAD : D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+			CHECK(frames[i].new_texture_upload->Map(0, NULL, (void**)&frames[i].new_texture_data));
+			memset(frames[i].new_texture_data, 0x20 + i, (size_t)NEW_TEXTURE_UPLOAD_BYTES);
+		}
+		if (buffers_every) {
+			UINT64 bytes = (UINT64)buffer_count * buffer_bytes;
+
+			frames[i].new_buffer_upload = create_buffer(bytes,
+					gpu_upload ? D3D12_HEAP_TYPE_GPU_UPLOAD : D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+			CHECK(frames[i].new_buffer_upload->Map(0, NULL, (void**)&frames[i].new_buffer_data));
+			memset(frames[i].new_buffer_data, 0x30 + i, (size_t)bytes);
+		}
+		if ((planes_every || streaming_every || buffers_every) && copy_queue_uploads)
+			CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&frames[i].copy_allocator)));
+	}
+	if (buffers_every) {
+		if ((UINT64)buffer_count * ((buffer_bytes + 255) & ~255ull) > BUFFER_POOL_BYTES) {
+			printf("FAILED: buffer-count times buffer-bytes is more than the pool of %llu bytes\n", BUFFER_POOL_BYTES);
+			return 1;
+		}
+		// Buffers are promoted from COMMON to COPY_DEST on any queue
+		buffer_pool = create_buffer(BUFFER_POOL_BYTES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
 	}
 	if (video) {
 		D3D12_HEAP_PROPERTIES heap = {};
@@ -1486,6 +1646,11 @@ int main(int argc, char **argv)
 		}
 
 		wait_for(frame->fence);
+		current_frame = f;
+		while (!new_textures.empty() && new_textures.front().first + NEW_TEXTURE_FRAMES <= f) {
+			new_textures.front().second->Release();
+			new_textures.pop_front();
+		}
 		if (evict_test && (int)f == evict_stop)
 			evict_test = false;
 		if (evict_test) {
@@ -1558,6 +1723,40 @@ int main(int argc, char **argv)
 			transition(lists[0], video_texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
 			lists[0]->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
 			transition(lists[0], video_texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		}
+
+		if ((planes_every && f % planes_every == 0) || (streaming_every && f % streaming_every == 0)
+		    || (buffers_every && f % buffers_every == 0)) {
+			ID3D12GraphicsCommandList *upload_list = lists[0];
+			UINT64 at = 0;
+
+			if (copy_queue_uploads) {
+				CHECK(frame->copy_allocator->Reset());
+				if (copy_list)
+					CHECK(copy_list->Reset(frame->copy_allocator, NULL));
+				else
+					CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, frame->copy_allocator, NULL, IID_PPV_ARGS(&copy_list)));
+				upload_list = copy_list;
+			}
+			if (planes_every && f % planes_every == 0) {
+				upload_new_texture(upload_list, frame, &at, 800, 600, DXGI_FORMAT_A8_UNORM, f);
+				upload_new_texture(upload_list, frame, &at, 400, 300, DXGI_FORMAT_A8_UNORM, f);
+				upload_new_texture(upload_list, frame, &at, 400, 300, DXGI_FORMAT_A8_UNORM, f);
+			}
+			if (streaming_every && f % streaming_every == 0) {
+				for (UINT k = 0; k < streaming_count; k++)
+					upload_new_texture(upload_list, frame, &at, 2048, 2048, DXGI_FORMAT_BC7_UNORM, f * 64 + k);
+			}
+			if (buffers_every && f % buffers_every == 0) {
+				for (UINT k = 0; k < buffer_count; k++)
+					upload_new_buffer(upload_list, frame, f, k);
+			}
+			if (copy_queue_uploads) {
+				CHECK(copy_list->Close());
+				copy_queue->ExecuteCommandLists(1, (ID3D12CommandList**)&copy_list);
+				CHECK(copy_queue->Signal(copy_fence, ++copy_fence_value));
+				CHECK(queue->Wait(copy_fence, copy_fence_value));
+			}
 		}
 
 		// What the mods matched or did not is written again with other
@@ -2109,6 +2308,18 @@ int main(int argc, char **argv)
 			mesh_count * passes, load_dll ? "with d3d11.dll" : "without", sorted[sorted.size() / 2], sorted[0], sum / blocks.size(), blocks.size());
 		printf("  of that recording and executing %.3f ms, presenting %.3f ms\n", record_ticks * 1000.0 / freq.QuadPart / timed_frames,
 			present_ticks * 1000.0 / freq.QuadPart / timed_frames);
+	}
+	if (new_texture_count) {
+		double ms = new_texture_ticks * 1000.0 / freq.QuadPart;
+		printf("  new textures: %llu uploaded (%.1f MB of top mips%s), recording their copies %.3f ms in all, %.3f ms each, %.1f MB/s\n",
+			new_texture_count, new_texture_bytes / 1048576.0, gpu_upload ? " from video memory" : "", ms, ms / new_texture_count,
+			ms > 0 ? new_texture_bytes / 1048576.0 / (ms / 1000.0) : 0.0);
+	}
+	if (new_buffer_count) {
+		double ms = new_buffer_ticks * 1000.0 / freq.QuadPart;
+		printf("  new buffers: %llu uploaded (%.1f MB%s), recording their copies %.3f ms in all, %.3f ms each, %.1f MB/s\n",
+			new_buffer_count, new_buffer_bytes / 1048576.0, gpu_upload ? " from video memory" : "", ms, ms / new_buffer_count,
+			ms > 0 ? new_buffer_bytes / 1048576.0 / (ms / 1000.0) : 0.0);
 	}
 	if (contend)
 		printf("  contend: %u rounds of making and releasing 80 MB\n", contend_rounds.load());
