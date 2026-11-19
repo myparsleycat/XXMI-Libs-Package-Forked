@@ -26,3 +26,6 @@ void Dx12FrameDumpDraw(Dx12GraphicsCommandList *list, const Dx12PipelineInfo *pi
 
 // Once per present, after what the frame recorded on our list was submitted
 void Dx12FrameDumpFramePresented();
+
+// Before input processing: retain an empty request for at most five Presents.
+void Dx12FrameDumpAdvanceCaptureWindow();
