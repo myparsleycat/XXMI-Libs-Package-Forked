@@ -21,7 +21,9 @@ class Dx12GraphicsCommandList;
 // buffer uploads of all lists being executed: the list to execute ahead of the
 // game's, or NULL. The uploads no copy was made of go to on_cpu_textures and
 // on_cpu_buffers, for the caller to hash with Dx12HashTextureUploadNow and
-// Dx12HashBufferUploadNow before the game's lists are executed. A non-NULL
+// Dx12HashBufferUploadNow before returning to the game: before the game's
+// lists are executed for sources outside upload heaps, which the lists can
+// write, and after for the others. A non-NULL
 // context is to be handed to Dx12UploadHashesSubmitted right after the queue
 // has the lists, still with that lock held.
 ID3D12CommandList* Dx12UploadHashesExecuting(ID3D12CommandQueue *queue, Dx12GraphicsCommandList *const *proxies, size_t count,

@@ -126,6 +126,38 @@ HRESULT STDMETHODCALLTYPE Dx12CommandQueue::GetDevice(REFIID riid, void **ppvDev
 	return mDevice->QueryInterface(riid, ppvDevice);
 }
 
+// Whether the lists being executed can write the memory the upload is read from
+static bool gpu_writable(ID3D12Resource *upload)
+{
+	D3D12_HEAP_PROPERTIES heap;
+	Dx12ResourceInfo info;
+
+	if (Dx12GetResourceInfo(upload, &info))
+		return info.heap_type != D3D12_HEAP_TYPE_UPLOAD;
+	return FAILED(upload->GetHeapProperties(&heap, NULL)) || heap.Type != D3D12_HEAP_TYPE_UPLOAD;
+}
+
+// The uploads no GPU copy was made of. Before the lists are submitted, only
+// those the lists can write are hashed and the rest are kept. After, the rest
+// are, so that the GPU and the queue do not wait for the slow reads: the game
+// keeps upload heap memory as it is until the lists are done, which it learns
+// from a signal it can only queue after the lists are submitted.
+template <typename Upload>
+static void hash_on_cpu(std::vector<Upload> *uploads, bool before_lists, volatile LONG64 *count, void (*hash)(const Upload*))
+{
+	size_t i, kept = 0;
+
+	for (i = 0; i < uploads->size(); i++) {
+		if (before_lists && !gpu_writable((*uploads)[i].upload)) {
+			(*uploads)[kept++] = (*uploads)[i];
+			continue;
+		}
+		InterlockedIncrement64(count);
+		hash(&(*uploads)[i]);
+	}
+	uploads->resize(kept);
+}
+
 void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandLists, ID3D12CommandList *const *ppCommandLists)
 {
 	ID3D12CommandList *stack[65], **lists = stack + 1;
@@ -231,6 +263,8 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 		upload_list = Dx12UploadHashesExecuting(mOrig, texture_uploads.data(), texture_uploads.size(), buffer_uploads,
 				&on_cpu, &buffers_on_cpu, &upload_context);
 	}
+	hash_on_cpu(&on_cpu, true, &dx12_texture_stats.deferred_on_cpu, Dx12HashTextureUploadNow);
+	hash_on_cpu(&buffers_on_cpu, true, &dx12_buffer_stats.deferred_on_cpu, Dx12HashBufferUploadNow);
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE_DRIVER, L"lists", NumCommandLists);
 		if (upload_list) {
@@ -245,17 +279,8 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 	if (locked)
 		Dx12QueueUnlock(mOrig);
 
-	// After submitting, so that the GPU and the queue do not wait for the
-	// slow reads: the game keeps the upload memory as it is until the lists
-	// are done
-	for (const Dx12TextureUpload &upload : on_cpu) {
-		InterlockedIncrement64(&dx12_texture_stats.deferred_on_cpu);
-		Dx12HashTextureUploadNow(&upload);
-	}
-	for (const Dx12BufferUpload &upload : buffers_on_cpu) {
-		InterlockedIncrement64(&dx12_buffer_stats.deferred_on_cpu);
-		Dx12HashBufferUploadNow(&upload);
-	}
+	hash_on_cpu(&on_cpu, false, &dx12_texture_stats.deferred_on_cpu, Dx12HashTextureUploadNow);
+	hash_on_cpu(&buffers_on_cpu, false, &dx12_buffer_stats.deferred_on_cpu, Dx12HashBufferUploadNow);
 
 	if (!pins.empty()) {
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE, L"after");
