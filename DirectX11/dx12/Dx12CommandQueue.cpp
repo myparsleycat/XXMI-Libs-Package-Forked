@@ -231,15 +231,6 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 		upload_list = Dx12UploadHashesExecuting(mOrig, texture_uploads.data(), texture_uploads.size(), buffer_uploads,
 				&on_cpu, &buffers_on_cpu, &upload_context);
 	}
-	// Outside the above, as hashing on the CPU has a category of its own
-	for (const Dx12TextureUpload &upload : on_cpu) {
-		InterlockedIncrement64(&dx12_texture_stats.deferred_on_cpu);
-		Dx12HashTextureUploadNow(&upload);
-	}
-	for (const Dx12BufferUpload &upload : buffers_on_cpu) {
-		InterlockedIncrement64(&dx12_buffer_stats.deferred_on_cpu);
-		Dx12HashBufferUploadNow(&upload);
-	}
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE_DRIVER, L"lists", NumCommandLists);
 		if (upload_list) {
@@ -253,6 +244,18 @@ void STDMETHODCALLTYPE Dx12CommandQueue::ExecuteCommandLists(UINT NumCommandList
 		Dx12UploadHashesSubmitted(mOrig, upload_context);
 	if (locked)
 		Dx12QueueUnlock(mOrig);
+
+	// After submitting, so that the GPU and the queue do not wait for the
+	// slow reads: the game keeps the upload memory as it is until the lists
+	// are done
+	for (const Dx12TextureUpload &upload : on_cpu) {
+		InterlockedIncrement64(&dx12_texture_stats.deferred_on_cpu);
+		Dx12HashTextureUploadNow(&upload);
+	}
+	for (const Dx12BufferUpload &upload : buffers_on_cpu) {
+		InterlockedIncrement64(&dx12_buffer_stats.deferred_on_cpu);
+		Dx12HashBufferUploadNow(&upload);
+	}
 
 	if (!pins.empty()) {
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_EXECUTE, L"after");

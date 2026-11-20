@@ -448,7 +448,7 @@ UINT Dx12BeginTextureHash(ID3D12Resource *resource, UINT64 *serial)
 	return generation;
 }
 
-bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generation, const uint32_t *data_hash)
+bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generation, bool known, bool has_data_hash, uint32_t data_hash)
 {
 	ResourceShard *shard = shard_of(resource);
 	bool taken = false;
@@ -458,9 +458,9 @@ bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generat
 	if (i != shard->resources.end() && i->second.serial == serial
 	    && i->second.hash_pending && i->second.hash_generation == generation) {
 		i->second.hash_pending = false;
-		if (data_hash) {
-			i->second.has_data_hash = true;
-			i->second.data_hash = *data_hash;
+		if (known) {
+			i->second.has_data_hash = has_data_hash;
+			i->second.data_hash = has_data_hash ? data_hash : 0;
 		}
 		InterlockedIncrement64(texture_stamp(resource));
 		taken = true;

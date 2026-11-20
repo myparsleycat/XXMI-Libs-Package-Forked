@@ -82,6 +82,9 @@ struct QueueHashes {
 	// executed with by the value the fence gets to after
 	ID3D12CommandAllocator *recording;
 	std::deque<std::pair<ID3D12CommandAllocator*, UINT64>> allocators;
+	// Lists that failed to close, which cannot be reset again, by the value
+	// the fence gets to after their earlier executions
+	std::deque<std::pair<ID3D12GraphicsCommandList*, UINT64>> retired_lists;
 
 	std::vector<Dx12ReadbackRing*> rings;
 
@@ -169,6 +172,8 @@ static void destroy_context(QueueHashes *q)
 		q->recording->Release();
 	if (q->list)
 		q->list->Release();
+	for (auto &list : q->retired_lists)
+		list.first->Release();
 	for (Dx12ReadbackRing *ring : q->rings)
 		release_ring(ring);
 	if (q->fence)
@@ -282,6 +287,10 @@ static bool open_list(QueueHashes *q)
 	ID3D12CommandAllocator *allocator = NULL;
 	UINT64 completed = q->fence->GetCompletedValue();
 
+	while (!q->retired_lists.empty() && completed != UINT64_MAX && q->retired_lists.front().second <= completed) {
+		q->retired_lists.front().first->Release();
+		q->retired_lists.pop_front();
+	}
 	if (!q->allocators.empty() && completed != UINT64_MAX && q->allocators.front().second <= completed) {
 		allocator = q->allocators.front().first;
 		q->allocators.pop_front();
@@ -409,8 +418,8 @@ ID3D12CommandList* Dx12UploadHashesExecuting(ID3D12CommandQueue *queue, Dx12Grap
 		return NULL;
 	}
 
-	// The list is reset for the next execution, which tries again after a
-	// failure. Without a copy in it, it is not executed.
+	// The list is reset for the next execution, or replaced after a failure
+	// to close. Without a copy in it, it is not executed.
 	close_failed = FAILED(q->list->Close());
 	if (close_failed || !added) {
 		if (close_failed && !q->close_failure_logged) {
@@ -426,6 +435,10 @@ ID3D12CommandList* Dx12UploadHashesExecuting(ID3D12CommandQueue *queue, Dx12Grap
 				on_cpu_textures->push_back(last.texture);
 			last.ring->FreeNewest();
 			q->pending.pop_back();
+		}
+		if (close_failed) {
+			q->retired_lists.push_back({ q->list, q->signalled });
+			q->list = NULL;
 		}
 		q->allocators.push_back({ q->recording, q->signalled });
 		q->recording = NULL;
@@ -484,6 +497,7 @@ void Dx12FinishUploadHashes()
 {
 	static SRWLOCK finish_lock = SRWLOCK_INIT;
 	static LONG64 frequency;
+	static size_t first_context;
 	std::vector<QueueHashes*> contexts, finished;
 	ULONGLONG now = GetTickCount64();
 	LARGE_INTEGER start, ticks;
@@ -506,8 +520,14 @@ void Dx12FinishUploadHashes()
 	contexts = registry;
 	ReleaseSRWLockShared(&registry_lock);
 
-	for (QueueHashes *q : contexts) {
-		AcquireSRWLockExclusive(&q->lock);
+	// Each queue in turn goes first, so that one with more copies than the
+	// budget does not keep another's from ever being hashed here. One that
+	// is busy making room in ring_alloc is left for the next present.
+	for (size_t i = 0; i < contexts.size(); i++) {
+		QueueHashes *q = contexts[(first_context + i) % contexts.size()];
+
+		if (!TryAcquireSRWLockExclusive(&q->lock))
+			continue;
 		if (!finish(q, deadline, &any)) {
 			// Removed with the device: nothing of ours runs any more,
 			// and what the copies were for keeps the hash it had
@@ -526,6 +546,8 @@ void Dx12FinishUploadHashes()
 			finished.push_back(q);
 		ReleaseSRWLockExclusive(&q->lock);
 	}
+
+	first_context++;
 
 	// The queues are gone, so nothing else looks for these
 	if (!finished.empty()) {

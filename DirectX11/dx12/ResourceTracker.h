@@ -135,8 +135,8 @@ void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32
 // The hash the texture had stays until then.
 UINT Dx12BeginTextureHash(ID3D12Resource *resource, UINT64 *serial);
 // False if the texture is gone or was written again since that Begin.
-// data_hash NULL keeps the hash the texture had.
-bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generation, const uint32_t *data_hash);
+// known false keeps the hash the texture had.
+bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generation, bool known, bool has_data_hash, uint32_t data_hash);
 void Dx12MarkCubeTexture(ID3D12Resource *resource);
 // For a copy that writes a texture's whole top mip: false while the game keeps
 // writing it, by the DX12_HOT_FRAMES and DX12_HOT_TEXTURE_LIMIT rule

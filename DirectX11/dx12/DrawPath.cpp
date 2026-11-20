@@ -1545,7 +1545,8 @@ static void remember_texture(ID3D12Resource *resource, const Published *entry)
 
 	// Only if the entry is of the resource as it is by now
 	if (!Dx12GetResourceInfo(resource, &info) || memcmp(&entry->desc, &info.desc, sizeof(info.desc))
-	    || entry->has_data_hash != info.has_data_hash || entry->data_hash != info.data_hash || entry->config != config_generation)
+	    || entry->has_data_hash != info.has_data_hash || entry->data_hash != info.data_hash || entry->hash_pending != info.hash_pending
+	    || entry->config != config_generation)
 		return;
 
 	// One whose hash is pending matches nothing by hash, unlike the

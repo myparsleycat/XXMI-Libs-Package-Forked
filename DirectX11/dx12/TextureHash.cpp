@@ -120,13 +120,13 @@ static std::atomic<UINT64> at_once_state;
 
 static LONG64 ticks_per_ms()
 {
-	static LONG64 ticks;
-	LARGE_INTEGER frequency;
+	static const LONG64 ticks = [] {
+		LARGE_INTEGER frequency;
 
-	if (!ticks) {
 		QueryPerformanceFrequency(&frequency);
-		ticks = frequency.QuadPart / 1000;
-	}
+		return frequency.QuadPart / 1000;
+	}();
+
 	return ticks;
 }
 
@@ -139,13 +139,16 @@ bool Dx12HashBudgetLeft()
 	return (UINT)(state >> 32) != dx12_frame || (UINT32)state < AT_ONCE_BUDGET_MS * ticks_per_ms();
 }
 
-// Returns the ticks the frame has spent with these
+// Returns the ticks the frame has spent with these. Ticks of a frame that
+// another thread has already moved on from go to that newer frame.
 static UINT32 at_once_spend(UINT frame, LONG64 ticks)
 {
 	UINT64 state = at_once_state.load(), next;
 	UINT64 spent;
 
 	do {
+		if ((INT32)((UINT)(state >> 32) - frame) > 0)
+			frame = (UINT)(state >> 32);
 		spent = (UINT)(state >> 32) == frame ? (UINT32)state : 0;
 		spent = min(spent + (UINT64)max(ticks, 0LL), (UINT64)UINT32_MAX);
 		next = (UINT64)frame << 32 | spent;
@@ -275,21 +278,34 @@ struct PendingKey {
 		return generation < other.generation;
 	}
 };
+// A copy from a texture whose hash is pending, with the hash the source had
+// before that write: what the copy gets if the write's hash never comes, as
+// the write then never reached the GPU or could not be read back
+struct PendingCopy {
+	PendingKey key;
+	bool had_data_hash;
+	uint32_t had_hash;
+};
 static SRWLOCK copies_lock = SRWLOCK_INIT;
-static std::multimap<PendingKey, PendingKey> pending_copies;
+static std::multimap<PendingKey, PendingCopy> pending_copies;
 
 void Dx12TextureHashDone(ID3D12Resource *texture, UINT64 serial, UINT generation, const uint32_t *data_hash)
 {
-	std::vector<PendingKey> work = { { texture, serial, generation } };
+	struct Work {
+		PendingKey key;
+		bool known, has_data_hash;
+		uint32_t data_hash;
+	};
+	std::vector<Work> work = { { { texture, serial, generation }, data_hash != NULL, data_hash != NULL, data_hash ? *data_hash : 0 } };
 	bool copy = false;
 
 	while (!work.empty()) {
-		PendingKey key = work.back();
+		Work at = work.back();
 
 		work.pop_back();
-		if (Dx12FinishTextureHash(key.texture, key.serial, key.generation, data_hash)) {
-			if (data_hash)
-				Dx12DumpTexture(key.texture, copy ? "copy" : "upload");
+		if (Dx12FinishTextureHash(at.key.texture, at.key.serial, at.key.generation, at.known, at.has_data_hash, at.data_hash)) {
+			if (at.known && at.has_data_hash)
+				Dx12DumpTexture(at.key.texture, copy ? "copy" : "upload");
 		} else {
 			InterlockedIncrement64(&dx12_texture_stats.deferred_superseded);
 		}
@@ -298,9 +314,13 @@ void Dx12TextureHashDone(ID3D12Resource *texture, UINT64 serial, UINT generation
 		// write the hash is of, even when the texture has been
 		// written again since
 		AcquireSRWLockExclusive(&copies_lock);
-		auto range = pending_copies.equal_range(key);
-		for (auto i = range.first; i != range.second; ++i)
-			work.push_back(i->second);
+		auto range = pending_copies.equal_range(at.key);
+		for (auto i = range.first; i != range.second; ++i) {
+			if (at.known)
+				work.push_back({ i->second.key, true, at.has_data_hash, at.data_hash });
+			else
+				work.push_back({ i->second.key, true, i->second.had_data_hash, i->second.had_hash });
+		}
 		pending_copies.erase(range.first, range.second);
 		ReleaseSRWLockExclusive(&copies_lock);
 		copy = true;
@@ -473,7 +493,8 @@ static void propagate_hash(ID3D12Resource *dst, ID3D12Resource *src)
 
 		copy.generation = Dx12BeginTextureHash(dst, &copy.serial);
 		if (copy.generation) {
-			pending_copies.insert({ { src, src_info.serial, src_info.hash_generation }, copy });
+			pending_copies.insert({ { src, src_info.serial, src_info.hash_generation },
+				{ copy, src_info.has_data_hash, src_info.data_hash } });
 			InterlockedIncrement64(&dx12_texture_stats.copy_deferred);
 		}
 		ReleaseSRWLockExclusive(&copies_lock);

@@ -152,6 +152,12 @@ void Dx12GraphicsCommandList::ForgetInfo()
 
 HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Reset(ID3D12CommandAllocator *pAllocator, ID3D12PipelineState *pInitialState)
 {
+	// A failed Reset leaves the list as it was, which may still be executed
+	HRESULT hr = mOrig->Reset(pAllocator, pInitialState);
+
+	if (FAILED(hr))
+		return hr;
+
 	mDraws = mDispatches = mFastDraws = 0;
 	mResets++;
 	Dx12ResetCmdState(&mState, pInitialState);
@@ -169,7 +175,7 @@ HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Reset(ID3D12CommandAllocator 
 	mExecuted = false;
 	mShimFence = 0;
 
-	return mOrig->Reset(pAllocator, pInitialState);
+	return hr;
 }
 
 void STDMETHODCALLTYPE Dx12GraphicsCommandList::ClearState(ID3D12PipelineState *pPipelineState)
