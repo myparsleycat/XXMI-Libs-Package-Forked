@@ -65,6 +65,7 @@ dcl_sampler s0, mode_default
 * `Pattern` (optional): must match the D3D11-style declarations the DLL derives from the shader's reflection, such as `dcl_input_ps linear v0.xy`. A dynamically indexed array counts in full, so constant buffer sizes can differ from D3D11. It cannot have a `Replace`.
 * `InsertDeclarations`: the resources the patched shader can read. See [Declarations](#declarations).
 * `SpirvPattern*`: regular expressions on the shader's text, applied in name order. With a `Replace` subsection the first match is replaced; without one the pattern only has to match. If any pattern of the group does not match, the whole group is undone for that shader. Groups are applied in name order.
+* The lines of a pattern or `Replace` subsection are joined without a separator, after leading and trailing whitespace is removed, so a replacement that spans several lines needs `\n` at the end of each line. A line whose first `=` has nothing after it is dropped with a "No value found" warning, so keep an `=` and the text that follows it on the same line, for example `${c0} = OpConstant %zz_int 0\n`.
 * Commands and `filter_index` in a SPIR-V group are not run. Put them in a separate group without `SpirvPattern`.
 
 ## The shader's text
