@@ -441,14 +441,14 @@ static void LeaveCriticalSectionHook(CRITICAL_SECTION *lock)
 
 static void DeleteCriticalSectionHook(CRITICAL_SECTION *lock)
 {
-	// If a TLS structure hasn't been allocated yet for this thread, we
-	// might be in the TLS allocation itself!
-	if (!TlsGetValue(tls_idx))
+	// The lock is only left in our data structures when this thread has no
+	// TLS yet or is inside code that suppresses tracking (such as the
+	// original D3D11CreateDeviceAndSwapChain call, during which other
+	// DLLs load, unload and delete their locks). It must be deleted anyway:
+	if (!TlsGetValue(tls_idx) || get_tls()->hooking_quirk_protection) {
+		_DeleteCriticalSection(lock);
 		return;
-
-	// Protect against reentrancy:
-	if (get_tls()->hooking_quirk_protection)
-		return;
+	}
 	get_tls()->hooking_quirk_protection = true;
 
 	// Purge the lock from our data structures:
@@ -463,8 +463,10 @@ static void DeleteCriticalSectionHook(CRITICAL_SECTION *lock)
 		next++;
 		for (auto &info: stack->second) {
 			if (info.lock == lock) {
+				size_t key = stack->first;
+
 				next = cached_stacks.erase(stack);
-				reported_stacks.erase(stack->first);
+				reported_stacks.erase(key);
 				break;
 			}
 		}

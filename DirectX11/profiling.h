@@ -130,6 +130,7 @@ namespace Profiling {
 			DX12_PIPELINE_DRIVER,
 			DX12_TEXTURE_HASH,
 			DX12_BUFFER_HASH,
+			DX12_UPLOAD_HASH_COPY,
 			// Nested inside the above (or inside each other):
 			RESOURCE_LOAD,
 			SHADER_CREATE_DRIVER,
@@ -154,6 +155,8 @@ namespace Profiling {
 			RESOURCE_FILE_READ,
 			RESOURCE_FILE_SHARE,
 			DX12_UPLOAD_COPY,
+			DX12_UPLOAD_HASH_FINISH,
+			DX12_UPLOAD_HASH_RING,
 			VK_DRAW,
 			VK_TEXTURE_IMAGE,
 			VK_TEXTURE_COPY,
@@ -257,6 +260,49 @@ namespace Profiling {
 
 		const unsigned SAMPLED_INTERVAL = 16;
 		void add_sampled(Category category, INT64 ticks);
+
+		extern thread_local UINT32 sample_state;
+
+		// Picked at random rather than every SAMPLED_INTERVAL-th call,
+		// so that calls a game makes in a repeating order are not
+		// always sampled at the same position
+		static inline bool sample_this_call()
+		{
+			UINT32 x = sample_state;
+
+			if (!x)
+				x = GetCurrentThreadId() * 2654435761u | 1;
+			x ^= x << 13;
+			x ^= x >> 17;
+			x ^= x << 5;
+			sample_state = x;
+			return x % SAMPLED_INTERVAL == 0;
+		}
+
+		// A Scope for calls made thousands of times a frame, where
+		// timing every call would cost more than the call itself:
+		// times one call in SAMPLED_INTERVAL on average.
+		class SampledScope {
+			LARGE_INTEGER start;
+			Category category;
+		public:
+			SampledScope(Category category) : category(category)
+			{
+				start.QuadPart = 0;
+				if (threshold && sample_this_call())
+					QueryPerformanceCounter(&start);
+			}
+
+			~SampledScope()
+			{
+				LARGE_INTEGER end;
+
+				if (start.QuadPart) {
+					QueryPerformanceCounter(&end);
+					add_sampled(category, end.QuadPart - start.QuadPart);
+				}
+			}
+		};
 
 		// The time of a part of a command list less that of the parts
 		// inside it, so that the categories add up to the time of the

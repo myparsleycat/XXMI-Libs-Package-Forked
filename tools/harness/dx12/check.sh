@@ -5,9 +5,11 @@
 #   test   matching by hash (case/test.ini): which watched meshes are hidden
 #   fold   conditions on targets in a list of a game's draw: which meshes each
 #          form leaves hidden
-#   move   hashes carried along GPU copies, frame by frame (harness.cpp, move)
+#   move   hashes carried along GPU copies, frame by frame (harness.cpp, move),
+#          also with every upload hash deferred (dx12_defer_upload_hash = 2)
 #   lowmip a copy of a texture without its top mip level, with
-#          track_texture_updates = 1 and match_lower_mip_textures off and on
+#          track_texture_updates = 1 and match_lower_mip_textures off and on,
+#          also with every upload hash deferred
 #   ref    the pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
 #   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
@@ -261,14 +263,23 @@ run_move() {
 	cp case/test.ini run/Mods/test.ini
 	check_move_frames "$expect_move" "" || bad=1
 	check_move_frames "$expect_move_one_pass" passes=1 || bad=1
+	# Every upload hashed from a GPU copy some frames later, so that copies
+	# take ranges whose hash is pending. The one-pass cases need the hash
+	# in the frame of the upload, which a deferred hash is not.
+	cp run/d3dx.ini run/d3dx.ini.keep
+	sed -i 's/^;\?dx12_defer_upload_hash *=.*/dx12_defer_upload_hash = 2/' run/d3dx.ini
+	check_move_frames "$expect_move" "" || { echo "  (with dx12_defer_upload_hash = 2)"; bad=1; }
+	mv run/d3dx.ini.keep run/d3dx.ini
 	rm -f run/Mods/test.ini
 	[ $bad = 0 ] && echo "move: OK" || { echo "move: FAILED"; ok=0; }
 }
 
 lowmip_at() {
-	# state of the lowmip meshes with match_lower_mip_textures = $1
+	# state of the lowmip meshes with match_lower_mip_textures = $1 and
+	# dx12_defer_upload_hash = $2 (the default when empty)
 	cp run/d3dx.ini run/d3dx.ini.keep
 	sed -i "s/^track_texture_updates *=.*/track_texture_updates = 1/; s/^match_lower_mip_textures *=.*/match_lower_mip_textures = $1/" run/d3dx.ini
+	[ -z "$2" ] || sed -i "s/^;\?dx12_defer_upload_hash *=.*/dx12_defer_upload_hash = $2/" run/d3dx.ini
 	(cd run && ./harness.exe test lowmip frames=60 dump=lowmip.bmp 2>&1) |
 		sed -n 's/^  mesh *[0-9]* lowmip \(full\|copy\) *\(hidden\|drawn\)$/\1=\2/p' | tr '\n' ',' | sed 's/,$//'
 	mv run/d3dx.ini.keep run/d3dx.ini
@@ -278,10 +289,13 @@ run_lowmip() {
 	local bad=0 pair value want got
 	grep -q "^match_lower_mip_textures *=" run/d3dx.ini || { echo "lowmip: FAILED, run/d3dx.ini has no match_lower_mip_textures: run setup.sh again"; ok=0; return; }
 	cp case/test.ini run/Mods/test.ini
-	for pair in $expect_lowmip; do
-		value=${pair%%:*}; want=${pair#*:}
-		got=$(lowmip_at $value)
-		[ "$got" = "$want" ] || { echo "  match_lower_mip_textures = $value: ${got:-not reported}, expected $want"; bad=1; }
+	# The copies of a texture whose hash is pending get it when it comes
+	for defer in "" 2; do
+		for pair in $expect_lowmip; do
+			value=${pair%%:*}; want=${pair#*:}
+			got=$(lowmip_at $value $defer)
+			[ "$got" = "$want" ] || { echo "  match_lower_mip_textures = $value${defer:+, dx12_defer_upload_hash = $defer}: ${got:-not reported}, expected $want"; bad=1; }
+		done
 	done
 	rm -f run/Mods/test.ini
 	[ $bad = 0 ] && echo "lowmip: OK" || { echo "lowmip: FAILED"; ok=0; }

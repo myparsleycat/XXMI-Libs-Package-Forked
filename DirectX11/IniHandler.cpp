@@ -5129,6 +5129,8 @@ void LoadConfigFile()
 	G->dx12_evict_idle = GetIniBool(L"Rendering", L"dx12_evict_idle", true, NULL);
 	G->dx12_evict_idle_seconds = max(0, GetIniInt(L"Rendering", L"dx12_evict_idle_seconds", 10, NULL));
 	G->dx12_evict_budget_percent = min(max(0, GetIniInt(L"Rendering", L"dx12_evict_budget_percent", 75, NULL)), 1000);
+	// 2 defers every upload, for testing the deferred path where uploads read fast
+	G->dx12_defer_upload_hash = min(max(0, GetIniInt(L"Rendering", L"dx12_defer_upload_hash", 1, NULL)), 2);
 	if (GetIniStringAndLog(L"Rendering", L"override_directory", 0, G->SHADER_PATH, MAX_PATH))
 	{
 		while (G->SHADER_PATH[wcslen(G->SHADER_PATH) - 1] == L' ')

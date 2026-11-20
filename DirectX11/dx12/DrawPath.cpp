@@ -17,6 +17,7 @@
 #include "DxilPatch.h"
 #include "FrameDump.h"
 #include "HashDump.h"
+#include "ReadbackRing.h"
 #include "ShimContext.h"
 #include "ShimDevice.h"
 #include "ShimObjects.h"
@@ -173,6 +174,8 @@ struct Published {
 	UINT64 bytes;
 	bool has_data_hash;
 	uint32_t data_hash;
+	// Textures: see Dx12ResourceInfo
+	bool hash_pending;
 	// Vertex buffers: the part its index buffer reaches, see VertexReach
 	UINT64 reach_bytes;
 	uint32_t reach_hash;
@@ -509,89 +512,28 @@ const UINT64 REACH_READBACK_STEP = 1 << 16;
 const UINT64 REACH_SPARE_BYTES = 4 << 20;
 const size_t REACH_SPARES = 4;
 
-// One readback buffer, mapped for good, that the copies take turns in.
 // Making and releasing a buffer for each copy held the draw up for 10-40 ms at
 // a time while the game was loading, with the lock held. Reaches are done with
 // in the order they were started (the fence only goes up, and update_reaches
-// only ever drops pending ones from the front), so the space is handed out as
-// a ring and given back oldest first. A copy that does not fit has a buffer of
-// its own as before.
-static ID3D12Resource *reach_ring;
-static BYTE *reach_ring_data;
+// only ever drops pending ones from the front), which a ring needs. A copy
+// that does not fit has a buffer of its own as before.
+static Dx12ReadbackRing reach_ring;
 static bool reach_ring_failed;
-static UINT64 reach_ring_head;
-// Where each copy in the ring that is pending starts, oldest first
-static std::deque<UINT64> reach_ring_starts;
 const UINT64 REACH_RING_BYTES = 8 << 20;
-const UINT64 REACH_RING_ALIGNMENT = 256;
-
-static bool create_reach_ring()
-{
-	D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_READBACK };
-	D3D12_RESOURCE_DESC desc = {};
-	D3D12_RANGE range = { 0, (SIZE_T)REACH_RING_BYTES };
-
-	desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-	desc.Width = REACH_RING_BYTES;
-	desc.Height = 1;
-	desc.DepthOrArraySize = 1;
-	desc.MipLevels = 1;
-	desc.SampleDesc.Count = 1;
-	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-	if (FAILED(dx12_shim->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-			D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&reach_ring))))
-		return false;
-	if (FAILED(reach_ring->Map(0, &range, (void**)&reach_ring_data)) || !reach_ring_data) {
-		reach_ring->Release();
-		reach_ring = NULL;
-		reach_ring_data = NULL;
-		return false;
-	}
-	return true;
-}
 
 static bool reach_ring_alloc(UINT64 bytes, UINT64 *offset)
 {
-	UINT64 start = reach_ring_head, tail;
-
-	if (!reach_ring && !reach_ring_failed && !create_reach_ring()) {
+	if (!reach_ring.resource && !reach_ring_failed && !reach_ring.Create(dx12_shim->device, REACH_RING_BYTES)) {
 		reach_ring_failed = true;
 		Dx12LogInfo("*** Failed to create the readback buffer for index reaches, each gets one of its own\n");
 	}
-	if (!reach_ring)
-		return false;
-
-	bytes = (bytes + REACH_RING_ALIGNMENT - 1) & ~(REACH_RING_ALIGNMENT - 1);
-	if (bytes > REACH_RING_BYTES)
-		return false;
-
-	if (reach_ring_starts.empty()) {
-		start = 0;
-	} else {
-		tail = reach_ring_starts.front();
-		// With copies pending, the head on the tail is a full ring
-		if (start > tail) {
-			if (start + bytes > REACH_RING_BYTES) {
-				if (bytes > tail)
-					return false;
-				start = 0;
-			}
-		} else if (start == tail || start + bytes > tail) {
-			return false;
-		}
-	}
-
-	reach_ring_head = start + bytes;
-	reach_ring_starts.push_back(start);
-	*offset = start;
-	return true;
+	return reach_ring.Alloc(bytes, offset);
 }
 
 // For the oldest copy in the ring, once what it read is gone through
 static void reach_ring_free()
 {
-	if (!reach_ring_starts.empty())
-		reach_ring_starts.pop_front();
+	reach_ring.FreeOldest();
 }
 
 // The barriers that let a list of ours copy from a buffer of the game and
@@ -643,7 +585,7 @@ static bool start_reach(const ReachKey *key, VertexReach *reach, UINT64 vb_bytes
 
 	reach->in_ring = reach_ring_alloc(key->ib_bytes + vb_bytes, &reach->readback_offset);
 	if (reach->in_ring) {
-		destination = reach_ring;
+		destination = reach_ring.resource;
 	} else {
 		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
 		// In steps, for one that finish_reach kept to do for another mesh
@@ -909,7 +851,7 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 	if (Dx12ShimSubmissionDiscarded(reach->fence))
 		data = NULL;
 	else if (reach->in_ring)
-		data = reach_ring_data + reach->readback_offset;
+		data = reach_ring.data + reach->readback_offset;
 	else if (FAILED(reach->readback->Map(0, &range, (void**)&data)))
 		data = NULL;
 	if (data) {
@@ -1085,7 +1027,8 @@ static Published* publish_resource(ID3D12Resource *resource)
 	memo->remembered = false;
 
 	if (entry->resource && !memcmp(&entry->desc, &info.desc, sizeof(info.desc))) {
-		if (entry->has_data_hash == info.has_data_hash && entry->data_hash == info.data_hash && entry->config == config_generation)
+		if (entry->has_data_hash == info.has_data_hash && entry->data_hash == info.data_hash
+		    && entry->hash_pending == info.hash_pending && entry->config == config_generation)
 			return entry;
 	} else {
 		release_published(entry);
@@ -1095,12 +1038,19 @@ static Published* publish_resource(ID3D12Resource *resource)
 
 	entry->has_data_hash = info.has_data_hash;
 	entry->data_hash = info.data_hash;
+	entry->hash_pending = info.hash_pending;
 	entry->config = config_generation;
 
 	entry->resource->GetType(&dimension);
 	if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
 		static_cast<ShimTexture2D*>(entry->resource)->GetDesc(&desc2d);
-		set_resource_hash(entry->resource, dimension, pick_texture_hash(&info), info.has_data_hash ? info.data_hash : 0, &desc2d);
+		// Until the hash of the upload or copy it waits for comes, a
+		// texture would go by that of its description alone, as if it had
+		// been made empty.
+		// Hash 0 matches no [TextureOverride] by hash.
+		set_resource_hash(entry->resource, dimension,
+			info.hash_pending && !info.has_data_hash ? 0 : pick_texture_hash(&info),
+			info.has_data_hash ? info.data_hash : 0, &desc2d);
 	} else if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER && (info.desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
 	    && info.desc.Width <= UINT_MAX) {
 		set_resource_hash(entry->resource, dimension, pick_written_buffer_hash(info.desc.Width), 0, NULL);
@@ -1595,8 +1545,20 @@ static void remember_texture(ID3D12Resource *resource, const Published *entry)
 
 	// Only if the entry is of the resource as it is by now
 	if (!Dx12GetResourceInfo(resource, &info) || memcmp(&entry->desc, &info.desc, sizeof(info.desc))
-	    || entry->has_data_hash != info.has_data_hash || entry->data_hash != info.data_hash || entry->config != config_generation)
+	    || entry->has_data_hash != info.has_data_hash || entry->data_hash != info.data_hash || entry->hash_pending != info.hash_pending
+	    || entry->config != config_generation)
 		return;
+
+	// One whose hash is pending matches nothing by hash, unlike the
+	// textures of no data hash it would share the word with. The memo is
+	// left once the hash comes, which changes the stamp.
+	if (info.hash_pending && !info.has_data_hash) {
+		if (known) {
+			memo->remembered = true;
+			memo->boring = NULL;
+		}
+		return;
+	}
 
 	slot = boring_texture_slot(resource, &info, &word);
 	if (known) {

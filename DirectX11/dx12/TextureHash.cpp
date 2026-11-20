@@ -7,6 +7,9 @@
 #include "HashDump.h"
 #include "../profiling.h"
 
+#include <atomic>
+#include <map>
+
 // For GetSurfaceInfo, which is what ResourceHash.cpp sizes a texture with
 #include "DirectXTK/Src/pch.h"
 #include "DirectXTK/Src/PlatformHelpers.h"
@@ -103,14 +106,271 @@ static bool is_mappable(ID3D12Resource *resource, UINT64 *size)
 	return heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_GPU_UPLOAD;
 }
 
-static void texture_uploaded(ID3D12Resource *texture, UINT subresource, UINT x, UINT y, UINT z,
+// dx12_defer_upload_hash still hashes uploads when the copy is recorded until
+// that took this long in the frame, so that where upload memory reads fast a
+// texture or buffer matches from its first draw. The time is measured every
+// AT_ONCE_STEP_BYTES rather than estimated from earlier uploads.
+static const double AT_ONCE_BUDGET_MS = 0.5;
+static const size_t AT_ONCE_STEP_BYTES = 4 << 10;
+
+// The frame in the upper half and the ticks hashing at record time took in it
+// in the lower, so that a new frame starts from 0 without losing what another
+// thread added for it meanwhile
+static std::atomic<UINT64> at_once_state;
+
+static LONG64 ticks_per_ms()
+{
+	static const LONG64 ticks = [] {
+		LARGE_INTEGER frequency;
+
+		QueryPerformanceFrequency(&frequency);
+		return frequency.QuadPart / 1000;
+	}();
+
+	return ticks;
+}
+
+bool Dx12HashBudgetLeft()
+{
+	UINT64 state = at_once_state.load();
+
+	if (G->dx12_defer_upload_hash == 2)
+		return false;
+	return (UINT)(state >> 32) != dx12_frame || (UINT32)state < AT_ONCE_BUDGET_MS * ticks_per_ms();
+}
+
+// Returns the ticks the frame has spent with these. Ticks of a frame that
+// another thread has already moved on from go to that newer frame.
+static UINT32 at_once_spend(UINT frame, LONG64 ticks)
+{
+	UINT64 state = at_once_state.load(), next;
+	UINT64 spent;
+
+	do {
+		if ((INT32)((UINT)(state >> 32) - frame) > 0)
+			frame = (UINT)(state >> 32);
+		spent = (UINT)(state >> 32) == frame ? (UINT32)state : 0;
+		spent = min(spent + (UINT64)max(ticks, 0LL), (UINT64)UINT32_MAX);
+		next = (UINT64)frame << 32 | spent;
+	} while (!at_once_state.compare_exchange_weak(state, next));
+
+	return (UINT32)spent;
+}
+
+// Measures hashing at record time against the frame's budget, if budgeted
+struct AtOnceTimer {
+	bool budgeted;
+	UINT frame;
+	LONG64 budget;
+	LARGE_INTEGER last;
+
+	AtOnceTimer(bool budgeted) : budgeted(budgeted), frame(0), budget(0), last()
+	{
+		if (!budgeted)
+			return;
+		frame = dx12_frame;
+		budget = (LONG64)(AT_ONCE_BUDGET_MS * ticks_per_ms());
+		QueryPerformanceCounter(&last);
+	}
+
+	// Adds the time since the last call as it goes, so that hashing on
+	// other threads stops on it as well. True once the budget is spent.
+	bool spent()
+	{
+		LARGE_INTEGER now;
+		UINT32 frame_spent;
+
+		if (!budgeted)
+			return false;
+		QueryPerformanceCounter(&now);
+		frame_spent = at_once_spend(frame, now.QuadPart - last.QuadPart);
+		last = now;
+		return frame_spent >= budget;
+	}
+};
+
+static uint32_t crc_step(uint32_t crc, const BYTE *data, size_t count, bool write_combined)
+{
+	return write_combined ? Dx12Crc32cWriteCombined(crc, data, count) : crc32c_hw(crc, data, count);
+}
+
+// texture_hash = 1 covers the whole top mip without row padding. The default
+// hash stops after as many bytes as the mip has texels, see
+// CalcTexture2DDataHash for the history of that.
+static size_t hash_bytes(const Dx12TextureUpload *upload)
+{
+	return min(upload->limit, upload->row_bytes * upload->rows);
+}
+
+UINT64 Dx12TextureUploadStart(const Dx12TextureUpload *upload)
+{
+	return upload->offset + (UINT64)upload->row_pitch * (upload->hashed / upload->row_bytes);
+}
+
+UINT64 Dx12TextureUploadSpan(const Dx12TextureUpload *upload)
+{
+	size_t total = hash_bytes(upload);
+	size_t first = upload->hashed / upload->row_bytes, last = (total - 1) / upload->row_bytes;
+
+	return (UINT64)upload->row_pitch * (last - first) + (total - last * upload->row_bytes);
+}
+
+bool Dx12HashTextureRows(const BYTE *data, Dx12TextureUpload *upload, bool write_combined, bool budgeted)
+{
+	size_t total = hash_bytes(upload), column = upload->hashed % upload->row_bytes, count, done = 0;
+	AtOnceTimer timer(budgeted);
+	bool complete = true;
+
+	while (upload->hashed < total) {
+		count = min(upload->row_bytes - column, total - upload->hashed);
+		if (budgeted && count > AT_ONCE_STEP_BYTES)
+			count = AT_ONCE_STEP_BYTES;
+		upload->crc = crc_step(upload->crc, data + column, count, write_combined);
+		upload->hashed += count;
+		done += count;
+		column += count;
+		if (column == upload->row_bytes) {
+			data += upload->row_pitch;
+			column = 0;
+		}
+
+		if (timer.spent() && upload->hashed < total) {
+			complete = false;
+			break;
+		}
+	}
+	InterlockedAdd64(&dx12_texture_stats.hashed_bytes, done);
+	if (complete)
+		InterlockedIncrement64(&dx12_texture_stats.hashed);
+
+	return complete;
+}
+
+bool Dx12HashUploadBytes(const BYTE *data, UINT64 total, UINT64 *hashed, uint32_t *crc, bool write_combined, bool budgeted)
+{
+	AtOnceTimer timer(budgeted);
+	size_t count;
+
+	while (*hashed < total) {
+		count = (size_t)min(total - *hashed, budgeted ? (UINT64)AT_ONCE_STEP_BYTES : (UINT64)SIZE_MAX);
+		*crc = crc_step(*crc, data + *hashed, count, write_combined);
+		*hashed += count;
+		if (timer.spent() && *hashed < total)
+			return false;
+	}
+	return true;
+}
+
+// With the hash of a pending texture, copies recorded of it go by what it
+// comes to: the texture, its serial and generation are those of the write
+// whose hash it is to be
+struct PendingKey {
+	ID3D12Resource *texture;
+	UINT64 serial;
+	UINT generation;
+
+	bool operator<(const PendingKey &other) const
+	{
+		if (texture != other.texture)
+			return texture < other.texture;
+		if (serial != other.serial)
+			return serial < other.serial;
+		return generation < other.generation;
+	}
+};
+// A copy from a texture whose hash is pending, with the hash the source had
+// before that write: what the copy gets if the write's hash never comes, as
+// the write then never reached the GPU or could not be read back
+struct PendingCopy {
+	PendingKey key;
+	bool had_data_hash;
+	uint32_t had_hash;
+};
+static SRWLOCK copies_lock = SRWLOCK_INIT;
+static std::multimap<PendingKey, PendingCopy> pending_copies;
+
+void Dx12TextureHashDone(ID3D12Resource *texture, UINT64 serial, UINT generation, const uint32_t *data_hash)
+{
+	struct Work {
+		PendingKey key;
+		bool known, has_data_hash;
+		uint32_t data_hash;
+	};
+	std::vector<Work> work = { { { texture, serial, generation }, data_hash != NULL, data_hash != NULL, data_hash ? *data_hash : 0 } };
+	bool copy = false;
+
+	while (!work.empty()) {
+		Work at = work.back();
+
+		work.pop_back();
+		if (Dx12FinishTextureHash(at.key.texture, at.key.serial, at.key.generation, at.known, at.has_data_hash, at.data_hash)) {
+			if (at.known && at.has_data_hash)
+				Dx12DumpTexture(at.key.texture, copy ? "copy" : "upload");
+		} else {
+			InterlockedIncrement64(&dx12_texture_stats.deferred_superseded);
+		}
+
+		// What was copied from the texture has the content of the
+		// write the hash is of, even when the texture has been
+		// written again since
+		AcquireSRWLockExclusive(&copies_lock);
+		auto range = pending_copies.equal_range(at.key);
+		for (auto i = range.first; i != range.second; ++i) {
+			if (at.known)
+				work.push_back({ i->second.key, true, at.has_data_hash, at.data_hash });
+			else
+				work.push_back({ i->second.key, true, i->second.had_data_hash, i->second.had_hash });
+		}
+		pending_copies.erase(range.first, range.second);
+		ReleaseSRWLockExclusive(&copies_lock);
+		copy = true;
+	}
+}
+
+// From the upload heap: -1 if the upload buffer cannot be mapped, else whether
+// all of it is hashed
+static int hash_mapped(Dx12TextureUpload *upload, bool budgeted, const wchar_t *what)
+{
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_TEXTURE_HASH, what);
+	BYTE *data = NULL;
+	bool complete;
+
+	if (FAILED(upload->upload->Map(0, NULL, (void**)&data)) || !data) {
+		InterlockedIncrement64(&dx12_texture_stats.not_mappable);
+		return -1;
+	}
+	complete = Dx12HashTextureRows(data + Dx12TextureUploadStart(upload), upload, true, budgeted);
+	upload->upload->Unmap(0, NULL);
+
+	return complete;
+}
+
+void Dx12HashTextureUploadNow(const Dx12TextureUpload *upload)
+{
+	Dx12TextureUpload rest = *upload;
+
+	if (hash_mapped(&rest, false, L"after all") < 0)
+		Dx12TextureHashDone(rest.texture, rest.serial, rest.generation, NULL);
+	else
+		Dx12TextureHashDone(rest.texture, rest.serial, rest.generation, &rest.crc);
+}
+
+void Dx12AbandonTextureUploads(std::vector<Dx12TextureUpload> *uploads)
+{
+	for (const Dx12TextureUpload &upload : *uploads) {
+		InterlockedIncrement64(&dx12_texture_stats.deferred_abandoned);
+		Dx12TextureHashDone(upload.texture, upload.serial, upload.generation, NULL);
+	}
+	uploads->clear();
+}
+
+static void texture_uploaded(std::vector<Dx12TextureUpload> *uploads, ID3D12Resource *texture, UINT subresource, UINT x, UINT y, UINT z,
 		ID3D12Resource *buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *footprint, const D3D12_BOX *box)
 {
-	size_t row_bytes = 0, rows = 0, limit, count, row;
+	size_t row_bytes = 0, rows = 0;
+	Dx12TextureUpload upload = {};
 	Dx12ResourceInfo info;
 	UINT64 buffer_size;
-	uint32_t hash = 0;
-	BYTE *data = NULL;
 	UINT width, height;
 
 	if (!Dx12GetResourceInfo(texture, &info)) {
@@ -137,7 +397,7 @@ static void texture_uploaded(ID3D12Resource *texture, UINT subresource, UINT x, 
 	// Under D3D11 the first write is the initial data, which is always
 	// hashed, and anything after it an update, which only is with
 	// track_texture_updates.
-	if (info.has_data_hash && G->track_texture_updates != 1) {
+	if ((info.has_data_hash || info.hash_pending) && G->track_texture_updates != 1) {
 		InterlockedIncrement64(&dx12_texture_stats.update_ignored);
 		return;
 	}
@@ -149,10 +409,10 @@ static void texture_uploaded(ID3D12Resource *texture, UINT subresource, UINT x, 
 	// where the description alone is the same from one run to the next.
 	if (!Dx12NoteTopMipUpload(texture)) {
 		InterlockedIncrement64(&dx12_texture_stats.dynamic);
-		if (info.has_data_hash) {
+		if (info.has_data_hash || info.hash_pending)
 			Dx12SetTextureDataHash(texture, false, 0);
+		if (info.has_data_hash)
 			Dx12DumpTexture(texture, "dynamic");
-		}
 		return;
 	}
 
@@ -174,32 +434,42 @@ static void texture_uploaded(ID3D12Resource *texture, UINT subresource, UINT x, 
 		return;
 	}
 
+	upload.texture = texture;
+	upload.upload = buffer;
+	upload.offset = footprint->Offset;
+	upload.row_pitch = footprint->Footprint.RowPitch;
+	upload.rows = (UINT)rows;
+	upload.row_bytes = row_bytes;
+	upload.limit = G->texture_hash_version ? SIZE_MAX : (size_t)width * height * info.desc.DepthOrArraySize;
+
 	wchar_t what[48] = L"";
 	if (Profiling::Spike::threshold)
 		swprintf_s(what, L"%ux%u format %d", width, height, (int)info.desc.Format);
-	Profiling::Spike::Scope spike(Profiling::Spike::DX12_TEXTURE_HASH, what);
 
-	if (FAILED(buffer->Map(0, NULL, (void**)&data)) || !data) {
-		InterlockedIncrement64(&dx12_texture_stats.not_mappable);
+	if (G->dx12_defer_upload_hash && uploads) {
+		int complete = 0;
+
+		if (Dx12HashBudgetLeft())
+			complete = hash_mapped(&upload, true, what);
+		if (complete < 0)
+			return;
+		if (complete) {
+			InterlockedIncrement64(&dx12_texture_stats.hashed_at_once);
+			Dx12SetTextureDataHash(texture, true, upload.crc);
+			Dx12DumpTexture(texture, "upload");
+			return;
+		}
+		upload.generation = Dx12BeginTextureHash(texture, &upload.serial);
+		if (upload.generation) {
+			InterlockedIncrement64(&dx12_texture_stats.deferred);
+			uploads->push_back(upload);
+			return;
+		}
+	}
+
+	if (hash_mapped(&upload, false, what) < 0)
 		return;
-	}
-
-	// texture_hash = 1 covers the whole top mip without row padding. The
-	// default hash stops after as many bytes as the mip has texels, see
-	// CalcTexture2DDataHash for the history of that.
-	limit = G->texture_hash_version ? SIZE_MAX : (size_t)width * height * info.desc.DepthOrArraySize;
-	data += footprint->Offset;
-	for (row = 0; row < rows && limit; row++, data += footprint->Footprint.RowPitch) {
-		count = row_bytes < limit ? row_bytes : limit;
-		hash = Dx12Crc32cWriteCombined(hash, data, count);
-		limit -= count;
-		InterlockedAdd64(&dx12_texture_stats.hashed_bytes, count);
-	}
-
-	buffer->Unmap(0, NULL);
-
-	InterlockedIncrement64(&dx12_texture_stats.hashed);
-	Dx12SetTextureDataHash(texture, true, hash);
+	Dx12SetTextureDataHash(texture, true, upload.crc);
 	Dx12DumpTexture(texture, "upload");
 }
 
@@ -211,9 +481,28 @@ static void propagate_hash(ID3D12Resource *dst, ID3D12Resource *src)
 
 	if (!Dx12GetResourceInfo(dst, &dst_info) || dst_info.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
 		return;
-	if (!Dx12GetResourceInfo(src, &src_info) || src_info.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+	// Under the lock, so that the source's hash cannot come in between
+	// being found pending and this being noted for it
+	AcquireSRWLockExclusive(&copies_lock);
+	if (!Dx12GetResourceInfo(src, &src_info) || src_info.desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+		ReleaseSRWLockExclusive(&copies_lock);
 		return;
-	if (src_info.has_data_hash == dst_info.has_data_hash && src_info.data_hash == dst_info.data_hash)
+	}
+	if (src_info.hash_pending) {
+		PendingKey copy = { dst };
+
+		copy.generation = Dx12BeginTextureHash(dst, &copy.serial);
+		if (copy.generation) {
+			pending_copies.insert({ { src, src_info.serial, src_info.hash_generation },
+				{ copy, src_info.has_data_hash, src_info.data_hash } });
+			InterlockedIncrement64(&dx12_texture_stats.copy_deferred);
+		}
+		ReleaseSRWLockExclusive(&copies_lock);
+		return;
+	}
+	ReleaseSRWLockExclusive(&copies_lock);
+
+	if (!dst_info.hash_pending && src_info.has_data_hash == dst_info.has_data_hash && src_info.data_hash == dst_info.data_hash)
 		return;
 
 	InterlockedIncrement64(&dx12_texture_stats.copy_propagated);
@@ -221,14 +510,14 @@ static void propagate_hash(ID3D12Resource *dst, ID3D12Resource *src)
 	Dx12DumpTexture(dst, "copy");
 }
 
-void Dx12CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z,
+void Dx12CopyTextureRegion(std::vector<Dx12TextureUpload> *uploads, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z,
 		const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *box)
 {
 	if (!dst || !src || !dst->pResource || !src->pResource || dst->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
 		return;
 
 	if (src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
-		texture_uploaded(dst->pResource, dst->SubresourceIndex, x, y, z, src->pResource, &src->PlacedFootprint, box);
+		texture_uploaded(uploads, dst->pResource, dst->SubresourceIndex, x, y, z, src->pResource, &src->PlacedFootprint, box);
 		return;
 	}
 

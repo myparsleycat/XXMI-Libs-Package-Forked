@@ -4,6 +4,7 @@
 
 #include "BufferHash.h"
 #include "CmdState.h"
+#include "TextureHash.h"
 
 class Dx12Device;
 
@@ -104,6 +105,9 @@ public:
 	std::vector<Dx12Transition> mTransitions;
 	// The same for what the copies it records write to buffers
 	Dx12ListBufferWrites mBufferWrites;
+	// Uploads to textures whose hash is worked out when the list is first
+	// executed, see Dx12TextureUpload
+	std::vector<Dx12TextureUpload> mTextureUploads;
 
 	Dx12GraphicsCommandList(Dx12Device *device, ID3D12GraphicsCommandList *orig);
 

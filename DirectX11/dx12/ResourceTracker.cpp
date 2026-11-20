@@ -414,12 +414,60 @@ void Dx12SetTextureDataHash(ID3D12Resource *resource, bool has_data_hash, uint32
 
 	AcquireSRWLockExclusive(&shard->lock);
 	auto i = shard->resources.find(resource);
-	if (i != shard->resources.end() && (i->second.has_data_hash != has_data_hash || i->second.data_hash != data_hash)) {
-		i->second.has_data_hash = has_data_hash;
-		i->second.data_hash = data_hash;
-		InterlockedIncrement64(texture_stamp(resource));
+	if (i != shard->resources.end()) {
+		i->second.hash_generation++;
+		if (i->second.hash_pending || i->second.has_data_hash != has_data_hash || i->second.data_hash != data_hash) {
+			i->second.hash_pending = false;
+			i->second.has_data_hash = has_data_hash;
+			i->second.data_hash = data_hash;
+			InterlockedIncrement64(texture_stamp(resource));
+		}
 	}
 	ReleaseSRWLockExclusive(&shard->lock);
+}
+
+UINT Dx12BeginTextureHash(ID3D12Resource *resource, UINT64 *serial)
+{
+	ResourceShard *shard = shard_of(resource);
+	UINT generation = 0;
+
+	AcquireSRWLockExclusive(&shard->lock);
+	auto i = shard->resources.find(resource);
+	if (i != shard->resources.end()) {
+		if (!++i->second.hash_generation)
+			i->second.hash_generation = 1;
+		if (!i->second.hash_pending) {
+			i->second.hash_pending = true;
+			InterlockedIncrement64(texture_stamp(resource));
+		}
+		generation = i->second.hash_generation;
+		*serial = i->second.serial;
+	}
+	ReleaseSRWLockExclusive(&shard->lock);
+
+	return generation;
+}
+
+bool Dx12FinishTextureHash(ID3D12Resource *resource, UINT64 serial, UINT generation, bool known, bool has_data_hash, uint32_t data_hash)
+{
+	ResourceShard *shard = shard_of(resource);
+	bool taken = false;
+
+	AcquireSRWLockExclusive(&shard->lock);
+	auto i = shard->resources.find(resource);
+	if (i != shard->resources.end() && i->second.serial == serial
+	    && i->second.hash_pending && i->second.hash_generation == generation) {
+		i->second.hash_pending = false;
+		if (known) {
+			i->second.has_data_hash = has_data_hash;
+			i->second.data_hash = has_data_hash ? data_hash : 0;
+		}
+		InterlockedIncrement64(texture_stamp(resource));
+		taken = true;
+	}
+	ReleaseSRWLockExclusive(&shard->lock);
+
+	return taken;
 }
 
 bool Dx12NoteTopMipUpload(ID3D12Resource *resource)
