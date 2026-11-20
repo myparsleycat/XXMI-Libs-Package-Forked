@@ -510,6 +510,7 @@ namespace Profiling {
 		bool command_detail;
 		const wchar_t *reason_names[NUM_REASONS];
 		volatile LONG reason_counts[NUM_REASONS];
+		thread_local UINT32 sample_state;
 	}
 }
 

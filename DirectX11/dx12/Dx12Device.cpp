@@ -375,7 +375,7 @@ void STDMETHODCALLTYPE Dx12Device::CopyDescriptors(UINT NumDestDescriptorRanges,
 	}
 
 	{
-		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Profiling::Spike::SampledScope spike(Profiling::Spike::DX12_DESCRIPTORS);
 		Dx12ShadowCopyDescriptors(NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
 			NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes);
 	}
@@ -390,7 +390,7 @@ void STDMETHODCALLTYPE Dx12Device::CopyDescriptors(UINT NumDestDescriptorRanges,
 
 	// Once more for the destinations that have a mirror, which usually is
 	// all of them or none
-	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
+	Profiling::Spike::SampledScope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	for (i = 0; i < NumDestDescriptorRanges; i++)
 		mirrored += Dx12MirrorCpuHandle(pDestDescriptorRangeStarts[i], &handles[i]);
 	if (mirrored == NumDestDescriptorRanges) {
@@ -411,11 +411,11 @@ void STDMETHODCALLTYPE Dx12Device::CopyDescriptorsSimple(UINT NumDescriptors, D3
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
 	{
-		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Profiling::Spike::SampledScope spike(Profiling::Spike::DX12_DESCRIPTORS);
 		Dx12ShadowCopyDescriptorsSimple(NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart);
 	}
 	mOrig->CopyDescriptorsSimple(NumDescriptors, Dx12OrigCpuHandle(DestDescriptorRangeStart), Dx12OrigCpuHandle(SrcDescriptorRangeStart), DescriptorHeapsType);
-	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
+	Profiling::Spike::SampledScope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptorRangeStart, &mirror))
 		mOrig->CopyDescriptorsSimple(NumDescriptors, mirror, Dx12OrigCpuHandle(SrcDescriptorRangeStart), DescriptorHeapsType);
 }
@@ -425,11 +425,11 @@ void STDMETHODCALLTYPE Dx12Device::CreateConstantBufferView(const D3D12_CONSTANT
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
 	{
-		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Profiling::Spike::SampledScope spike(Profiling::Spike::DX12_DESCRIPTORS);
 		Dx12ShadowConstantBufferView(pDesc, DestDescriptor);
 	}
 	mOrig->CreateConstantBufferView(pDesc, Dx12OrigCpuHandle(DestDescriptor));
-	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
+	Profiling::Spike::SampledScope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptor, &mirror))
 		mOrig->CreateConstantBufferView(pDesc, mirror);
 }
@@ -439,11 +439,11 @@ void STDMETHODCALLTYPE Dx12Device::CreateShaderResourceView(ID3D12Resource *pRes
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
 	{
-		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Profiling::Spike::SampledScope spike(Profiling::Spike::DX12_DESCRIPTORS);
 		Dx12ShadowShaderResourceView(pResource, pDesc, DestDescriptor);
 	}
 	mOrig->CreateShaderResourceView(pResource, pDesc, Dx12OrigCpuHandle(DestDescriptor));
-	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
+	Profiling::Spike::SampledScope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptor, &mirror))
 		mOrig->CreateShaderResourceView(pResource, pDesc, mirror);
 }
@@ -453,11 +453,11 @@ void STDMETHODCALLTYPE Dx12Device::CreateUnorderedAccessView(ID3D12Resource *pRe
 	D3D12_CPU_DESCRIPTOR_HANDLE mirror;
 
 	{
-		Profiling::Spike::Scope spike(Profiling::Spike::DX12_DESCRIPTORS);
+		Profiling::Spike::SampledScope spike(Profiling::Spike::DX12_DESCRIPTORS);
 		Dx12ShadowUnorderedAccessView(pResource, pDesc, DestDescriptor);
 	}
 	mOrig->CreateUnorderedAccessView(pResource, pCounterResource, pDesc, Dx12OrigCpuHandle(DestDescriptor));
-	Profiling::Spike::Scope spike_mirror(Profiling::Spike::DX12_MIRROR);
+	Profiling::Spike::SampledScope spike_mirror(Profiling::Spike::DX12_MIRROR);
 	if (Dx12MirrorCpuHandle(DestDescriptor, &mirror))
 		mOrig->CreateUnorderedAccessView(pResource, pCounterResource, pDesc, mirror);
 }
