@@ -9,6 +9,7 @@
 * [Variables](variables/README.md) — extended variable declarations and read-only mode
 * [Resources](resources/README.md) — resource metadata, buffer region and slot range support
 * [Sampler States](resources/sampler-states.md) — sampler state resources and `ps-s0` style sampler slot bindings
+* [Filters](filters/README.md) — reusable resource-matching criteria, currently focused on dHash-based texture identification and filtering
 * [Pools](pools/README.md) — indexed storage for resources and variables
 * [Input Layouts](input-layouts/README.md) — vertex input layout overrides
 * [SPIR-V Shader Regex](spirv-shader-regex/README.md) — ShaderRegex patches for Vulkan vertex and pixel shaders

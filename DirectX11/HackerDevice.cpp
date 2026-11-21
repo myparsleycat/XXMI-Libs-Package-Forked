@@ -2440,6 +2440,9 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 	// Register texture. Every one seen.
 	if (hr == S_OK && ppTexture2D)
 	{
+		D3D11_TEXTURE2D_DESC actualDesc = {};
+		(*ppTexture2D)->GetDesc(&actualDesc);
+
 		EnterCriticalSectionPretty(&G->mResourcesLock);
 			ResourceHandleInfo *handle_info = &G->mResources[*ppTexture2D];
 			ForgetTextureOverrideMiss(*ppTexture2D);
@@ -2447,6 +2450,7 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 			handle_info->hash = hash;
 			handle_info->orig_hash = hash;
 			handle_info->data_hash = data_hash;
+			handle_info->InitializeSubresourceTracking(actualDesc.MipLevels, actualDesc.ArraySize, pInitialData != nullptr);
 			if (pDesc)
 				memcpy(&handle_info->desc2D, pDesc, sizeof(D3D11_TEXTURE2D_DESC));
 		LeaveCriticalSection(&G->mResourcesLock);

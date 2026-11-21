@@ -34,6 +34,7 @@ CustomResources customResources;
 CustomResourcePools customResourcePools;
 std::unordered_map<std::wstring, CustomResourcePool*> custom_resource_pool_path_keys;
 CustomShaders customShaders;
+ResourceFilters resourceFilters;
 ExplicitCommandListSections explicitCommandListSections;
 CommandListVariables command_list_globals;
 std::vector<CommandListVariable*> persistent_variables;
@@ -1409,6 +1410,12 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 	if (!wcsncmp(key, L"commandlist", 11))
 		return ParseCopyCommandListCommand(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+
+	if (!wcscmp(val->c_str(), L"snapshotinitialtextures"))
+		return AddCommandToList(new SnapshotInitialTexturesOperation(), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
+
+	if (!wcscmp(val->c_str(), L"restoreinitialtextures"))
+		return AddCommandToList(new RestoreInitialTexturesOperation(), explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
 
 	return ParseDrawCommand(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
 }
@@ -3850,6 +3857,9 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 		case ResourceCopyTargetEvaluationMode::RESOURCE_MIPS:
 			return texture_filter_target.GetResourceMips(state);
 
+		case ResourceCopyTargetEvaluationMode::RESOURCE_HAMMING_DISTANCE:
+			return texture_filter_target.GetResourceHammingDistance(state);
+
 		case ResourceCopyTargetEvaluationMode::RESOURCE_BIND_FLAGS:
 			return texture_filter_target.GetResourceBindFlags(state);
 
@@ -4088,6 +4098,28 @@ float CommandListOperand::evaluate_shader_bindings(CommandListState *state, cons
 	}
 	
 	return 0.0;
+}
+
+float CommandListOperand::process_resource_filter(CommandListState* state)
+{
+	const ResourceFilter* resource_filter = filter_target.GetFilter();
+
+	if (!resource_filter)
+		return 0.0f;
+
+	switch (filter_target.evaluation_mode)
+	{
+	case ResourceFilterTargetEvaluationMode::FILTER_IDENTITY:
+		return filter_target.GetFilterId(state);
+
+	case ResourceFilterTargetEvaluationMode::FORMAT:
+		return (float)resource_filter->match_format;
+
+	case ResourceFilterTargetEvaluationMode::CONFIDENCE:
+		return (float)resource_filter->match_confidence;
+	}
+
+	return 0.0f;
 }
 
 void CommandList::clear()
@@ -4594,6 +4626,8 @@ float CommandListOperand::evaluate(CommandListState *state, HackerDevice *device
 			return process_texture_filter(state);
 		case ParamOverrideType::SHADER:
 			return process_shader_filter(state);
+		case ParamOverrideType::RESOURCE_FILTER:
+			return process_resource_filter(state);
 		case ParamOverrideType::VERTEX_COUNT:
 			if (state->call_info)
 				return (float)state->call_info->VertexCount;
@@ -5089,6 +5123,49 @@ inline bool ParseFloatToken(const wstring& input, float& out, size_t& length)
 	return true;
 }
 
+inline bool ParseHashToken(const wstring& input, uint64_t& out, size_t& length)
+{
+	out = 0;
+	length = 0;
+
+	const wchar_t* begin = input.c_str();
+	const wchar_t* p = begin;
+
+	// Optional 0x prefix.
+	if (p[0] == L'0' && (p[1] == L'x'))
+		p += 2;
+
+	uint64_t value = 0;
+	size_t digits = 0;
+
+	for (; *p; ++p)
+	{
+		unsigned int digit;
+
+		if (*p >= L'0' && *p <= L'9')
+			digit = *p - L'0';
+		else if (*p >= L'a' && *p <= L'f')
+			digit = *p - L'a' + 10;
+		else
+			break;
+
+		// Maximum 64-bit hash: 16 hexadecimal digits.
+		if (digits >= 16)
+			return false;
+
+		value = (value << 4) | digit;
+		++digits;
+	}
+
+	if (digits == 0)
+		return false;
+
+	out = value;
+	length = static_cast<size_t>(p - begin);
+
+	return true;
+}
+
 #pragma endregion CommandLexer
 
 
@@ -5241,6 +5318,32 @@ bool CommandArgumentReader::GetTarget(ResourceCopyTarget* out, bool is_source, P
 	return true;
 }
 
+bool CommandArgumentReader::GetFilter(ResourceFilterTarget* out, bool is_source, PeekMode mode, bool validate)
+{
+	wstring token;
+
+	if (!PeekToken(&token, mode))
+		return false;
+
+	if (validate && FindResourceCopyTargetTokenEnd(token, 0) != token.size())
+	{
+		SetError(L"Invalid filter: " + token, m_peek_start_pos);
+		return false;
+	}
+
+	if (!out->ParseTarget(token.c_str(), is_source, m_ini_namespace, m_scope))
+	{
+		SetError(L"Unknown filter: " + token, m_peek_start_pos);
+		return false;
+	}
+
+	ConsumeToken();
+
+	LogDebugW(L"  ResourceFilterTarget: '%ls'\n", token.c_str());
+
+	return true;
+}
+
 bool CommandArgumentReader::GetFloat(float* out)
 {
 	wstring token;
@@ -5259,6 +5362,28 @@ bool CommandArgumentReader::GetFloat(float* out)
 	ConsumeToken();
 
 	LogDebugW(L"  Float: '%ls'\n", token.c_str());
+
+	return true;
+}
+
+bool CommandArgumentReader::GetHash(uint64_t* out)
+{
+	wstring token;
+
+	if (!PeekToken(&token))
+		return false;
+
+	size_t len;
+
+	if (!ParseHashToken(token, *out, len) || len != token.size())
+	{
+		SetError(L"Invalid hash: " + token, m_peek_start_pos);
+		return false;
+	}
+
+	ConsumeToken();
+
+	LogDebugW(L"  Hash: '%ls'\n", token.c_str());
 
 	return true;
 }
@@ -5845,6 +5970,14 @@ static void tokenise(const wstring* expression, CommandListSyntaxTree* tree, con
 			if (operand->parse_target(&token, ini_namespace, scope))
 			{
 				LogDebugW(L"      ResourceCopyTarget: \"%ls\"\n", token.c_str());
+				pos += len_target;
+				goto import_operand;
+			}
+
+			// Parse Filter section value getters (e.g. `FilterA`).
+			if (operand->parse_resource_filter(&token, ini_namespace, scope))
+			{
+				LogDebug("      Filter: \"%S\"\n", token.c_str());
 				pos += len_target;
 				goto import_operand;
 			}
@@ -7064,6 +7197,17 @@ bool CommandListOperand::parse_shader(const wstring* operand, const wstring* ini
 	return false;
 }
 
+bool CommandListOperand::parse_resource_filter(const wstring* operand, const wstring* ini_namespace, CommandListScope* scope)
+{
+	int ret;
+	ret = filter_target.ParseTarget(operand->c_str(), true, ini_namespace, scope);
+	if (ret) {
+		type = ParamOverrideType::RESOURCE_FILTER;
+		return operand_allowed_in_context(type, scope);
+	}
+	return false;
+}
+
 bool CommandListOperand::parse_scissor(const wstring* operand, const wstring* ini_namespace, CommandListScope* scope)
 {
 	int len1 = 0;
@@ -7338,6 +7482,318 @@ static ResourceType* GetResourceFromPool(
 }
 
 #pragma endregion ResourcePool
+
+
+#pragma region ResourceFilter
+
+ResourceFilter* ResourceFilter::ResolveFilter()
+{
+	return source_filter ? source_filter->ResolveFilter() : this;
+}
+
+bool ResourceFilter::SetSource(ResourceFilter* src)
+{
+	if (src == source_filter)
+		return true;
+
+	if (!src)
+	{
+		source_filter = nullptr;
+		return true;
+	}
+
+	ResourceFilter* root = src->ResolveFilter();
+
+	// Prevent self-reference.
+	if (root == this) {
+		LogOverlayW(LOG_NOTICE, L"Ignoring cyclic filter reference `%ls` <=> `%ls`\n",
+			name.c_str(), src->name.c_str());
+		return false;
+	}
+
+	source_filter = root;
+	return true;
+}
+
+void ResourceFilter::CopyMetadataFrom(const ResourceFilter& src)
+{
+	is_empty = src.is_empty;
+
+	match_dhash = src.match_dhash;
+	match_format = src.match_format;
+	match_confidence = src.match_confidence;
+}
+
+IniParserResult ResourceFilterTarget::ParseTargetPrefix(const wchar_t*& target, size_t& length)
+{
+	switch (target[0]) {
+	case L'@':
+		evaluation_mode = ResourceFilterTargetEvaluationMode::FILTER_IDENTITY;
+		target++;
+		length--;
+		return IniParserResult::TOKEN_FOUND;
+	}
+	return IniParserResult::TOKEN_NOT_FOUND;
+}
+
+IniParserResult ResourceFilterTarget::ParseTargetMember(
+	const wchar_t*& target, size_t& length, wstring& temp_target, const wstring* ini_namespace, CommandListScope* scope
+)
+{
+	//LogInfo("ResourceFilterTarget::ParseTargetMember: target=%ls, length=%d\n", target, length);
+
+	if (length < 15) // Smallest possible match is "filtera->format".
+		return IniParserResult::TOKEN_NOT_FOUND;
+
+	static constexpr MemberInfo members[] = {
+		{ L"->format",      8, ResourceFilterTargetEvaluationMode::FORMAT },
+		{ L"->confidence", 12, ResourceFilterTargetEvaluationMode::CONFIDENCE },
+	};
+
+	return SyntaxTarget::ParseTargetMember(members, target, length, temp_target, evaluation_mode, ini_namespace, scope);
+}
+
+bool ResourceFilterTarget::ParseTarget(const wchar_t* target, bool is_source, const wstring* ini_namespace, CommandListScope* scope)
+{
+	IniParserResult ret;
+	size_t length = wcslen(target);
+	std::wstring temp_target;
+
+	filter = nullptr;
+
+	if (!target)
+		return false;
+
+	if (length == 4 && is_source && !_wcsnicmp(target, L"null", 4))
+	{
+		type = ResourceFilterTargetType::EMPTY;
+		return true;
+	}
+
+	// Consume an optional target prefix (`@`).
+	ret = ParseTargetPrefix(target, length);
+	//LogInfo("ParseTarget: %d at ParseTargetPrefix\n", ret);
+	if (ret == IniParserResult::SYNTAX_ERROR)
+		return false;
+
+	// Target must start with "filter".
+	if (length < 7 || _wcsnicmp(target, L"filter", 6))
+		return false;
+
+	// Consume an optional member suffix. Not compatible with identity prefix.
+	if (evaluation_mode != ResourceFilterTargetEvaluationMode::FILTER_IDENTITY)
+	{
+		ret = ParseTargetMember(target, length, temp_target, ini_namespace, scope);
+		//LogInfo("ParseTarget: %d at ParseTargetMember\n", ret);
+		if (ret == IniParserResult::SYNTAX_ERROR)
+			return false;
+	}
+
+	wstring filter_id(target);
+	wstring namespaced_section;
+
+	ResourceFilters::iterator resource_filter = resourceFilters.end();
+	if (get_namespaced_section_name_lower(&filter_id, ini_namespace, &namespaced_section))
+		resource_filter = resourceFilters.find(namespaced_section);
+	if (resource_filter == resourceFilters.end())
+		resource_filter = resourceFilters.find(filter_id);
+	if (resource_filter == resourceFilters.end())
+		return false;
+
+	filter = &resource_filter->second;
+
+	type = ResourceFilterTargetType::FILTER;
+
+	return true;
+}
+
+float ResourceFilterTarget::GetFilterId(CommandListState* state)
+{
+	ResourceFilter* resource_filter = GetFilter();
+
+	if (!resource_filter || resource_filter->is_empty)
+		return 0.0f;
+
+	// Hash 64-bit pointer to mix bits
+	uint64_t hash = HashPointer(resource_filter);
+
+	// Encode 64-bit hash as float30 to preserve as much precision as possible at low cost.
+	return EncodeFloat30((uint32_t)hash);
+}
+
+#pragma endregion ResourceFilter
+
+
+#pragma endregion ResourceFilterTargetDirective
+
+void ResourceFilterCopyOperation::CopyFilterToFilter(CommandListState* state)
+{
+	// Operation enters "failed" state when recursively resolved SRC root is DST.
+	// It allows to bail on cyclic reference to avoid runtime overhead from warnings spam.
+	if (failed_root) {
+		if (src.filter && failed_root != src.filter->ResolveFilter())
+			failed_root = nullptr;  // Recover from "failed" state if SRC root changed.
+		else
+			return;
+	}
+
+	if (options & ResourceCopyOptions::COPY_MASK)
+	{
+		if (options & ResourceCopyOptions::COPY) {
+			COMMAND_LIST_LOG(state, "  copying filter fields\n");
+			dst.filter->CopyMetadataFrom(*src.filter);
+		}
+	}
+	else {
+		COMMAND_LIST_LOG(state, "  copying filter by reference\n");
+		if (!dst.filter->SetSource(src.filter)) {
+			// Cyclic reference encountered. Enter "failed" state.
+			failed_root = src.filter->ResolveFilter();
+		}
+	}
+}
+
+void ResourceFilterCopyOperation::run(CommandListState* state)
+{
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	switch (src.type)
+	{
+	case ResourceFilterTargetType::FILTER:
+		CopyFilterToFilter(state);
+		return;
+
+	case ResourceFilterTargetType::EMPTY:
+		// Reset filter proxy state.
+		dst.filter->SetSource(nullptr);
+		return;
+	}
+}
+
+static bool parse_filter_target_copy_source(
+	const wchar_t* section, const wstring& val, ResourceFilterTarget& src, ResourceCopyOptions& options,
+	CommandList* command_list, const wstring* ini_namespace, const wchar_t* key
+)
+{
+	wstring token;
+	ResourceCopyOptions option;
+	bool src_found = false;
+	size_t unknown_token_count = 0;
+
+	CommandArgumentReader args(L"filter_copy", val, section, ini_namespace, command_list->scope);
+
+	while (args.PeekToken(&token))
+	{
+		if (args.GetEnum(ResourceCopyOptionNames, ResourceCopyOptions::INVALID, &option))
+		{
+			options |= option;
+			continue;
+		}
+
+		if (!src_found && args.GetFilter(&src, true, CommandArgumentReader::PeekMode::Token, true))
+		{
+			src_found = true;
+			continue;
+		}
+
+		args.ConsumeToken();
+
+		if (!args.Finished())
+		{
+			if (!args.ConsumeSeparator(SeparatorMode::Space))
+				return args.Fail();
+		}
+
+		unknown_token_count++;
+
+		if (unknown_token_count > 1 && !args.Finished())
+		{
+			LogOverlayW(LOG_WARNING, L"WARNING: Unknown option: %ls\n", token.c_str());
+			options |= ResourceCopyOptions::UNKNOWN;
+		}
+	}
+
+	if (options & ResourceCopyOptions::UNKNOWN) {
+		LogOverlayW(LOG_WARNING, L"Filter copy source contains invalid options: \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
+			key, val.c_str(), section, ini_namespace->c_str());
+	}
+
+	return src_found;
+}
+
+static CommandListCommand* parse_resource_filter_copy_operation(
+	const wchar_t* section, ResourceFilterTarget& dst, ResourceFilterTarget& src, ResourceCopyOptions options, CommandList* command_list, const wstring* ini_namespace
+)
+{
+	// DST must be non-evaluatable filter target.
+	if (dst.type != ResourceFilterTargetType::FILTER || dst.evaluation_mode != ResourceFilterTargetEvaluationMode::INVALID)
+		return nullptr;
+
+	// SRC must be non-evaluatable filter target or empty target.
+	if (src.type == ResourceFilterTargetType::INVALID || src.evaluation_mode != ResourceFilterTargetEvaluationMode::INVALID)
+		return nullptr;
+
+	if (!(options & ResourceCopyOptions::REFERENCE) && (options & ResourceCopyOptions::COPY_TYPE_MASK)) {
+		if (options & ResourceCopyOptions::COPY)
+			LogOverlayW(LOG_WARNING, L"WIP: Filter `copy` is not supported (`%ls = copy %ls`)\n - [% ls] @[% ls]\n",
+				src.filter->name.c_str(), dst.filter->name.c_str(), section, ini_namespace->c_str());
+		else if (options & ResourceCopyOptions::COPY_DESC)
+			LogOverlayW(LOG_WARNING, L"WIP: Filter `copy_desc` is not supported (`%ls = copy_desc %ls`)\n - [% ls] @[% ls]\n",
+				src.filter->name.c_str(), dst.filter->name.c_str(), section, ini_namespace->c_str());
+		return nullptr;
+	}
+	else
+	{
+		options |= ResourceCopyOptions::REFERENCE;
+	}
+
+	ResourceFilterCopyOperation* operation = new ResourceFilterCopyOperation();
+
+	operation->src = std::move(src);
+	operation->dst = std::move(dst);
+	operation->options = options;
+
+	return operation;
+}
+
+bool ParseCommandListResourceFilterTargetDirective(
+	const wchar_t* section, const wchar_t* key, wstring* val, CommandList* command_list, const wstring* ini_namespace
+)
+{
+	//LogInfo("Parsing ParseResourceFilterTargetDirective: `%ls = %ls`\n", key, val->c_str());
+
+	ResourceFilterTarget dst = ResourceFilterTarget();
+
+	if (!dst.ParseTarget(key, false, ini_namespace, command_list->scope))
+		return false;
+
+	CommandListCommand* operation = nullptr;
+
+	ResourceCopyOptions options = ResourceCopyOptions::INVALID;
+	ResourceFilterTarget src = ResourceFilterTarget();
+
+	if (!parse_filter_target_copy_source(section, *val, src, options, command_list, ini_namespace, key))
+		return false;
+
+	// 1. Copy NULL to Filter (reset filter proxy mode).
+	//   FilterFoo = null
+	// 2. Copy Filter To Filter
+	//   FilterFoo = copy FilterFoo
+	//   FilterFoo = ref FilterFoo
+	operation = parse_resource_filter_copy_operation(section, dst, src, options, command_list, ini_namespace);
+
+	if (operation == nullptr)
+		return false;
+
+	//LogInfo("Parsed ParseResourceFilterTargetDirective: `%ls = %ls`\n", key, val->c_str());
+
+	operation->ini_line = L"[" + wstring(section) + L"] " + wstring(key) + L" = " + *val;
+	command_list->commands.push_back(std::shared_ptr<CommandListCommand>(operation));
+
+	return true;
+}
+
+#pragma endregion ResourceFilterTargetDirective
 
 
 #pragma region CustomResource
@@ -9237,6 +9693,42 @@ bool SyntaxTarget::ParseMemberArguments(
 			break;
 		}
 
+		case MemberArg::Type::Hash:
+		{
+			uint64_t hash;
+
+			if (!args.GetHash(&hash))
+				return args.Fail();
+
+			member_args[i].constant_hash = hash;
+			member_args[i].type = MemberArg::Type::Hash;
+			break;
+		}
+
+		case MemberArg::Type::Resource:
+		{
+			auto resource = std::make_unique<ResourceCopyTarget>();
+
+			if (!args.GetTarget(resource.get(), true, CommandArgumentReader::PeekMode::Token, false, false))
+				return args.Fail();
+
+			member_args[i].resource = std::move(resource);
+			member_args[i].type = MemberArg::Type::Resource;
+			break;
+		}
+
+		case MemberArg::Type::Filter:
+		{
+			auto filter = std::make_unique<ResourceFilterTarget>();
+
+			if (!args.GetFilter(filter.get(), true, CommandArgumentReader::PeekMode::Token, true))
+				return args.Fail();
+
+			member_args[i].filter = std::move(filter);
+			member_args[i].type = MemberArg::Type::Filter;
+			break;
+		}
+
 		case MemberArg::Type::Unsigned:
 		case MemberArg::Type::Signed:
 		case MemberArg::Type::Float:
@@ -9439,6 +9931,9 @@ IniParserResult ResourceCopyTarget::ParseTargetMember(
 		{ L"->elementoffset", 15, ResourceCopyTargetEvaluationMode::LAYOUT_ELEMENT_OFFSET, {{
 			MemberArg::Type::String,  // Semantic Name
 			MemberArg::Type::Unsigned // Semantic Index
+		}} },
+		{ L"->hammingdistance", 17, ResourceCopyTargetEvaluationMode::RESOURCE_HAMMING_DISTANCE, {{
+			MemberArg::Type::Filter,  // Dhash Filter
 		}} },
 	};
 
@@ -9709,6 +10204,14 @@ IniParserResult ResourceCopyTarget::ParseTargetSlotExpression(const wchar_t* tex
 	max_slot = info->max_slot_count;
 
 	wstring inner(open + 1, text + length - 1);
+
+	ResourceFilterTarget filter;
+	if (filter.ParseTarget(inner.c_str(), false, ini_namespace, scope)) {
+		slot_filter = filter.GetFilter();
+		evaluation_mode = ResourceCopyTargetEvaluationMode::SLOT_FILTER;
+		return IniParserResult::TOKEN_FOUND;
+	}
+
 	size_t colon = inner.find(L':');
 
 	if (colon == wstring::npos) {
@@ -10069,6 +10572,402 @@ void PoolCopyOperation::run(CommandListState* state)
 #pragma endregion PoolCopyOperation
 
 
+#pragma region SlotFilterOperation
+
+// Release any SRV references still held by the cache when it is destroyed.
+InitialTexturesSnapshot::~InitialTexturesSnapshot()
+{
+	Clear();
+}
+
+void InitialTexturesSnapshot::ResetMatches()
+{
+	if (!active)
+		return;
+
+	for (UINT slot = first_srv_slot; slot <= last_srv_slot; ++slot)
+	{
+		if (initial_textures[slot])
+		{
+			// Reset the best accepted Hamming distance for this slot.
+			// 65 indicates that no matching filter has been accepted.
+			hamming_distance[slot] = 65;
+		}
+	}
+}
+
+// Release the references acquired by the most recent snapshot and reset its state.
+void InitialTexturesSnapshot::Clear()
+{
+	if (!active)
+		return;
+
+	// Snapshot references are confined to the recorded pixel-shader SRV range.
+	for (UINT slot = first_srv_slot; slot <= last_srv_slot; ++slot)
+	{
+		if (initial_textures[slot])
+		{
+			// Release the reference acquired by PSGetShaderResources.
+			initial_textures[slot]->Release();
+			initial_textures[slot] = nullptr;
+
+			// Reset the best accepted Hamming distance for this slot.
+			// 65 indicates that no matching filter has been accepted.
+			hamming_distance[slot] = 65;
+		}
+	}
+
+	active = false;
+}
+
+// Resolve the binding metadata for the pixel shader currently bound to the context.
+// Returns nullptr if the current shader or its binding metadata cannot be found.
+static const ShaderBindings* ResolvePixelShaderBindings(CommandListState* state)
+{
+	if (!state || !state->mHackerContext)
+		return nullptr;
+
+	ID3D11PixelShader* shader = state->mHackerContext->mCurrentPixelShaderHandle;
+
+	if (!shader)
+		return nullptr;
+
+	// Find the shader's registered hash.
+	auto shader_it = lookup_shader_hash(shader);
+	if (shader_it == G->mShaders.end())
+		return nullptr;
+
+	// Find the resource binding metadata associated with that shader hash.
+	auto bindings_it = G->mShaderBindingsCache.find(shader_it->second);
+	if (bindings_it == G->mShaderBindingsCache.end())
+	{
+		assert(false);
+		return nullptr;
+	}
+
+	return &bindings_it->second;
+}
+
+void InitialTexturesSnapshot::SnapshotInitialTextures(CommandListState* state)
+{
+	if (!state || !state->mHackerContext || !state->mOrigContext1)
+		return;
+
+	const unsigned current_call_number = state->mHackerContext->GetCallNumber();
+
+	// A snapshot is taken at most once per draw.
+	if (active)
+	{
+		// In particular, don't reset distances when another snapshot operation runs in the same draw.
+		if (call_number == current_call_number)
+			return;
+
+		// Clear existing snapshot.
+		Clear();
+	}
+
+	// Mark the snapshot as active for this draw.
+	active = true;
+	call_number = current_call_number;
+
+	// Resolve the resource slots declared by the currently bound pixel shader.
+	const ShaderBindings* bindings = ResolvePixelShaderBindings(state);
+
+	if (!bindings || !bindings->resource_slots.count)
+		return;
+
+	const auto& range = bindings->resource_slots;
+
+	// Remember the complete range so matching and restoration use the same slots.
+	// The range may include slots that are not declared as SRVs.
+	first_srv_slot = range.first;
+	last_srv_slot = range.last;
+
+	const auto& resources = bindings->resources;
+
+	UINT slot = range.first;
+
+	while (slot <= range.last)
+	{
+		// Skip slots not declared as SRVs by this shader.
+		while (slot <= range.last && !(static_cast<float>(resources[slot].type) > 0.0f))
+			++slot;
+
+		if (slot > range.last)
+			break;
+
+		// Collect a contiguous run of declared SRV slots.
+		// Querying contiguous runs avoids requesting undeclared slots.
+		const UINT first = slot;
+
+		while (slot <= range.last && static_cast<float>(resources[slot].type) > 0.0f)
+			++slot;
+
+		const UINT count = slot - first;
+
+		// PSGetShaderResources AddRefs each returned non-null view.
+		// These references are retained by the cache until next SnapshotInitialTextures or Clear.
+		state->mOrigContext1->PSGetShaderResources(first, count, initial_textures.data() + first);
+
+		// Initialize the best Hamming distance for each captured, non-null initial SRV.
+		// A value of 65 means no filter has matched yet.
+		for (UINT i = first; i < first + count; ++i)
+		{
+			if (initial_textures[i])
+				hamming_distance[i] = 65;
+		}
+	}
+}
+
+// Capture the initial pixel-shader SRV references for the current draw.
+// This snapshot is shared by all TextureOverrideOperations executed during the draw.
+void SnapshotInitialTexturesOperation::run(CommandListState* state)
+{
+	if (!state || !state->mHackerContext)
+		return;
+
+	InitialTexturesSnapshot& snapshot = state->mHackerContext->GetInitialTexturesSnapshot();
+
+	snapshot.SnapshotInitialTextures(state);
+}
+
+// Configure the source and destination targets used to restore initial SRV references.
+RestoreInitialTexturesOperation::RestoreInitialTexturesOperation()
+{
+	// The initial texture reference is the source.
+	src.type = ResourceCopyTargetType::SHADER_RESOURCE;
+	src.evaluation_mode = ResourceCopyTargetEvaluationMode::RESOURCE;
+
+	// Restore the reference to the corresponding pixel-shader SRV slot.
+	dst.type = ResourceCopyTargetType::SHADER_RESOURCE;
+	dst.evaluation_mode = ResourceCopyTargetEvaluationMode::RESOURCE;
+	dst.shader_type = L'p';
+
+	// Restore references rather than copying resource contents.
+	options = ResourceCopyOptions::REFERENCE;
+}
+
+// Restore all initial pixel-shader SRV references captured by the current draw.
+void RestoreInitialTexturesOperation::run(CommandListState* state)
+{
+	if (!state || !state->mHackerContext)
+		return;
+
+	InitialTexturesSnapshot& snapshot = state->mHackerContext->GetInitialTexturesSnapshot();
+
+	// Only active snapshot can be restored.
+	if (!snapshot.active)
+		return;
+
+	// The snapshot must be restored using the same draw in which it was captured.
+	// Clear it if that invariant has been violated.
+	if (snapshot.call_number != state->mHackerContext->GetCallNumber())
+	{
+		assert(false);
+		snapshot.Clear();
+		return;
+	}
+
+	for (UINT slot = snapshot.first_srv_slot; slot <= snapshot.last_srv_slot; ++slot)
+	{
+		ID3D11ShaderResourceView* initial_srv = snapshot.initial_textures[slot];
+
+		// Ignore undeclared slots and declared slots that had no bound SRV.
+		if (!initial_srv)
+			continue;
+
+		// Retrieve the resource associated with the initial SRV.
+		ID3D11Resource* initial_resource = nullptr;
+		initial_srv->GetResource(&initial_resource);
+
+		if (!initial_resource)
+			continue;
+
+		// Restore this slot through the inherited resource-copy mechanism.
+		dst.slot = slot;
+
+		CopyResourceToResource(state, initial_resource, initial_srv, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+
+		initial_resource->Release();
+	}
+
+	// All SRV slots were reset to initial textures, any existing matches data is now obsolete.
+	snapshot.ResetMatches();
+}
+
+// Calculate the Hamming distance between a filter and each captured
+// initial SRV whose format matches the filter.
+// Returns the smallest valid distance, or 65 if no comparison succeeds.
+unsigned FindBestMatchingTextureDistance(CommandListState* state, ResourceFilter* slot_filter, std::array<uint8_t, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>& distances)
+{
+	// Initialize every slot as having no valid comparison.
+	// This also excludes undeclared slots and slots without initial SRVs.
+	distances.fill(65);
+
+	InitialTexturesSnapshot& snapshot = state->mHackerContext->GetInitialTexturesSnapshot();
+
+	unsigned best_distance = 65;
+
+	for (UINT slot = snapshot.first_srv_slot; slot <= snapshot.last_srv_slot; ++slot)
+	{
+		ID3D11ShaderResourceView* initial_srv = snapshot.initial_textures[slot];
+
+		// Only slots containing an initial SRV can participate in matching.
+		if (!initial_srv)
+			continue;
+
+		// If match_format is provided, skip slot on format mismatch.
+		if (slot_filter->match_format != DXGI_FORMAT_UNKNOWN)
+		{
+			// Only compare textures with the same SRV format as the filter.
+			D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+			initial_srv->GetDesc(&srv_desc);
+
+			if (srv_desc.Format != slot_filter->match_format)
+				continue;
+		}
+
+		// Retrieve the initial resource so its dHash can be calculated.
+		ID3D11Resource* initial_resource = nullptr;
+		initial_srv->GetResource(&initial_resource);
+
+		if (!initial_resource)
+			continue;
+
+		uint64_t initial_dhash = 0;
+
+		// Calculate the initial texture's dHash and compare it with the filter's precomputed match_dhash.
+		const bool has_dhash = GetDhash(state->mHackerContext, initial_resource, G->dhash_mip_size, G->dhash_allow_rehash, initial_dhash, initial_srv);
+
+		initial_resource->Release();
+
+		// A failed dHash calculation makes this slot ineligible for matching.
+		if (!has_dhash)
+			continue;
+
+		// Store this filter's distance for the slot.
+		const unsigned distance = HammingDistance(slot_filter->match_dhash, initial_dhash);
+
+		// Keep track of the smallest valid distance across all eligible slots.
+		distances[slot] = static_cast<uint8_t>(distance);
+
+		if (distance < best_distance)
+			best_distance = distance;
+	}
+
+	return best_distance;
+}
+
+// Replace the initial SRVs whose distance equals the best distance found for the current filter,
+// provided that distance improves on the best distance previously accepted for each individual slot.
+void SlotFilterOperation::ReplaceBestMatchingTextures(
+	CommandListState* state, ID3D11Resource* source_resource, ID3D11View* source_view, UINT stride, UINT offset, DXGI_FORMAT format, UINT buf_size, const std::array<uint8_t, SLOT_COUNT>& distances, unsigned best_distance
+)
+{
+	InitialTexturesSnapshot& snapshot = state->mHackerContext->GetInitialTexturesSnapshot();
+
+	for (UINT slot = snapshot.first_srv_slot; slot <= snapshot.last_srv_slot; ++slot)
+	{
+		// Only slots with a captured initial SRV are eligible for replacement.
+		if (!snapshot.initial_textures[slot])
+			continue;
+
+		const uint8_t distance = distances[slot];
+
+		// Replace only slots tied at this filter's global best distance.
+		// Also require the distance to improve on the best match already accepted for this slot during the current draw.
+		if (distance != best_distance || distance >= snapshot.hamming_distance[slot])
+			continue;
+
+		// Configure the inherited destination to target this pixel-shader slot.
+		dst.slot = slot;
+
+		// Use the base resource-copy operation to create and bind the compatible SRV reference in the destination slot.
+		CopyResourceToResource(state, source_resource, source_view, stride, offset, format, buf_size);
+
+		// Record the improved match so a less accurate filter cannot replace it later in the same draw.
+		snapshot.hamming_distance[slot] = distance;
+	}
+}
+
+// Find the best matching initial texture slots for this filter and replace
+// every slot tied at the best distance when the match is within the confidence
+// threshold and improves on that slot's previously accepted match.
+void SlotFilterOperation::OverrideMatchingTextures(CommandListState* state)
+{
+	if (!state || !state->mHackerContext || !dst.slot_filter)
+		return;
+
+	InitialTexturesSnapshot& snapshot = state->mHackerContext->GetInitialTexturesSnapshot();
+
+	unsigned current_call_number = state->mHackerContext->GetCallNumber();
+
+	// All matching operations must use the snapshot captured for the current draw.
+	if (!snapshot.active || current_call_number != snapshot.call_number)
+	{
+		// Try to capture a snapshot automatically.
+		snapshot.SnapshotInitialTextures(state);
+
+		if (!snapshot.active || current_call_number != snapshot.call_number)
+		{
+			assert(false);
+			return;
+		}
+	}
+
+	ResourceFilter* slot_filter = dst.GetSlotFilter();
+
+	// Convert confidence into the maximum acceptable Hamming distance.
+	// For example, 0.75 confidence permits a distance of 16.
+	// The comparison below is inclusive: a distance equal to this limit is accepted.
+	const unsigned max_distance = static_cast<unsigned>((1.0f - slot_filter->match_confidence) * 64.0f);
+
+	std::array<uint8_t, SLOT_COUNT> distances;
+
+	// Pass 1: calculate the filter's distance against every eligible
+	// initial SRV in the shared snapshot and identify the global best distance.
+	const unsigned best_distance = FindBestMatchingTextureDistance(state, slot_filter, distances);
+
+	// Reject the filter if no valid match was found within the threshold.
+	if (best_distance > max_distance)
+		return;
+
+	ID3D11View* source_view = nullptr;
+	UINT stride = 0, offset = 0, buf_size = 0;
+	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+
+	// Resolve the replacement resource and view using the inherited source target.
+	ID3D11Resource* source_resource = src.GetResource(state, &source_view, &stride, &offset, &format, &buf_size, &dst);
+
+	if (!source_resource)
+	{
+		if (source_view)
+			source_view->Release();
+		return;
+	}
+
+	// Pass 2: replace all slots tied at the filter's global best distance.
+	// A slot is updated only when this filter improves on the best distance
+	// already accepted for that slot during the current draw.
+	ReplaceBestMatchingTextures(state, source_resource, source_view, stride, offset, format, buf_size, distances, best_distance);
+
+	// Release the temporary references returned while resolving the source.
+	if (source_view)
+		source_view->Release();
+
+	source_resource->Release();
+}
+
+void SlotFilterOperation::run(CommandListState* state)
+{
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	OverrideMatchingTextures(state);
+}
+
+#pragma endregion SlotFilterOperation
+
+
 #pragma region ParseResourceCopyOperation
 
 static CommandListCommand* parse_resource_copy_operation(
@@ -10163,6 +11062,73 @@ static CommandListCommand* parse_resource_copy_operation(
 
 #pragma endregion ParseResourceCopyOperation
 
+#pragma region ParseSlotFilterOperation
+
+static CommandListCommand* parse_slot_filter_operation(
+	const wchar_t* section, ResourceCopyTarget& dst, ResourceCopyTarget& src, ResourceCopyOptions options, CommandList* command_list, const wstring* ini_namespace
+)
+{
+	//LogInfoW(L"parse_slot_filter_operation dst_type=%ls, dst_mode=%ls, src_type=%ls, src_mode=%ls\n",
+	//	lookup_enum_name(ResourceCopyTargetTypeNames, dst.type), lookup_enum_name(ResourceCopyTargetEvaluationModeNames, dst.evaluation_mode),
+	//	lookup_enum_name(ResourceCopyTargetTypeNames, src.type), lookup_enum_name(ResourceCopyTargetEvaluationModeNames, src.evaluation_mode));
+
+	if (dst.shader_type != L'p' || dst.type != ResourceCopyTargetType::SHADER_RESOURCE)
+	{
+		LogOverlayW(LOG_WARNING, L"Work in progress - slot filtering is only supported for ps-t slots\n - [%ls] @ [%ls]\n", section, ini_namespace->c_str());
+		return nullptr;
+	}
+
+	// Configure the inherited ResourceCopyTarget as a pixel-shader SRV.
+	// Its slot is selected dynamically by OverrideMatchingTextures().
+	dst.evaluation_mode = ResourceCopyTargetEvaluationMode::RESOURCE;
+	dst.max_slot = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
+
+	if (!(options & ResourceCopyOptions::COPY_TYPE_MASK))
+	{
+		switch (src.type)
+		{
+		case ResourceCopyTargetType::SHADER_RESOURCE:
+		case ResourceCopyTargetType::CUSTOM_RESOURCE:
+		case ResourceCopyTargetType::INI_PARAMS:
+		case ResourceCopyTargetType::CURSOR_MASK:
+		case ResourceCopyTargetType::CURSOR_COLOR:
+			options |= ResourceCopyOptions::REFERENCE;
+			break;
+
+		default:
+			options |= ResourceCopyOptions::COPY;
+			break;
+		}
+	}
+
+	// A referenced custom resource must support SRV binding.
+	if (src.type == ResourceCopyTargetType::CUSTOM_RESOURCE && (options & ResourceCopyOptions::REFERENCE))
+	{
+		CustomResource* src_custom_resource = src.GetCustomResource(nullptr, true);
+
+		if (!src_custom_resource)
+			return nullptr;
+
+		D3D11_RESOURCE_MISC_FLAG misc_flags = (D3D11_RESOURCE_MISC_FLAG)0;
+
+		if (!src_custom_resource->AddFlags(dst.BindFlags(nullptr, &misc_flags), misc_flags, true))
+		{
+			LogOverlayW(LOG_WARNING, L"Cannot reference `%ls` as a shader resource; use the `copy` option instead\n - [%ls] @ [%ls]\n",
+				src_custom_resource->name.c_str(), section, ini_namespace->c_str());
+			return nullptr;
+		}
+	}
+
+	SlotFilterOperation* operation = new SlotFilterOperation();
+
+	operation->src = std::move(src);
+	operation->dst = std::move(dst);
+	operation->options = options;
+
+	return operation;
+}
+
+#pragma endregion ParseSlotFilterOperation
 
 #pragma region LayoutElementOperation
 
@@ -10568,6 +11534,12 @@ bool ParseCommandListResourceCopyTargetDirective(
 			LogOverlayW(LOG_WARNING, L"A SamplerState resource can only be bound to a sampler slot (ps-s0 = ResourceFoo): \"%ls = %ls\"\n - [%ls] @ [%ls]\n",
 				key, val->c_str(), section, ini_namespace->c_str());
 			return true;
+		}
+
+		if (dst.evaluation_mode == ResourceCopyTargetEvaluationMode::SLOT_FILTER)
+		{
+			operation = parse_slot_filter_operation(section, dst, src, options, command_list, ini_namespace);
+			break;
 		}
 
 		if (dst.evaluation_mode == ResourceCopyTargetEvaluationMode::SLOT_RANGE
@@ -12166,6 +13138,49 @@ float ResourceCopyTarget::GetResourceMips(CommandListState* state)
 
 		resource->Release();
 	}
+
+	if (view)
+		view->Release();
+
+	return ret;
+}
+
+float ResourceCopyTarget::GetResourceHammingDistance(CommandListState* state)
+{
+	float ret = ResourcePropertyResult::UNKNOWN;
+
+	ID3D11View* view = nullptr;
+	ID3D11Resource* resource = GetResource(state, &view, nullptr, nullptr, nullptr, nullptr);
+
+	if (!resource)
+	{
+		ret = ResourcePropertyResult::RESOURCE_NOT_FOUND;
+		goto cleanup;
+	}
+
+	uint64_t resource_dhash = 0;
+	bool has_resource_dhash = GetDhash(state->mHackerContext, resource, G->dhash_mip_size, G->dhash_allow_rehash, resource_dhash, view);
+
+	if (has_resource_dhash)
+	{
+		auto* target_ptr = member_args[0].filter.get();
+
+		if (target_ptr)
+		{
+			ResourceFilter* resource_filter = target_ptr->GetFilter();
+
+			if (resource_filter)
+			{
+				const uint64_t reference_dhash = resource_filter->match_dhash;
+				ret = static_cast<float>(HammingDistance(reference_dhash, resource_dhash));
+			}
+		}
+	}
+
+cleanup:
+
+	if (resource)
+		resource->Release();
 
 	if (view)
 		view->Release();
@@ -14456,6 +15471,9 @@ void ShaderResourceFetchBatch::run(CommandListState *state)
 
 static bool is_batchable_bind(const ResourceCopyOperation *op)
 {
+	if (!op->IsBatchable())
+		return false;
+
 	// Sources must not be pipeline slots, otherwise reading them all before
 	// binding any would change the meaning of e.g. a slot swap:
 	return op->dst.type == ResourceCopyTargetType::SHADER_RESOURCE
@@ -14467,6 +15485,9 @@ static bool is_batchable_bind(const ResourceCopyOperation *op)
 
 static bool is_batchable_fetch(const ResourceCopyOperation *op)
 {
+	if (!op->IsBatchable())
+		return false;
+
 	return op->src.type == ResourceCopyTargetType::SHADER_RESOURCE
 		&& op->src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE
 		&& !op->src.slot_expression

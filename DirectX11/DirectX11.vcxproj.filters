@@ -73,6 +73,7 @@
     <ClCompile Include="vk\VkDrawPath.cpp" />
     <ClCompile Include="vk\VkDump.cpp" />
     <ClCompile Include="vk\VkHooks.cpp" />
+    <ClCompile Include="DHash64Gpu.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="d3d11Wrapper.def" />
@@ -153,6 +154,7 @@
     <ClInclude Include="vk\VkDump.h" />
     <ClInclude Include="vk\VkHooks.h" />
     <ClInclude Include="vk\VkScope.h" />
+    <ClInclude Include="DHash64Gpu.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="DirectX11.rc" />

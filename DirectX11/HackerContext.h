@@ -10,6 +10,7 @@
 #include "HackerInputLayout.h"
 #include "HackerDevice.h"
 #include "Globals.h"
+#include "DHash64Gpu.h"
 
 // {A3046B1E-336B-4D90-9FD6-234BC09B8687}
 DEFINE_GUID(IID_HackerContext,
@@ -71,16 +72,24 @@ struct DispatchContext
 // These are per-context so we shouldn't need locks
 struct MappedResourceInfo {
 	D3D11_MAPPED_SUBRESOURCE map;
+
 	bool mapped_writable;
 	void *orig_pData;
 	size_t size;
 	UINT bind_flags;
 
+	UINT subresource;
+	D3D11_MAP map_type;
+	bool tracks_texture_subresource;
+
 	MappedResourceInfo() :
 		orig_pData(NULL),
 		size(0),
 		mapped_writable(false),
-		bind_flags(0)
+		bind_flags(0),
+		subresource(0),
+		map_type(D3D11_MAP_READ),
+		tracks_texture_subresource(false)
 	{}
 };
 
@@ -154,6 +163,8 @@ private:
 	HackerInputLayout* mOriginalInputLayout;
 	HackerInputLayout* mOverrideInputLayout;
 
+	InitialTexturesSnapshot mInitialTexturesSnapshot;
+
 	// Used for deny_cpu_read, track_texture_updates and constant buffer matching
 	// What this context has mapped and tracks, which is rarely more than
 	// one resource at a time and comes and goes with every constant buffer
@@ -161,6 +172,14 @@ private:
 	// map allocate nothing once they have grown:
 	std::vector<ID3D11Resource*> mMappedResources;
 	std::vector<MappedResourceInfo> mMappedResourceInfos;
+	size_t FindMappedResource(ID3D11Resource *resource, UINT subresource) const
+	{
+		for (size_t i = 0; i < mMappedResources.size(); i++) {
+			if (mMappedResources[i] == resource && mMappedResourceInfos[i].subresource == subresource)
+				return i;
+		}
+		return mMappedResources.size();
+	}
 
 	// The memory a small mapping was diverted to, kept for the next one of
 	// the same size: one block a size, for sizes that are multiples of 16
@@ -169,6 +188,7 @@ private:
 	void *mDivertSpares[DIVERT_REUSE_MAX / 16 + 1];
 	void* AllocDiverted(size_t size);
 	void FreeDiverted(void *data, size_t size);
+	DHash64Gpu mDHasher;
 
 	unsigned draw_number;
 	unsigned dispatch_number;
@@ -389,6 +409,7 @@ public:
 
 	unsigned GetDrawNumber() const { return draw_number; };
 	unsigned GetDispatchNumber() const { return dispatch_number; };
+	unsigned GetCallNumber() const { return draw_number + dispatch_number; };
 	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
 
 	// public to allow CommandList access, see mCheckTextureOverrideResults:
@@ -486,6 +507,9 @@ public:
 		for (UINT i = first; i < first + count && i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
 			slots[i >> 6] &= ~(1ull << (i & 63));
 	}
+	InitialTexturesSnapshot& GetInitialTexturesSnapshot() { return mInitialTexturesSnapshot; }
+
+	HRESULT ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash);
 
 	// These are the shaders the game has set, which may be different from
 	// the ones we have bound to the pipeline:

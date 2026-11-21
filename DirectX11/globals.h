@@ -543,6 +543,8 @@ struct Globals
 	bool any_deny_cpu_read;
 	bool allow_buffer_resize;
 	int texture_hash_version;
+	int dhash_mip_size = 0;
+	bool dhash_allow_rehash = false;
 	int EXPORT_HLSL;		// 0=off, 1=HLSL only, 2=HLSL+OriginalASM, 3= HLSL+OriginalASM+recompiledASM
 	bool EXPORT_SHADERS, EXPORT_FIXED, EXPORT_BINARY, CACHE_SHADERS, SCISSOR_DISABLE;
 	int track_texture_updates;
