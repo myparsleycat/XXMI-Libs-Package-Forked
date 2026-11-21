@@ -1,7 +1,7 @@
 #!/bin/bash
-# check.sh [test] [fold] [move] [lowmip] [ref]: the checks of the D3D12 shim, in
-# the run folder setup.sh makes (default: test fold move lowmip). Exits with 1
-# when one fails.
+# check.sh [test] [fold] [move] [lowmip] [filter] [ref]: the checks of the D3D12
+# shim, in the run folder setup.sh makes (default: test fold move lowmip filter).
+# Exits with 1 when one fails.
 #   test   matching by hash (case/test.ini): which watched meshes are hidden
 #   fold   conditions on targets in a list of a game's draw: which meshes each
 #          form leaves hidden
@@ -10,6 +10,9 @@
 #   lowmip a copy of a texture without its top mip level, with
 #          track_texture_updates = 1 and match_lower_mip_textures off and on,
 #          also with every upload hash deferred
+#   filter a texture bound over the game's after SnapshotInitialTextures, with
+#          a ps-t[Filter] line, is taken back by RestoreInitialTextures: the
+#          picture has to be the one without them
 #   ref    the pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
 #   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
@@ -660,12 +663,51 @@ run_ref() {
 	compare mod 1300 "" mod.bmp
 }
 
-for what in ${@:-test fold move lowmip}; do
+filter_picture() {
+	# filter_picture <name> <lines>: the picture checksum of test with <lines>
+	# in place of the skip of the meshes drawn with texture 40
+	python -I - case/test.ini run/Mods/test.ini "$2" <<'EOF'
+import sys
+source, target, body = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+old = "hash = b090e28e\nhandling = skip\n"
+assert old in text
+text = text.replace(old, "hash = b090e28e\n" + body, 1)
+text += "\n[ResourceFilterTex]\nfilename = mod/test.dds\n\n[FilterTest]\nmatch_dhash = 1042084108210420\n"
+open(target, "w", encoding="utf-8").write(text)
+EOF
+	[ $? = 0 ] || return
+	(cd run && ./harness.exe frames=900 test dump=filter-$1.bmp 2>&1) | grep "^picture checksum"
+	rm -f run/Mods/test.ini
+}
+
+run_filter() {
+	local base leak got
+	base=$(filter_picture base "")
+	leak=$(filter_picture leak "ps-t0 = ResourceFilterTex
+")
+	if [ -z "$base" ] || [ "$base" = "$leak" ]; then
+		echo "filter: FAILED, no difference to tell: base [$base] leak [$leak]"; ok=0; return
+	fi
+	got=$(filter_picture restore "run = SnapshotInitialTextures
+ps-t0 = ResourceFilterTex
+ps-t[FilterTest] = ref ResourceFilterTex
+run = RestoreInitialTextures
+")
+	if [ "$got" = "$base" ]; then
+		echo "filter: OK (restore shows the game's texture)"
+	else
+		echo "filter: FAILED, restore: want [$base], got [$got]"; ok=0
+	fi
+}
+
+for what in ${@:-test fold move lowmip filter}; do
 	case $what in
 	test) run_test; run_null_ib ;;
 	fold) run_fold ;;
 	move) run_move ;;
 	lowmip) run_lowmip ;;
+	filter) run_filter ;;
 	ref) run_ref ;;
 	root-uav) run_root_uav ;;
 	dxil-iniparams) run_dxil_iniparams '' ;;

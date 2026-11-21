@@ -5,7 +5,9 @@
 // an 8 element RWBuffer), presents (which runs the ini's [Present]) and prints
 // what the custom shaders sampled and which samplers are bound afterwards,
 // then checks those of the last frame against what case/d3dx.ini asks for.
-// It also checks the views of two ->Region() buffer copies.
+// It also checks the views of two ->Region() buffer copies, and [Filter]
+// matching against two 9x8 textures bound at ps-t2 and ps-t3 of a "game"
+// pixel shader, whose dHashes the harness works out itself.
 //
 //   harness.exe <run folder> [frames]
 //
@@ -15,8 +17,10 @@
 #include <windows.h>
 #include "../common/window.h"
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <stdio.h>
 #include <float.h>
+#include <intrin.h>
 
 #pragma comment(lib, "user32.lib")
 
@@ -43,6 +47,54 @@ static void expect(const char *what, bool ok)
 static bool close_to(float a, float b)
 {
 	return a > b - 0.01f && a < b + 0.01f;
+}
+
+// A 9x8 pattern whose texel centres are exactly where the dHash shader
+// samples, so the hash follows from the bytes: bit y * 8 + x is set when
+// texel (x, y) is brighter than texel (x + 1, y). Must match the
+// match_dhash values of case/d3dx.ini.
+static void filter_pattern(int a, int b, int c, unsigned char out[8][9][4])
+{
+	for (int y = 0; y < 8; y++)
+		for (int x = 0; x < 9; x++)
+			for (int i = 0; i < 4; i++)
+				out[y][x][i] = (unsigned char)((x * a + y * b + c) % 200 + 20);
+}
+
+static unsigned long long filter_dhash(unsigned char texels[8][9][4])
+{
+	unsigned long long hash = 0;
+
+	for (int y = 0; y < 8; y++)
+		for (int x = 0; x < 8; x++)
+			if (texels[y][x][0] > texels[y][x + 1][0])
+				hash |= 1ull << (y * 8 + x);
+	return hash;
+}
+
+typedef HRESULT (WINAPI *CompileFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR,
+		UINT, UINT, ID3DBlob**, ID3DBlob**);
+
+// The game's pixel shader of the filter checks, declaring t2 and t3
+static ID3D11PixelShader *filter_game_shader()
+{
+	static const char source[] =
+		"Texture2D<float4> a : register(t2);\n"
+		"Texture2D<float4> b : register(t3);\n"
+		"float4 main(float4 pos : SV_Position) : SV_Target0 { return a.Load(int3(0, 0, 0)) + b.Load(int3(0, 0, 0)); }\n";
+	HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+	CompileFn compile = compiler ? (CompileFn)GetProcAddress(compiler, "D3DCompile") : NULL;
+	ID3DBlob *code = NULL, *errors = NULL;
+	ID3D11PixelShader *shader;
+
+	if (!compile) {
+		printf("cannot load D3DCompile from d3dcompiler_47.dll\n");
+		exit(1);
+	}
+	CHECK(compile(source, sizeof(source) - 1, "filter_game", NULL, NULL, "main", "ps_5_0", 0, 0, &code, &errors));
+	CHECK(dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), NULL, &shader));
+	code->Release();
+	return shader;
 }
 
 typedef void (STDMETHODCALLTYPE ID3D11DeviceContext::*GetSamplersFn)(UINT, UINT, ID3D11SamplerState**);
@@ -158,7 +210,7 @@ int main(int argc, char **argv)
 	CHECK(dev->CreateTexture2D(&td, NULL, &rt_staging));
 
 	D3D11_BUFFER_DESC bd = {};
-	bd.ByteWidth = 8 * 16;
+	bd.ByteWidth = 16 * 16;
 	bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
 	ID3D11Buffer *buf, *buf_staging;
 	CHECK(dev->CreateBuffer(&bd, NULL, &buf));
@@ -169,7 +221,7 @@ int main(int argc, char **argv)
 	D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
 	ud.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
 	ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-	ud.Buffer.NumElements = 8;
+	ud.Buffer.NumElements = 16;
 	ID3D11UnorderedAccessView *uav;
 	CHECK(dev->CreateUnorderedAccessView(buf, &ud, &uav));
 
@@ -194,6 +246,26 @@ int main(int argc, char **argv)
 	ID3D11SamplerState *game;
 	CHECK(dev->CreateSamplerState(&sd, &game));
 
+	static unsigned char pattern_a[8][9][4], pattern_b[8][9][4];
+	filter_pattern(37, 91, 11, pattern_a);
+	filter_pattern(53, 29, 7, pattern_b);
+	unsigned long long dhash_a = filter_dhash(pattern_a), dhash_b = filter_dhash(pattern_b);
+	unsigned distance_ab = (unsigned)__popcnt64(dhash_a ^ dhash_b);
+	printf("filter textures: dhash a=%016llx b=%016llx, distance %u\n", dhash_a, dhash_b, distance_ab);
+	td = {};
+	td.Width = 9; td.Height = 8; td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	ID3D11Texture2D *tex_a, *tex_b;
+	ID3D11ShaderResourceView *filter_srvs[2];
+	D3D11_SUBRESOURCE_DATA init_a = { pattern_a, 9 * 4, 0 }, init_b = { pattern_b, 9 * 4, 0 };
+	CHECK(dev->CreateTexture2D(&td, &init_a, &tex_a));
+	CHECK(dev->CreateTexture2D(&td, &init_b, &tex_b));
+	CHECK(dev->CreateShaderResourceView(tex_a, NULL, &filter_srvs[0]));
+	CHECK(dev->CreateShaderResourceView(tex_b, NULL, &filter_srvs[1]));
+	ID3D11PixelShader *filter_game = filter_game_shader();
+
 	for (int frame = 0; frame < frames; frame++) {
 		ID3D11SamplerState *games[16];
 		for (int i = 0; i < 16; i++)
@@ -209,6 +281,8 @@ int main(int argc, char **argv)
 		D3D11_VIEWPORT vp = { 0, 0, 8, 1, 0, 1 };
 		ctx->RSSetViewports(1, &vp);
 		ctx->PSSetShaderResources(0, 1, &srv);
+		ctx->PSSetShaderResources(2, 2, filter_srvs);
+		ctx->PSSetShader(filter_game, NULL, 0);
 		ctx->CSSetShaderResources(0, 1, &srv);
 		ctx->CSSetUnorderedAccessViews(0, 1, &uav, NULL);
 		ctx->CSSetConstantBuffers(1, 1, &cb);
@@ -220,7 +294,7 @@ int main(int argc, char **argv)
 		ctx->CopyResource(rt_staging, rt);
 		ctx->CopyResource(buf_staging, buf);
 		D3D11_MAPPED_SUBRESOURCE map;
-		float px[8][4], cs[8][4];
+		float px[8][4], cs[16][4];
 		CHECK(ctx->Map(rt_staging, 0, D3D11_MAP_READ, 0, &map));
 		memcpy(px, map.pData, sizeof(px));
 		ctx->Unmap(rt_staging, 0);
@@ -262,6 +336,20 @@ int main(int argc, char **argv)
 			expect("ref Region(0, 16) gives a view of 4 elements 1..4", cs[5][0] == 4 && cs[5][1] == 1 && cs[5][2] == 4);
 			expect("ref Region(8, 8) gives a view of 2 elements 3 4", cs[6][0] == 2 && cs[6][1] == 3 && cs[6][2] == 4);
 			expect("copy cs-cb1->Region(256, 256) of a 512 byte constant buffer starts with 16", cs[7][0] == 16);
+			// Texel (1, 0): 68 / 255 in a, 80 / 255 in b, 1 in the 2x1 marker
+			printf("  filter: %g %g %g %g | %g %g | %g %g %g\n", cs[8][0], cs[8][1], cs[8][2], cs[8][3],
+				cs[9][0], cs[9][1], cs[10][0], cs[10][1], cs[10][2]);
+			expect("ps-t2->HammingDistance(FilterA) is 0", cs[8][0] == 0);
+			expect("ps-t2->HammingDistance(FilterB) is the distance of the two patterns", cs[8][1] == (float)distance_ab);
+			expect("@FilterA is not 0 and @FilterEmpty is", cs[8][2] != 0 && cs[8][3] == 0);
+			expect("FilterProxy = ref FilterB matches ps-t3", cs[9][0] == 0);
+			expect("FilterProxy = null uses its own match_dhash again", cs[9][1] == (float)distance_ab);
+			// Only meaningful when the filter lines ran, as the replacement of ps-t3 shows
+			expect("ps-t2 is kept: FilterFar is over its confidence, FilterWrongFormat has another format",
+				close_to(cs[10][1], 1.0f) && close_to(cs[10][0], 68 / 255.0f));
+			expect("ps-t[FilterB] = ref ResourceMarker replaces ps-t3", close_to(cs[10][1], 1.0f));
+			expect("RestoreInitialTextures puts the original back in ps-t3",
+				close_to(cs[10][1], 1.0f) && close_to(cs[10][2], 80 / 255.0f));
 			expect("ps-s0..s2 restored after the custom shaders", bound(4, 0) == game && bound(4, 1) == game && bound(4, 2) == game);
 			expect("cs-s0 restored after the compute custom shader", bound(5, 0) == game);
 			expect("ps-s3 = null in [Present] leaves the slot empty", bound(4, 3) == NULL);

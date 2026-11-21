@@ -1,5 +1,5 @@
 #!/bin/bash
-# check.sh [tests] [fg] [upload] [lowmip]: the checks of the Vulkan side, in the
+# check.sh [tests] [fg] [upload] [lowmip] [filter]: the checks of the Vulkan side, in the
 # run folder setup.sh makes (default: all). Exits with 1 when one fails.
 #   tests  every case/tests/test_*.ini and bench_*.ini drawn with the DLL of run
 #          and with that of ref (setup.sh ref <older d3d11.dll>): the pixels
@@ -19,6 +19,10 @@
 #          track_texture_updates = 1 and match_lower_mip_textures = 1 the
 #          pixels have to be those of test_texhash, which matches the texture
 #          itself; with either at 0 those of the texture not replaced
+#   filter filter_restore (snapshot, ps-t0 and a ps-t[Filter] line, restore)
+#          and filter_identity (@FilterTest) have to show the game's texture
+#          as filter_base does; filter_leak, which binds the mod's texture,
+#          has to differ from it
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here/run" 2>/dev/null || { echo "no run folder: run setup.sh first"; exit 1; }
 ok=1
@@ -154,12 +158,36 @@ run_lowmip() {
 	cp ../case/tests/test_texture.ini Mods/test.ini
 }
 
-for what in ${@:-tests fg upload lowmip}; do
+run_filter() {
+	local base leak got name
+	cp ../case/tests/filter_base.ini Mods/test.ini
+	base=$(picture --pool)
+	cp ../case/tests/filter_leak.ini Mods/test.ini
+	leak=$(picture --pool)
+	if [ "$base" = "$leak" ] || ! echo "$base" | grep -q "^middle.*exit 0$"; then
+		echo "filter: FAILED, no difference to tell: base [$base] leak [$leak]"; ok=0
+	else
+		for name in filter_restore filter_identity; do
+			cp ../case/tests/$name.ini Mods/test.ini
+			got=$(picture --pool)
+			if [ "$got" = "$base" ]; then
+				echo "same  $name: the game's texture"
+			else
+				echo "DIFF  $name: want [$base], got [$got]"
+				ok=0
+			fi
+		done
+	fi
+	cp ../case/tests/test_texture.ini Mods/test.ini
+}
+
+for what in ${@:-tests fg upload lowmip filter}; do
 	case $what in
 	tests) run_tests ;;
 	fg) run_fg ;;
 	upload) run_upload ;;
 	lowmip) run_lowmip ;;
+	filter) run_filter ;;
 	*) sed -n '2,20p' "$0"; exit 1 ;;
 	esac
 done
