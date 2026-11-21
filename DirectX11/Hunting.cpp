@@ -22,6 +22,8 @@
 #include "ShaderRegex.h"
 #include "dx12/Bridge.h"
 #include "dx12/DrawPath.h"
+#include "dx12/FrameDump.h"
+#include "vk/VkScope.h"
 
 // bo3b: For this routine, we have a lot of warnings in x64, from converting a size_t result into the needed
 //  DWORD type for the Write calls.  These are writing 256 byte strings, so there is never a chance that it 
@@ -1307,7 +1309,17 @@ static void AnalyseFrame(HackerDevice *device, void *private_data)
 		factx->Release();
 	}
 
+	if (dx12_shim && VkModsHaveDevice()) {
+		LogOverlay(LOG_NOTICE, "Frame analysis is not available for Vulkan games\n");
+		return;
+	}
+
 	if (G->analyse_frame) {
+		if (dx12_shim) {
+			Dx12FrameDumpCancelPending();
+			LogOverlay(LOG_NOTICE, "Frame analysis aborted\n");
+			return;
+		}
 		// Frame analysis key has been pressed again while FA was
 		// already in progress, abort:
 		device->GetHackerContext()->FrameAnalysisLog("----- Frame analysis aborted -----\n");
@@ -1347,6 +1359,10 @@ static void AnalyseFrame(HackerDevice *device, void *private_data)
 
 static void AnalyseFrameStop(HackerDevice *device, void *private_data)
 {
+	// D3D12 records one frame whatever the options are
+	if (dx12_shim)
+		return;
+
 	// One of three places we can stop the frame analysis - the other is in
 	// the present call. We use this one when analyse_options=hold.
 	// We don't allow hold to be changed mid-frame due to potential

@@ -71,6 +71,9 @@ bool VkModsCountFrames();
 // Right after the above: true if [Present] is to repeat what it did for the
 // last frame of the game rather than run for a new one
 bool VkModsRepeatPresent();
+// With the lock of dx12/Bridge.h held: true while the game has a Vulkan
+// device, whose draws D3D12 frame analysis does not see
+bool VkModsHaveDevice();
 
 // For GetRegionHash. False if the buffer is not one of the above, and the
 // hash is the engine's to work out.

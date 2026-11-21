@@ -42,7 +42,10 @@ struct TextureCopy {
 // As much as is copied before waiting for the GPU and writing it out
 const UINT64 BATCH_BYTES = 256ull << 20;
 
+static const unsigned CAPTURE_WAIT_PRESENTS = 5;
+
 static bool active;
+static std::wstring capture_path;
 static FILE *log_file;
 static UINT draw_number;
 static std::vector<DumpedTexture> textures;
@@ -55,11 +58,12 @@ static void begin()
 	wchar_t path[MAX_PATH];
 
 	active = true;
+	capture_path = G->ANALYSIS_PATH;
 	draw_number = 0;
 	textures_written = textures_failed = 0;
 	links_failed = false;
 
-	swprintf_s(path, MAX_PATH, L"%ls\\log.txt", G->ANALYSIS_PATH);
+	swprintf_s(path, MAX_PATH, L"%ls\\log.txt", capture_path.c_str());
 	wfopen_ensuring_access(&log_file, path, L"w");
 	if (log_file)
 		fprintf(log_file, "D3D12: the draws in the order they were recorded in, which with several lists is not the order they are executed in\n\n");
@@ -337,7 +341,7 @@ static void link_names(const DumpedTexture *texture, const std::wstring &base)
 	UINT copies = 0;
 
 	for (const std::wstring &name : texture->names) {
-		link = std::wstring(G->ANALYSIS_PATH) + L"\\" + name;
+		link = capture_path + L"\\" + name;
 		if (CreateHardLinkW(link.c_str(), target.c_str(), NULL))
 			continue;
 		// A file only takes so many names
@@ -398,6 +402,49 @@ static void write_batch(std::vector<TextureCopy> *batch, const wchar_t *director
 	batch->clear();
 }
 
+static void write_status(const char *text)
+{
+	wchar_t path[MAX_PATH];
+	FILE *status = NULL;
+
+	if (swprintf_s(path, L"%ls\\capture_status.txt", G->ANALYSIS_PATH) >= 0)
+		wfopen_ensuring_access(&status, path, L"w");
+	if (status) {
+		fputs(text, status);
+		fclose(status);
+	}
+}
+
+void Dx12FrameDumpAdvanceCaptureWindow()
+{
+	static std::wstring pending_path;
+	static unsigned idle_presents;
+	char text[128];
+
+	if (G->analyse_frame && !active) {
+		if (pending_path != G->ANALYSIS_PATH) {
+			pending_path = G->ANALYSIS_PATH;
+			idle_presents = 0;
+		}
+		if (++idle_presents < CAPTURE_WAIT_PRESENTS)
+			return;
+
+		sprintf_s(text, "No draw was recorded within %u presents after the analyse_frame key. Nothing was captured.\n",
+			CAPTURE_WAIT_PRESENTS);
+		write_status(text);
+		LogOverlay(LOG_NOTICE, "Frame analysis: no draw was recorded within %u presents\n", CAPTURE_WAIT_PRESENTS);
+	}
+	pending_path.clear();
+	idle_presents = 0;
+	G->analyse_frame = false;
+}
+
+void Dx12FrameDumpCancelPending()
+{
+	write_status("Frame analysis was aborted before a draw was recorded.\n");
+	G->analyse_frame = false;
+}
+
 void Dx12FrameDumpFramePresented()
 {
 	std::vector<TextureCopy> batch;
@@ -407,11 +454,11 @@ void Dx12FrameDumpFramePresented()
 	size_t i;
 
 	// The key was pressed during this present: the frame is yet to come
-	if (!active || G->analyse_frame)
+	if (!active || (G->analyse_frame && capture_path == G->ANALYSIS_PATH))
 		return;
 
 	if (!textures.empty()) {
-		swprintf_s(directory, MAX_PATH, L"%ls\\deduped", G->ANALYSIS_PATH);
+		swprintf_s(directory, MAX_PATH, L"%ls\\deduped", capture_path.c_str());
 		CreateDirectoryEnsuringAccess(directory);
 		if (log_file)
 			fprintf(log_file, "\nTextures, as they were when the frame was presented:\n");
@@ -442,5 +489,5 @@ void Dx12FrameDumpFramePresented()
 	active = false;
 
 	LogOverlayW(LOG_INFO, L"Frame analysis saved to %ls: %u draws, %u textures written, %u not\n",
-		G->ANALYSIS_PATH, draw_number, textures_written, textures_failed);
+		capture_path.c_str(), draw_number, textures_written, textures_failed);
 }

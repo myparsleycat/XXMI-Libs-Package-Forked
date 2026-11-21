@@ -276,7 +276,7 @@ static void frame_actions()
 	else if (!dx12_mods_disabled)
 		RunCommandList(device, dx12_shim->hacker_context, &G->present_command_list, NULL, false);
 
-	G->analyse_frame = false;
+	Dx12FrameDumpAdvanceCaptureWindow();
 
 	if (G->hunting == HUNTING_MODE_ENABLED)
 		UpdateHuntingBufferSelection(device);

@@ -26,3 +26,10 @@ void Dx12FrameDumpDraw(Dx12GraphicsCommandList *list, const Dx12PipelineInfo *pi
 
 // Once per present, after what the frame recorded on our list was submitted
 void Dx12FrameDumpFramePresented();
+
+// Once per present, before input is dispatched: ends a request that recorded
+// no draw within CAPTURE_WAIT_PRESENTS presents
+void Dx12FrameDumpAdvanceCaptureWindow();
+
+// The analyse_frame key pressed again before a draw was recorded
+void Dx12FrameDumpCancelPending();
