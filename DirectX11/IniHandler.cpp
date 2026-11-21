@@ -5395,6 +5395,8 @@ void LoadConfigFile()
 
 	// Must be done before any command lists that may refer to them:
 	ParseFilterSections();
+	if (G->hunting != HUNTING_MODE_DISABLED)
+		G->track_texture_subresources = true;
 	ParseResourceSections();
 
 	// Second pass for the Constants command list:

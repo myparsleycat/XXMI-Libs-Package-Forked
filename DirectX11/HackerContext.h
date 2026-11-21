@@ -189,6 +189,7 @@ private:
 	void* AllocDiverted(size_t size);
 	void FreeDiverted(void *data, size_t size);
 	DHash64Gpu mDHasher;
+	bool mDHashUnavailable = false;
 
 	unsigned draw_number;
 	unsigned dispatch_number;
@@ -388,6 +389,9 @@ public:
 	// What that shader declares at its registers, where that is known
 	// without a D3D11 object: for a draw of a Vulkan game. NULL otherwise.
 	const struct ShaderBindings* Dx12CurrentShaderBindings(wchar_t shader_type);
+	// The context over the D3D12 shim, whose game textures have no
+	// D3D11 resource to read
+	bool IsDx12ShimContext() const;
 
 	HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1);
 	~HackerContext();
@@ -410,7 +414,8 @@ public:
 	unsigned GetDrawNumber() const { return draw_number; };
 	unsigned GetDispatchNumber() const { return dispatch_number; };
 	unsigned GetCallNumber() const { return draw_number + dispatch_number; };
-	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
+	// The snapshot is keyed by call number, which starts over each frame
+	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; mInitialTexturesSnapshot.Clear(); };
 
 	// public to allow CommandList access, see mCheckTextureOverrideResults:
 	void NoteCheckTextureOverrideResult(const CheckTextureOverrideCommand *command, const DrawCallInfo *call_info, const TextureOverrideMatches &matches)

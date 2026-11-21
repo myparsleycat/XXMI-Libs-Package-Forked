@@ -4005,13 +4005,21 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 
 	//LogDebug("ShaderTarget Member Evaluation hash=%016I64x\n", shader_it->second);
 
-	auto it = G->mShaderBindingsCache.find(shader_it->second);
-	if (it == G->mShaderBindingsCache.end()) {
+	const ShaderBindings *bindings = nullptr;
+	{
+		// Shaders created on other threads insert into the cache. Its
+		// elements stay where they are, so the pointer outlives the lock:
+		CriticalSectionGuard(&G->mShaderBindingsLock);
+		auto it = G->mShaderBindingsCache.find(shader_it->second);
+		if (it != G->mShaderBindingsCache.end())
+			bindings = &it->second;
+	}
+	if (!bindings) {
 		assert(false);
 		return 0.0;  // Safety check, should never happen;
 	}
 
-	return evaluate_shader_bindings(state, it->second);
+	return evaluate_shader_bindings(state, *bindings);
 }
 
 float CommandListOperand::evaluate_shader_bindings(CommandListState *state, const ShaderBindings &bindings)
@@ -5132,7 +5140,7 @@ inline bool ParseHashToken(const wstring& input, uint64_t& out, size_t& length)
 	const wchar_t* p = begin;
 
 	// Optional 0x prefix.
-	if (p[0] == L'0' && (p[1] == L'x'))
+	if (p[0] == L'0' && (p[1] == L'x' || p[1] == L'X'))
 		p += 2;
 
 	uint64_t value = 0;
@@ -5146,6 +5154,8 @@ inline bool ParseHashToken(const wstring& input, uint64_t& out, size_t& length)
 			digit = *p - L'0';
 		else if (*p >= L'a' && *p <= L'f')
 			digit = *p - L'a' + 10;
+		else if (*p >= L'A' && *p <= L'F')
+			digit = *p - L'A' + 10;
 		else
 			break;
 
@@ -7556,13 +7566,14 @@ IniParserResult ResourceFilterTarget::ParseTargetMember(
 bool ResourceFilterTarget::ParseTarget(const wchar_t* target, bool is_source, const wstring* ini_namespace, CommandListScope* scope)
 {
 	IniParserResult ret;
-	size_t length = wcslen(target);
 	std::wstring temp_target;
 
 	filter = nullptr;
 
 	if (!target)
 		return false;
+
+	size_t length = wcslen(target);
 
 	if (length == 4 && is_source && !_wcsnicmp(target, L"null", 4))
 	{
@@ -7734,12 +7745,13 @@ static CommandListCommand* parse_resource_filter_copy_operation(
 		return nullptr;
 
 	if (!(options & ResourceCopyOptions::REFERENCE) && (options & ResourceCopyOptions::COPY_TYPE_MASK)) {
+		const wchar_t* src_name = src.filter ? src.filter->name.c_str() : L"null";
 		if (options & ResourceCopyOptions::COPY)
-			LogOverlayW(LOG_WARNING, L"WIP: Filter `copy` is not supported (`%ls = copy %ls`)\n - [% ls] @[% ls]\n",
-				src.filter->name.c_str(), dst.filter->name.c_str(), section, ini_namespace->c_str());
+			LogOverlayW(LOG_WARNING, L"WIP: Filter `copy` is not supported (`%ls = copy %ls`)\n - [%ls] @ [%ls]\n",
+				dst.filter->name.c_str(), src_name, section, ini_namespace->c_str());
 		else if (options & ResourceCopyOptions::COPY_DESC)
-			LogOverlayW(LOG_WARNING, L"WIP: Filter `copy_desc` is not supported (`%ls = copy_desc %ls`)\n - [% ls] @[% ls]\n",
-				src.filter->name.c_str(), dst.filter->name.c_str(), section, ini_namespace->c_str());
+			LogOverlayW(LOG_WARNING, L"WIP: Filter `copy_desc` is not supported (`%ls = copy_desc %ls`)\n - [%ls] @ [%ls]\n",
+				dst.filter->name.c_str(), src_name, section, ini_namespace->c_str());
 		return nullptr;
 	}
 	else
@@ -9937,7 +9949,12 @@ IniParserResult ResourceCopyTarget::ParseTargetMember(
 		}} },
 	};
 
-	return SyntaxTarget::ParseTargetMember(members, target, length, temp_target, evaluation_mode, ini_namespace, scope);
+	IniParserResult ret = SyntaxTarget::ParseTargetMember(members, target, length, temp_target, evaluation_mode, ini_namespace, scope);
+
+	if (ret == IniParserResult::TOKEN_FOUND && evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_HAMMING_DISTANCE)
+		G->track_texture_subresources = true;
+
+	return ret;
 }
 
 IniParserResult ResourceCopyTarget::ParseTargetCustomResource(const wchar_t*& target, size_t length, const wstring* ini_namespace, CommandListScope* scope)
@@ -10610,6 +10627,7 @@ void InitialTexturesSnapshot::Clear()
 			// Release the reference acquired by PSGetShaderResources.
 			initial_textures[slot]->Release();
 			initial_textures[slot] = nullptr;
+			dhash_state[slot] = SlotDhash::UNKNOWN;
 
 			// Reset the best accepted Hamming distance for this slot.
 			// 65 indicates that no matching filter has been accepted.
@@ -10629,21 +10647,22 @@ static const ShaderBindings* ResolvePixelShaderBindings(CommandListState* state)
 
 	ID3D11PixelShader* shader = state->mHackerContext->mCurrentPixelShaderHandle;
 
+	// The shaders of a D3D12 or Vulkan game have no D3D11 object. Only a
+	// Vulkan draw says what its shader declares.
 	if (!shader)
-		return nullptr;
+		return state->mHackerContext->Dx12CurrentShaderBindings(L'p');
 
 	// Find the shader's registered hash.
 	auto shader_it = lookup_shader_hash(shader);
 	if (shader_it == G->mShaders.end())
 		return nullptr;
 
-	// Find the resource binding metadata associated with that shader hash.
+	// Shaders created on other threads insert into the cache. Its elements
+	// stay where they are, so the pointer outlives the lock:
+	CriticalSectionGuard(&G->mShaderBindingsLock);
 	auto bindings_it = G->mShaderBindingsCache.find(shader_it->second);
 	if (bindings_it == G->mShaderBindingsCache.end())
-	{
-		assert(false);
 		return nullptr;
-	}
 
 	return &bindings_it->second;
 }
@@ -10672,6 +10691,15 @@ void InitialTexturesSnapshot::SnapshotInitialTextures(CommandListState* state)
 
 	// Resolve the resource slots declared by the currently bound pixel shader.
 	const ShaderBindings* bindings = ResolvePixelShaderBindings(state);
+
+	// A D3D12 draw's declarations are unknown: take every slot that has a view.
+	if (!bindings && state->mHackerContext->IsDx12ShimContext())
+	{
+		first_srv_slot = 0;
+		last_srv_slot = SLOT_COUNT - 1;
+		state->mOrigContext1->PSGetShaderResources(0, SLOT_COUNT, initial_textures.data());
+		return;
+	}
 
 	if (!bindings || !bindings->resource_slots.count)
 		return;
@@ -10805,6 +10833,7 @@ unsigned FindBestMatchingTextureDistance(CommandListState* state, ResourceFilter
 	distances.fill(65);
 
 	InitialTexturesSnapshot& snapshot = state->mHackerContext->GetInitialTexturesSnapshot();
+	using SlotDhash = InitialTexturesSnapshot::SlotDhash;
 
 	unsigned best_distance = 65;
 
@@ -10816,37 +10845,40 @@ unsigned FindBestMatchingTextureDistance(CommandListState* state, ResourceFilter
 		if (!initial_srv)
 			continue;
 
-		// If match_format is provided, skip slot on format mismatch.
-		if (slot_filter->match_format != DXGI_FORMAT_UNKNOWN)
+		if (snapshot.dhash_state[slot] == SlotDhash::UNKNOWN)
 		{
-			// Only compare textures with the same SRV format as the filter.
 			D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 			initial_srv->GetDesc(&srv_desc);
-
-			if (srv_desc.Format != slot_filter->match_format)
-				continue;
+			snapshot.srv_format[slot] = srv_desc.Format;
+			snapshot.dhash_state[slot] = SlotDhash::FORMAT_ONLY;
 		}
 
-		// Retrieve the initial resource so its dHash can be calculated.
-		ID3D11Resource* initial_resource = nullptr;
-		initial_srv->GetResource(&initial_resource);
-
-		if (!initial_resource)
+		// If match_format is provided, only compare textures with the same SRV format as the filter.
+		if (slot_filter->match_format != DXGI_FORMAT_UNKNOWN && snapshot.srv_format[slot] != slot_filter->match_format)
 			continue;
 
-		uint64_t initial_dhash = 0;
+		if (snapshot.dhash_state[slot] == SlotDhash::FORMAT_ONLY)
+		{
+			// Retrieve the initial resource so its dHash can be calculated.
+			ID3D11Resource* initial_resource = nullptr;
+			initial_srv->GetResource(&initial_resource);
 
-		// Calculate the initial texture's dHash and compare it with the filter's precomputed match_dhash.
-		const bool has_dhash = GetDhash(state->mHackerContext, initial_resource, G->dhash_mip_size, G->dhash_allow_rehash, initial_dhash, initial_srv);
+			bool has_dhash = false;
+			if (initial_resource)
+			{
+				has_dhash = GetDhash(state->mHackerContext, initial_resource, G->dhash_mip_size, G->dhash_allow_rehash, snapshot.dhash[slot], initial_srv);
+				initial_resource->Release();
+			}
 
-		initial_resource->Release();
+			snapshot.dhash_state[slot] = has_dhash ? SlotDhash::KNOWN : SlotDhash::NONE;
+		}
 
 		// A failed dHash calculation makes this slot ineligible for matching.
-		if (!has_dhash)
+		if (snapshot.dhash_state[slot] != SlotDhash::KNOWN)
 			continue;
 
 		// Store this filter's distance for the slot.
-		const unsigned distance = HammingDistance(slot_filter->match_dhash, initial_dhash);
+		const unsigned distance = HammingDistance(slot_filter->match_dhash, snapshot.dhash[slot]);
 
 		// Keep track of the smallest valid distance across all eligible slots.
 		distances[slot] = static_cast<uint8_t>(distance);
@@ -11124,6 +11156,8 @@ static CommandListCommand* parse_slot_filter_operation(
 	operation->src = std::move(src);
 	operation->dst = std::move(dst);
 	operation->options = options;
+
+	G->track_texture_subresources = true;
 
 	return operation;
 }
@@ -13151,6 +13185,7 @@ float ResourceCopyTarget::GetResourceHammingDistance(CommandListState* state)
 
 	ID3D11View* view = nullptr;
 	ID3D11Resource* resource = GetResource(state, &view, nullptr, nullptr, nullptr, nullptr);
+	uint64_t resource_dhash = 0;
 
 	if (!resource)
 	{
@@ -13158,10 +13193,7 @@ float ResourceCopyTarget::GetResourceHammingDistance(CommandListState* state)
 		goto cleanup;
 	}
 
-	uint64_t resource_dhash = 0;
-	bool has_resource_dhash = GetDhash(state->mHackerContext, resource, G->dhash_mip_size, G->dhash_allow_rehash, resource_dhash, view);
-
-	if (has_resource_dhash)
+	if (GetDhash(state->mHackerContext, resource, G->dhash_mip_size, G->dhash_allow_rehash, resource_dhash, view))
 	{
 		auto* target_ptr = member_args[0].filter.get();
 
@@ -16114,6 +16146,10 @@ void merge_check_texture_override_batches(CommandList *command_list)
 // they come in too many flavours to vouch for here.
 static bool binds_destination_only(const ResourceCopyOperation *op)
 {
+	// Filter and snapshot operations pick their slots when they run
+	if (!op->IsBatchable())
+		return false;
+
 	if (op->dst.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE || op->dst.slot_expression)
 		return false;
 

@@ -231,6 +231,11 @@ void FrameAnalysisContext::FrameAnalysisLogResourceHashInline(ID3D11Resource *re
 	if (!G->analyse_frame || !frame_analysis_log || !resource)
 		return;
 
+	// GetDhash may dispatch and read back on the GPU, which must not
+	// happen under the locks below
+	uint64_t dhash = 0;
+	bool has_dhash = GetDhash(this, resource, G->dhash_mip_size, G->dhash_allow_rehash, dhash, view);
+
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 	EnterCriticalSectionPretty(&G->mResourcesLock);
 
@@ -260,12 +265,11 @@ void FrameAnalysisContext::FrameAnalysisLogResourceHashInline(ID3D11Resource *re
 				fprintf(frame_analysis_log, "UpdateSubresourceRegion,");
 		}
 
-		uint64_t dhash = 0;
-		if (GetDhash(this, resource, G->dhash_mip_size, G->dhash_allow_rehash, dhash, view))
-			fprintf(frame_analysis_log, " dhash=%016llx", dhash);
-
 	} catch (std::out_of_range) {
 	}
+
+	if (has_dhash)
+		fprintf(frame_analysis_log, " dhash=%016llx", dhash);
 
 	LeaveCriticalSection(&G->mResourcesLock);
 	LeaveCriticalSection(&G->mCriticalSection);

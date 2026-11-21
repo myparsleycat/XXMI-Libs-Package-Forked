@@ -266,6 +266,13 @@ struct InitialTexturesSnapshot
 	// Hamming distance accepted for each slot during this draw.
 	std::array<uint8_t, SLOT_COUNT> hamming_distance{};
 
+	// What the filters of this draw compare, looked up once per slot: the
+	// format first, the dHash only once a filter's format lets it count.
+	enum class SlotDhash : uint8_t { UNKNOWN, FORMAT_ONLY, NONE, KNOWN };
+	std::array<SlotDhash, SLOT_COUNT> dhash_state{};
+	std::array<uint64_t, SLOT_COUNT> dhash{};
+	std::array<DXGI_FORMAT, SLOT_COUNT> srv_format{};
+
 	bool active = false;
 	unsigned call_number = 0;
 

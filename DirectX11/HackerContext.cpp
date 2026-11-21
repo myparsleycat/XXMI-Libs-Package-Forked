@@ -109,16 +109,6 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mCurrentInputLayout = nullptr;
 	mOriginalInputLayout = nullptr;
 	mOverrideInputLayout = nullptr;
-
-	// Initialize DHash only for immediate contexts.
-	// Synchronous GPU readback is not supported on deferred contexts.
-	if (pContext1->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE)
-	{
-		HRESULT hr = mDHasher.Initialize(pDevice1);
-
-		if (FAILED(hr))
-			LogOverlayW(LOG_WARNING, L"Failed to initialize DHash64Gpu: 0x%08X\n", hr);
-	}
 }
 
 HackerContext::~HackerContext()
@@ -965,8 +955,21 @@ void HackerContext::RestoreInputLayout()
 
 HRESULT HackerContext::ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash)
 {
-	if (!mDHasher.IsInitialized())
-		return E_FAIL;
+	if (!mDHasher.IsInitialized()) {
+		// The hash is read back synchronously, which a deferred context
+		// cannot do, and the shim's game textures have no data to sample
+		if (mDHashUnavailable || IsDx12ShimContext() || mOrigContext1->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
+			mDHashUnavailable = true;
+			return E_NOTIMPL;
+		}
+
+		HRESULT hr = mDHasher.Initialize(mOrigDevice1);
+		if (FAILED(hr)) {
+			mDHashUnavailable = true;
+			LogOverlayW(LOG_WARNING, L"Failed to initialize DHash64Gpu: 0x%08X\n", hr);
+			return hr;
+		}
+	}
 
 	return mDHasher.ComputeHash(GetPassThroughOrigContext1(), texture, mipLevel, srvFormat, outHash);
 }
@@ -1499,11 +1502,13 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 	// track_texture_updates != 1, MapTrackRegionHashes() needs
 	// cache_resource_data and MapDenyCPURead() needs a TextureOverride
 	// with deny_cpu_read (merely having TextureOverrides, as every mod
-	// does, is not enough for it to do anything):
+	// does, is not enough for it to do anything), and the mip upload
+	// tracking needs track_texture_subresources:
 	if (G->hunting == HUNTING_MODE_DISABLED
 	 && G->track_texture_updates != 1
 	 && G->cache_resource_data == DataCacheBindFlags::INVALID
-	 && !G->any_deny_cpu_read)
+	 && !G->any_deny_cpu_read
+	 && !G->track_texture_subresources)
 		return;
 
 	D3D11_RESOURCE_DIMENSION dim;
@@ -1562,7 +1567,7 @@ void HackerContext::TrackAndDivertMap(HRESULT map_hr, ID3D11Resource *pResource,
 	}
 
 	// Track Texture2D subresource uploads (mips).
-	if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D && write)
+	if (G->track_texture_subresources && dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D && write)
 	{
 		D3D11_TEXTURE2D_DESC textureDesc = {};
 		((ID3D11Texture2D*)pResource)->GetDesc(&textureDesc);

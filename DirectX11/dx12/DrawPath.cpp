@@ -6275,6 +6275,11 @@ UINT64 HackerContext::Dx12CurrentShader(wchar_t shader_type)
 	return 0;
 }
 
+bool HackerContext::IsDx12ShimContext() const
+{
+	return dx12_shim && dx12_shim->hacker_context == this;
+}
+
 const ShaderBindings* HackerContext::Dx12CurrentShaderBindings(wchar_t shader_type)
 {
 	// Of a D3D12 shader the registers are known, but not what is declared

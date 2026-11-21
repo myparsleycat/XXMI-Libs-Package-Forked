@@ -29,6 +29,8 @@ This searches the eligible `ps-t` slots declared by the currently bound pixel sh
 
 > Filter-based slot matching currently supports pixel-shader resource slots (`ps-t`) only.
 
+> dHashes are computed in Direct3D 11 games only. See [Direct3D 12 and Vulkan](#direct3d-12-and-vulkan).
+
 For the underlying dHash comparison, Hamming-distance calculation, and confidence-to-distance conversion, see [Texture Filtering - Advanced](texture-filtering-advanced.md).
 
 ### Texture Similarity and Confidence
@@ -147,3 +149,9 @@ Some model importers and mod INI templates perform restoration automatically. Ch
 
 - **EFMI** restores the snapshot after calling `[CommandList\EFMIv1\Callback_Component_DrawCustom]` for each instance of an instanced draw.
 - **WWMI Tools**' latest `mod.ini` template restores the snapshot in `[CommandListCleanupSharedResources]`.
+
+## Direct3D 12 and Vulkan
+
+`[Filter]` sections, filter references, `@FilterFoo`, `SnapshotInitialTextures` and `RestoreInitialTextures` work in Direct3D 12 and Vulkan games. The game's textures have no dHash there, so `ps-t[FilterFoo] =` assignments match no slot and `->HammingDistance` returns an unknown result.
+
+In Direct3D 12 games the snapshot covers every `ps-t` slot that holds a view, because the slots declared by the game's pixel shader are not known.

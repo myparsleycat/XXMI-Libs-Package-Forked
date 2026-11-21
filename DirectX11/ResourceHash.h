@@ -421,6 +421,9 @@ struct ResourceHandleInfo
 	uint64_t dhash = 0;
 	uint64_t dhash_generation = 0;
 	uint64_t dhash_mip_level = (uint64_t)-1;
+	// resource_generation at which no dhash could be computed (no fitting mip
+	// or a failed computation), so it is not tried again until new data arrives
+	uint64_t dhash_failed_generation = (uint64_t)-1;
 
 	// Writes of subresource 0 for track_texture_updates, see note_top_update()
 	bool top_updated = false;

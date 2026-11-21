@@ -943,10 +943,21 @@ static ResourceHandleInfo* FindTrackedTexture2DNoLock(ID3D11Resource* resource)
 	return &info;
 }
 
+// Spares buffer updates, constant buffers above all, the lock taken below
+static bool IsTexture2D(ID3D11Resource* resource)
+{
+	D3D11_RESOURCE_DIMENSION dimension;
+	resource->GetType(&dimension);
+	return dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D;
+}
+
 void UpdateTextureSubresourceState(ID3D11Resource* resource, UINT subresource, bool fullSubresource, bool discard)
 {
-    if (!resource)
-        return;
+	if (!G->track_texture_subresources)
+		return;
+
+	if (!resource || !IsTexture2D(resource))
+		return;
 
 	{
 		CriticalSectionGuard(&G->mResourcesLock);
@@ -962,7 +973,10 @@ void UpdateTextureSubresourceState(ID3D11Resource* resource, UINT subresource, b
 
 void UpdateTextureResourceStateFromCopy(ID3D11Resource* dstResource, ID3D11Resource* srcResource)
 {
-	if (!dstResource)
+	if (!G->track_texture_subresources)
+		return;
+
+	if (!dstResource || !IsTexture2D(dstResource))
 		return;
 
 	{
@@ -1041,6 +1055,9 @@ bool GetTexture2DViewRange(const D3D11_SHADER_RESOURCE_VIEW_DESC& desc, Texture2
 
 void UpdateTextureGenerateMipsState(ID3D11ShaderResourceView* pShaderResourceView)
 {
+	if (!G->track_texture_subresources)
+		return;
+
 	if (!pShaderResourceView)
 		return;
 
@@ -1063,10 +1080,8 @@ void UpdateTextureGenerateMipsState(ID3D11ShaderResourceView* pShaderResourceVie
 
 		ResourceHandleInfo* info = FindTrackedTexture2DNoLock(resource);
 
-		if (!info)
-			return;
-		
-		info->ProcessGenerateMips(range.mostDetailedMip, range.mipLevels, range.firstArraySlice, range.arraySize);
+		if (info)
+			info->ProcessGenerateMips(range.mostDetailedMip, range.mipLevels, range.firstArraySlice, range.arraySize);
 	}
 
 	resource->Release();
@@ -1074,7 +1089,10 @@ void UpdateTextureGenerateMipsState(ID3D11ShaderResourceView* pShaderResourceVie
 
 void UpdateTextureSubresourceStateFromResolve(ID3D11Resource* pDstResource, UINT DstSubresource, ID3D11Resource* pSrcResource, UINT SrcSubresource)
 {
-	if (!pDstResource || !pSrcResource)
+	if (!G->track_texture_subresources)
+		return;
+
+	if (!pDstResource || !pSrcResource || !IsTexture2D(pDstResource))
 		return;
 
 	{
@@ -1163,7 +1181,10 @@ void UpdateTextureSubresourceStateFromCopy(
 	const D3D11_BOX* pSrcBox,
 	UINT CopyFlags)
 {
-	if (!pDstResource || !pSrcResource)
+	if (!G->track_texture_subresources)
+		return;
+
+	if (!pDstResource || !pSrcResource || !IsTexture2D(pDstResource))
 		return;
 
 	// Empty source boxes are no-op copies.
@@ -3567,11 +3588,15 @@ uint32_t GetSpatialHash(HackerContext* context, ID3D11Buffer* buffer, UINT offse
 // Selects an appropriate mip level based on the preferred size and available texture data.
 // - When `rehash_updated_mip` is enabled, the hash is recalculated using the latest updated mip.
 // - When `view` is supplied, its format is used for shader resource sampling.
+// Returns false when the texture has no dHash: no uploaded mip, an unsupported
+// layout, a context that cannot read it back, or a failed computation. Once a
+// dHash was computed, a rehash that fails or finds no fitting mip returns true
+// with that earlier dHash.
 bool GetDhash(HackerContext* context, ID3D11Resource* resource, UINT prefer_mip_size, bool rehash_updated_mip, uint64_t& out_hash, ID3D11View* view)
 {
 	out_hash = 0;
 
-	if (!context || !resource)
+	if (!context || !resource || context->IsDx12ShimContext())
 		return false;
 
 	D3D11_RESOURCE_DIMENSION dimension;
@@ -3585,87 +3610,81 @@ bool GetDhash(HackerContext* context, ID3D11Resource* resource, UINT prefer_mip_
 	D3D11_TEXTURE2D_DESC desc{};
 	texture->GetDesc(&desc);
 
-	DXGI_FORMAT format = desc.Format;
+	UINT mip_level = UINT_MAX;
+	uint64_t generation = 0;
+	bool has_cached_dhash = false;
+
+	// The generations are written under mResourcesLock by the upload hooks.
+	{
+		CriticalSectionGuard(&G->mResourcesLock);
+
+		auto it = lookup_resource_handle_info(resource);
+		if (it == G->mResources.end())
+			return false;
+
+		ResourceHandleInfo* info = &it->second;
+		generation = info->resource_generation;
+		has_cached_dhash = info->dhash_generation != 0;
+
+		if (has_cached_dhash)
+		{
+			out_hash = info->dhash;
+
+			// Uploads since the last calculation only count when rehashing is enabled.
+			if (info->dhash_generation == generation || !rehash_updated_mip)
+				return true;
+		}
+
+		if (info->dhash_failed_generation == generation)
+			return has_cached_dhash;
+
+		// A rehash wants the mip written by the latest upload.
+		mip_level = info->FindOptimalMip(desc, prefer_mip_size, has_cached_dhash ? generation : 0);
+		if (mip_level == UINT_MAX) {
+			info->dhash_failed_generation = generation;
+			return has_cached_dhash;
+		}
+	}
 
 	// Prefer the format of the actual SRV (may be required for typeless resources and sRGB views).
-	if (view)
+	// Frame analysis and ->HammingDistance can pass other view types.
+	DXGI_FORMAT format = desc.Format;
+	ID3D11ShaderResourceView* srv = nullptr;
+	if (view && SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&srv))))
 	{
 		D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
-		static_cast<ID3D11ShaderResourceView*>(view)->GetDesc(&srvDesc);
+		srv->GetDesc(&srvDesc);
 		format = srvDesc.Format;
+		srv->Release();
 	}
 
-	UINT mip_level = UINT_MAX;
+	// Compute outside the lock: this dispatches and reads back on the GPU.
+	uint64_t computed = 0;
+	HRESULT hr = context->ComputeDHash(texture, mip_level, format, computed);
 
-	ResourceHandleInfo* handle_info = nullptr;
+	CriticalSectionGuard(&G->mResourcesLock);
 
-	bool has_resource_dhash = false;
+	auto it = lookup_resource_handle_info(resource);
+	if (it == G->mResources.end())
+		return false;
 
-	// Check the cache and select a mip while holding the global lock.
+	ResourceHandleInfo* info = &it->second;
+
+	if (FAILED(hr))
 	{
-		CriticalSectionGuard(&G->mCriticalSection);
-
-		handle_info = GetResourceHandleInfo(resource);
-
-		if (handle_info)
-		{
-			if (handle_info->dhash_generation == handle_info->resource_generation && handle_info->dhash_generation != 0)
-			{
-				// Use cached dhash. Same generation means there were no data uploads to texture resource since last calculation.
-				out_hash = handle_info->dhash;
-				has_resource_dhash = true;
-			}
-			else
-			{
-				// By default, calculate dhash only if it wasn't calculated yet.
-				bool compute_dhash = handle_info->dhash_generation == 0;
-				uint64_t min_mip_generation = 0;
-
-				// If requested, recalculate a cached dHash if new texture data was uploaded to any mip level.
-				if (!compute_dhash)
-				{
-					compute_dhash = rehash_updated_mip;
-					// Request the latest updated mip.
-					if (compute_dhash)
-						min_mip_generation = handle_info->resource_generation;
-				}
-
-				if (!compute_dhash)
-					handle_info->dhash_generation = handle_info->resource_generation;
-				else
-					mip_level = handle_info->FindOptimalMip(desc, prefer_mip_size, min_mip_generation);
-			}
+		// E_NOTIMPL: this context cannot compute dHashes at all, but the
+		// immediate context may still compute this texture's
+		if (hr != E_NOTIMPL) {
+			LogInfo("DHash calculation failed: resource=%p mip=%u format=%u hr=0x%08X\n", resource, mip_level, (UINT)format, (UINT)hr);
+			info->dhash_failed_generation = generation;
 		}
+		return has_cached_dhash;
 	}
 
-	// Compute outside the global critical section.
-	if (!has_resource_dhash && handle_info && mip_level != UINT_MAX)
-	{
-		HRESULT hr = context->ComputeDHash(texture, mip_level, format, out_hash);
-
-		if (FAILED(hr))
-		{
-			LogOverlayW(LOG_WARNING, L"DHash calculation failed. mip=%u, hr=0x%08X\n", mip_level, hr);
-
-			return false;
-		}
-
-		has_resource_dhash = true;
-
-		// Store the computed hash.
-		{
-			CriticalSectionGuard(&G->mCriticalSection);
-
-			handle_info = GetResourceHandleInfo(resource);
-
-			if (handle_info)
-			{
-				handle_info->dhash = out_hash;
-				handle_info->dhash_generation = handle_info->resource_generation;
-				handle_info->dhash_mip_level = mip_level;
-			}
-		}
-	}
+	info->dhash = computed;
+	info->dhash_generation = generation;
+	info->dhash_mip_level = mip_level;
+	out_hash = computed;
 
 	return true;
 }
