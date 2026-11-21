@@ -42,6 +42,8 @@ struct TextureCopy {
 // As much as is copied before waiting for the GPU and writing it out
 const UINT64 BATCH_BYTES = 256ull << 20;
 
+static const unsigned CAPTURE_WAIT_PRESENTS = 5;
+
 static bool active;
 static std::wstring capture_path;
 static FILE *log_file;
@@ -400,34 +402,46 @@ static void write_batch(std::vector<TextureCopy> *batch, const wchar_t *director
 	batch->clear();
 }
 
+static void write_status(const char *text)
+{
+	wchar_t path[MAX_PATH];
+	FILE *status = NULL;
+
+	if (swprintf_s(path, L"%ls\\capture_status.txt", G->ANALYSIS_PATH) >= 0)
+		wfopen_ensuring_access(&status, path, L"w");
+	if (status) {
+		fputs(text, status);
+		fclose(status);
+	}
+}
+
 void Dx12FrameDumpAdvanceCaptureWindow()
 {
 	static std::wstring pending_path;
 	static unsigned idle_presents;
+	char text[128];
 
 	if (G->analyse_frame && !active) {
 		if (pending_path != G->ANALYSIS_PATH) {
 			pending_path = G->ANALYSIS_PATH;
 			idle_presents = 0;
 		}
-		// An input event can arrive after the lists for an intervening
-		// Present were recorded (or on a generated/idle Present). Do not
-		// disarm before the recorder has had a bounded chance to see a draw.
-		if (++idle_presents <= 4)
+		if (++idle_presents < CAPTURE_WAIT_PRESENTS)
 			return;
 
-		wchar_t path[MAX_PATH];
-		FILE *status = NULL;
-		if (swprintf_s(path, L"%ls\\capture_status.txt", G->ANALYSIS_PATH) >= 0)
-			wfopen_ensuring_access(&status, path, L"w");
-		if (status) {
-			fputs("No DX12 draw reached the recorder in five Presents. No DDS captured.\n", status);
-			fclose(status);
-		}
-		LogOverlay(LOG_NOTICE, "Frame analysis: no DX12 draw reached the recorder in five Presents\n");
+		sprintf_s(text, "No draw was recorded within %u presents after the analyse_frame key. Nothing was captured.\n",
+			CAPTURE_WAIT_PRESENTS);
+		write_status(text);
+		LogOverlay(LOG_NOTICE, "Frame analysis: no draw was recorded within %u presents\n", CAPTURE_WAIT_PRESENTS);
 	}
 	pending_path.clear();
 	idle_presents = 0;
+	G->analyse_frame = false;
+}
+
+void Dx12FrameDumpCancelPending()
+{
+	write_status("Frame analysis was aborted before a draw was recorded.\n");
 	G->analyse_frame = false;
 }
 
