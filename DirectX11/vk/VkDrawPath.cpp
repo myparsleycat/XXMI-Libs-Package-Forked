@@ -6467,14 +6467,35 @@ static void mod_draw_failed(const char *why)
 			"the game then, and the game's is.\n", why);
 }
 
-static void bind_vb(UINT slot, VkBuffer buffer, VkDeviceSize offset)
+static void bind_vbs(const ModDraw *draw)
 {
-	if (scope->vbs[slot] == buffer && scope->vb_offsets[slot] == offset)
-		return;
-	api.CmdBindVertexBuffers(scope->cmd, slot, 1, &buffer, &offset);
-	scope->vbs[slot] = buffer;
-	scope->vb_offsets[slot] = offset;
-	scope->vbs_changed |= 1u << slot;
+	const CmdState &game = scope->state;
+	UINT changed = 0;
+	UINT slots = draw ? (1u << MAX_VBS) - 1 : scope->vbs_changed;
+	unsigned long slot;
+
+	while (_BitScanForward(&slot, slots)) {
+		const UINT bit = 1u << slot;
+		const bool replaced = draw && (draw->vbs_set & bit);
+		const VkBuffer buffer = replaced ? draw->vbs[slot] : game.vbs[slot];
+		const VkDeviceSize offset = replaced ? draw->vb_offsets[slot] : game.vb_offsets[slot];
+
+		slots &= slots - 1;
+		if (!buffer || (scope->vbs[slot] == buffer && scope->vb_offsets[slot] == offset))
+			continue;
+		scope->vbs[slot] = buffer;
+		scope->vb_offsets[slot] = offset;
+		changed |= bit;
+	}
+	scope->vbs_changed |= changed;
+
+	while (_BitScanForward(&slot, changed)) {
+		UINT end = slot + 1;
+		while (end < MAX_VBS && (changed & (1u << end)))
+			end++;
+		api.CmdBindVertexBuffers(scope->cmd, slot, end - slot, scope->vbs + slot, scope->vb_offsets + slot);
+		changed &= ~(((1u << (end - slot)) - 1u) << slot);
+	}
 }
 
 static void bind_ib(VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
@@ -6515,12 +6536,9 @@ static void restore_bindings()
 {
 	const CmdState *game = &scope->state;
 	unsigned long slot;
-	UINT vbs, sets;
+	UINT sets;
 
-	for (vbs = scope->vbs_changed; _BitScanForward(&slot, vbs); vbs &= vbs - 1) {
-		if (game->vbs[slot])
-			bind_vb(slot, game->vbs[slot], game->vb_offsets[slot]);
-	}
+	bind_vbs(NULL);
 	if (scope->ib_changed && game->ib)
 		bind_ib(game->ib, game->ib_offset, game->index_type);
 	for (sets = scope->sets_changed; _BitScanForward(&slot, sets); sets &= sets - 1)
@@ -6713,12 +6731,7 @@ static void record_mod_draws()
 
 	for (const ModDraw &draw : mod_draws) {
 		bind_pipeline(draw.pipeline ? draw.pipeline : game->pipeline->handle);
-		for (slot = 0; slot < MAX_VBS; slot++) {
-			if (draw.vbs_set & 1u << slot)
-				bind_vb(slot, draw.vbs[slot], draw.vb_offsets[slot]);
-			else if (game->vbs[slot])
-				bind_vb(slot, game->vbs[slot], game->vb_offsets[slot]);
-		}
+		bind_vbs(&draw);
 		if (draw.ib_set)
 			bind_ib(draw.ib, draw.ib_offset, draw.index_type);
 		else if (draw.indexed)
