@@ -6471,7 +6471,7 @@ static void bind_vbs(const ModDraw *draw)
 {
 	const CmdState &game = scope->state;
 	UINT changed = 0;
-	UINT slots = draw ? (1u << MAX_VBS) - 1 : scope->vbs_changed;
+	UINT slots = scope->vbs_changed | (draw ? draw->vbs_set : 0);
 	unsigned long slot;
 
 	while (_BitScanForward(&slot, slots)) {

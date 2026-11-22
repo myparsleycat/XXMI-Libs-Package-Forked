@@ -2313,7 +2313,7 @@ static void restore_overrides()
 	const Dx12CmdState *game = &scope->list->mState;
 	const Dx12RootArguments *arguments = scope->compute ? &game->compute : &game->graphics;
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
-	UINT slot;
+	unsigned long first;
 
 	for (const ChangedParameter &changed : scope->parameters) {
 		if (changed.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && scope->heaps_changed)
@@ -2323,10 +2323,16 @@ static void restore_overrides()
 	}
 	scope->parameters.clear();
 
-	for (slot = 0; scope->vbs_changed; slot++, scope->vbs_changed >>= 1) {
-		if (scope->vbs_changed & 1)
-			list->IASetVertexBuffers(slot, 1, &game->vertex_buffers[slot]);
+	UINT slots = scope->vbs_changed;
+	while (_BitScanForward(&first, slots)) {
+		UINT end = first;
+		do {
+			slots &= slots - 1;
+			end++;
+		} while (end < ARRAYSIZE(game->vertex_buffers) && (slots & (1u << end)));
+		list->IASetVertexBuffers(first, end - first, &game->vertex_buffers[first]);
 	}
+	scope->vbs_changed = 0;
 	if (scope->ib_changed)
 		list->IASetIndexBuffer(game->index_buffer.BufferLocation ? &game->index_buffer : NULL);
 	scope->ib_changed = false;
