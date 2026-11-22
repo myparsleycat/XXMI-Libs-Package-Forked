@@ -6727,7 +6727,7 @@ static void record_mod_draws()
 	Profiling::Spike::Scope spike(Profiling::Spike::VK_RECORD_DRAWS);
 	const CmdState *game = &scope->state;
 	Timed timed(TIMED_RECORDING);
-	UINT slot;
+	unsigned long slot;
 
 	for (const ModDraw &draw : mod_draws) {
 		bind_pipeline(draw.pipeline ? draw.pipeline : game->pipeline->handle);
@@ -6736,10 +6736,10 @@ static void record_mod_draws()
 			bind_ib(draw.ib, draw.ib_offset, draw.index_type);
 		else if (draw.indexed)
 			bind_ib(game->ib, game->ib_offset, game->index_type);
-		for (slot = 0; slot < MAX_SETS; slot++) {
+		for (UINT sets = draw.sets_set | scope->sets_changed; _BitScanForward(&slot, sets); sets &= sets - 1) {
 			if (draw.sets_set & 1u << slot)
 				bind_set(slot, draw.sets[slot], draw.dynamic[slot]);
-			else if (scope->sets_changed & 1u << slot)
+			else
 				bind_set(slot, game->sets[slot], game->dynamic[slot]);
 		}
 		// After those: binding one of the game's with the game's layout

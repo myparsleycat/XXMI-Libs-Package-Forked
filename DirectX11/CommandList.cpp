@@ -15939,22 +15939,10 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		COMMAND_LIST_LOG(state, "%S\n", command->ini_line.c_str());
 
 		if (!(fetched & (1u << checks[i].fetch))) {
-			unsigned first = fetch.first_binding, last = fetch.first_binding + fetch.count - 1;
-
-			// Reading the slots again after a match, the lines that
-			// have had their turn no longer need theirs:
-			if (matched) {
-				first = last = b;
-				for (size_t j = i + 1; j < checks.size(); j++) {
-					if (checks[j].fetch != checks[i].fetch)
-						continue;
-					first = min(first, checks[j].binding);
-					last = max(last, checks[j].binding);
-				}
-			}
-
+			const auto &check = checks[i];
+			unsigned first = matched ? check.refetch_first : fetch.first_binding;
+			UINT count = matched ? check.refetch_count : fetch.count;
 			UINT slot = fetch.first_slot + (first - fetch.first_binding);
-			UINT count = last - first + 1;
 
 			switch (fetch.type) {
 				case ResourceCopyTargetType::SHADER_RESOURCE:
@@ -16071,7 +16059,7 @@ static void emit_check_texture_override_batch(const std::vector<std::shared_ptr<
 			saves_calls = true;
 
 		// Binding indices are filled in below, once the ranges are known:
-		batch->checks.push_back({command, (unsigned)f, slot});
+		batch->checks.push_back({command, slot, static_cast<uint8_t>(f), 0, 0});
 	}
 
 	for (size_t f = 0; f < batch->fetches.size(); f++) {
@@ -16085,9 +16073,23 @@ static void emit_check_texture_override_batch(const std::vector<std::shared_ptr<
 		return;
 	}
 
-	for (auto &check : batch->checks) {
-		const CheckTextureOverrideBatch::Fetch &fetch = batch->fetches[check.fetch];
-		check.binding = fetch.first_binding + (check.binding - fetch.first_slot);
+	unsigned first_remaining[CheckTextureOverrideBatch::MAX_BINDINGS];
+	unsigned last_remaining[CheckTextureOverrideBatch::MAX_BINDINGS];
+	for (size_t f = 0; f < batch->fetches.size(); f++) {
+		const auto &fetch = batch->fetches[f];
+		first_remaining[f] = fetch.first_binding + fetch.count - 1;
+		last_remaining[f] = fetch.first_binding;
+	}
+
+	// After a match the next fetch only needs slots from that check onward.
+	for (auto check = batch->checks.rbegin(); check != batch->checks.rend(); ++check) {
+		unsigned f = check->fetch;
+		const auto &fetch = batch->fetches[f];
+		check->binding = fetch.first_binding + (check->binding - fetch.first_slot);
+		first_remaining[f] = min(first_remaining[f], check->binding);
+		last_remaining[f] = max(last_remaining[f], check->binding);
+		check->refetch_first = static_cast<uint8_t>(first_remaining[f]);
+		check->refetch_count = static_cast<uint8_t>(last_remaining[f] - first_remaining[f] + 1);
 	}
 
 	// Shown by the command profiler in place of the individual lines:

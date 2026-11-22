@@ -2210,8 +2210,10 @@ public:
 	// One of the merged lines, and where its slot ends up:
 	struct Check {
 		std::shared_ptr<CheckTextureOverrideCommand> command;
-		unsigned fetch;
 		unsigned binding;
+		uint8_t fetch;
+		uint8_t refetch_first;
+		uint8_t refetch_count;
 	};
 	// Slots read by all fetches of a batch together. Also bounds the number
 	// of fetches, which run() relies on to track them in a bitmask:
