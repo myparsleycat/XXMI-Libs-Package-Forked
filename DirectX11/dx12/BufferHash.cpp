@@ -853,8 +853,9 @@ void Dx12DescribeBufferRange(ID3D12Resource *resource, UINT64 offset, char *text
 void Dx12ForgetBufferHashes(ID3D12Resource *resource)
 {
 	AcquireSRWLockExclusive(&lock);
-	if (ranges.erase(resource))
+	if (ranges.erase(resource)) {
 		InterlockedDecrement(with_ranges(resource));
-	InterlockedIncrement64(resource_stamp(resource));
+		InterlockedIncrement64(resource_stamp(resource));
+	}
 	ReleaseSRWLockExclusive(&lock);
 }
