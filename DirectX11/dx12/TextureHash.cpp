@@ -108,10 +108,12 @@ static bool is_mappable(ID3D12Resource *resource, UINT64 *size)
 
 // dx12_defer_upload_hash still hashes uploads when the copy is recorded until
 // that took this long in the frame, so that where upload memory reads fast a
-// texture or buffer matches from its first draw. The time is measured every
-// AT_ONCE_STEP_BYTES rather than estimated from earlier uploads.
+// texture or buffer matches from its first draw. Time is measured at each
+// chunk boundary rather than estimated from earlier uploads.
 static const double AT_ONCE_BUDGET_MS = 0.5;
 static const size_t AT_ONCE_STEP_BYTES = 4 << 10;
+static const size_t AT_ONCE_TEXTURE_STEP_BYTES = 16 << 10;
+static const UINT AT_ONCE_TEXTURE_STEP_ROWS = 64;
 
 // The frame in the upper half and the ticks hashing at record time took in it
 // in the lower, so that a new frame starts from 0 without losing what another
@@ -217,29 +219,45 @@ UINT64 Dx12TextureUploadSpan(const Dx12TextureUpload *upload)
 
 bool Dx12HashTextureRows(const BYTE *data, Dx12TextureUpload *upload, bool write_combined, bool budgeted)
 {
-	size_t total = hash_bytes(upload), column = upload->hashed % upload->row_bytes, count, done = 0;
+	const size_t total = hash_bytes(upload), padding = upload->row_pitch - upload->row_bytes;
+	const size_t start = upload->hashed;
+	size_t column = start % upload->row_bytes, step = 0;
+	UINT rows = 0;
 	AtOnceTimer timer(budgeted);
-	bool complete = true;
 
+	data += column;
 	while (upload->hashed < total) {
-		count = min(upload->row_bytes - column, total - upload->hashed);
-		if (budgeted && count > AT_ONCE_STEP_BYTES)
-			count = AT_ONCE_STEP_BYTES;
-		upload->crc = crc_step(upload->crc, data + column, count, write_combined);
+		size_t count = total - upload->hashed;
+
+		if (padding)
+			count = min(count, upload->row_bytes - column);
+		if (budgeted)
+			count = min(count, AT_ONCE_TEXTURE_STEP_BYTES - step);
+		upload->crc = crc_step(upload->crc, data, count, write_combined);
 		upload->hashed += count;
-		done += count;
-		column += count;
-		if (column == upload->row_bytes) {
-			data += upload->row_pitch;
-			column = 0;
+		data += count;
+		if (padding) {
+			column += count;
+			if (column == upload->row_bytes) {
+				if (upload->hashed < total)
+					data += padding;
+				column = 0;
+				rows++;
+			}
 		}
 
-		if (timer.spent() && upload->hashed < total) {
-			complete = false;
-			break;
+		if (budgeted) {
+			step += count;
+			if (step == AT_ONCE_TEXTURE_STEP_BYTES || rows == AT_ONCE_TEXTURE_STEP_ROWS || upload->hashed == total) {
+				if (timer.spent())
+					break;
+				step = 0;
+				rows = 0;
+			}
 		}
 	}
-	InterlockedAdd64(&dx12_texture_stats.hashed_bytes, done);
+	InterlockedAdd64(&dx12_texture_stats.hashed_bytes, upload->hashed - start);
+	bool complete = upload->hashed >= total;
 	if (complete)
 		InterlockedIncrement64(&dx12_texture_stats.hashed);
 

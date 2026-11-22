@@ -3789,6 +3789,8 @@ static void rebuild_skin_filter()
 
 static void forget_unused_skin_outputs()
 {
+	bool removed = false;
+
 	for (auto j = skin_outputs.begin(); j != skin_outputs.end();) {
 		if (dx12_frame - j->second.frame > 600) {
 			if (j->second.buffer)
@@ -3796,11 +3798,13 @@ static void forget_unused_skin_outputs()
 			if (j->second.spare)
 				j->second.spare->Release();
 			j = skin_outputs.erase(j);
+			removed = true;
 		} else {
 			++j;
 		}
 	}
-	rebuild_skin_filter();
+	if (removed)
+		rebuild_skin_filter();
 }
 
 // A constant buffer holding nothing but a number of vertices. There are as
@@ -5751,8 +5755,8 @@ static bool ini_params_reach_shaders(const Dx12RootSignatureInfo *signature)
 // times it was in them, and the sum of those stamps. While the counters come
 // to that sum the entries would say the same of the same buffers, see
 // DrawMemo.
-const UINT DRAW_MEMO_COUNTERS = 14;
 const UINT DRAW_MEMO_BUFFERS = 4;
+const UINT DRAW_MEMO_COUNTERS = 14 + DRAW_MEMO_BUFFERS + 1;
 
 struct DrawBufferRange {
 	ID3D12Resource *resource;
@@ -5820,26 +5824,29 @@ static void add_draw_stamp_counters(DrawStamps *stamps, const volatile LONG64 *c
 // when the entry was found to go by them
 static void add_draw_stamps(DrawStamps *stamps, const BufferCacheEntry *cached, UINT64 stamp)
 {
-	const volatile LONG64 *counters[2 + 17];
+	const UINT hash_counters = 17;
+	const volatile LONG64 *counters[DX12_VA_STAMP_COUNTERS + hash_counters];
 	UINT count;
 
 	if (!stamps->whole)
 		return;
 
 	Dx12FindBufferStampCounters(cached->va, counters);
-	count = Dx12BufferHashStampCounters(cached->resource, cached->offset, cached->span, counters + 2, 17);
+	count = Dx12BufferHashStampCounters(cached->resource, cached->offset, cached->span,
+		counters + DX12_VA_STAMP_COUNTERS, hash_counters);
 	if (!count) {
 		stamps->whole = false;
 		return;
 	}
-	add_draw_stamp_counters(stamps, counters, 2 + count);
+	add_draw_stamp_counters(stamps, counters, DX12_VA_STAMP_COUNTERS + count);
 	add_draw_buffer_range(&stamps->buffers, cached->resource, cached->offset, cached->span);
 
 	if (cached->ib_asked) {
 		Dx12FindBufferStampCounters(cached->ib_va, counters);
 		count = 0;
 		if (cached->ib_found) {
-			count = Dx12BufferHashStampCounters(cached->ib, cached->ib_offset, cached->ib_span, counters + 2, 17);
+			count = Dx12BufferHashStampCounters(cached->ib, cached->ib_offset, cached->ib_span,
+				counters + DX12_VA_STAMP_COUNTERS, hash_counters);
 			if (!count) {
 				stamps->whole = false;
 				return;
@@ -5848,7 +5855,7 @@ static void add_draw_stamps(DrawStamps *stamps, const BufferCacheEntry *cached, 
 		} else {
 			stamps->buffers.complete = false;
 		}
-		add_draw_stamp_counters(stamps, counters, 2 + count);
+		add_draw_stamp_counters(stamps, counters, DX12_VA_STAMP_COUNTERS + count);
 	}
 	stamps->total += stamp;
 }

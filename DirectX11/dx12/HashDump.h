@@ -1,18 +1,20 @@
 #pragma once
 
+#include <atomic>
+
 #include "BufferHash.h"
 #include "PipelineRegistry.h"
 
 class Dx12GraphicsCommandList;
 
 // Tells how well the identification layer does against the mods that are
-// installed: every hash it comes up with is checked against the
-// [TextureOverride] and [ShaderOverride] sections of the loaded configuration
-// and the totals go to the log with the frame statistics.
+// installed: hashes collected during startup or diagnostics are checked
+// against the loaded [TextureOverride] and [ShaderOverride] sections.
+// The totals go to the log with the frame statistics.
 //
-// With dx12_dump_hashes in [Hunting], everything identified is also written
-// to CSV files next to the log, for comparing against a D3D11 session of the
-// same scene:
+// With dx12_dump_hashes in [Hunting], hashes identified while enabled are
+// also written to CSV files next to the log for comparing against a D3D11
+// session of the same scene:
 //
 //   dx12_shaders.csv   every distinct shader a pipeline was created with
 //   dx12_textures.csv  every texture as it gets a hash
@@ -21,7 +23,9 @@ class Dx12GraphicsCommandList;
 //                      seconds as resolving that is far from free
 
 // True while the draws being recorded go to dx12_draws.csv
-extern volatile bool dx12_dump_draws;
+extern std::atomic<bool> dx12_dump_draws;
+
+void Dx12ConfigureHashCollection(bool dump, bool debug_log);
 
 void Dx12DumpShader(Dx12ShaderStage stage, const Dx12ShaderInfo *info);
 void Dx12DumpTexture(ID3D12Resource *texture, const char *source);
@@ -39,4 +43,4 @@ void Dx12ReportNote(const char *format, ...);
 void Dx12DumpReportLineIfFree(const char *line);
 
 void Dx12DumpFramePresented();
-void Dx12HashReport(bool info);
+void Dx12HashReport(bool info, bool last_startup_report);

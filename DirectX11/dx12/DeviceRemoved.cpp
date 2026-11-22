@@ -77,12 +77,15 @@ static void note_game_buffer(UINT64 va, void (*note)(const char *format, ...))
 	Dx12ResourceInfo info;
 	UINT64 offset;
 
-	if (!Dx12FindBuffer(va, &resource, &offset)) {
+	if (Dx12FindBuffer(va, &resource, &offset)) {
+		if (!Dx12GetResourceInfo(resource, &info)) {
+			note("    at the address: %p, a buffer of the game, at 0x%llx in it\n", resource, offset);
+			return;
+		}
+	} else if (Dx12FindReadbackBuffer(va, &resource, &info)) {
+		offset = va - info.va;
+	} else {
 		note("    no buffer of the game there\n");
-		return;
-	}
-	if (!Dx12GetResourceInfo(resource, &info)) {
-		note("    at the address: %p, a buffer of the game, at 0x%llx in it\n", resource, offset);
 		return;
 	}
 	note("    at the address: %p, a buffer of the game, %llu bytes, heap type %d, at 0x%llx in it%s (%u of its Evict calls held back)\n",

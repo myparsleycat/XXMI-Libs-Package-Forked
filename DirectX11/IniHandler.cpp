@@ -18,6 +18,7 @@
 #include "ShaderRegex.h"
 #include "cursor.h"
 #include "dx12/Bridge.h"
+#include "dx12/HashDump.h"
 #include "dx12/PipelineRegistry.h"
 #include "desktop/Channel.h"
 #include <chrono>
@@ -5176,6 +5177,7 @@ void LoadConfigFile()
 	G->texture_hash_version = GetIniInt(L"Rendering", L"texture_hash", 0, NULL);
 	G->extended_rendering = GetIniBool(L"Rendering", L"extended_rendering", true, NULL);
 	G->dx12_dump_hashes = GetIniBool(L"Hunting", L"dx12_dump_hashes", false, NULL);
+	Dx12ConfigureHashCollection(G->dx12_dump_hashes, gLogDebug);
 	G->vk_dump_hashes = GetIniBool(L"Hunting", L"vk_dump_hashes", false, NULL);
 	G->vk_buffers_first = GetIniBool(L"Rendering", L"vk_buffers_first", false, NULL);
 	G->vk_cache_patched_shaders = GetIniBool(L"Rendering", L"vk_cache_patched_shaders", true, NULL);

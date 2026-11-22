@@ -148,10 +148,14 @@ bool Dx12NoteTopMipUpload(ID3D12Resource *resource);
 UINT64 Dx12TextureStamp(ID3D12Resource *resource);
 
 bool Dx12FindBuffer(UINT64 va, ID3D12Resource **resource, UINT64 *offset);
+// DRED fallback for buffers excluded from the binding VA index. Prefers the
+// highest matching start VA, then the highest serial at that address.
+bool Dx12FindReadbackBuffer(UINT64 va, ID3D12Resource **resource, Dx12ResourceInfo *info);
 // For remembering what Dx12FindBuffer said about an address: a number that
 // has changed if a buffer was created or destroyed there since, and may have
 // changed without that. Taken before asking.
 UINT64 Dx12FindBufferStamp(UINT64 va);
 // The counters that stamp is the sum of, for keeping the stamps of several
 // addresses as one: they only go up
-void Dx12FindBufferStampCounters(UINT64 va, const volatile LONG64 *counters[2]);
+const UINT DX12_VA_STAMP_COUNTERS = 3;
+void Dx12FindBufferStampCounters(UINT64 va, const volatile LONG64 *counters[DX12_VA_STAMP_COUNTERS]);

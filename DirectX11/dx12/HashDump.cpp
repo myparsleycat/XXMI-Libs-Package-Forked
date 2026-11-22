@@ -13,7 +13,15 @@
 #include "Dx12CommandList.h"
 #include "TextureHash.h"
 
-volatile bool dx12_dump_draws;
+std::atomic<bool> dx12_dump_draws{ false };
+
+enum {
+	COLLECT_STARTUP = 1,
+	COLLECT_DEBUG_LOG = 2,
+	COLLECT_DUMP = 4,
+};
+static std::atomic<unsigned> hash_collection{ COLLECT_STARTUP };
+static std::atomic<bool> sample_requested{ false };
 
 // The format a texture hash is reported with where only one fits
 const Dx12FormatRule DEFAULT_FORMAT_RULE = DX12_FORMAT_BC_TYPELESS;
@@ -50,10 +58,11 @@ static const char *const csv_headers[CSV_COUNT] = {
 	"",
 };
 
-// Guards everything below
+// Guards file and sample data and serializes changes to the atomic flags.
 static SRWLOCK lock = SRWLOCK_INIT;
 static FILE *csv_files[CSV_COUNT];
 static bool csv_failed[CSV_COUNT];
+static bool collection_paused;
 
 // What was seen is only compared with the configuration when reporting, on
 // the thread that presents: that one loads the configuration, and the mods may
@@ -80,14 +89,64 @@ struct DrawSample {
 	unsigned textures_unresolved;
 };
 static DrawSample sample;
-static bool sample_requested, sample_finished;
+static bool sample_finished;
+
+static bool dumping_hashes()
+{
+	return (hash_collection.load(std::memory_order_relaxed) & COLLECT_DUMP) != 0;
+}
+
+static void set_hash_collection(unsigned collection)
+{
+	if (!collection && hash_collection.load(std::memory_order_relaxed))
+		collection_paused = true;
+	hash_collection.store(collection, std::memory_order_relaxed);
+}
+
+static void flush_csv()
+{
+	for (FILE *file : csv_files) {
+		if (file)
+			fflush(file);
+	}
+}
+
+void Dx12ConfigureHashCollection(bool dump, bool debug_log)
+{
+	AcquireSRWLockExclusive(&lock);
+	unsigned previous = hash_collection.load(std::memory_order_relaxed);
+	if ((previous & COLLECT_DUMP) && !dump) {
+		flush_csv();
+		dx12_dump_draws.store(false, std::memory_order_relaxed);
+		sample_requested.store(false, std::memory_order_relaxed);
+		sample_finished = false;
+	}
+	unsigned collection = previous & COLLECT_STARTUP;
+	if (dump)
+		collection |= COLLECT_DUMP;
+	if (debug_log)
+		collection |= COLLECT_DEBUG_LOG;
+	set_hash_collection(collection);
+	ReleaseSRWLockExclusive(&lock);
+}
+
+static bool lock_hash_collection()
+{
+	if (!hash_collection.load(std::memory_order_relaxed))
+		return false;
+	AcquireSRWLockExclusive(&lock);
+	if (hash_collection.load(std::memory_order_relaxed))
+		return true;
+	ReleaseSRWLockExclusive(&lock);
+	return false;
+}
 
 // With the lock held
 static FILE* csv(int which, bool always = false)
 {
 	wchar_t path[MAX_PATH];
 
-	if (!(G->dx12_dump_hashes || always) || csv_failed[which])
+	if (!(dumping_hashes() || always) || csv_failed[which])
 		return NULL;
 	if (csv_files[which])
 		return csv_files[which];
@@ -165,7 +224,8 @@ void Dx12DumpShader(Dx12ShaderStage stage, const Dx12ShaderInfo *info)
 	FILE *file;
 	UINT reg;
 
-	AcquireSRWLockExclusive(&lock);
+	if (!lock_hash_collection())
+		return;
 
 	if (info->dxil)
 		dxil_shaders++;
@@ -198,13 +258,14 @@ void Dx12DumpTexture(ID3D12Resource *texture, const char *source)
 	FILE *file;
 	int rule;
 
-	if (!Dx12GetResourceInfo(texture, &info))
+	if (!hash_collection.load(std::memory_order_relaxed) || !Dx12GetResourceInfo(texture, &info))
 		return;
 
 	for (rule = 0; rule < DX12_FORMAT_RULE_COUNT; rule++)
 		hashes[rule] = Dx12TextureHash(&info, (Dx12FormatRule)rule);
 
-	AcquireSRWLockExclusive(&lock);
+	if (!lock_hash_collection())
+		return;
 
 	for (rule = 0; rule < DX12_FORMAT_RULE_COUNT; rule++)
 		texture_hashes[rule].insert(hashes[rule]);
@@ -227,10 +288,14 @@ void Dx12DumpBuffer(ID3D12Resource *buffer, UINT64 offset, const Dx12BufferHash 
 	FILE *file;
 	int i;
 
+	if (!hash_collection.load(std::memory_order_relaxed))
+		return;
+
 	for (i = 0; i < ARRAYSIZE(buffer_bind_flags); i++)
 		hashes[i] = Dx12BufferDescHash(hash, buffer_bind_flags[i]);
 
-	AcquireSRWLockExclusive(&lock);
+	if (!lock_hash_collection())
+		return;
 
 	for (i = 0; i < ARRAYSIZE(buffer_bind_flags); i++)
 		buffer_hashes[i].insert(hashes[i]);
@@ -345,6 +410,10 @@ void Dx12DumpDraw(Dx12GraphicsCommandList *list, const char *type, UINT count, U
 	}
 
 	AcquireSRWLockExclusive(&lock);
+	if (!dx12_dump_draws.load(std::memory_order_relaxed)) {
+		ReleaseSRWLockExclusive(&lock);
+		return;
+	}
 
 	sample.draws++;
 	sample.unknown_pipeline += !pipeline;
@@ -374,18 +443,18 @@ void Dx12DumpDraw(Dx12GraphicsCommandList *list, const char *type, UINT count, U
 
 void Dx12DumpFramePresented()
 {
-	if (!dx12_dump_draws && !sample_requested)
+	if (!dx12_dump_draws.load(std::memory_order_relaxed) && !sample_requested.load(std::memory_order_relaxed))
 		return;
 
 	AcquireSRWLockExclusive(&lock);
-	if (dx12_dump_draws) {
-		dx12_dump_draws = false;
+	if (dx12_dump_draws.load(std::memory_order_relaxed)) {
+		dx12_dump_draws.store(false, std::memory_order_relaxed);
 		sample_finished = true;
-	} else {
-		sample_requested = false;
+	} else if (sample_requested.load(std::memory_order_relaxed)) {
+		sample_requested.store(false, std::memory_order_relaxed);
 		sample = {};
 		sample.frame = dx12_frame;
-		dx12_dump_draws = true;
+		dx12_dump_draws.store(true, std::memory_order_relaxed);
 	}
 	ReleaseSRWLockExclusive(&lock);
 }
@@ -412,21 +481,19 @@ static size_t count_in_ini(const Seen &seen, const Map &map)
 	return count;
 }
 
-void Dx12HashReport(bool info)
+static void report_hashes(bool info, size_t pipeline_count, size_t signature_count, size_t shader_count)
 {
-	size_t pipeline_count, signature_count, shader_count;
 	const Dx12TextureStats *t = &dx12_texture_stats;
 	const Dx12BufferStats *b = &dx12_buffer_stats;
 	FILE *report;
 	int i;
 
-	Dx12GetPipelineCounts(&pipeline_count, &signature_count, &shader_count);
-
-	AcquireSRWLockExclusive(&lock);
-
 	report = csv(CSV_REPORT);
 	if (report)
 		fprintf(report, "Frame %u\n", dx12_frame);
+
+	if (collection_paused)
+		REPORT("%s", "  Hash coverage: hashes seen and shader-kind counts cover only periods when collection was enabled.\n");
 
 	REPORT("  %Iu pipelines, %Iu root signatures, %Iu shaders (%u DXBC, %u DXIL, %u without register information), ShaderOverride hashes seen: %Iu of %Iu\n",
 		pipeline_count, signature_count, shader_count, dxbc_shaders, dxil_shaders, unreflected_shaders,
@@ -464,13 +531,27 @@ void Dx12HashReport(bool info)
 			sample.textures_untracked, sample.textures_unresolved);
 	}
 
-	for (i = 0; i < CSV_COUNT; i++) {
-		if (csv_files[i])
-			fflush(csv_files[i]);
+	if (dumping_hashes()) {
+		flush_csv();
+		sample_requested.store(true, std::memory_order_relaxed);
 	}
+}
 
-	if (G->dx12_dump_hashes)
-		sample_requested = true;
+void Dx12HashReport(bool info, bool last_startup_report)
+{
+	const bool log = gLogVerbosity >= (info ? LogVerbosity::INFO : LogVerbosity::DEBUG);
+	const bool output = log || dumping_hashes();
+	size_t pipeline_count, signature_count, shader_count;
 
+	if (!output && !last_startup_report)
+		return;
+	if (output)
+		Dx12GetPipelineCounts(&pipeline_count, &signature_count, &shader_count);
+
+	AcquireSRWLockExclusive(&lock);
+	if (output)
+		report_hashes(info, pipeline_count, signature_count, shader_count);
+	if (last_startup_report)
+		set_hash_collection(hash_collection.load(std::memory_order_relaxed) & ~COLLECT_STARTUP);
 	ReleaseSRWLockExclusive(&lock);
 }

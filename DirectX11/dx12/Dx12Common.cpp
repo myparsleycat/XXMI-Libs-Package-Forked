@@ -139,7 +139,9 @@ void Dx12FramePresented()
 	per_frame = 1.0 / frames;
 
 	// Keeps a long session from filling the log at the default log level
-	if (reports++ < 12) {
+	const unsigned startup_reports = 12;
+	const bool info = ++reports <= startup_reports;
+	if (info) {
 		Dx12LogInfo("%u frames in %.1fs (%.1f fps), per frame: %.0f draws, %.0f dispatches, %.1f command lists closed, %.1f executed in %.1f calls\n",
 			frames, seconds, frames / seconds, draws * per_frame, dispatches * per_frame,
 			closed * per_frame, executed * per_frame, calls * per_frame);
@@ -152,7 +154,7 @@ void Dx12FramePresented()
 		Dx12LogInfo("Ray tracing: %.1f acceleration structure builds and %.1f DispatchRays per frame\n",
 			blas * per_frame, rays * per_frame);
 	}
-	Dx12HashReport(reports <= 12);
+	Dx12HashReport(info, reports == startup_reports);
 	if (LogFile)
 		fflush(LogFile);
 
