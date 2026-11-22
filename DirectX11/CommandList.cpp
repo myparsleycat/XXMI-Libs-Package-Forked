@@ -25,6 +25,7 @@
 #include "dx12/HashDump.h"
 #include "dx12/PipelineRegistry.h"
 #include "dx12/PresentPass.h"
+#include "dx12/ShimContext.h"
 #include "dx12/ShimDevice.h"
 #include "vk/VkScope.h"
 
@@ -15887,6 +15888,8 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_CHECK_BATCH);
 	HackerContext *context = state->mHackerContext;
 	ID3D11DeviceContext1 *mOrigContext1 = state->mOrigContext1;
+	ShimContext *shim = dx12_shim && mOrigContext1 == dx12_shim->shim_context && !VkInDrawScope()
+		? dx12_shim->shim_context : NULL;
 	// Views for t slots, buffers for vb and ib slots. Only the entries of
 	// the fetches marked in fetched are valid, and those hold a reference.
 	// held_first and held_count, by fetch, are the entries it read:
@@ -15938,7 +15941,10 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 
 		COMMAND_LIST_LOG(state, "%S\n", command->ini_line.c_str());
 
-		if (!(fetched & (1u << checks[i].fetch))) {
+		// The shim resolves each buffer separately. Read the current binding
+		// when its check runs and consume it before any mod command can run.
+		bool borrow_buffer = shim && fetch.type != ResourceCopyTargetType::SHADER_RESOURCE;
+		if (!borrow_buffer && !(fetched & (1u << checks[i].fetch))) {
 			const auto &check = checks[i];
 			unsigned first = matched ? check.refetch_first : fetch.first_binding;
 			UINT count = matched ? check.refetch_count : fetch.count;
@@ -15969,14 +15975,22 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 					views[b]->GetResource(&resource);
 				break;
 			case ResourceCopyTargetType::VERTEX_BUFFER:
-				resource = buffers[b];
-				stride = strides[b];
-				offset = offsets[b];
+				if (borrow_buffer) {
+					resource = shim->BorrowVertexBuffer(command->target.slot, &stride, &offset);
+				} else {
+					resource = buffers[b];
+					stride = strides[b];
+					offset = offsets[b];
+				}
 				break;
 			default: // INDEX_BUFFER
-				resource = buffers[b];
-				format = formats[b];
-				offset = offsets[b];
+				if (borrow_buffer) {
+					resource = shim->BorrowIndexBuffer(&format, &offset);
+				} else {
+					resource = buffers[b];
+					format = formats[b];
+					offset = offsets[b];
+				}
 				break;
 		}
 

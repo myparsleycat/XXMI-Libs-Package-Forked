@@ -1,8 +1,9 @@
 #!/bin/bash
-# check.sh [test] [fold] [move] [lowmip] [filter] [ref]: the checks of the D3D12
-# shim, in the run folder setup.sh makes (default: test fold move lowmip filter).
+# check.sh [test] [refetch] [fold] [move] [lowmip] [filter] [ref]: the checks of the D3D12
+# shim, in the run folder setup.sh makes (default: test refetch fold move lowmip filter).
 # Exits with 1 when one fails.
 #   test   matching by hash (case/test.ini): which watched meshes are hidden
+#   refetch  a vb0 override rebinds vb1, and the next check must see it
 #   fold   conditions on targets in a list of a game's draw: which meshes each
 #          form leaves hidden
 #   move   hashes carried along GPU copies, frame by frame (harness.cpp, move),
@@ -259,6 +260,21 @@ endif" || bad=1
 	rm -f run/Mods/test.ini
 	cp case/Mods/harness.ini run/Mods/harness.ini
 	[ $bad = 0 ] && echo "fold: OK" || { echo "fold: FAILED"; ok=0; }
+}
+
+run_refetch() {
+	local out status got
+	mv run/Mods/harness.ini run/Mods/harness.ini.keep || { ok=0; return; }
+	cp case/refetch.ini run/Mods/harness.ini
+	out=$(cd run && ./harness.exe frames=900 test dump=refetch.bmp 2>&1); status=$?
+	mv run/Mods/harness.ini.keep run/Mods/harness.ini
+	got=$(echo "$out" | watched)
+	if [ "$status" = 0 ] && [ "$got" = "A=hidden B=hidden C=drawn control=drawn texture=drawn texture_written=drawn texture_control=drawn" ]; then
+		echo "refetch: OK ($got)"
+	else
+		echo "refetch: FAILED (exit $status, got $got)"
+		ok=0
+	fi
 }
 
 run_move() {
@@ -701,9 +717,10 @@ run = RestoreInitialTextures
 	fi
 }
 
-for what in ${@:-test fold move lowmip filter}; do
+for what in ${@:-test refetch fold move lowmip filter}; do
 	case $what in
 	test) run_test; run_null_ib ;;
+	refetch) run_refetch ;;
 	fold) run_fold ;;
 	move) run_move ;;
 	lowmip) run_lowmip ;;

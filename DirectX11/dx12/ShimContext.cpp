@@ -429,22 +429,25 @@ void STDMETHODCALLTYPE ShimContext::IASetVertexBuffers(UINT StartSlot, UINT NumB
 	mChanged = true;
 }
 
+ID3D11Buffer *ShimContext::BorrowVertexBuffer(UINT slot, UINT *stride, UINT *offset)
+{
+	bool valid = slot < ARRAYSIZE(mState->vbs);
+	ID3D11Buffer *buffer = valid ? mState->vbs[slot] : NULL;
+
+	*stride = valid ? mState->vb_strides[slot] : 0;
+	*offset = valid ? mState->vb_offsets[slot] : 0;
+	if (!buffer && valid && Dx12InDrawScope()) {
+		buffer = Dx12ScopeVertexBuffer(slot, stride);
+		*offset = 0;
+	}
+	return buffer;
+}
+
 void STDMETHODCALLTYPE ShimContext::IAGetVertexBuffers(UINT StartSlot, UINT NumBuffers, ID3D11Buffer **ppVertexBuffers, UINT *pStrides, UINT *pOffsets)
 {
-	ID3D11Buffer *buffer;
-	UINT i, stride, offset;
-	bool valid;
-
-	for (i = 0; i < NumBuffers; i++) {
-		valid = StartSlot + i < ARRAYSIZE(mState->vbs);
-		buffer = valid ? mState->vbs[StartSlot + i] : NULL;
-		stride = valid ? mState->vb_strides[StartSlot + i] : 0;
-		offset = valid ? mState->vb_offsets[StartSlot + i] : 0;
-		if (!buffer && valid && Dx12InDrawScope()) {
-			buffer = Dx12ScopeVertexBuffer(StartSlot + i, &stride);
-			offset = 0;
-		}
-
+	for (UINT i = 0; i < NumBuffers; i++) {
+		UINT stride, offset;
+		ID3D11Buffer *buffer = BorrowVertexBuffer(StartSlot + i, &stride, &offset);
 		if (ppVertexBuffers)
 			get(buffer, &ppVertexBuffers[i]);
 		if (pStrides)
@@ -463,17 +466,24 @@ void STDMETHODCALLTYPE ShimContext::IASetIndexBuffer(ID3D11Buffer *pIndexBuffer,
 	mChanged = true;
 }
 
-void STDMETHODCALLTYPE ShimContext::IAGetIndexBuffer(ID3D11Buffer **pIndexBuffer, DXGI_FORMAT *Format, UINT *Offset)
+ID3D11Buffer *ShimContext::BorrowIndexBuffer(DXGI_FORMAT *format, UINT *offset)
 {
 	ID3D11Buffer *buffer = mState->ib;
-	DXGI_FORMAT format = mState->ib_format;
-	UINT offset = mState->ib_offset;
 
+	*format = mState->ib_format;
+	*offset = mState->ib_offset;
 	if (!buffer && !mState->ib_unbound && Dx12InDrawScope()) {
-		buffer = Dx12ScopeIndexBuffer(&format);
-		offset = 0;
+		buffer = Dx12ScopeIndexBuffer(format);
+		*offset = 0;
 	}
+	return buffer;
+}
 
+void STDMETHODCALLTYPE ShimContext::IAGetIndexBuffer(ID3D11Buffer **pIndexBuffer, DXGI_FORMAT *Format, UINT *Offset)
+{
+	DXGI_FORMAT format;
+	UINT offset;
+	ID3D11Buffer *buffer = BorrowIndexBuffer(&format, &offset);
 	if (pIndexBuffer)
 		get(buffer, pIndexBuffer);
 	if (Format)
