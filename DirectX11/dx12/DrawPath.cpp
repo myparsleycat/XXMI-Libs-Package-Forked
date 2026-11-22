@@ -960,8 +960,8 @@ static void update_reaches()
 			readback->Release();
 		spare_readbacks.clear();
 	}
-	buffer_cache_generation++;
-	kept = reaches.size() <= REACH_KEPT;
+	const size_t count = reaches.size();
+	kept = count <= REACH_KEPT;
 	for (auto j = reaches.begin(); j != reaches.end();) {
 		if (j->second.state != REACH_PENDING && !(kept && j->second.state == REACH_KNOWN)
 		    && dx12_frame - j->second.frame > 600)
@@ -969,6 +969,8 @@ static void update_reaches()
 		else
 			++j;
 	}
+	if (reaches.size() != count)
+		buffer_cache_generation++;
 }
 
 // What publish_resource and remember_texture came to for a resource, which a
@@ -1672,7 +1674,8 @@ static View* new_game_view(Published *entry)
 
 static void forget_unused_published()
 {
-	buffer_cache_generation++;
+	const size_t count = published.size();
+
 	for (auto i = published.begin(); i != published.end();) {
 		if (dx12_frame - i->second.frame > 600) {
 			release_published(&i->second);
@@ -1681,6 +1684,8 @@ static void forget_unused_published()
 			++i;
 		}
 	}
+	if (published.size() != count)
+		buffer_cache_generation++;
 }
 
 // -----------------------------------------------------------------------------
