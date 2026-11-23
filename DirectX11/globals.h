@@ -947,7 +947,7 @@ struct TLS
 	// Only entries it found are kept: they stay where they are until
 	// erased, which G->resource_erase_generation tells. Part of this
 	// structure because it is freed without its destructor running.
-	static const unsigned RESOURCE_HANDLE_CACHE_BITS = 10;
+	static const unsigned RESOURCE_HANDLE_CACHE_BITS = 12;
 	struct ResourceHandleCacheEntry {
 		ID3D11Resource *resource;
 		struct ResourceHandleInfo *info;
