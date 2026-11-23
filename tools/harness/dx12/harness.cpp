@@ -8,7 +8,7 @@
 //             [key=VK] [keyframe=N] [uploads=60] [churn=1] [table=4] [heap=N]
 //             [video] [planes=N] [streaming=N [streaming-count=K]] [buffers=N [buffer-count=K] [buffer-bytes=B]]
 //             [gpu-upload] [upload-queue=copy]
-//             [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend]
+//             [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend] [generated=N]
 //             [profile | profile=present] [test [move | evict [evictstop=N] | lowmip]]
 //             [scene=file [slot=vb0] [appear=N]]
 // Prints the average frame time of the frames after the first 300, in blocks.
@@ -30,6 +30,9 @@
 //   dxil           the game's shaders compiled to DXIL (dxcompiler.dll next to it)
 //   rootconst      root constants in the root signature
 //   threads=1      passes after the first recorded on a thread of their own
+//   generated=N    N more presents after each frame's, without draws, as frame
+//                  generation adds, from frame GENERATED_FROM on: the present
+//                  after the one that loads the mods runs [Present] as a frame
 //   test           the meshes and textures that Mods/test.ini looks for (check.sh)
 //   move, evict    with test: see move_test and evict_test below
 //   lowmip         with test: see lowmip_test below
@@ -87,6 +90,8 @@ static UINT rereach;
 // time, as a game streaming in its world does
 static bool contend;
 static std::atomic<bool> contend_stop;
+static UINT generated_presents;
+const UINT GENERATED_FROM = 100;
 static std::atomic<UINT> contend_rounds;
 static bool test;
 // move (with test): the positions of mesh A are moved by copies between
@@ -1406,6 +1411,7 @@ int main(int argc, char **argv)
 		else if (!strncmp(argv[a], "appear=", 7)) appear_frames = atoi(argv[a] + 7);
 		else if (!strncmp(argv[a], "rereach=", 8)) rereach = atoi(argv[a] + 8);
 		else if (!strcmp(argv[a], "contend")) contend = true;
+		else if (!strncmp(argv[a], "generated=", 10)) generated_presents = atoi(argv[a] + 10);
 		else {
 			printf("unknown argument %s\n", argv[a]);
 			return 1;
@@ -2225,6 +2231,8 @@ int main(int argc, char **argv)
 		if (profile_present && f >= 300)
 			profiling = true;
 		CHECK(swap_chain->Present(0, DXGI_PRESENT_ALLOW_TEARING));
+		for (UINT g = 0; f >= GENERATED_FROM && g < generated_presents; g++)
+			CHECK(swap_chain->Present(0, DXGI_PRESENT_ALLOW_TEARING));
 		frame->fence = signal();
 		if (profile_present)
 			profiling = false;

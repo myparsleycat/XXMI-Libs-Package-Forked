@@ -102,8 +102,14 @@ struct Dx12Stats {
 	// Resources of mods given another D3D12 resource for a write, see
 	// ShimRenameResource
 	volatile LONG64 resources_renamed;
+	// Presents frame generation added: those that left [Present] out, as it
+	// did not use the swap chain's buffers, and those that ran it again
+	volatile LONG64 present_skips;
+	volatile LONG64 present_reruns;
 };
 extern Dx12Stats dx12_stats;
+// Draws in the game's command lists closed so far, never reset
+extern volatile LONG64 dx12_game_draws;
 
 // What the resources of mods take of the memory of the GPU now, by what
 // GetResourceAllocationInfo says of them

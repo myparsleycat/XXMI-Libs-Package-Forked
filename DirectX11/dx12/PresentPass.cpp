@@ -172,6 +172,48 @@ static bool present_seen_valid;
 static bool frame_writes_open;
 static bool present_repeated;
 
+// Whether [Present] and its post for the game's frame left the swap chain's
+// buffers alone. Then running them again for a repeat would only do again to
+// the same resources what they did, with nothing of it on the picture being
+// presented, and the repeat leaves them out.
+static bool present_left_buffers;
+
+// As many pictures as frame generation adds to one frame of the game, as for
+// Vulkan (vk/VkDrawPath.cpp)
+const UINT PRESENT_REPEATS_MAX = 3;
+// The draws of the game below this share of the last frame's, as of an
+// overlay drawing with the game's device, are no frame of the game
+const LONG64 FRAME_DRAWS_SHARE = 16;
+
+// D3D12 has no submissions of the game to count frames by, as Vulkan has: a
+// present is of a frame if the game closed lists with draws since the one
+// before, and one without, after one that had, is frame generation's.
+static bool dx12_repeat_present()
+{
+	static LONG64 draws_seen, frame_draws;
+	static bool had_frame;
+	static UINT repeats;
+	LONG64 draws = dx12_game_draws, since = draws - draws_seen;
+
+	draws_seen = draws;
+	if (since > 0 && since * FRAME_DRAWS_SHARE > frame_draws) {
+		frame_draws = since;
+		had_frame = true;
+		repeats = 0;
+		return false;
+	}
+	if (had_frame && repeats < PRESENT_REPEATS_MAX) {
+		repeats++;
+		return true;
+	}
+	// Without a frame for longer the game draws far less than before, or
+	// nothing: the next present with draws is a frame
+	had_frame = false;
+	frame_draws = 0;
+	repeats = 0;
+	return false;
+}
+
 static void upload_params()
 {
 	ID3D11Texture1D *texture = dx12_shim->hacker_device->mIniTexture;
@@ -195,6 +237,17 @@ static void set_params(const std::vector<DirectX::XMFLOAT4> &params)
 	}
 }
 
+// Whether a command list that ran since submit() used a buffer of the swap
+// chain: those are in the state to be presented in until then
+static bool back_buffer_used()
+{
+	for (ShimTexture2D *buffer : back_buffers) {
+		if (buffer && buffer->r.state != D3D12_RESOURCE_STATE_PRESENT)
+			return true;
+	}
+	return false;
+}
+
 static void run_present_list_for_frame()
 {
 	frame_writes.clear();
@@ -208,6 +261,20 @@ static void run_present_list_for_frame()
 	pool_undo_log = NULL;
 	present_seen_valid = true;
 	frame_writes_open = true;
+	present_left_buffers = !back_buffer_used();
+}
+
+// A repeat leaves the variables, pools and ini params as the frame's post left
+// them, the same as running [Present] again and undoing its writes
+static void skip_present_list()
+{
+	static bool noted;
+
+	InterlockedIncrement64(&dx12_stats.present_skips);
+	if (!noted) {
+		noted = true;
+		Dx12LogInfo("Frame generation presents leave out [Present] where it does not use the swap chain's buffers\n");
+	}
 }
 
 static void repeat_present_list()
@@ -215,6 +282,9 @@ static void repeat_present_list()
 	static VariableWriteLog repeat_writes;
 	static PoolUndoLog pool_states;
 	static std::vector<DirectX::XMFLOAT4> params_kept;
+	Profiling::Spike::Scope spike(Profiling::Spike::COMMAND_LIST, L"[Present] of the game's frame run again");
+
+	InterlockedIncrement64(&dx12_stats.present_reruns);
 
 	repeat_writes.clear();
 	pool_states.clear();
@@ -261,6 +331,9 @@ static void frame_actions()
 	bool new_event;
 
 	if (!frames_by_submission)
+		repeat = dx12_repeat_present();
+
+	if (!frames_by_submission)
 		G->gFrameTime = (ticks - G->gSystemTickCount) / 1'000'000.0f;
 	G->gTime = (ticks - G->ticks_at_launch) / 1'000'000.0f;
 	G->gSystemTickCount = ticks;
@@ -269,12 +342,14 @@ static void frame_actions()
 
 	present_repeated = repeat && present_seen_valid && params_seen.size() == G->iniParams.size() && !dx12_mods_disabled;
 	frame_writes_open = false;
-	if (present_repeated)
+	if (present_repeated && present_left_buffers)
+		skip_present_list();
+	else if (present_repeated)
 		repeat_present_list();
-	else if (!dx12_mods_disabled && frames_by_submission)
-		run_present_list_for_frame();
 	else if (!dx12_mods_disabled)
-		RunCommandList(device, dx12_shim->hacker_context, &G->present_command_list, NULL, false);
+		run_present_list_for_frame();
+	else
+		present_seen_valid = false;
 
 	Dx12FrameDumpAdvanceCaptureWindow();
 
@@ -363,6 +438,8 @@ void Dx12PresentEnd(Dx12SwapChain *swap_chain)
 			RunCommandList(dx12_shim->hacker_device, dx12_shim->hacker_context, &G->post_present_command_list, NULL, true);
 			variable_write_log = NULL;
 			pool_undo_log = NULL;
+			if (frame_writes_open && back_buffer_used())
+				present_left_buffers = false;
 		}
 		frame_writes_open = false;
 		Dx12DrawPathEngineRan();

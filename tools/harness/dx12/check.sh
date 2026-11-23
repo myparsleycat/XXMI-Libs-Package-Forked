@@ -1,6 +1,7 @@
 #!/bin/bash
-# check.sh [test] [refetch] [fold] [move] [lowmip] [filter] [ref]: the checks of the D3D12
-# shim, in the run folder setup.sh makes (default: test refetch fold move lowmip filter).
+# check.sh [test] [refetch] [fold] [move] [lowmip] [filter] [present] [ref]: the checks of the
+# D3D12 shim, in the run folder setup.sh makes (default: test refetch fold move lowmip filter
+# present).
 # Exits with 1 when one fails.
 #   test   matching by hash (case/test.ini): which watched meshes are hidden
 #   refetch  a vb0 override rebinds vb1, and the next check must see it
@@ -14,6 +15,9 @@
 #   filter a texture bound over the game's after SnapshotInitialTextures, with
 #          a ps-t[Filter] line, is taken back by RestoreInitialTextures: the
 #          picture has to be the one without them
+#   present  with 1 and 3 presents frame generation would add (harness.cpp
+#          generated=N), [Present] is left out of them, or with bb run again
+#          leaving the variables and ini params as the frame did
 #   ref    the pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
 #   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
@@ -669,6 +673,73 @@ run_custom_sampler_restore() {
 	fi
 }
 
+present_picture() {
+	# present_picture <name> <harness arguments>: the picture checksum, or
+	# "exit N"; the output and the log of the run go to run/present-<name>.*
+	local status
+	rm -f run/d3d11_log.txt
+	(cd run && ./harness.exe "${@:2}" dump=present-$1.bmp >present-$1.out 2>&1); status=$?
+	cp run/d3d11_log.txt run/present-$1.log 2>/dev/null
+	[ $status = 0 ] || { echo "exit $status"; return; }
+	sed -n 's/^picture checksum //p' run/present-$1.out
+}
+
+present_counts() {
+	# present_counts <name>: the presents frame generation added that left
+	# [Present] out and that ran it again, from the report of the first 5 s
+	sed -n 's/.*Frame generation presents: \([0-9]*\) left \[Present\] out, \([0-9]*\) ran it again$/\1 \2/p' run/present-$1.log 2>/dev/null | head -1
+}
+
+run_present() {
+	local mod=run/Mods/mod/mod.ini frames=400 fail="" s0 s1 s3 snext b0 b1 b3 skips reruns bskips breruns
+	cp "$mod" "$mod.present-backup" || { ok=0; return; }
+	cp run/d3dx.ini run/d3dx.ini.present-backup || { ok=0; return; }
+	sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^ps-t0 = ResourceModDiffuse$/ps-t0 = ResourcePresentSum/; }' "$mod"
+	cat case/present.ini >> "$mod"
+	cp case/present-tint.hlsl case/present-sum.hlsl run/Mods/mod/
+	sed -i 's/^log_level = disabled$/log_level = info/' run/d3dx.ini
+
+	# The mesh shows how often the compute shaders ran
+	s0=$(present_picture 0 frames=$frames)
+	s1=$(present_picture 1 frames=$frames generated=1)
+	s3=$(present_picture 3 frames=$frames generated=3)
+	snext=$(present_picture next frames=$((frames + 1)))
+	# Long enough for the report of the first 5 s
+	present_picture long frames=4000 generated=1 >/dev/null
+	read skips reruns <<< "$(present_counts long)"
+	# Using the swap chain's buffer has repeats run [Present] again, which
+	# leaves the variables and ini params as the frame did: the mesh shows
+	# the colour made of the frame count
+	sed -i 's/^global \$present_bb = 0$/global $present_bb = 1/; s/^ps-t0 = ResourcePresentSum$/ps-t0 = ResourcePresentTint/' "$mod"
+	b0=$(present_picture bb0 frames=$frames)
+	b1=$(present_picture bb1 frames=$frames generated=1)
+	b3=$(present_picture bb3 frames=$frames generated=3)
+	present_picture bblong frames=4000 generated=1 >/dev/null
+	read bskips breruns <<< "$(present_counts bblong)"
+
+	mv "$mod.present-backup" "$mod"
+	mv run/d3dx.ini.present-backup run/d3dx.ini
+	rm -f run/Mods/mod/present-tint.hlsl run/Mods/mod/present-sum.hlsl
+
+	for sum in "$s0" "$s1" "$s3" "$snext" "$b0" "$b1" "$b3"; do
+		case $sum in ""|exit*) fail="$fail a run failed ($sum);" ;; esac
+	done
+	[ "$s0" != "$snext" ] || fail="$fail the picture does not show one frame more;"
+	[ "$s0" = "$s1" ] && [ "$s0" = "$s3" ] || fail="$fail repeats ran the compute shaders again;"
+	[ "$b0" = "$b1" ] && [ "$b0" = "$b3" ] || fail="$fail repeats that ran [Present] again changed what the frame left;"
+	if [ -z "$skips" ] || [ "$skips" -lt 100 ] || [ "$reruns" -gt 0 ]; then
+		fail="$fail without bb: left out ${skips:-?}, ran again ${reruns:-?};"
+	fi
+	if [ -z "$breruns" ] || [ "$breruns" -lt 100 ] || [ "$bskips" -gt 0 ]; then
+		fail="$fail with bb: left out ${bskips:-?}, ran again ${breruns:-?};"
+	fi
+	if [ -z "$fail" ]; then
+		echo "present: OK (left out $skips times, with bb ran again $breruns times)"
+	else
+		echo "present: FAILED:$fail"; ok=0
+	fi
+}
+
 run_ref() {
 	[ -x ref/harness.exe ] && [ -f ref/d3d11.dll ] || { echo "ref: FAILED, no ref folder: setup.sh ref <older d3d11.dll>"; ok=0; return; }
 	for dir in run ref; do
@@ -717,7 +788,7 @@ run = RestoreInitialTextures
 	fi
 }
 
-for what in ${@:-test refetch fold move lowmip filter}; do
+for what in ${@:-test refetch fold move lowmip filter present}; do
 	case $what in
 	test) run_test; run_null_ib ;;
 	refetch) run_refetch ;;
@@ -725,6 +796,7 @@ for what in ${@:-test refetch fold move lowmip filter}; do
 	move) run_move ;;
 	lowmip) run_lowmip ;;
 	filter) run_filter ;;
+	present) run_present ;;
 	ref) run_ref ;;
 	root-uav) run_root_uav ;;
 	dxil-iniparams) run_dxil_iniparams '' ;;

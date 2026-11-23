@@ -124,8 +124,10 @@ HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::GetDevice(REFIID riid, void *
 
 HRESULT STDMETHODCALLTYPE Dx12GraphicsCommandList::Close()
 {
-	if (mDraws)
+	if (mDraws) {
 		InterlockedAdd64(&dx12_stats.draws, mDraws);
+		InterlockedAdd64(&dx12_game_draws, mDraws);
+	}
 	if (mDispatches)
 		InterlockedAdd64(&dx12_stats.dispatches, mDispatches);
 	InterlockedIncrement64(&dx12_stats.lists_closed);
