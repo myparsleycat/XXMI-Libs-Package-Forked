@@ -32,7 +32,12 @@ static bool has_avx2()
 	return (regs[1] & 0x20) != 0;
 }
 
-static const bool avx2_stream_loads = has_avx2();
+static const bool avx2_available = has_avx2();
+
+bool Dx12HasAvx2()
+{
+	return avx2_available;
+}
 
 static void copy_write_combined_sse41(BYTE *dst, const BYTE *src, size_t count)
 {
@@ -70,7 +75,7 @@ uint32_t Dx12Crc32cWriteCombined(uint32_t hash, const BYTE *src, size_t length)
 
 	while (length) {
 		count = length < sizeof(chunk) ? length : sizeof(chunk);
-		if (avx2_stream_loads)
+		if (avx2_available)
 			copy_write_combined_avx2(chunk, src, count);
 		else
 			copy_write_combined_sse41(chunk, src, count);

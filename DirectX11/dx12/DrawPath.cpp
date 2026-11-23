@@ -1,6 +1,7 @@
 #include "DrawPath.h"
 
 #include <d3dcompiler.h>
+#include <immintrin.h>
 
 #include <algorithm>
 #include <deque>
@@ -832,19 +833,86 @@ static bool pack_positions(const BYTE *vertices, UINT64 count, UINT stride, std:
 	return true;
 }
 
+template <typename Index>
+static Index max_reach_index(const BYTE *data, UINT count, Index last)
+{
+	constexpr Index strip_restart = Index(-1);
+	for (UINT i = 0; i < count; i++, data += sizeof(Index)) {
+		Index index;
+		memcpy(&index, data, sizeof(index));
+		if (index != strip_restart)
+			last = max(last, index);
+	}
+	return last;
+}
+
+template <typename Index>
+static __declspec(noinline) Index max_reach_index_avx2(const BYTE *data, UINT count, Index last)
+{
+	constexpr UINT lanes = 32 / sizeof(Index);
+	const __m256i strip_restart = _mm256_set1_epi32(-1);
+	__m256i maxima = _mm256_setzero_si256();
+	while (count >= lanes) {
+		const __m256i values = _mm256_loadu_si256((const __m256i*)data);
+		if (sizeof(Index) == sizeof(UINT16)) {
+			const __m256i valid = _mm256_andnot_si256(_mm256_cmpeq_epi16(values, strip_restart), values);
+			maxima = _mm256_max_epu16(maxima, valid);
+		} else {
+			const __m256i valid = _mm256_andnot_si256(_mm256_cmpeq_epi32(values, strip_restart), values);
+			maxima = _mm256_max_epu32(maxima, valid);
+		}
+		data += 32;
+		count -= lanes;
+	}
+
+	alignas(32) Index values[lanes];
+	_mm256_store_si256((__m256i*)values, maxima);
+	_mm256_zeroupper();
+	for (Index value : values)
+		last = max(last, value);
+	return max_reach_index(data, count, last);
+}
+
+template <typename Index>
+static void scan_reach_indices(const BYTE *data, UINT bytes, const std::vector<UINT> &section_ends, bool avx2,
+		std::vector<UINT64> &ends)
+{
+	constexpr UINT min_avx2_indices = 128;
+	const UINT count = bytes / sizeof(Index);
+	UINT first = 0;
+	Index last = 0;
+	auto append_end = [&](UINT end) {
+		const UINT length = end - first;
+		const BYTE *start = data + first * sizeof(Index);
+		if (avx2 && length >= min_avx2_indices)
+			last = max_reach_index_avx2(start, length, last);
+		else
+			last = max_reach_index(start, length, last);
+		const UINT64 vertices = (UINT64)last + 1;
+		if (ends.empty() || ends.back() != vertices)
+			ends.push_back(vertices);
+		first = end;
+	};
+
+	for (UINT end : section_ends) {
+		if (end >= count)
+			break;
+		if (end != 0)
+			append_end(end);
+	}
+	append_end(count);
+}
+
 static void finish_reach(const ReachKey *key, VertexReach *reach)
 {
 	D3D12_RANGE range = { 0, (SIZE_T)(key->ib_bytes + reach->vb_bytes) }, nothing = {};
-	UINT64 last = 0, limit = reach->vb_bytes / key->stride;
-	size_t next_end = 0;
+	const UINT64 limit = reach->vb_bytes / key->stride;
 	Profiling::Spike::Scope spike(Profiling::Spike::DX12_REACH, L"finish, bytes", reach->vb_bytes);
 	// Vertices used up to the end of each section, which never go down
 	std::vector<UINT64> ends;
 	Dx12BufferHash hash = {}, matched = {}, packed_hash = {};
 	std::vector<BYTE> packed;
 	BYTE *data = NULL;
-	UINT32 index, count;
-	UINT i;
 
 	reach->state = REACH_FAILED;
 	stats.reaches_failed++;
@@ -857,20 +925,11 @@ static void finish_reach(const ReachKey *key, VertexReach *reach)
 	if (data) {
 		collect_section_ends();
 
-		for (i = 0; i + key->index_bytes <= key->ib_bytes; i += key->index_bytes) {
-			index = key->index_bytes == 2 ? *(const UINT16*)(data + i) : *(const UINT32*)(data + i);
-			// The highest value is a strip restart, not a vertex
-			if (index != (key->index_bytes == 2 ? 0xffffu : 0xffffffffu))
-				last = max(last, (UINT64)index);
-
-			count = i / key->index_bytes + 1;
-			while (next_end < section_ends.size() && section_ends[next_end] < count)
-				next_end++;
-			if (next_end < section_ends.size() && section_ends[next_end] == count && (ends.empty() || ends.back() != last + 1))
-				ends.push_back(last + 1);
-		}
-		if (ends.empty() || ends.back() != last + 1)
-			ends.push_back(last + 1);
+		const bool avx2 = Dx12HasAvx2();
+		if (key->index_bytes == 2)
+			scan_reach_indices<UINT16>(data, key->ib_bytes, section_ends, avx2, ends);
+		else
+			scan_reach_indices<UINT32>(data, key->ib_bytes, section_ends, avx2, ends);
 
 		for (UINT64 vertices : ends) {
 			vertices = min(vertices, limit);

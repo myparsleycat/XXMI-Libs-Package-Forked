@@ -152,6 +152,8 @@ const UINT DX12_HOT_TEXTURE_LIMIT = 16;
 
 void Dx12FramePresented();
 
+bool Dx12HasAvx2();
+
 // crc32c_hw for memory that may be an upload heap. Those are write combined,
 // where ordinary reads are an order of magnitude slower than the streaming
 // loads this uses.
