@@ -653,6 +653,9 @@ struct Globals
 	// Bumped whenever an entry is added to or taken out of mShaders or
 	// mReloadedShaders, see HackerContext::LookupShaderHandle():
 	unsigned shader_handle_generation;
+	// Bumped under mResourcesLock right before an entry is taken out of
+	// mResources, see GetResourceHandleInfo():
+	unsigned resource_erase_generation;
 
 	std::set<UINT64> mVisitedComputeShaders;
 	UINT64 mSelectedComputeShader;
@@ -772,6 +775,7 @@ struct Globals
 		deferred_shader_generation(0),
 		shader_override_generation(1), // 0 marks unused cache entries
 		shader_handle_generation(1), // likewise
+		resource_erase_generation(1), // likewise
 
 		hunting(HUNTING_MODE_DISABLED),
 		overlay_buffer_hash_lifetime(-1),
@@ -939,10 +943,22 @@ struct TLS
 	// The innermost Profiling::Spike::SelfTime open on this thread
 	void *spike_self_time;
 
+	// What GetResourceHandleInfo() found in G->mResources on this thread.
+	// Only entries it found are kept: they stay where they are until
+	// erased, which G->resource_erase_generation tells. Part of this
+	// structure because it is freed without its destructor running.
+	static const unsigned RESOURCE_HANDLE_CACHE_BITS = 10;
+	struct ResourceHandleCacheEntry {
+		ID3D11Resource *resource;
+		struct ResourceHandleInfo *info;
+		unsigned generation;
+	} resource_handle_cache[1 << RESOURCE_HANDLE_CACHE_BITS];
+
 	TLS() :
 		hooking_quirk_protection(false),
 		com_initialized(false),
-		spike_self_time(NULL)
+		spike_self_time(NULL),
+		resource_handle_cache()
 	{}
 };
 

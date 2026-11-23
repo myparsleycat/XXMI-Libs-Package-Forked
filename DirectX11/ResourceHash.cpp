@@ -881,6 +881,19 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 {
 	std::unordered_map<ID3D11Resource *, ResourceHandleInfo>::iterator j;
 	ResourceHandleInfo* ret = NULL;
+	TLS::ResourceHandleCacheEntry *entry = &get_tls()->resource_handle_cache[
+		((uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull) >> (64 - TLS::RESOURCE_HANDLE_CACHE_BITS)];
+	// Read before the lookup: an erase bumps it under the lock first, so
+	// an entry found before the erase is cached as stale already
+	unsigned generation = G->resource_erase_generation;
+
+	if (entry->resource == resource && entry->generation == generation) {
+		if (Profiling::mode == Profiling::Mode::SUMMARY) {
+			Profiling::texture_handle_info_lookup_overhead.count++;
+			Profiling::texture_handle_info_lookup_overhead.hits++;
+		}
+		return entry->info;
+	}
 
 	EnterCriticalSectionPretty(&G->mResourcesLock);
 
@@ -890,6 +903,11 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 
 	LeaveCriticalSection(&G->mResourcesLock);
 
+	if (ret) {
+		entry->resource = resource;
+		entry->info = ret;
+		entry->generation = generation;
+	}
 	return ret;
 }
 
@@ -1827,6 +1845,7 @@ ULONG STDMETHODCALLTYPE ResourceReleaseTracker::Release(void)
 		//                                                        //
 		////////////////////////////////////////////////////////////
 		EnterCriticalSectionPretty(&G->mResourcesLock);
+		G->resource_erase_generation++;
 		G->mResources.erase(resource);
 		LeaveCriticalSection(&G->mResourcesLock);
 		delete this;
