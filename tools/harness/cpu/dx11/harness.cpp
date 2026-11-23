@@ -999,12 +999,24 @@ int main(int argc, char **argv)
 		// The DLL reads the clock while it loads, as the start of `time`,
 		// before patch_imports gets to it, so for a check it binds to ours
 		// from the start. What loads after it keeps the real clock.
+		// The cursor functions likewise: the DLL keeps copies of them
+		// made while it loads (cursor.cpp), which patch_imports does not
+		// reach, and the real ones return where the mouse is.
 		HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-		void *real_qpc = NULL;
-		DWORD *qpc_slot = check ? redirect_export(kernel32, "QueryPerformanceCounter", my_QueryPerformanceCounter, &real_qpc) : NULL;
+		HMODULE user32 = GetModuleHandleW(L"user32.dll");
+		void *real_qpc = NULL, *real_cursor_pos = NULL, *real_cursor_info = NULL;
+		DWORD *qpc_slot = NULL, *cursor_pos_slot = NULL, *cursor_info_slot = NULL;
+		if (check) {
+			qpc_slot = redirect_export(kernel32, "QueryPerformanceCounter", my_QueryPerformanceCounter, &real_qpc);
+			cursor_pos_slot = redirect_export(user32, "GetCursorPos", my_GetCursorPos, &real_cursor_pos);
+			cursor_info_slot = redirect_export(user32, "GetCursorInfo", my_GetCursorInfo, &real_cursor_info);
+		}
 		lib = LoadLibraryW(own_path);
-		if (qpc_slot)
+		if (check) {
 			restore_export(kernel32, qpc_slot, real_qpc);
+			restore_export(user32, cursor_pos_slot, real_cursor_pos);
+			restore_export(user32, cursor_info_slot, real_cursor_info);
+		}
 		if (!lib) {
 			printf("no d3d11.dll next to the harness\n");
 			return 1;
