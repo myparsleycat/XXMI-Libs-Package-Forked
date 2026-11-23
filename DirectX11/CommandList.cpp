@@ -162,6 +162,8 @@ static inline void profile_command_list_cmd_end(CommandListCommand *cmd, Command
 	}
 }
 
+static void forget_active_check_texture_bindings(CommandListState *state, const CommandListCommand *command = nullptr);
+
 static void _RunCommandList(CommandList *command_list, CommandListState *state, bool recursive=true)
 {
 	CommandList::Commands::iterator i;
@@ -191,6 +193,8 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 		} else if ((*i)->binds_known_slots) {
 			// Looks nothing up itself, so there is nothing to
 			// forget up front:
+			if (state->active_check_texture_bindings)
+				forget_active_check_texture_bindings(state, i->get());
 			(*i)->run(state);
 			state->mHackerContext->ForgetCheckTextureOverrideResults((*i)->bound_type,
 					(*i)->bound_shader_type, (*i)->bound_first_slot, (*i)->bound_slot_count);
@@ -200,6 +204,8 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 			// after, since it may have noted results for bindings
 			// that it only had in place while it ran (as running a
 			// custom shader does):
+			if (state->active_check_texture_bindings)
+				forget_active_check_texture_bindings(state);
 			state->mHackerContext->ForgetCheckTextureOverrideResults();
 			(*i)->run(state);
 			state->mHackerContext->ForgetCheckTextureOverrideResults();
@@ -15883,6 +15889,74 @@ void merge_shader_resource_batches(CommandList *command_list)
 
 #pragma region CheckTextureOverrideBatches
 
+struct CheckTextureOverrideBatchBindings {
+	const std::vector<CheckTextureOverrideBatch::Fetch> &fetches;
+	CheckTextureOverrideBatchBindings *parent = nullptr;
+	uint32_t fetched = 0;
+	// Only fetched ranges are read or released.
+	ID3D11ShaderResourceView *views[CheckTextureOverrideBatch::MAX_BINDINGS];
+	ID3D11Buffer *buffers[CheckTextureOverrideBatch::MAX_BINDINGS];
+	UINT strides[CheckTextureOverrideBatch::MAX_BINDINGS], offsets[CheckTextureOverrideBatch::MAX_BINDINGS];
+	DXGI_FORMAT index_format;
+	unsigned held_first[CheckTextureOverrideBatch::MAX_BINDINGS], held_count[CheckTextureOverrideBatch::MAX_BINDINGS];
+
+	explicit CheckTextureOverrideBatchBindings(const std::vector<CheckTextureOverrideBatch::Fetch> &fetches)
+		: fetches(fetches)
+	{
+	}
+
+	void Release(uint32_t slots)
+	{
+		fetched &= ~slots;
+		for (unsigned f = 0; slots; ++f, slots >>= 1) {
+			if (!(slots & 1))
+				continue;
+			if (fetches[f].type == ResourceCopyTargetType::SHADER_RESOURCE)
+				release_slots(views + held_first[f], held_count[f]);
+			else
+				release_slots(buffers + held_first[f], held_count[f]);
+		}
+	}
+
+	void Forget(const CommandListCommand *command)
+	{
+		if (!command) {
+			Release(fetched);
+			return;
+		}
+
+		uint32_t slots = 0, remaining = fetched;
+		for (unsigned f = 0; remaining; ++f, remaining >>= 1) {
+			if (!(remaining & 1))
+				continue;
+			const auto &fetch = fetches[f];
+			if (fetch.type != command->bound_type)
+				continue;
+			if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE && fetch.shader_type != command->bound_shader_type)
+				continue;
+			const unsigned first = fetch.first_slot + (held_first[f] - fetch.first_binding);
+			if (fetch.type == ResourceCopyTargetType::INDEX_BUFFER
+					|| (first < command->bound_first_slot + command->bound_slot_count
+						&& command->bound_first_slot < first + held_count[f]))
+				slots |= 1u << f;
+		}
+		Release(slots);
+	}
+};
+
+// The active chain contains only enclosing batches that still hold bindings.
+static void forget_active_check_texture_bindings(CommandListState *state, const CommandListCommand *command)
+{
+	for (auto **link = &state->active_check_texture_bindings; *link;) {
+		auto *bindings = *link;
+		bindings->Forget(command);
+		if (bindings->fetched)
+			link = &bindings->parent;
+		else
+			*link = bindings->parent;
+	}
+}
+
 void CheckTextureOverrideBatch::run(CommandListState *state)
 {
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_CHECK_BATCH);
@@ -15890,106 +15964,93 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 	ID3D11DeviceContext1 *mOrigContext1 = state->mOrigContext1;
 	ShimContext *shim = dx12_shim && mOrigContext1 == dx12_shim->shim_context && !VkInDrawScope()
 		? dx12_shim->shim_context : NULL;
-	// Views for t slots, buffers for vb and ib slots. Only the entries of
-	// the fetches marked in fetched are valid, and those hold a reference.
-	// held_first and held_count, by fetch, are the entries it read:
-	ID3D11ShaderResourceView *views[MAX_BINDINGS];
-	ID3D11Buffer *buffers[MAX_BINDINGS];
-	UINT strides[MAX_BINDINGS], offsets[MAX_BINDINGS];
-	DXGI_FORMAT formats[MAX_BINDINGS];
-	unsigned held_first[MAX_BINDINGS], held_count[MAX_BINDINGS];
-	uint32_t fetched = 0;
+	CheckTextureOverrideBatchBindings bindings(fetches);
+	const bool track_regions = G->track_region_hashes;
 	bool matched = false;
 
-	auto release = [&]() {
-		for (size_t f = 0; fetched; f++, fetched >>= 1) {
-			if (!(fetched & 1))
-				continue;
-			const Fetch &fetch = fetches[f];
-			for (unsigned b = held_first[f]; b < held_first[f] + held_count[f]; b++) {
-				if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE) {
-					if (views[b])
-						views[b]->Release();
-				} else if (buffers[b]) {
-					buffers[b]->Release();
-				}
+	auto run_matches = [&](CheckTextureOverrideCommand *command, TextureOverrideMatches &matches) {
+		if (bindings.fetched) {
+			if (shim || VkInDrawScope()) {
+				bindings.Release(bindings.fetched);
+			} else {
+				bindings.parent = state->active_check_texture_bindings;
+				state->active_check_texture_bindings = &bindings;
 			}
 		}
+
+		command->RunMatches(state, matches);
+		if (state->active_check_texture_bindings == &bindings)
+			state->active_check_texture_bindings = bindings.parent;
+		matched = true;
 	};
 
 	for (size_t i = 0; i < checks.size() && !state->aborted; i++) {
-		CheckTextureOverrideCommand *command = checks[i].command.get();
-		const Fetch &fetch = fetches[checks[i].fetch];
-		unsigned b = checks[i].binding;
+		const Check &check = checks[i];
+		CheckTextureOverrideCommand *command = check.command.get();
+		const Fetch &fetch = fetches[check.fetch];
+		const unsigned b = check.binding;
 		ID3D11Resource *resource = NULL;
 		UINT stride = 0, offset = 0;
 		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		TextureOverrideMatches matches;
 
-		// Same as CheckTextureOverrideCommand::run(), every merged line
-		// names a static pipeline slot. In a post command list this is
-		// usually how all of them end, without reading any bindings:
 		if (command->RecallMatches(state, &matches)) {
-			if (matches.empty())
-				continue;
-
-			release();
-			matched = true;
-			command->RunMatches(state, matches);
+			if (!matches.empty())
+				run_matches(command, matches);
 			continue;
 		}
 
 		COMMAND_LIST_LOG(state, "%S\n", command->ini_line.c_str());
-
-		// The shim resolves each buffer separately. Read the current binding
-		// when its check runs and consume it before any mod command can run.
-		bool borrow_buffer = shim && fetch.type != ResourceCopyTargetType::SHADER_RESOURCE;
-		if (!borrow_buffer && !(fetched & (1u << checks[i].fetch))) {
-			const auto &check = checks[i];
-			unsigned first = matched ? check.refetch_first : fetch.first_binding;
-			UINT count = matched ? check.refetch_count : fetch.count;
-			UINT slot = fetch.first_slot + (first - fetch.first_binding);
+		const bool borrow_buffer = shim && fetch.type != ResourceCopyTargetType::SHADER_RESOURCE;
+		const uint32_t bit = 1u << check.fetch;
+		if (!borrow_buffer && !(bindings.fetched & bit)) {
+			const unsigned first = matched ? check.refetch_first : fetch.first_binding;
+			const UINT count = matched ? check.refetch_count : fetch.count;
+			const UINT slot = fetch.first_slot + (first - fetch.first_binding);
 
 			switch (fetch.type) {
 				case ResourceCopyTargetType::SHADER_RESOURCE:
-					GetShaderResourcesBatch(mOrigContext1, fetch.shader_type, slot, count, &views[first]);
+					GetShaderResourcesBatch(mOrigContext1, fetch.shader_type, slot, count, &bindings.views[first]);
 					break;
 				case ResourceCopyTargetType::VERTEX_BUFFER:
-					mOrigContext1->IAGetVertexBuffers(slot, count, &buffers[first], &strides[first], &offsets[first]);
+					mOrigContext1->IAGetVertexBuffers(slot, count, &bindings.buffers[first],
+							track_regions ? &bindings.strides[first] : nullptr, track_regions ? &bindings.offsets[first] : nullptr);
 					break;
 				default: // INDEX_BUFFER
-					mOrigContext1->IAGetIndexBuffer(&buffers[first], &formats[first], &offsets[first]);
+					mOrigContext1->IAGetIndexBuffer(&bindings.buffers[first],
+							track_regions ? &bindings.index_format : nullptr, track_regions ? &bindings.offsets[first] : nullptr);
 					break;
 			}
-			held_first[checks[i].fetch] = first;
-			held_count[checks[i].fetch] = count;
-			fetched |= 1u << checks[i].fetch;
+			bindings.held_first[check.fetch] = first;
+			bindings.held_count[check.fetch] = count;
+			bindings.fetched |= bit;
 		}
 
-		// What GetResource() would have returned for the slot:
 		switch (fetch.type) {
 			case ResourceCopyTargetType::SHADER_RESOURCE:
-				// Most views are of a resource that matches
-				// nothing, which is known without asking them:
-				if (views[b] && !TextureOverrideViewKnownMiss(views[b]))
-					views[b]->GetResource(&resource);
+				if (bindings.views[b] && !TextureOverrideViewKnownMiss(bindings.views[b]))
+					bindings.views[b]->GetResource(&resource);
 				break;
 			case ResourceCopyTargetType::VERTEX_BUFFER:
 				if (borrow_buffer) {
 					resource = shim->BorrowVertexBuffer(command->target.slot, &stride, &offset);
 				} else {
-					resource = buffers[b];
-					stride = strides[b];
-					offset = offsets[b];
+					resource = bindings.buffers[b];
+					if (track_regions) {
+						stride = bindings.strides[b];
+						offset = bindings.offsets[b];
+					}
 				}
 				break;
 			default: // INDEX_BUFFER
 				if (borrow_buffer) {
 					resource = shim->BorrowIndexBuffer(&format, &offset);
 				} else {
-					resource = buffers[b];
-					format = formats[b];
-					offset = offsets[b];
+					resource = bindings.buffers[b];
+					if (track_regions) {
+						format = bindings.index_format;
+						offset = bindings.offsets[b];
+					}
 				}
 				break;
 		}
@@ -15997,26 +16058,16 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		if (resource) {
 			command->target.FindTextureOverridesForResource(state, resource, stride, offset, format, &matches);
 			if (fetch.type == ResourceCopyTargetType::SHADER_RESOURCE) {
-				NoteTextureOverrideViewResource(views[b], resource);
+				NoteTextureOverrideViewResource(bindings.views[b], resource);
 				resource->Release();
 			}
 		}
 
-		// Before running the matches, see RecallMatches():
 		context->NoteCheckTextureOverrideResult(command, state->call_info, matches);
-
-		if (matches.empty())
-			continue;
-
-		// The command lists about to run may bind anything anywhere, so
-		// nothing read so far can be trusted for the lines that follow.
-		// Drop it all, which also makes those lines fetch again:
-		release();
-		matched = true;
-		command->RunMatches(state, matches);
+		if (!matches.empty())
+			run_matches(command, matches);
 	}
-
-	release();
+	bindings.Release(bindings.fetched);
 }
 
 static bool is_batchable_check(const CheckTextureOverrideCommand *command)
