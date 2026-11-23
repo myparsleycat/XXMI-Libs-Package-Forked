@@ -881,18 +881,20 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 {
 	std::unordered_map<ID3D11Resource *, ResourceHandleInfo>::iterator j;
 	ResourceHandleInfo* ret = NULL;
-	TLS::ResourceHandleCacheEntry *entry = &get_tls()->resource_handle_cache[
+	TLS::ResourceHandleCacheSet *set = &get_tls()->resource_handle_cache[
 		((uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull) >> (64 - TLS::RESOURCE_HANDLE_CACHE_BITS)];
 	// Read before the lookup: an erase bumps it under the lock first, so
 	// an entry found before the erase is cached as stale already
 	unsigned generation = G->resource_erase_generation;
 
-	if (entry->resource == resource && entry->generation == generation) {
-		if (Profiling::mode == Profiling::Mode::SUMMARY) {
-			Profiling::texture_handle_info_lookup_overhead.count++;
-			Profiling::texture_handle_info_lookup_overhead.hits++;
+	for (int way = 0; way < 2; way++) {
+		if (set->resource[way] == resource && set->generation[way] == generation) {
+			if (Profiling::mode == Profiling::Mode::SUMMARY) {
+				Profiling::texture_handle_info_lookup_overhead.count++;
+				Profiling::texture_handle_info_lookup_overhead.hits++;
+			}
+			return set->info[way];
 		}
-		return entry->info;
 	}
 
 	EnterCriticalSectionPretty(&G->mResourcesLock);
@@ -904,9 +906,12 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 	LeaveCriticalSection(&G->mResourcesLock);
 
 	if (ret) {
-		entry->resource = resource;
-		entry->info = ret;
-		entry->generation = generation;
+		set->resource[1] = set->resource[0];
+		set->info[1] = set->info[0];
+		set->generation[1] = set->generation[0];
+		set->resource[0] = resource;
+		set->info[0] = ret;
+		set->generation[0] = generation;
 	}
 	return ret;
 }
@@ -2292,7 +2297,7 @@ static void collect_fuzzy_texture_overrides_for_resource(ID3D11Resource *resourc
 // - The resource hash changes (track_texture_updates)
 // - The TextureOverride sections are reloaded
 // The latter two and adding entries are serialised by G->mCriticalSection.
-#define TEXTURE_OVERRIDE_MISS_CACHE_BITS 14
+#define TEXTURE_OVERRIDE_MISS_CACHE_BITS 16
 static std::atomic<ID3D11Resource*> texture_override_miss_cache[1 << TEXTURE_OVERRIDE_MISS_CACHE_BITS];
 
 static inline std::atomic<ID3D11Resource*>* texture_override_miss_slot(ID3D11Resource *resource)

@@ -483,6 +483,7 @@ public:
 		}
 		return NULL;
 	}
+	unsigned CheckTextureOverrideResultCount() const { return mCheckTextureOverrideResultCount; }
 	void ForgetCheckTextureOverrideResults() { mCheckTextureOverrideResultCount = 0; };
 	// As above, for a command known to have bound to these slots only, see
 	// CommandListCommand::binds_known_slots:

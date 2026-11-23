@@ -16073,6 +16073,10 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 	CheckTextureOverrideBatchBindings bindings(fetches);
 	const bool track_regions = G->track_region_hashes;
 	bool matched = false;
+	// Each line of a batch is a command of its own, so with no results noted
+	// when the batch starts, one for a line can only come from the command
+	// lists of a match:
+	const bool none_noted = context->CheckTextureOverrideResultCount() == 0;
 
 	auto run_matches = [&](CheckTextureOverrideCommand *command, TextureOverrideMatches &matches) {
 		if (bindings.fetched) {
@@ -16100,7 +16104,7 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		TextureOverrideMatches matches;
 
-		if (command->RecallMatches(state, &matches)) {
+		if (!(none_noted && !matched) && command->RecallMatches(state, &matches)) {
 			if (!matches.empty())
 				run_matches(command, matches);
 			continue;

@@ -946,12 +946,13 @@ struct TLS
 	// What GetResourceHandleInfo() found in G->mResources on this thread.
 	// Only entries it found are kept: they stay where they are until
 	// erased, which G->resource_erase_generation tells. Part of this
-	// structure because it is freed without its destructor running.
-	static const unsigned RESOURCE_HANDLE_CACHE_BITS = 12;
-	struct ResourceHandleCacheEntry {
-		ID3D11Resource *resource;
-		struct ResourceHandleInfo *info;
-		unsigned generation;
+	// structure because it is freed without its destructor running. A set
+	// keeps the last two entries made in it, the newer one first.
+	static const unsigned RESOURCE_HANDLE_CACHE_BITS = 11;
+	struct ResourceHandleCacheSet {
+		ID3D11Resource *resource[2];
+		struct ResourceHandleInfo *info[2];
+		unsigned generation[2];
 	} resource_handle_cache[1 << RESOURCE_HANDLE_CACHE_BITS];
 
 	TLS() :
