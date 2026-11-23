@@ -695,56 +695,63 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 			? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
 	}
 
-	signature = get_root_signature(&root, true);
-	if (!signature)
-		return false;
-	pipeline = get_pipeline(state, &key, shaders, signature);
+	{
+		Profiling::Spike::SelfTime pipeline_time(Profiling::Spike::CL_PREPARE_DRAW_PIPELINE);
+		signature = get_root_signature(&root, true);
+		pipeline = signature ? get_pipeline(state, &key, shaders, signature) : NULL;
+	}
 	if (!pipeline)
 		return false;
 
-	// Everything up to here was able to bail out without leaving half a
-	// draw on the list
-	if (indexed) {
-		if (!state->ib || !(ib.BufferLocation = Dx12ShimBufferAddress(state->ib, D3D12_RESOURCE_STATE_INDEX_BUFFER))) {
-			log_once(&no_ib, "A mod draws indexed without an index buffer of its own, which needs the draw of the game it belongs to. Dropped.");
-			return false;
+	{
+		Profiling::Spike::SelfTime resources_time(Profiling::Spike::CL_PREPARE_DRAW_RESOURCES);
+		// Everything up to here was able to bail out without leaving half a
+		// draw on the list
+		if (indexed) {
+			if (!state->ib || !(ib.BufferLocation = Dx12ShimBufferAddress(state->ib, D3D12_RESOURCE_STATE_INDEX_BUFFER))) {
+				log_once(&no_ib, "A mod draws indexed without an index buffer of its own, which needs the draw of the game it belongs to. Dropped.");
+				return false;
+			}
+			ShimGetResourceDesc(state->ib, &buffer);
+			if (state->ib_offset >= buffer.byte_width)
+				return false;
+			ib.BufferLocation += state->ib_offset;
+			ib.SizeInBytes = buffer.byte_width - state->ib_offset;
+			ib.Format = state->ib_format;
 		}
-		ShimGetResourceDesc(state->ib, &buffer);
-		if (state->ib_offset >= buffer.byte_width)
-			return false;
-		ib.BufferLocation += state->ib_offset;
-		ib.SizeInBytes = buffer.byte_width - state->ib_offset;
-		ib.Format = state->ib_format;
-	}
 
-	for (i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++) {
-		if (!state->vbs[i])
-			continue;
-		ShimGetResourceDesc(state->vbs[i], &buffer);
-		if (state->vb_offsets[i] >= buffer.byte_width)
-			continue;
-		vbs[i].BufferLocation = Dx12ShimBufferAddress(state->vbs[i], D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-		if (!vbs[i].BufferLocation && ShimNotReady(ShimResourceOf(state->vbs[i])))
-			return false;
-		if (!vbs[i].BufferLocation)
-			continue;
-		vbs[i].BufferLocation += state->vb_offsets[i];
-		vbs[i].SizeInBytes = buffer.byte_width - state->vb_offsets[i];
-		vbs[i].StrideInBytes = state->vb_strides[i];
-		vb_count = i + 1;
-	}
+		for (i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++) {
+			if (!state->vbs[i])
+				continue;
+			ShimGetResourceDesc(state->vbs[i], &buffer);
+			if (state->vb_offsets[i] >= buffer.byte_width)
+				continue;
+			vbs[i].BufferLocation = Dx12ShimBufferAddress(state->vbs[i], D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+			if (!vbs[i].BufferLocation && ShimNotReady(ShimResourceOf(state->vbs[i])))
+				return false;
+			if (!vbs[i].BufferLocation)
+				continue;
+			vbs[i].BufferLocation += state->vb_offsets[i];
+			vbs[i].SizeInBytes = buffer.byte_width - state->vb_offsets[i];
+			vbs[i].StrideInBytes = state->vb_strides[i];
+			vb_count = i + 1;
+		}
 
-	for (i = 0; i < key.rtv_count; i++) {
-		if (state->rtvs[i] && !Dx12ShimTransition(ShimViewOf(state->rtvs[i])->resource, D3D12_RESOURCE_STATE_RENDER_TARGET))
+		for (i = 0; i < key.rtv_count; i++) {
+			if (state->rtvs[i] && !Dx12ShimTransition(ShimViewOf(state->rtvs[i])->resource, D3D12_RESOURCE_STATE_RENDER_TARGET))
+				return false;
+		}
+		if (dsv && !Dx12ShimTransition(dsv->resource, dsv->read_only ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE))
 			return false;
 	}
-	if (dsv && !Dx12ShimTransition(dsv->resource, dsv->read_only ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE))
-		return false;
 
 	list = Dx12ShimList();
 	list->SetGraphicsRootSignature(signature);
-	if (!bind_tables(state, &root, shaders, uav_used, false))
-		return false;
+	{
+		Profiling::Spike::SelfTime tables_time(Profiling::Spike::CL_PREPARE_DRAW_TABLES);
+		if (!bind_tables(state, &root, shaders, uav_used, false))
+			return false;
+	}
 	list->SetPipelineState(pipeline);
 
 	list->OMSetRenderTargets(key.rtv_count, rtvs, FALSE, dsv ? &dsv->handle : NULL);
