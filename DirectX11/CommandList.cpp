@@ -3644,6 +3644,7 @@ void RunCustomShaderCommand::run(CommandListState *state)
 
 	mOrigContext1->RSSetViewports(num_viewports, saved_viewports);
 	restore_om_state(mOrigContext1, &om_state);
+	state->mHackerContext->ForgetDrawOutputViews();
 
 	if (saved_vs)
 		saved_vs->Release();
@@ -12541,6 +12542,7 @@ void ResourceCopyTarget::SetResource(
 		render_view[slot] = (ID3D11RenderTargetView*)view;
 
 		mOrigContext1->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, render_view, depth_view);
+		state->mHackerContext->ForgetDrawOutputViews();
 
 		release_slots(render_view, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, slot);
 		if (depth_view)
@@ -12556,6 +12558,7 @@ void ResourceCopyTarget::SetResource(
 		depth_view = (ID3D11DepthStencilView*)view;
 
 		mOrigContext1->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, render_view, depth_view);
+		state->mHackerContext->ForgetDrawOutputViews();
 
 		// Only the depth view was replaced, and it is the caller's,
 		// so no slot of this array is kept:
@@ -12723,7 +12726,32 @@ static bool find_native_output_filter_overrides(ResourceCopyTarget &target, Comm
 {
 	const unsigned slot = target.ResolveSlot(state);
 	ID3D11View *output_view = nullptr;
-	if (slot != UINT_MAX) {
+	bool owned = true;
+	HackerContext *context = state->mHackerContext;
+	if (slot != UINT_MAX && context->InDrawCommandLists(state->call_info)) {
+		// Filters on the output views are typically evaluated by several
+		// sections for every draw call, which cannot rebind them unseen:
+		if (target.type == ResourceCopyTargetType::RENDER_TARGET) {
+			if (!context->mDrawOutputRtvsKnown) {
+				state->mOrigContext1->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+						context->mDrawOutputRtvs, nullptr);
+				for (ID3D11RenderTargetView *view : context->mDrawOutputRtvs)
+					if (view)
+						view->Release();
+				context->mDrawOutputRtvsKnown = true;
+			}
+			output_view = context->mDrawOutputRtvs[slot];
+		} else {
+			if (!context->mDrawOutputDsvKnown) {
+				state->mOrigContext1->OMGetRenderTargets(0, nullptr, &context->mDrawOutputDsv);
+				if (context->mDrawOutputDsv)
+					context->mDrawOutputDsv->Release();
+				context->mDrawOutputDsvKnown = true;
+			}
+			output_view = context->mDrawOutputDsv;
+		}
+		owned = false;
+	} else if (slot != UINT_MAX) {
 		if (target.type == ResourceCopyTargetType::RENDER_TARGET) {
 			ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
 			state->mOrigContext1->OMGetRenderTargets(slot + 1, targets, nullptr);
@@ -12748,7 +12776,8 @@ static bool find_native_output_filter_overrides(ResourceCopyTarget &target, Comm
 				resource->Release();
 			}
 		}
-		output_view->Release();
+		if (owned)
+			output_view->Release();
 	}
 	return bound;
 }

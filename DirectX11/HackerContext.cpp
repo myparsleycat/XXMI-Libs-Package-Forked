@@ -105,6 +105,7 @@ HackerContext::~HackerContext()
 
 void HackerContext::ResetTrackedPipelineState()
 {
+	ForgetDrawOutputViews();
 	memset(mCurrentVertexBuffers, 0, sizeof(mCurrentVertexBuffers));
 	mCurrentIndexBuffer = 0;
 	memset(mCurrentVertexBuffersBindings, 0, sizeof(mCurrentVertexBuffersBindings));
@@ -1020,6 +1021,7 @@ void HackerContext::BeforeDraw(DrawContext &data)
 
 	mCheckTextureOverrideResultCount = 0;
 	mCheckTextureOverrideResultsDraw = &data.call_info;
+	ForgetDrawOutputViews();
 
 	if (mShaderResourceViewCacheCount && mShaderResourceViewCacheFrame != G->frame_no)
 		ExpireShaderResourceViews();
@@ -1276,6 +1278,7 @@ void HackerContext::AfterDraw(DrawContext &data)
 	// The bindings are the game's to change again from here:
 	mCheckTextureOverrideResultCount = 0;
 	mCheckTextureOverrideResultsDraw = NULL;
+	ForgetDrawOutputViews();
 
 	if (data.oldVertexShader) {
 		ID3D11VertexShader *ret;
@@ -2501,6 +2504,7 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 		return;
 
 	mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
+	ForgetDrawOutputViews();
 	if (GpuWatch::enabled)
 		GpuWatch::mark_command_list(mOrigContext1);
 
@@ -3607,6 +3611,7 @@ STDMETHODIMP_(void) HackerContext::OMSetRenderTargets(THIS_
 	}
 
 	mOrigContext1->OMSetRenderTargets(NumViews, ppRenderTargetViews, pDepthStencilView);
+	ForgetDrawOutputViews();
 }
 
 STDMETHODIMP_(void) HackerContext::OMSetRenderTargetsAndUnorderedAccessViews(THIS_
@@ -3661,6 +3666,7 @@ STDMETHODIMP_(void) HackerContext::OMSetRenderTargetsAndUnorderedAccessViews(THI
 
 	mOrigContext1->OMSetRenderTargetsAndUnorderedAccessViews(NumRTVs, ppRenderTargetViews, pDepthStencilView,
 		UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+	ForgetDrawOutputViews();
 }
 
 STDMETHODIMP_(void) HackerContext::DrawAuto(THIS)

@@ -450,6 +450,22 @@ public:
 	// NULL unless the command has run before during this draw call and
 	// nothing may have bound to its slot since. The result does not outlive
 	// the next command that runs, copy the matches before running theirs:
+	// Whether command lists run with call_info belong to the draw call in
+	// progress, from the start of BeforeDraw() to the end of AfterDraw():
+	bool InDrawCommandLists(const DrawCallInfo *call_info) const
+	{
+		return call_info && call_info == mCheckTextureOverrideResultsDraw;
+	}
+	// The output views bound while the command lists of the draw call in
+	// progress run, as the output filters (o0, od) first read them. Held
+	// without references, as they stay bound until something binds others:
+	// whatever binds output views on this context forgets them, and so
+	// does the start and end of each draw call.
+	ID3D11RenderTargetView *mDrawOutputRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+	ID3D11DepthStencilView *mDrawOutputDsv;
+	bool mDrawOutputRtvsKnown, mDrawOutputDsvKnown;
+	void ForgetDrawOutputViews() { mDrawOutputRtvsKnown = mDrawOutputDsvKnown = false; }
+
 	const CheckTextureOverrideResult* FindCheckTextureOverrideResult(const CheckTextureOverrideCommand *command, const DrawCallInfo *call_info) const
 	{
 		if (!call_info || call_info != mCheckTextureOverrideResultsDraw)
