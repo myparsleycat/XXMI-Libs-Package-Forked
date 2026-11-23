@@ -1261,6 +1261,8 @@ static void register_buffer(ShimBuffer *object, uint32_t hash)
 	handle->data_hash = 0;
 	handle->texture_override_candidates_valid = false;
 	LeaveCriticalSection(&G->mResourcesLock);
+	// The address may be that of a buffer released since
+	ForgetTextureOverrideMiss(object);
 }
 
 static PublishedBuffer* publish_buffer(VkBuffer buffer, UINT bind_flags)
