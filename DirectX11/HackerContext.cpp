@@ -722,7 +722,32 @@ const HackerContext::ShaderHandleCacheEntry* HackerContext::LookupShaderHandle(I
 	entry->hash = entry->hash_found ? i->second : 0;
 	entry->reload_info = (j != G->mReloadedShaders.end()) ? &j->second : NULL;
 	entry->buffer_srv_slots_shader = NULL;
+	entry->bindings = NULL;
 	return entry;
+}
+
+bool HackerContext::BoundShaderInfo(ID3D11DeviceChild *shader, ShaderOverride **shader_override,
+		const ShaderBindings **bindings)
+{
+	ShaderHandleCacheEntry *entry = const_cast<ShaderHandleCacheEntry*>(LookupShaderHandle(shader));
+
+	if (!entry->hash_found)
+		return false;
+
+	if (shader_override)
+		*shader_override = LookupShaderOverride(entry->hash);
+
+	if (bindings) {
+		if (!entry->bindings) {
+			// Shaders created on other threads insert into the cache
+			CriticalSectionGuard(&G->mShaderBindingsLock);
+			auto it = G->mShaderBindingsCache.find(entry->hash);
+			if (it != G->mShaderBindingsCache.end())
+				entry->bindings = &it->second;
+		}
+		*bindings = entry->bindings;
+	}
+	return true;
 }
 
 void HackerContext::DeferredShaderReplacementBeforeDraw()

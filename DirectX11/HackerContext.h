@@ -239,6 +239,9 @@ private:
 		// shader that really runs in place of this one, which reloading changes:
 		ID3D11DeviceChild *buffer_srv_slots_shader;
 		UINT64 buffer_srv_slots[2];
+		// mShaderBindingsCache for hash, filled in by BoundShaderInfo() when
+		// it first finds it. Its entries are never replaced or taken out:
+		const struct ShaderBindings *bindings;
 	} mShaderHandleCache[1 << SHADER_HANDLE_CACHE_BITS];
 	const ShaderHandleCacheEntry* LookupShaderHandle(ID3D11DeviceChild *shader);
 
@@ -392,6 +395,12 @@ public:
 	// What that shader declares at its registers, where that is known
 	// without a D3D11 object: for a draw of a Vulkan game. NULL otherwise.
 	const struct ShaderBindings* Dx12CurrentShaderBindings(wchar_t shader_type);
+	// What G->mShaderOverrideMap and G->mShaderBindingsCache have for the
+	// hash of a shader the game created, looked up through the caches of
+	// this context. False if the shader has no hash. Either output may be
+	// NULL when not needed.
+	bool BoundShaderInfo(ID3D11DeviceChild *shader, struct ShaderOverride **shader_override,
+			const struct ShaderBindings **bindings);
 	// The context over the D3D12 shim, whose game textures have no
 	// D3D11 resource to read
 	bool IsDx12ShimContext() const;

@@ -4001,34 +4001,23 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 		return override->second.filter_index != FLT_MAX ? override->second.filter_index : 1.0f;
 	}
 
-	ShaderMap::iterator shader_it = lookup_shader_hash(shader);
-
-	if (shader_it == G->mShaders.end())
-		return 0.0;
-
 	if (shader_target.evaluation_mode == ShaderTargetEvaluationMode::SHADER)
 	{
-		ShaderOverrideMap::iterator override = lookup_shaderoverride(shader_it->second);
-		if (override == G->mShaderOverrideMap.end())
+		ShaderOverride *shader_override;
+		if (!mHackerContext->BoundShaderInfo(shader, &shader_override, nullptr))
+			return 0.0;
+		if (!shader_override)
 			return 0.0;  // Positive zero means shader bound with no ShaderOverride.
 
-		if (override->second.filter_index != FLT_MAX)
-			return override->second.filter_index;
+		if (shader_override->filter_index != FLT_MAX)
+			return shader_override->filter_index;
 
 		return 1.0;  // Matched ShaderOverride / ShaderRegex, but no filter_index.
 	}
 
-	//LogDebug("ShaderTarget Member Evaluation hash=%016I64x\n", shader_it->second);
-
-	const ShaderBindings *bindings = nullptr;
-	{
-		// Shaders created on other threads insert into the cache. Its
-		// elements stay where they are, so the pointer outlives the lock:
-		CriticalSectionGuard(&G->mShaderBindingsLock);
-		auto it = G->mShaderBindingsCache.find(shader_it->second);
-		if (it != G->mShaderBindingsCache.end())
-			bindings = &it->second;
-	}
+	const ShaderBindings *bindings;
+	if (!mHackerContext->BoundShaderInfo(shader, nullptr, &bindings))
+		return 0.0;
 	if (!bindings) {
 		assert(false);
 		return 0.0;  // Safety check, should never happen;
@@ -10685,19 +10674,10 @@ static const ShaderBindings* ResolvePixelShaderBindings(CommandListState* state)
 	if (!shader)
 		return state->mHackerContext->Dx12CurrentShaderBindings(L'p');
 
-	// Find the shader's registered hash.
-	auto shader_it = lookup_shader_hash(shader);
-	if (shader_it == G->mShaders.end())
+	const ShaderBindings *bindings;
+	if (!state->mHackerContext->BoundShaderInfo(shader, nullptr, &bindings))
 		return nullptr;
-
-	// Shaders created on other threads insert into the cache. Its elements
-	// stay where they are, so the pointer outlives the lock:
-	CriticalSectionGuard(&G->mShaderBindingsLock);
-	auto bindings_it = G->mShaderBindingsCache.find(shader_it->second);
-	if (bindings_it == G->mShaderBindingsCache.end())
-		return nullptr;
-
-	return &bindings_it->second;
+	return bindings;
 }
 
 void InitialTexturesSnapshot::SnapshotInitialTextures(CommandListState* state)
