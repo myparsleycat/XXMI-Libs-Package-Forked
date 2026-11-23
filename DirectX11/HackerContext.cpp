@@ -549,16 +549,19 @@ void HackerContext::ProcessShaderOverride(ShaderOverride *shaderOverride, bool i
 	if (ENABLE_LEGACY_FILTERS) {
 		// Deprecated since the logic can be moved into the shaders with far more flexibility
 		if (use_orig) {
-			if (isPixelShader) {
-				ShaderReplacementMap::iterator i = lookup_original_shader(mCurrentPixelShaderHandle.Get());
-				if (i != G->mOriginalShaders.end())
-					data->oldPixelShader = SwitchPSShader((ID3D11PixelShader*)i->second);
-			}
-			else {
-				ShaderReplacementMap::iterator i = lookup_original_shader(mCurrentVertexShaderHandle.Get());
-				if (i != G->mOriginalShaders.end())
-					data->oldVertexShader = SwitchVSShader((ID3D11VertexShader*)i->second);
-			}
+			ID3D11DeviceChild *orig = NULL;
+
+			EnterCriticalSectionPretty(&G->mCriticalSection);
+			ShaderReplacementMap::iterator i = lookup_original_shader(isPixelShader ?
+				(ID3D11DeviceChild*)mCurrentPixelShaderHandle.Get() : (ID3D11DeviceChild*)mCurrentVertexShaderHandle.Get());
+			if (i != G->mOriginalShaders.end())
+				orig = i->second;
+			LeaveCriticalSection(&G->mCriticalSection);
+
+			if (orig && isPixelShader)
+				data->oldPixelShader = SwitchPSShader((ID3D11PixelShader*)orig);
+			else if (orig)
+				data->oldVertexShader = SwitchVSShader((ID3D11VertexShader*)orig);
 		}
 	}
 }
@@ -715,6 +718,8 @@ const HackerContext::ShaderHandleCacheEntry* HackerContext::LookupShaderHandle(I
 		return entry;
 	}
 
+	// Shaders created on other threads are added to these maps
+	EnterCriticalSectionPretty(&G->mCriticalSection);
 	ShaderMap::iterator i = lookup_shader_hash(shader);
 	ShaderReloadMap::iterator j = lookup_reloaded_shader(shader);
 	entry->shader = shader;
@@ -722,6 +727,7 @@ const HackerContext::ShaderHandleCacheEntry* HackerContext::LookupShaderHandle(I
 	entry->hash_found = i != G->mShaders.end();
 	entry->hash = entry->hash_found ? i->second : 0;
 	entry->reload_info = (j != G->mReloadedShaders.end()) ? &j->second : NULL;
+	LeaveCriticalSection(&G->mCriticalSection);
 	entry->buffer_srv_slots_shader = NULL;
 	entry->bindings = NULL;
 	return entry;
@@ -2711,9 +2717,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 			// *wrong* hash
 			*currentShaderHash = 0;
 
-			ShaderReloadMap::iterator it = lookup_reloaded_shader(pShader);
-			if (it != G->mReloadedShaders.end())
-				reload_info = &it->second;
+			reload_info = LookupShaderHandle(pShader)->reload_info;
 		}
 
 		// If the shader has been live reloaded from ShaderFixes, use the new one
@@ -2744,10 +2748,12 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 		if (G->hunting == HUNTING_MODE_ENABLED) {
 			// Replacement map.
 			if (G->marking_mode == MarkingMode::ORIGINAL || !G->fix_enabled) {
+				EnterCriticalSectionPretty(&G->mCriticalSection);
 				ShaderReplacementMap::iterator j = lookup_original_shader(pShader);
 				if ((selectedShader == *currentShaderHash || !G->fix_enabled) && j != G->mOriginalShaders.end()) {
 					repl_shader = (ID3D11Shader*)j->second;
 				}
+				LeaveCriticalSection(&G->mCriticalSection);
 			}
 		}
 
