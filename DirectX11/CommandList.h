@@ -1510,6 +1510,19 @@ public:
 	// resolved binding is handed back through here instead of being bound.
 	DeferredBinding *deferred = nullptr;
 
+	// The view this operation last failed to create with E_INVALIDARG. The
+	// same call for the same resource fails the same way, and a failed view
+	// creation costs microseconds in the runtime: a mod that binds a buffer
+	// without a format to a t slot would otherwise try again every draw.
+	// Holds a reference so that the address cannot pass to another resource.
+	struct FailedView {
+		ID3D11Resource *resource;
+		ResourceCopyTargetType type;
+		UINT stride, offset, size;
+		DXGI_FORMAT format;
+		ResourceCopyOptions options;
+	} failed_view = {};
+
 	ResourceCopyOperation();
 	~ResourceCopyOperation();
 
@@ -1527,6 +1540,9 @@ public:
 
 private:
 	void SetOrDeferResource(CommandListState* state, ID3D11Resource* res, ID3D11View* view, UINT stride, UINT offset, DXGI_FORMAT format, UINT buf_size);
+	ResourceCopyTargetType ViewTargetType(CommandListState *state) const;
+	bool RepeatsFailedView(CommandListState *state, ID3D11Resource *resource, UINT stride, UINT offset, DXGI_FORMAT format, UINT size) const;
+	void NoteFailedView(CommandListState *state, ID3D11Resource *resource, UINT stride, UINT offset, DXGI_FORMAT format, UINT size);
 };
 
 // Adjacent resource copies between a contiguous range of shader resource

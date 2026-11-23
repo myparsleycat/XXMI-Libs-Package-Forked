@@ -14465,7 +14465,8 @@ static ID3D11View* _CreateCompatibleView(
 		UINT offset,
 		DXGI_FORMAT format,
 		UINT buf_src_size,
-		ResourceCopyOptions options)
+		ResourceCopyOptions options,
+		HRESULT *create_hr = NULL)
 {
 	D3D11_RESOURCE_DIMENSION dimension;
 	ID3D11Buffer *buf;
@@ -14526,6 +14527,8 @@ static ID3D11View* _CreateCompatibleView(
 	}
 
 	hr = (state->mOrigDevice1->*CreateView)(resource, pDesc, &view);
+	if (create_hr)
+		*create_hr = hr;
 	if (FAILED(hr)) {
 		LogInfo("Resource copy CreateCompatibleView failed: %x\n", hr);
 		if (pDesc)
@@ -14548,32 +14551,33 @@ static ID3D11View* CreateCompatibleView(
 		UINT offset,
 		DXGI_FORMAT format,
 		UINT buf_src_size,
-		ResourceCopyOptions options)
+		ResourceCopyOptions options,
+		HRESULT *create_hr = NULL)
 {
 	switch (dst->type) {
 		case ResourceCopyTargetType::SHADER_RESOURCE:
 			return _CreateCompatibleView<ID3D11ShaderResourceView,
 			       D3D11_SHADER_RESOURCE_VIEW_DESC,
 			       &ID3D11Device::CreateShaderResourceView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::RENDER_TARGET:
 			return _CreateCompatibleView<ID3D11RenderTargetView,
 			       D3D11_RENDER_TARGET_VIEW_DESC,
 			       &ID3D11Device::CreateRenderTargetView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::DEPTH_STENCIL_TARGET:
 			return _CreateCompatibleView<ID3D11DepthStencilView,
 			       D3D11_DEPTH_STENCIL_VIEW_DESC,
 			       &ID3D11Device::CreateDepthStencilView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::UNORDERED_ACCESS_VIEW:
 			return _CreateCompatibleView<ID3D11UnorderedAccessView,
 			       D3D11_UNORDERED_ACCESS_VIEW_DESC,
 			       &ID3D11Device::CreateUnorderedAccessView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::THIS_RESOURCE:
 			if (state->this_target)
-				return CreateCompatibleView(state->this_target, resource, state, stride, offset, format, buf_src_size, options);
+				return CreateCompatibleView(state->this_target, resource, state, stride, offset, format, buf_src_size, options, create_hr);
 			break;
 	}
 	return NULL;
@@ -14935,6 +14939,34 @@ ResourceCopyOperation::~ResourceCopyOperation()
 
 	if (cached_view)
 		cached_view->Release();
+
+	if (failed_view.resource)
+		failed_view.resource->Release();
+}
+
+// The kind of view CreateCompatibleView makes for the destination
+ResourceCopyTargetType ResourceCopyOperation::ViewTargetType(CommandListState *state) const
+{
+	if (dst.type == ResourceCopyTargetType::THIS_RESOURCE)
+		return state->this_target ? state->this_target->type : ResourceCopyTargetType::INVALID;
+	return dst.type;
+}
+
+bool ResourceCopyOperation::RepeatsFailedView(CommandListState *state, ID3D11Resource *resource, UINT stride, UINT offset, DXGI_FORMAT format, UINT size) const
+{
+	return resource && failed_view.resource == resource
+		&& failed_view.type == ViewTargetType(state)
+		&& failed_view.stride == stride && failed_view.offset == offset
+		&& failed_view.format == format && failed_view.size == size
+		&& failed_view.options == options;
+}
+
+void ResourceCopyOperation::NoteFailedView(CommandListState *state, ID3D11Resource *resource, UINT stride, UINT offset, DXGI_FORMAT format, UINT size)
+{
+	resource->AddRef();
+	if (failed_view.resource)
+		failed_view.resource->Release();
+	failed_view = { resource, ViewTargetType(state), stride, offset, size, format, options };
 }
 
 static bool ViewMatchesResource(ID3D11View *view, ID3D11Resource *resource)
@@ -15198,9 +15230,13 @@ void ResourceCopyOperation::CopyResourceToResource(
 					stride, offset, format, buf_src_size, options);
 		}
 
-		if (!dst_view) {
+		if (!dst_view && !RepeatsFailedView(state, dst_resource, stride, offset, format, buf_src_size)) {
+			HRESULT hr = S_OK;
+
 			dst_view = CreateCompatibleView(&dst, dst_resource, state,
-					stride, offset, format, buf_src_size, options);
+					stride, offset, format, buf_src_size, options, &hr);
+			if (hr == E_INVALIDARG)
+				NoteFailedView(state, dst_resource, stride, offset, format, buf_src_size);
 
 			if (recall_view && dst_view) {
 				state->mHackerContext->NoteShaderResourceView(dst_view, dst_resource,
