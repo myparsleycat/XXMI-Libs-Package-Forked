@@ -3793,6 +3793,9 @@ static void UpdateScissorInfo(CommandListState *state)
 	state->scissor_valid = true;
 }
 
+static bool find_native_output_filter_overrides(ResourceCopyTarget &target, CommandListState *state,
+		TextureOverrideMatches *matches);
+
 float CommandListOperand::process_texture_filter(CommandListState *state)
 {
 	switch (texture_filter_target.evaluation_mode)
@@ -3803,7 +3806,12 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 			TextureOverrideMatches::reverse_iterator rit;
 			bool resource_found;
 
-			texture_filter_target.FindTextureOverrides(state, &resource_found, &matches);
+			const auto type = texture_filter_target.type;
+			if ((type == ResourceCopyTargetType::RENDER_TARGET || type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET)
+					&& !(dx12_shim && state->mOrigContext1 == dx12_shim->shim_context) && !VkInDrawScope())
+				resource_found = find_native_output_filter_overrides(texture_filter_target, state, &matches);
+			else
+				texture_filter_target.FindTextureOverrides(state, &resource_found, &matches);
 
 			// If there is no resource bound we want to return a special value that
 			// is distinct from simply not finding a texture override section. For
@@ -12710,6 +12718,41 @@ D3D11_BIND_FLAG ResourceCopyTarget::BindFlags(CommandListState *state, D3D11_RES
 
 	// Shouldn't happen. No return value makes sense, so raise an exception
 	throw(std::range_error("Bad 3DMigoto ResourceCopyTarget"));
+}
+
+static bool find_native_output_filter_overrides(ResourceCopyTarget &target, CommandListState *state,
+		TextureOverrideMatches *matches)
+{
+	const unsigned slot = target.ResolveSlot(state);
+	ID3D11View *output_view = nullptr;
+	if (slot != UINT_MAX) {
+		if (target.type == ResourceCopyTargetType::RENDER_TARGET) {
+			ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+			state->mOrigContext1->OMGetRenderTargets(slot + 1, targets, nullptr);
+			output_view = take_slot(targets, slot);
+		} else {
+			ID3D11DepthStencilView *depth_view = nullptr;
+			state->mOrigContext1->OMGetRenderTargets(0, nullptr, &depth_view);
+			output_view = depth_view;
+		}
+	}
+
+	// The filter distinguishes a bound target with no matches from an unbound one.
+	bool bound = output_view != nullptr;
+	if (output_view) {
+		if (!TextureOverrideViewKnownMiss(output_view)) {
+			ID3D11Resource *resource = nullptr;
+			output_view->GetResource(&resource);
+			bound = resource != nullptr;
+			if (resource) {
+				target.FindTextureOverridesForResource(state, resource, 0, 0, DXGI_FORMAT_UNKNOWN, matches);
+				NoteTextureOverrideViewResource(output_view, resource);
+				resource->Release();
+			}
+		}
+		output_view->Release();
+	}
+	return bound;
 }
 
 void ResourceCopyTarget::FindTextureOverrides(CommandListState *state, bool *resource_found, TextureOverrideMatches *matches)
