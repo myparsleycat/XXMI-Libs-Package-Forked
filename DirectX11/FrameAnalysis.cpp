@@ -2638,7 +2638,7 @@ void FrameAnalysisContext::DumpTextures(bool compute)
 		if (mCurrentPixelShader) {
 			ShaderBindings* bindings = nullptr;
 			if (mCurrentPixelShaderHandle) {
-				ID3D11DeviceChild *running = RunningShader(mCurrentPixelShaderHandle);
+				ID3D11DeviceChild *running = RunningShader(mCurrentPixelShaderHandle.Get());
 
 				// Shaders created on other threads insert into these maps.
 				// Its elements stay where they are, so the pointer outlives the lock:

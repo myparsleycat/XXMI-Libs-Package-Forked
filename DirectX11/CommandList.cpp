@@ -247,7 +247,7 @@ static void RealignInputLayoutOffsets(
 		if (element.AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT)
 			continue;
 
-		UINT boundary = original_format + dxgi_format_size(original_format);
+		UINT boundary = original_offset + dxgi_format_size(original_format);
 
 		if (element.AlignedByteOffset >= boundary) {
 			//LogInfo("  Element %zu offset %u -> %u\n", i, element.AlignedByteOffset, static_cast<UINT>(static_cast<INT>(element.AlignedByteOffset) + sizeDelta));
@@ -3952,22 +3952,22 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 	switch (shader_target.shader_type)
 	{
 		case L'v':
-			shader = mHackerContext->mCurrentVertexShaderHandle;
+			shader = mHackerContext->mCurrentVertexShaderHandle.Get();
 			break;
 		case L'h':
-			shader = mHackerContext->mCurrentHullShaderHandle;
+			shader = mHackerContext->mCurrentHullShaderHandle.Get();
 			break;
 		case L'd':
-			shader = mHackerContext->mCurrentDomainShaderHandle;
+			shader = mHackerContext->mCurrentDomainShaderHandle.Get();
 			break;
 		case L'g':
-			shader = mHackerContext->mCurrentGeometryShaderHandle;
+			shader = mHackerContext->mCurrentGeometryShaderHandle.Get();
 			break;
 		case L'p':
-			shader = mHackerContext->mCurrentPixelShaderHandle;
+			shader = mHackerContext->mCurrentPixelShaderHandle.Get();
 			break;
 		case L'c':
-			shader = mHackerContext->mCurrentComputeShaderHandle;
+			shader = mHackerContext->mCurrentComputeShaderHandle.Get();
 			break;
 		default:
 			LogOverlay(LOG_DIRE, "BUG: Unknown shader filter type: \"%C\"\n", shader_target.shader_type);
@@ -10660,7 +10660,7 @@ static const ShaderBindings* ResolvePixelShaderBindings(CommandListState* state)
 	if (!state || !state->mHackerContext)
 		return nullptr;
 
-	ID3D11PixelShader* shader = state->mHackerContext->mCurrentPixelShaderHandle;
+	ID3D11PixelShader* shader = state->mHackerContext->mCurrentPixelShaderHandle.Get();
 
 	// The shaders of a D3D12 or Vulkan game have no D3D11 object. Only a
 	// Vulkan draw says what its shader declares.
@@ -15465,8 +15465,8 @@ void HackerContext::GuardShaderResources(bool compute)
 {
 	static const wchar_t shader_types[] = L"vhdgpc";
 	ID3D11DeviceChild *const handles[6] = {
-		mCurrentVertexShaderHandle, mCurrentHullShaderHandle, mCurrentDomainShaderHandle,
-		mCurrentGeometryShaderHandle, mCurrentPixelShaderHandle, mCurrentComputeShaderHandle,
+		mCurrentVertexShaderHandle.Get(), mCurrentHullShaderHandle.Get(), mCurrentDomainShaderHandle.Get(),
+		mCurrentGeometryShaderHandle.Get(), mCurrentPixelShaderHandle.Get(), mCurrentComputeShaderHandle.Get(),
 	};
 
 	for (int stage = compute ? 5 : 0; stage < (compute ? 6 : 5); stage++) {

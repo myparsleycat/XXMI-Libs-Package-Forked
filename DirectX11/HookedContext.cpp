@@ -39,6 +39,7 @@
 #undef D3D11_NO_HELPERS
 #undef CINTERFACE
 
+#include <cstddef>
 #include <unordered_map>
 
 #include "HookedContext.h"
@@ -61,31 +62,94 @@
 // A map to look up the hacker context from the original context:
 typedef std::unordered_map<ID3D11DeviceContext1 *, ID3D11DeviceContext1 *> ContextMap;
 static ContextMap context_map;
-static CRITICAL_SECTION context_map_lock;
+static CRITICAL_SECTION *context_map_lock()
+{
+	static CRITICAL_SECTION lock;
+	static const bool initialized = [] {
+		InitializeCriticalSectionPretty(&lock);
+		return true;
+	}();
+	return &lock;
+}
 
-// Holds all the function pointers that we need to call into the real original
-// context:
-static struct ID3D11DeviceContext1Vtbl orig_vtable;
+static ID3D11DeviceContext1Vtbl orig_vtable;
 
-static bool hooks_installed = false;
-
+struct ID3D11DeviceContext1Trampoline {
+	CONST_VTBL ID3D11DeviceContext1Vtbl *lpVtbl;
+	ID3D11DeviceContext1 *orig_this;
+	bool supports_context1;
+};
 
 ID3D11DeviceContext1* lookup_hooked_context(ID3D11DeviceContext1 *orig_context)
 {
-	ContextMap::iterator i;
+	CriticalSectionGuard(context_map_lock());
+	auto context = context_map.find(orig_context);
+	return context != context_map.end() ? context->second : nullptr;
+}
 
-	if (!hooks_installed)
-		return NULL;
+template<typename Function, Function ID3D11DeviceContext1Vtbl::*Method>
+struct Context1Method;
 
-	EnterCriticalSectionPretty(&context_map_lock);
-	i = context_map.find(orig_context);
-	if (i == context_map.end()) {
-		LeaveCriticalSection(&context_map_lock);
-		return NULL;
+template<typename... Args, void (STDMETHODCALLTYPE *ID3D11DeviceContext1Vtbl::*Method)(ID3D11DeviceContext1*, Args...)>
+struct Context1Method<void (STDMETHODCALLTYPE *)(ID3D11DeviceContext1*, Args...), Method>
+{
+	static void STDMETHODCALLTYPE Hook(ID3D11DeviceContext1 *original, Args... args)
+	{
+		if (auto *context = lookup_hooked_context(original))
+			(context->lpVtbl->*Method)(context, args...);
+		else
+			(orig_vtable.*Method)(original, args...);
 	}
-	LeaveCriticalSection(&context_map_lock);
 
-	return i->second;
+	static void STDMETHODCALLTYPE Trampoline(ID3D11DeviceContext1 *self, Args... args)
+	{
+		auto *context = reinterpret_cast<ID3D11DeviceContext1Trampoline*>(self);
+		if (context->supports_context1)
+			(orig_vtable.*Method)(context->orig_this, args...);
+	}
+};
+
+#define FOR_EACH_CONTEXT1_METHOD(M) \
+	M(CopySubresourceRegion1) \
+	M(UpdateSubresource1) \
+	M(DiscardResource) \
+	M(DiscardView) \
+	M(VSSetConstantBuffers1) \
+	M(HSSetConstantBuffers1) \
+	M(DSSetConstantBuffers1) \
+	M(GSSetConstantBuffers1) \
+	M(PSSetConstantBuffers1) \
+	M(CSSetConstantBuffers1) \
+	M(VSGetConstantBuffers1) \
+	M(HSGetConstantBuffers1) \
+	M(DSGetConstantBuffers1) \
+	M(GSGetConstantBuffers1) \
+	M(PSGetConstantBuffers1) \
+	M(CSGetConstantBuffers1) \
+	M(SwapDeviceContextState) \
+	M(ClearView) \
+	M(DiscardView1)
+
+#define CONTEXT1_METHOD(name) Context1Method<decltype(ID3D11DeviceContext1Vtbl::name), &ID3D11DeviceContext1Vtbl::name>
+
+static bool install_context1_hooks(ID3D11DeviceContext1 *context)
+{
+	ID3D11DeviceContext1 *context1 = nullptr;
+	if (FAILED(orig_vtable.QueryInterface(context, IID_ID3D11DeviceContext1, reinterpret_cast<void**>(&context1))))
+		return false;
+
+	static bool installed = false;
+	if (!installed) {
+		size_t hook_id;
+#define INSTALL(name) \
+		orig_vtable.name = context1->lpVtbl->name; \
+		cHookMgr.Hook(&hook_id, (void**)&orig_vtable.name, context1->lpVtbl->name, CONTEXT1_METHOD(name)::Hook);
+		FOR_EACH_CONTEXT1_METHOD(INSTALL)
+#undef INSTALL
+		installed = true;
+	}
+	orig_vtable.Release(context1);
+	return true;
 }
 
 
@@ -121,7 +185,7 @@ static ULONG STDMETHODCALLTYPE Release(ID3D11DeviceContext1 *This)
 
 	HookDebug("HookedContext::Release()\n");
 
-	EnterCriticalSectionPretty(&context_map_lock);
+	EnterCriticalSectionPretty(context_map_lock());
 	i = context_map.find(This);
 	if (i != context_map.end()) {
 		ref = ID3D11DeviceContext1_Release(i->second);
@@ -130,7 +194,7 @@ static ULONG STDMETHODCALLTYPE Release(ID3D11DeviceContext1 *This)
 	} else
 		ref = orig_vtable.Release(This);
 
-	LeaveCriticalSection(&context_map_lock);
+	LeaveCriticalSection(context_map_lock());
 
 	return ref;
 }
@@ -2088,14 +2152,14 @@ static void install_hooks(ID3D11DeviceContext1 *context)
 	SIZE_T hook_id;
 
 	// Hooks should only be installed once as they will affect all contexts
-	if (hooks_installed)
+	static bool installed = false;
+	if (installed)
 		return;
-	InitializeCriticalSectionPretty(&context_map_lock);
-	hooks_installed = true;
+	installed = true;
 
 	// Make sure that everything in the orig_vtable is filled in just in
 	// case we miss one of the hooks below:
-	memcpy(&orig_vtable, context->lpVtbl, sizeof(struct ID3D11DeviceContext1Vtbl));
+	memcpy(&orig_vtable, context->lpVtbl, offsetof(ID3D11DeviceContext1Vtbl, CopySubresourceRegion1));
 
 	// At the moment we are just throwing away the hook IDs - we should
 	// probably hold on to them incase we need to remove the hooks later:
@@ -2222,12 +2286,6 @@ static void install_hooks(ID3D11DeviceContext1 *context)
 // functions in orig_vtable. This replaces mOrigContext in the HackerContext
 // and elsewhere and gives us a way to call back into the game with minimal
 // code changes.
-typedef struct ID3D11DeviceContext1Trampoline {
-	CONST_VTBL struct ID3D11DeviceContext1Vtbl *lpVtbl;
-	ID3D11DeviceContext1 *orig_this;
-} ID3D11DeviceContext1Trampoline;
-
-
 // IUnknown
 static HRESULT STDMETHODCALLTYPE TrampolineQueryInterface(ID3D11DeviceContext1 *This, REFIID riid, void **ppvObject)
 {
@@ -3533,7 +3591,13 @@ static CONST_VTBL struct ID3D11DeviceContext1Vtbl trampoline_vtable = {
 	TrampolineGetType,
 	TrampolineGetContextFlags,
 	TrampolineFinishCommandList,
+#define TRAMPOLINE(name) CONTEXT1_METHOD(name)::Trampoline,
+	FOR_EACH_CONTEXT1_METHOD(TRAMPOLINE)
+#undef TRAMPOLINE
 };
+
+#undef CONTEXT1_METHOD
+#undef FOR_EACH_CONTEXT1_METHOD
 
 ID3D11DeviceContext1* hook_context(ID3D11DeviceContext1 *orig_context, ID3D11DeviceContext1 *hacker_context)
 {
@@ -3541,10 +3605,10 @@ ID3D11DeviceContext1* hook_context(ID3D11DeviceContext1 *orig_context, ID3D11Dev
 	trampoline_context->lpVtbl = &trampoline_vtable;
 	trampoline_context->orig_this = orig_context;
 
+	CriticalSectionGuard(context_map_lock());
 	install_hooks(orig_context);
-	EnterCriticalSectionPretty(&context_map_lock);
+	trampoline_context->supports_context1 = install_context1_hooks(orig_context);
 	context_map[orig_context] = hacker_context;
-	LeaveCriticalSection(&context_map_lock);
 
 	return (ID3D11DeviceContext1*)trampoline_context;
 }

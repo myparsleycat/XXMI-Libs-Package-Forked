@@ -722,7 +722,7 @@ void MarkResourceHashContaminated(ID3D11Resource *dest, UINT DstSubresource,
 void UpdateResourceHashFromCPU(ID3D11Resource *resource,
 	const void *data, UINT rowPitch, UINT depthPitch, bool note_update);
 
-void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src);
+void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src, bool require_same_extent = false);
 
 bool MapTrackResourceHashUpdate(ID3D11Resource *pResource, UINT Subresource, D3D11_RESOURCE_DIMENSION dim);
 

@@ -2384,14 +2384,8 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 	if (pDesc)
 		LogDebugResourceDesc(pDesc);
 	if (pInitialData && pInitialData->pSysMem)
-	{
-		LogDebugNoNL("  pInitialData = %p->%p, SysMemPitch: %u, SysMemSlicePitch: %u ",
+		LogDebug("  pInitialData = %p->%p, SysMemPitch: %u, SysMemSlicePitch: %u\n",
 			pInitialData, pInitialData->pSysMem, pInitialData->SysMemPitch, pInitialData->SysMemSlicePitch);
-		const uint8_t* hex = static_cast<const uint8_t*>(pInitialData->pSysMem);
-		for (size_t i = 0; i < 16; i++)
-			LogDebugNoNL(" %02hX", hex[i]);
-		LogDebug("\n");
-	}
 
 	// Rectangular depth stencil textures of at least 640x480 may indicate
 	// the game's resolution, for games that upscale to their swap chains:

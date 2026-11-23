@@ -159,9 +159,12 @@ private:
 	UINT mCurrentPSUAVStartSlot;
 	UINT mCurrentPSNumUAVs;
 
-	HackerInputLayout* mCurrentInputLayout;
-	HackerInputLayout* mOriginalInputLayout;
-	HackerInputLayout* mOverrideInputLayout;
+	Microsoft::WRL::ComPtr<HackerInputLayout> mCurrentInputLayout;
+	Microsoft::WRL::ComPtr<HackerInputLayout> mOriginalInputLayout;
+	Microsoft::WRL::ComPtr<HackerInputLayout> mOverrideInputLayout;
+	bool mInputLayoutOverridden = false;
+
+	void ResetTrackedPipelineState();
 
 	InitialTexturesSnapshot mInitialTexturesSnapshot;
 
@@ -342,7 +345,7 @@ private:
 		std::set<UINT64> *visitedShaders,
 		UINT64 selectedShader,
 		UINT64 *currentShaderHash,
-		ID3D11Shader **currentShaderHandle,
+		Microsoft::WRL::ComPtr<ID3D11Shader> &currentShaderHandle,
 		bool *deferredPending);
 	template <void (__stdcall ID3D11DeviceContext::*OrigSetShaderResources)(THIS_
 			UINT StartSlot,
@@ -518,12 +521,12 @@ public:
 
 	// These are the shaders the game has set, which may be different from
 	// the ones we have bound to the pipeline:
-	ID3D11VertexShader *mCurrentVertexShaderHandle;
-	ID3D11PixelShader *mCurrentPixelShaderHandle;
-	ID3D11ComputeShader *mCurrentComputeShaderHandle;
-	ID3D11GeometryShader *mCurrentGeometryShaderHandle;
-	ID3D11DomainShader *mCurrentDomainShaderHandle;
-	ID3D11HullShader *mCurrentHullShaderHandle;
+	Microsoft::WRL::ComPtr<ID3D11VertexShader> mCurrentVertexShaderHandle;
+	Microsoft::WRL::ComPtr<ID3D11PixelShader> mCurrentPixelShaderHandle;
+	Microsoft::WRL::ComPtr<ID3D11ComputeShader> mCurrentComputeShaderHandle;
+	Microsoft::WRL::ComPtr<ID3D11GeometryShader> mCurrentGeometryShaderHandle;
+	Microsoft::WRL::ComPtr<ID3D11DomainShader> mCurrentDomainShaderHandle;
+	Microsoft::WRL::ComPtr<ID3D11HullShader> mCurrentHullShaderHandle;
 
 	/*** IUnknown methods ***/
 

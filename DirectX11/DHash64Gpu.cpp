@@ -245,6 +245,28 @@ HRESULT DHash64Gpu::Initialize(ID3D11Device* device)
 
 namespace
 {
+    class ScopedPredication
+    {
+    public:
+        explicit ScopedPredication(ID3D11DeviceContext* context) : context(context)
+        {
+            context->GetPredication(predicate.GetAddressOf(), &value);
+            if (predicate)
+                context->SetPredication(nullptr, value);
+        }
+
+        ~ScopedPredication()
+        {
+            if (predicate)
+                context->SetPredication(predicate.Get(), value);
+        }
+
+    private:
+        ID3D11DeviceContext* context;
+        ComPtr<ID3D11Predicate> predicate;
+        BOOL value = FALSE;
+    };
+
     class ScopedCSState
     {
     public:
@@ -383,6 +405,7 @@ HRESULT DHash64Gpu::ComputeHash(
         return hr;
     }
 
+    ScopedPredication predication(context);
     {
         ScopedCSState savedState(context);
 
@@ -393,6 +416,12 @@ HRESULT DHash64Gpu::ComputeHash(
         context->CSSetShader(mComputeShader.Get(), nullptr, 0);
 
         context->CSSetShaderResources(0, 1, &inputSrv);
+        ComPtr<ID3D11ShaderResourceView> boundSrv;
+        context->CSGetShaderResources(0, 1, boundSrv.GetAddressOf());
+        // An overlapping output binding causes the runtime to clear the SRV slot.
+        if (boundSrv.Get() != inputSrv)
+            return E_PENDING;
+
         context->CSSetSamplers(0, 1, &sampler);
 
         context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);

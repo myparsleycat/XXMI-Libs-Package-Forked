@@ -1630,7 +1630,19 @@ out_profile:
 		Profiling::end(&profiling_state, &Profiling::hash_tracking_overhead);
 }
 
-void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src)
+static bool SameTextureExtent(const ResourceHandleInfo *dst, const ResourceHandleInfo *src)
+{
+	if (src->type != dst->type)
+		return false;
+
+	if (dst->type == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+		return src->desc2D.Width == dst->desc2D.Width && src->desc2D.Height == dst->desc2D.Height;
+
+	return src->desc3D.Width == dst->desc3D.Width && src->desc3D.Height == dst->desc3D.Height
+		&& src->desc3D.Depth == dst->desc3D.Depth;
+}
+
+void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src, bool require_same_extent)
 {
 	ResourceHandleInfo *dst_info, *src_info;
 	D3D11_RESOURCE_DIMENSION dim;
@@ -1661,7 +1673,7 @@ void PropagateResourceHash(ID3D11Resource *dst, ID3D11Resource *src)
 		goto out_unlock;
 
 	src_info = GetResourceHandleInfo(src);
-	if (!src_info)
+	if (!src_info || (require_same_extent && !SameTextureExtent(dst_info, src_info)))
 		goto out_unlock;
 
 	// If there was no initial data in either source or destination, or
@@ -3254,10 +3266,11 @@ UINT GetIndexBufferRegionSize(DXGI_FORMAT format, DrawCallInfo* call_info)
 // Optimized for single global "entry point" into TextureOverride's, e.g. `CheckTextureOverride = ib` from global ShaderRegEx.
 // Usually, total number of handles is 5-10 times bigger than of ones bound to some specific slot.
 // So lookup in dedicated continuous container is expected to be always faster than one in huge unordered map. 
-FlatHashMap<RegionHashKeyL3, uint32_t, RegionHashKeyHasherL3> region_hashes_global_cache(1024);
+static FlatHashMap<RegionHashKeyL3, uint32_t, RegionHashKeyHasherL3> region_hashes_global_cache(1024);
 
 void ClearRegionHashesGlobalCache()
 {
+	CriticalSectionGuard(&G->mCriticalSection);
 	region_hashes_global_cache.clear();
 }
 
@@ -3276,15 +3289,14 @@ uint32_t GetRegionHash(HackerContext* context, ID3D11Buffer* buffer, UINT offset
 	if (custom_resource == nullptr && VkScopeRegionHash(buffer, offset, size, &vk_hash))
 		return vk_hash;
 
-	// Lookup offset in fast L3 cache without any locking involved.
-	RegionHashKeyL3 level_3_cache_key{ (uint64_t)buffer, offset, size };
-	if (uint32_t* h = region_hashes_global_cache.find_ptr(level_3_cache_key))
-	{
-		//LogInfo("GetRegionHash: From L3 cache: hash=%08lx, offset=%d, size=%d, pResource=0x%p, cache_size=%d \n", *h, offset, size, buffer, region_hashes_global_cache.size());
-		return *h;
-	}
-
 	EnterCriticalSectionPretty(&G->mCriticalSection);
+
+	RegionHashKeyL3 level_3_cache_key{ (uint64_t)buffer, offset, size };
+	uint32_t hash;
+	if (region_hashes_global_cache.find(level_3_cache_key, hash)) {
+		LeaveCriticalSection(&G->mCriticalSection);
+		return hash;
+	}
 
 	// Acquire HandleInfo. For dozens of thousands of handles in unordered_map, usually it's more expensive than L3 cache lookup. 
 	ResourceHandleInfo* handle_info = (custom_resource == nullptr) ? GetResourceHandleInfo(buffer) : custom_resource->GetHandleInfo();
@@ -3293,10 +3305,8 @@ uint32_t GetRegionHash(HackerContext* context, ID3D11Buffer* buffer, UINT offset
 		return 0;
 	}
 
-	uint32_t hash;
-
-	// Lookup offset in L2 cache. This one is slower and requires `handle_info` lookup.
-	RegionHashKeyL2 level_2_cache_key{ (uint64_t)offset, size };
+	// Lookup offset in L2 cache.
+	RegionHashKeyL2 level_2_cache_key{ offset, size };
 	hash = handle_info->GetCachedRegionHash(level_2_cache_key);
 	if (hash) {
 		region_hashes_global_cache.insert(level_3_cache_key, hash);
@@ -3503,17 +3513,6 @@ uint32_t GetSpatialHash(HackerContext* context, ID3D11Buffer* buffer, UINT offse
 		return 0;
 	}
 
-	// Use zero size to share the cache with region hashes, which are always non-zero.
-	uint32_t size = 0;
-
-	// Lookup offset in fast L3 cache without any locking involved.
-	//RegionHashKeyL3 level_3_cache_key{ (uint64_t)buffer, offset_x, size };
-	//if (uint32_t* h = region_hashes_global_cache.find_ptr(level_3_cache_key))
-	//{
-	//	//LogInfo("GetSpatialHash: From L3 cache: hash=%08lx, pResource=0x%p, cache_size=%d \n", *h, buffer, region_hashes_global_cache.size());
-	//	return *h;
-	//}
-
 	EnterCriticalSectionPretty(&G->mCriticalSection);
 
 	// Acquire HandleInfo. For dozens of thousands of handles in unordered_map, usually it's more expensive than L3 cache lookup. 
@@ -3521,18 +3520,6 @@ uint32_t GetSpatialHash(HackerContext* context, ID3D11Buffer* buffer, UINT offse
 	if (!handle_info) {
 		LeaveCriticalSection(&G->mCriticalSection);
 		return 0;
-	}
-
-	uint32_t hash;
-
-	// Lookup offset in L2 cache. This one is slower and requires `handle_info` lookup.
-	RegionHashKeyL2 level_2_cache_key{ (uint64_t)offset_x, size };
-	hash = handle_info->GetCachedRegionHash(level_2_cache_key);
-	if (hash) {
-		//region_hashes_global_cache.insert(level_3_cache_key, hash);
-		LeaveCriticalSection(&G->mCriticalSection);
-		//LogInfo("GetSpatialHash: From L2 cache: hash=%08lx, full_hash=%08lx, pResource=0x%p, cache_size=%d \n", hash, handle_info->hash, buffer, handle_info->region_hashes_cache->GetSize());
-		return hash;
 	}
 
 	// Check if cached buffer snapshot exists in RAM
@@ -3552,33 +3539,21 @@ uint32_t GetSpatialHash(HackerContext* context, ID3D11Buffer* buffer, UINT offse
 		EnterCriticalSectionPretty(&G->mCriticalSection);
 	}
 
-	// Calculate the minimal buffer size required to fit requested X Y Z offsets.
-	UINT min_buffer_size = max(max(offset_x, offset_y), offset_z) * 4 + 4;
-
-	// Ensure upper bound does not exceed buffer size.
-	if (min_buffer_size >= handle_info->cached_data_size) {
+	const uint64_t required_size = (uint64_t(max(max(offset_x, offset_y), offset_z)) + 1) * sizeof(float);
+	if (required_size > handle_info->cached_data_size) {
 		LeaveCriticalSection(&G->mCriticalSection);
 		return 0;
 	}
 
-	// Make pointer for given offset in L1 cache (raw data).
-	handle_info->GetCachedData(offset_x * 4, 4);
-	handle_info->GetCachedData(offset_y * 4, 4);
-	const uint8_t* ptr = handle_info->GetCachedData(offset_z * 4, 4);
-
-	const float* data = reinterpret_cast<const float*>(ptr);
-
-	// Compute spatial hash for the 3D coordinates.
-	hash = PackCellCoords(data[offset_x], data[offset_y], data[offset_z], cell_size);
-
-	// Store computed region hash in the L2 cache (local per ResourceHandleInfo).
-	handle_info->CacheRegionHash(level_2_cache_key, hash);
-	// Store computed region hash in the L3 cache (global per-frame).
-	//region_hashes_global_cache.insert(level_3_cache_key, hash);
-
+	const auto read_coordinate = [handle_info](UINT index) {
+		const size_t offset = size_t(index) * sizeof(float);
+		float value;
+		memcpy(&value, handle_info->GetCachedData(offset, sizeof(value)) + offset, sizeof(value));
+		return value;
+	};
+	const uint32_t hash = PackCellCoords(read_coordinate(offset_x), read_coordinate(offset_y),
+			read_coordinate(offset_z), cell_size);
 	LeaveCriticalSection(&G->mCriticalSection);
-
-	//LogInfo("GetSpatialHash: New hash: frame=%d, hash=%08lx, x=%.3f, y=%.3f, z=%.3f, full_hash=%08lx, pResource=0x%p, cache_size=%d\n", G->frame_no, hash, data[offset_x], data[offset_y], data[offset_z], handle_info->hash, buffer, handle_info->region_hashes_cache->GetSize());
 
 	return hash;
 }
@@ -3672,9 +3647,9 @@ bool GetDhash(HackerContext* context, ID3D11Resource* resource, UINT prefer_mip_
 
 	if (FAILED(hr))
 	{
-		// E_NOTIMPL: this context cannot compute dHashes at all, but the
-		// immediate context may still compute this texture's
-		if (hr != E_NOTIMPL) {
+		// The immediate context may still compute the hash, or a conflicting
+		// output may be unbound without changing the texture's generation.
+		if (hr != E_NOTIMPL && hr != E_PENDING) {
 			LogInfo("DHash calculation failed: resource=%p mip=%u format=%u hr=0x%08X\n", resource, mip_level, (UINT)format, (UINT)hr);
 			info->dhash_failed_generation = generation;
 		}

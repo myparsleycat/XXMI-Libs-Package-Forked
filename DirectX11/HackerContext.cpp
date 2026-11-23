@@ -26,6 +26,8 @@
 #include "profiling.h"
 #include "GpuWatch.h"
 
+#include <wrl/implements.h>
+
 // -----------------------------------------------------------------------------------------------
 
 HackerContext* HackerContextFactory(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1)
@@ -71,28 +73,7 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mRealOrigContext1 = pContext1;
 	mHackerDevice = NULL;
 
-	memset(mCurrentVertexBuffers, 0, sizeof(mCurrentVertexBuffers));
-	mCurrentIndexBuffer = 0;
-	memset(mCurrentVertexBuffersBindings, 0, sizeof(mCurrentVertexBuffersBindings));
-	memset(&mCurrentIndexBufferBinding, 0, sizeof(mCurrentIndexBufferBinding));
-	mCurrentVertexShader = 0;
-	mCurrentVertexShaderHandle = NULL;
-	mCurrentPixelShader = 0;
-	mCurrentPixelShaderHandle = NULL;
-	mCurrentComputeShader = 0;
-	mCurrentComputeShaderHandle = NULL;
-	mCurrentGeometryShader = 0;
-	mCurrentGeometryShaderHandle = NULL;
-	mCurrentDomainShader = 0;
-	mCurrentDomainShaderHandle = NULL;
-	mCurrentHullShader = 0;
-	mCurrentHullShaderHandle = NULL;
-	mVertexShaderDeferredPending = false;
-	mHullShaderDeferredPending = false;
-	mDomainShaderDeferredPending = false;
-	mGeometryShaderDeferredPending = false;
-	mPixelShaderDeferredPending = false;
-	mComputeShaderDeferredPending = false;
+	ResetTrackedPipelineState();
 	mDeferredShaderGeneration = G->deferred_shader_generation;
 	memset(mShaderOverrideCache, 0, sizeof(mShaderOverrideCache));
 	memset(mShaderHandleCache, 0, sizeof(mShaderHandleCache));
@@ -103,12 +84,6 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	memset(mShaderResourceViewCache, 0, sizeof(mShaderResourceViewCache));
 	mShaderResourceViewCacheCount = 0;
 	mShaderResourceViewCacheFrame = 0;
-	mCurrentDepthTarget = NULL;
-	mCurrentPSUAVStartSlot = 0;
-	mCurrentPSNumUAVs = 0;
-	mCurrentInputLayout = nullptr;
-	mOriginalInputLayout = nullptr;
-	mOverrideInputLayout = nullptr;
 }
 
 HackerContext::~HackerContext()
@@ -126,6 +101,42 @@ HackerContext::~HackerContext()
 
 	for (void *spare : mDivertSpares)
 		free(spare);
+}
+
+void HackerContext::ResetTrackedPipelineState()
+{
+	memset(mCurrentVertexBuffers, 0, sizeof(mCurrentVertexBuffers));
+	mCurrentIndexBuffer = 0;
+	memset(mCurrentVertexBuffersBindings, 0, sizeof(mCurrentVertexBuffersBindings));
+	memset(&mCurrentIndexBufferBinding, 0, sizeof(mCurrentIndexBufferBinding));
+	mCurrentVertexShader = 0;
+	mCurrentVertexShaderHandle.Reset();
+	mCurrentPixelShader = 0;
+	mCurrentPixelShaderHandle.Reset();
+	mCurrentComputeShader = 0;
+	mCurrentComputeShaderHandle.Reset();
+	mCurrentGeometryShader = 0;
+	mCurrentGeometryShaderHandle.Reset();
+	mCurrentDomainShader = 0;
+	mCurrentDomainShaderHandle.Reset();
+	mCurrentHullShader = 0;
+	mCurrentHullShaderHandle.Reset();
+	mVertexShaderDeferredPending = false;
+	mHullShaderDeferredPending = false;
+	mDomainShaderDeferredPending = false;
+	mGeometryShaderDeferredPending = false;
+	mPixelShaderDeferredPending = false;
+	mComputeShaderDeferredPending = false;
+	mCurrentRenderTargets.clear();
+	mCurrentDepthTarget = nullptr;
+	mCurrentPSUAVStartSlot = 0;
+	mCurrentPSNumUAVs = 0;
+	mCurrentInputLayout.Reset();
+	mOriginalInputLayout.Reset();
+	mOverrideInputLayout.Reset();
+	mInputLayoutOverridden = false;
+	memset(mCommandListSrvSlots, 0, sizeof(mCommandListSrvSlots));
+	ForgetCheckTextureOverrideResults();
 }
 
 void* HackerContext::AllocDiverted(size_t size)
@@ -538,12 +549,12 @@ void HackerContext::ProcessShaderOverride(ShaderOverride *shaderOverride, bool i
 		// Deprecated since the logic can be moved into the shaders with far more flexibility
 		if (use_orig) {
 			if (isPixelShader) {
-				ShaderReplacementMap::iterator i = lookup_original_shader(mCurrentPixelShaderHandle);
+				ShaderReplacementMap::iterator i = lookup_original_shader(mCurrentPixelShaderHandle.Get());
 				if (i != G->mOriginalShaders.end())
 					data->oldPixelShader = SwitchPSShader((ID3D11PixelShader*)i->second);
 			}
 			else {
-				ShaderReplacementMap::iterator i = lookup_original_shader(mCurrentVertexShaderHandle);
+				ShaderReplacementMap::iterator i = lookup_original_shader(mCurrentVertexShaderHandle.Get());
 				if (i != G->mOriginalShaders.end())
 					data->oldVertexShader = SwitchVSShader((ID3D11VertexShader*)i->second);
 			}
@@ -735,31 +746,31 @@ void HackerContext::DeferredShaderReplacementBeforeDraw()
 		mVertexShaderDeferredPending = DeferredShaderReplacement<ID3D11VertexShader,
 			&ID3D11DeviceContext::VSGetShader,
 			&ID3D11DeviceContext::VSSetShader>
-			(mCurrentVertexShaderHandle, mCurrentVertexShader, L"vs");
+			(mCurrentVertexShaderHandle.Get(), mCurrentVertexShader, L"vs");
 	}
 	if (mCurrentHullShaderHandle && mHullShaderDeferredPending) {
 		mHullShaderDeferredPending = DeferredShaderReplacement<ID3D11HullShader,
 			&ID3D11DeviceContext::HSGetShader,
 			&ID3D11DeviceContext::HSSetShader>
-			(mCurrentHullShaderHandle, mCurrentHullShader, L"hs");
+			(mCurrentHullShaderHandle.Get(), mCurrentHullShader, L"hs");
 	}
 	if (mCurrentDomainShaderHandle && mDomainShaderDeferredPending) {
 		mDomainShaderDeferredPending = DeferredShaderReplacement<ID3D11DomainShader,
 			&ID3D11DeviceContext::DSGetShader,
 			&ID3D11DeviceContext::DSSetShader>
-			(mCurrentDomainShaderHandle, mCurrentDomainShader, L"ds");
+			(mCurrentDomainShaderHandle.Get(), mCurrentDomainShader, L"ds");
 	}
 	if (mCurrentGeometryShaderHandle && mGeometryShaderDeferredPending) {
 		mGeometryShaderDeferredPending = DeferredShaderReplacement<ID3D11GeometryShader,
 			&ID3D11DeviceContext::GSGetShader,
 			&ID3D11DeviceContext::GSSetShader>
-			(mCurrentGeometryShaderHandle, mCurrentGeometryShader, L"gs");
+			(mCurrentGeometryShaderHandle.Get(), mCurrentGeometryShader, L"gs");
 	}
 	if (mCurrentPixelShaderHandle && mPixelShaderDeferredPending) {
 		mPixelShaderDeferredPending = DeferredShaderReplacement<ID3D11PixelShader,
 			&ID3D11DeviceContext::PSGetShader,
 			&ID3D11DeviceContext::PSSetShader>
-			(mCurrentPixelShaderHandle, mCurrentPixelShader, L"ps");
+			(mCurrentPixelShaderHandle.Get(), mCurrentPixelShader, L"ps");
 	}
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
@@ -779,7 +790,7 @@ void HackerContext::DeferredShaderReplacementBeforeDispatch()
 	mComputeShaderDeferredPending = DeferredShaderReplacement<ID3D11ComputeShader,
 		&ID3D11DeviceContext::CSGetShader,
 		&ID3D11DeviceContext::CSSetShader>
-		(mCurrentComputeShaderHandle, mCurrentComputeShader, L"cs");
+		(mCurrentComputeShaderHandle.Get(), mCurrentComputeShader, L"cs");
 }
 
 static UINT NextPow2(UINT v)
@@ -922,35 +933,37 @@ void HackerContext::DeferInputLayoutOverride(HackerInputLayout* pInputLayout)
 {
 	LogDebug("HackerContext::DeferInputLayoutOverride(%s@%p) called pInputLayout=%p\n", type_name(this), this, pInputLayout);
 
-	if (mOverrideInputLayout != nullptr)
-		mOverrideInputLayout->Release();
-
-	mOverrideInputLayout = pInputLayout;
+	mOverrideInputLayout.Attach(pInputLayout);
 }
 
 void HackerContext::OverrideInputLayout()
 {
-	if (mOverrideInputLayout == nullptr || mOverrideInputLayout == mCurrentInputLayout)
+	if (!mOverrideInputLayout)
 		return;
+	if (mOverrideInputLayout.Get() == mCurrentInputLayout.Get()) {
+		mOverrideInputLayout.Reset();
+		return;
+	}
 
-	LogDebug("HackerContext::OverrideInputLayout(%s@%p) called mOverrideInputLayout=%p\n", type_name(this), this, mOverrideInputLayout);
+	LogDebug("HackerContext::OverrideInputLayout(%s@%p) called mOverrideInputLayout=%p\n", type_name(this), this, mOverrideInputLayout.Get());
 
-	if (mOriginalInputLayout == nullptr)
+	if (!mInputLayoutOverridden) {
 		mOriginalInputLayout = mCurrentInputLayout;
+		mInputLayoutOverridden = true;
+	}
 
-	IASetInputLayout(mOverrideInputLayout);
+	IASetInputLayout(mOverrideInputLayout.Get());
 }
 
 void HackerContext::RestoreInputLayout()
 {
-	LogDebug("HackerContext::RestoreInputLayout(%s@%p) called mOriginalInputLayout=%p\n", type_name(this), this, mOriginalInputLayout);
+	LogDebug("HackerContext::RestoreInputLayout(%s@%p) called mOriginalInputLayout=%p\n", type_name(this), this, mOriginalInputLayout.Get());
 
-	mOverrideInputLayout->Release();
+	IASetInputLayout(mOriginalInputLayout.Get());
 
-	IASetInputLayout(mOriginalInputLayout);
-
-	mOverrideInputLayout = nullptr;
-	mOriginalInputLayout = nullptr;
+	mOverrideInputLayout.Reset();
+	mOriginalInputLayout.Reset();
+	mInputLayoutOverridden = false;
 }
 
 HRESULT HackerContext::ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash)
@@ -1121,7 +1134,7 @@ void HackerContext::BeforeDraw(DrawContext &data)
 				if (mCurrentPixelShader == G->mSelectedPixelShader) {
 					for (i = 0; i < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT; i++) {
 						if (mCurrentVertexBuffers[i])
-							G->mSelectedVertexShader_VertexBuffer.insert(mCurrentVertexBuffers[i]);
+							G->mSelectedPixelShader_VertexBuffer.insert(mCurrentVertexBuffers[i]);
 					}
 					if (mCurrentIndexBuffer)
 						G->mSelectedPixelShader_IndexBuffer.insert(mCurrentIndexBuffer);
@@ -1254,10 +1267,8 @@ void HackerContext::AfterDraw(DrawContext &data)
 			ret->Release();
 	}
 
-	if (mOriginalInputLayout != nullptr) {
+	if (mInputLayoutOverridden)
 		RestoreInputLayout();
-		mOriginalInputLayout = nullptr;
-	}
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY)
 		Profiling::end(&profiling_state, &Profiling::draw_overhead);
@@ -1785,13 +1796,7 @@ STDMETHODIMP_(void) HackerContext::IASetInputLayout(THIS_
 {
 	LogDebug("HackerContext::IASetInputLayout(%s@%p) called pInputLayout=%p\n", type_name(this), this, pInputLayout);
 
-	if (mCurrentInputLayout)
-		mCurrentInputLayout->Release();
-
-	mCurrentInputLayout = pInputLayout ? static_cast<HackerInputLayout*>(pInputLayout) : nullptr;
-
-	if (mCurrentInputLayout)
-		mCurrentInputLayout->AddRef();
+	mCurrentInputLayout = static_cast<HackerInputLayout*>(pInputLayout);
 
 	mOrigContext1->IASetInputLayout(mCurrentInputLayout ? mCurrentInputLayout->GetOrigInputLayout() : nullptr);
 }
@@ -1835,6 +1840,8 @@ STDMETHODIMP_(void) HackerContext::IASetVertexBuffers(THIS_
 				mCurrentVertexBuffersBindings[i].buffer = ppVertexBuffers[idx];
 				mCurrentVertexBuffersBindings[i].offset = pOffsets ? pOffsets[idx] : 0;
 				mCurrentVertexBuffersBindings[i].stride = pStrides ? pStrides[idx] : 0;
+			} else {
+				mCurrentVertexBuffersBindings[i] = {};
 			}
 		 }
 	 }
@@ -1863,7 +1870,7 @@ STDMETHODIMP_(void) HackerContext::GSSetShader(THIS_
 		 &G->mVisitedGeometryShaders,
 		 G->mSelectedGeometryShader,
 		 &mCurrentGeometryShader,
-		 &mCurrentGeometryShaderHandle,
+		 mCurrentGeometryShaderHandle,
 		 &mGeometryShaderDeferredPending);
 }
 
@@ -2465,13 +2472,15 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 	__in  ID3D11CommandList *pCommandList,
 	BOOL RestoreContextState)
 {
-	if (G->deferred_contexts_enabled) {
-		mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
-		if (GpuWatch::enabled)
-			GpuWatch::mark_command_list(mOrigContext1);
-	}
+	if (!G->deferred_contexts_enabled)
+		return;
+
+	mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
+	if (GpuWatch::enabled)
+		GpuWatch::mark_command_list(mOrigContext1);
 
 	if (!RestoreContextState) {
+		ResetTrackedPipelineState();
 		// This is equivalent to calling ClearState() afterwards, so we
 		// need to rebind the 3DMigoto resources now. See also
 		// FinishCommandList's RestoreDeferredContextState:
@@ -2503,7 +2512,7 @@ STDMETHODIMP_(void) HackerContext::HSSetShader(THIS_
 		 &G->mVisitedHullShaders,
 		 G->mSelectedHullShader,
 		 &mCurrentHullShader,
-		 &mCurrentHullShaderHandle,
+		 mCurrentHullShaderHandle,
 		 &mHullShaderDeferredPending);
 }
 
@@ -2553,7 +2562,7 @@ STDMETHODIMP_(void) HackerContext::DSSetShader(THIS_
 		 &G->mVisitedDomainShaders,
 		 G->mSelectedDomainShader,
 		 &mCurrentDomainShader,
-		 &mCurrentDomainShaderHandle,
+		 mCurrentDomainShaderHandle,
 		 &mDomainShaderDeferredPending);
 }
 
@@ -2630,7 +2639,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 	std::set<UINT64> *visitedShaders,
 	UINT64 selectedShader,
 	UINT64 *currentShaderHash,
-	ID3D11Shader **currentShaderHandle,
+	Microsoft::WRL::ComPtr<ID3D11Shader> &currentShaderHandle,
 	bool *deferredPending)
 {
 	ID3D11Shader *repl_shader = pShader;
@@ -2638,7 +2647,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 	// Always update the current shader handle no matter what so we can
 	// reliably check if a shader of a given type is bound and for certain
 	// types of old style filtering:
-	*currentShaderHandle = pShader;
+	currentShaderHandle = pShader;
 	*deferredPending = false;
 
 	if (pShader) {
@@ -2657,7 +2666,7 @@ STDMETHODIMP_(void) HackerContext::SetShader(THIS_
 			reload_info = entry->reload_info;
 			if (entry->hash_found) {
 				*currentShaderHash = entry->hash;
-				LogDebug("  shader found: handle = %p, hash = %016I64x\n", *currentShaderHandle, *currentShaderHash);
+				LogDebug("  shader found: handle = %p, hash = %016I64x\n", currentShaderHandle.Get(), *currentShaderHash);
 
 				if ((G->hunting == HUNTING_MODE_ENABLED) && visitedShaders) {
 					EnterCriticalSectionPretty(&G->mCriticalSection);
@@ -2733,7 +2742,7 @@ STDMETHODIMP_(void) HackerContext::CSSetShader(THIS_
 		 &G->mVisitedComputeShaders,
 		 G->mSelectedComputeShader,
 		 &mCurrentComputeShader,
-		 &mCurrentComputeShaderHandle,
+		 mCurrentComputeShaderHandle,
 		 &mComputeShaderDeferredPending);
 }
 
@@ -2834,10 +2843,9 @@ STDMETHODIMP_(void) HackerContext::IAGetInputLayout(THIS_
 	if (!ppInputLayout)
 		return;
 
-	*ppInputLayout = mCurrentInputLayout;
-
-	if (mCurrentInputLayout)
-		mCurrentInputLayout->AddRef();
+	*ppInputLayout = mCurrentInputLayout.Get();
+	if (*ppInputLayout)
+		(*ppInputLayout)->AddRef();
 }
 
 STDMETHODIMP_(void) HackerContext::IAGetVertexBuffers(THIS_
@@ -3177,6 +3185,7 @@ STDMETHODIMP_(void) HackerContext::CSGetConstantBuffers(THIS_
 STDMETHODIMP_(void) HackerContext::ClearState(THIS)
 {
 	 mOrigContext1->ClearState();
+	 ResetTrackedPipelineState();
 
 	 // ClearState() will unbind StereoParams and IniParams, so we need to
 	 // rebind them now:
@@ -3203,9 +3212,10 @@ STDMETHODIMP HackerContext::FinishCommandList(THIS_
 	/* [annotation] */
 	__out_opt  ID3D11CommandList **ppCommandList)
 {
-	BOOL ret = mOrigContext1->FinishCommandList(RestoreDeferredContextState, ppCommandList);
+	HRESULT ret = mOrigContext1->FinishCommandList(RestoreDeferredContextState, ppCommandList);
 
-	if (!RestoreDeferredContextState) {
+	if (SUCCEEDED(ret) && !RestoreDeferredContextState) {
+		ResetTrackedPipelineState();
 		// This is equivalent to calling ClearState() afterwards, so we
 		// need to rebind the 3DMigoto resources now. See also
 		// ExecuteCommandList's RestoreContextState:
@@ -3380,7 +3390,7 @@ STDMETHODIMP_(void) HackerContext::VSSetShader(THIS_
 		 &G->mVisitedVertexShaders,
 		 G->mSelectedVertexShader,
 		 &mCurrentVertexShader,
-		 &mCurrentVertexShaderHandle,
+		 mCurrentVertexShaderHandle,
 		 &mVertexShaderDeferredPending);
 }
 
@@ -3408,7 +3418,7 @@ STDMETHODIMP_(void) HackerContext::PSSetShader(THIS_
 		 &G->mVisitedPixelShaders,
 		 G->mSelectedPixelShader,
 		 &mCurrentPixelShader,
-		 &mCurrentPixelShaderHandle,
+		 mCurrentPixelShaderHandle,
 		 &mPixelShaderDeferredPending);
 
 	if (pPixelShader) {
@@ -3706,12 +3716,26 @@ void STDMETHODCALLTYPE HackerContext::CopySubresourceRegion1(
 	/* [annotation] */
 	_In_  UINT CopyFlags)
 {
-	if (G->cache_resource_data != DataCacheBindFlags::INVALID)
-		ClearResourceRegionHashCache(pDstResource);
+	const bool empty = IsEmptyDstBox(pSrcBox);
+	UINT actualDstX = DstX;
+	D3D11_BOX expandedBox;
+	if (!empty) {
+		if (G->hunting && G->track_texture_updates != 2)
+			MarkResourceHashContaminated(pDstResource, DstSubresource, pSrcResource, SrcSubresource, 'S', DstX, DstY, DstZ, pSrcBox);
+		if (ExpandRegionCopy(pDstResource, DstX, DstY, pSrcResource, pSrcBox, &actualDstX, &expandedBox))
+			pSrcBox = &expandedBox;
+		if (G->cache_resource_data != DataCacheBindFlags::INVALID)
+			ClearResourceRegionHashCache(pDstResource);
+	}
 
-	mOrigContext1->CopySubresourceRegion1(pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox, CopyFlags);
-	
-	UpdateTextureSubresourceStateFromCopy(pDstResource, DstSubresource, DstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox, CopyFlags);
+	mOrigContext1->CopySubresourceRegion1(pDstResource, DstSubresource, actualDstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox, CopyFlags);
+	if (empty)
+		return;
+
+	UpdateTextureSubresourceStateFromCopy(pDstResource, DstSubresource, actualDstX, DstY, DstZ, pSrcResource, SrcSubresource, pSrcBox, CopyFlags);
+	if (G->track_texture_updates == 1 && DstSubresource == 0 && SrcSubresource == 0
+			&& DstX == 0 && DstY == 0 && DstZ == 0 && !pSrcBox)
+		PropagateResourceHash(pDstResource, pSrcResource, true);
 }
 
 void STDMETHODCALLTYPE HackerContext::UpdateSubresource1(
@@ -3730,18 +3754,22 @@ void STDMETHODCALLTYPE HackerContext::UpdateSubresource1(
 	/* [annotation] */
 	_In_  UINT CopyFlags)
 {
-	if (G->cache_resource_data != DataCacheBindFlags::INVALID)
-		ClearResourceRegionHashCache(pDstResource);
+	const bool writes = pSrcData && !IsEmptyDstBox(pDstBox);
+	if (writes) {
+		if (G->hunting && G->track_texture_updates != 2)
+			MarkResourceHashContaminated(pDstResource, DstSubresource, nullptr, 0, 'U', 0, 0, 0, nullptr);
+		if (G->cache_resource_data != DataCacheBindFlags::INVALID)
+			ClearResourceRegionHashCache(pDstResource);
+	}
 
 	mOrigContext1->UpdateSubresource1(pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
+	if (!writes)
+		return;
 
-	// TODO: Track resource hash updates
-
-	if (pSrcData && !IsEmptyDstBox(pDstBox))
-	{
-		const bool discard = (CopyFlags & D3D11_COPY_DISCARD) != 0;
-		UpdateTextureSubresourceState(pDstResource, DstSubresource, pDstBox == nullptr, discard);
-	}
+	const bool discard = (CopyFlags & D3D11_COPY_DISCARD) != 0;
+	UpdateTextureSubresourceState(pDstResource, DstSubresource, pDstBox == nullptr, discard);
+	if (G->track_texture_updates == 1 && DstSubresource == 0 && !pDstBox)
+		UpdateResourceHashFromCPU(pDstResource, pSrcData, SrcRowPitch, SrcDepthPitch, true);
 }
 
 
@@ -3961,18 +3989,135 @@ void STDMETHODCALLTYPE HackerContext::CSGetConstantBuffers1(
 }
 
 
-void STDMETHODCALLTYPE HackerContext::SwapDeviceContextState(
-	/* [annotation] */
-	_In_  ID3DDeviceContextState *pState,
-	/* [annotation] */
-	_Out_opt_  ID3DDeviceContextState **ppPreviousState)
-{
-	mOrigContext1->SwapDeviceContextState(pState, ppPreviousState);
+namespace {
+using Microsoft::WRL::ComPtr;
 
-	// If a game or overlay creates separate context state objects we won't
-	// have had a chance to bind the 3DMigoto resources when it was
-	// first created, so do so now:
-	Bind3DMigotoResources();
+constexpr GUID ContextStateTrackingGuid =
+	{ 0x347b3292, 0xfa49, 0x4e58, { 0xaa, 0x3d, 0x81, 0xd6, 0xed, 0xbf, 0x7b, 0x59 } };
+
+struct ContextStateTracking :
+	Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IUnknown>
+{
+	ComPtr<HackerInputLayout> input_layout;
+	ComPtr<ID3D11DeviceChild> shader_handles[6];
+	UINT64 shader_hashes[6];
+	UINT64 command_list_srvs[6][2];
+	UINT ps_uav_start;
+	UINT ps_uav_count;
+};
+}
+
+void STDMETHODCALLTYPE HackerContext::SwapDeviceContextState(
+	_In_ ID3DDeviceContextState *pState,
+	_Out_opt_ ID3DDeviceContextState **ppPreviousState)
+{
+	if (!pState) {
+		mOrigContext1->SwapDeviceContextState(pState, ppPreviousState);
+		return;
+	}
+
+	ComPtr<ID3DDeviceContextState> previous;
+	mOrigContext1->SwapDeviceContextState(pState, previous.GetAddressOf());
+	if (previous && previous.Get() != pState) {
+		auto tracking = Microsoft::WRL::Make<ContextStateTracking>();
+		if (tracking) {
+			tracking->input_layout = mCurrentInputLayout;
+			tracking->shader_handles[0] = mCurrentVertexShaderHandle;
+			tracking->shader_handles[1] = mCurrentHullShaderHandle;
+			tracking->shader_handles[2] = mCurrentDomainShaderHandle;
+			tracking->shader_handles[3] = mCurrentGeometryShaderHandle;
+			tracking->shader_handles[4] = mCurrentPixelShaderHandle;
+			tracking->shader_handles[5] = mCurrentComputeShaderHandle;
+			GetShaderHashes(tracking->shader_hashes);
+			tracking->shader_hashes[5] = mCurrentComputeShader;
+			memcpy(tracking->command_list_srvs, mCommandListSrvSlots, sizeof(mCommandListSrvSlots));
+			tracking->ps_uav_start = mCurrentPSUAVStartSlot;
+			tracking->ps_uav_count = mCurrentPSNumUAVs;
+			previous->SetPrivateDataInterface(ContextStateTrackingGuid, tracking.Get());
+		}
+
+		ResetTrackedPipelineState();
+		ComPtr<IUnknown> private_data;
+		UINT size = sizeof(IUnknown*);
+		pState->GetPrivateData(ContextStateTrackingGuid, &size, private_data.GetAddressOf());
+		auto *saved = static_cast<ContextStateTracking*>(private_data.Get());
+		if (saved) {
+			mCurrentInputLayout = saved->input_layout;
+			memcpy(mCommandListSrvSlots, saved->command_list_srvs, sizeof(mCommandListSrvSlots));
+			mCurrentPSUAVStartSlot = saved->ps_uav_start;
+			mCurrentPSNumUAVs = saved->ps_uav_count;
+		}
+
+		const auto restore_shader = [this, saved](auto getter, unsigned stage, auto &handle, UINT64 &hash, bool &pending) {
+			if (saved) {
+				handle = static_cast<decltype(handle.Get())>(saved->shader_handles[stage].Get());
+				hash = saved->shader_hashes[stage];
+			} else {
+				(mOrigContext1->*getter)(handle.GetAddressOf(), nullptr, nullptr);
+			}
+			if (!handle)
+				return;
+
+			const ShaderHandleCacheEntry *entry = LookupShaderHandle(handle.Get());
+			if (entry->hash_found)
+				hash = entry->hash;
+			if (entry->reload_info)
+				pending = entry->reload_info->deferred_replacement_candidate
+					&& !entry->reload_info->deferred_replacement_processed;
+		};
+		restore_shader(&ID3D11DeviceContext::VSGetShader, 0, mCurrentVertexShaderHandle, mCurrentVertexShader, mVertexShaderDeferredPending);
+		restore_shader(&ID3D11DeviceContext::HSGetShader, 1, mCurrentHullShaderHandle, mCurrentHullShader, mHullShaderDeferredPending);
+		restore_shader(&ID3D11DeviceContext::DSGetShader, 2, mCurrentDomainShaderHandle, mCurrentDomainShader, mDomainShaderDeferredPending);
+		restore_shader(&ID3D11DeviceContext::GSGetShader, 3, mCurrentGeometryShaderHandle, mCurrentGeometryShader, mGeometryShaderDeferredPending);
+		restore_shader(&ID3D11DeviceContext::PSGetShader, 4, mCurrentPixelShaderHandle, mCurrentPixelShader, mPixelShaderDeferredPending);
+		restore_shader(&ID3D11DeviceContext::CSGetShader, 5, mCurrentComputeShaderHandle, mCurrentComputeShader, mComputeShaderDeferredPending);
+		if (saved)
+			pState->SetPrivateDataInterface(ContextStateTrackingGuid, nullptr);
+
+		const bool hunting = G->hunting == HUNTING_MODE_ENABLED;
+		if (hunting || G->track_region_hashes) {
+			ID3D11Buffer *buffers[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
+			UINT strides[ARRAYSIZE(buffers)] = {}, offsets[ARRAYSIZE(buffers)] = {};
+			const UINT count = mOrigDevice1->GetFeatureLevel() >= D3D_FEATURE_LEVEL_10_1 ? ARRAYSIZE(buffers) : 16;
+			mOrigContext1->IAGetVertexBuffers(0, count, buffers, strides, offsets);
+			for (UINT slot = 0; slot < count; ++slot) {
+				if (auto *buffer = buffers[slot]) {
+					if (hunting)
+						mCurrentVertexBuffers[slot] = GetResourceHash(buffer);
+					if (G->track_region_hashes)
+						mCurrentVertexBuffersBindings[slot] = { buffer, offsets[slot], strides[slot] };
+					buffer->Release();
+				}
+			}
+		}
+		if (hunting || G->track_region_hashes || G->track_implicit_index_buffers) {
+			IndexBufferBinding &binding = mCurrentIndexBufferBinding;
+			mOrigContext1->IAGetIndexBuffer(&binding.buffer, &binding.format, &binding.offset);
+			if (binding.buffer) {
+				if (hunting)
+					mCurrentIndexBuffer = GetResourceHash(binding.buffer);
+				binding.is_explicit = true;
+				binding.buffer->Release();
+			}
+		}
+
+		if (hunting) {
+			ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+			ComPtr<ID3D11DepthStencilView> depth;
+			mOrigContext1->OMGetRenderTargets(ARRAYSIZE(targets), targets, depth.GetAddressOf());
+			for (UINT slot = 0; slot < ARRAYSIZE(targets); ++slot) {
+				if (auto *target = targets[slot]) {
+					RecordRenderTargetInfo(target, slot);
+					target->Release();
+				}
+			}
+			RecordDepthStencil(depth.Get());
+		}
+		Bind3DMigotoResources();
+	}
+
+	if (ppPreviousState)
+		*ppPreviousState = previous.Detach();
 }
 
 
