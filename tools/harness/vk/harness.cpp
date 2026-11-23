@@ -9,7 +9,7 @@
 //               [--upload late|unmapped|discard|fill|srcfill|lastfill]
 //               [--generated N [--overlay]] [--reload 1|2|3] [--profile]
 //               [--efmi file [--characters N] [--passes N] [--appear N]] [--lowmip [--wide]]
-//               [--frames N [--min-seconds N]]
+//               [--frames N [--min-seconds N]] [--cbring N]
 //
 // --instance gets the device's functions from vkGetInstanceProcAddr instead
 // of vkGetDeviceProcAddr, which are the loader's exports. --pool draws the
@@ -186,6 +186,9 @@ int main(int argc, char **argv)
 	// --bonetick: the first bone of the pool is another every frame, the
 	// last of which is printed, for the picture to be checked against
 	bool bonetick = false;
+	// --cbring N: the constants move to another of N places every frame, as
+	// in the ring buffer of a game, and the place before is zeroed
+	int cbring = 0;
 	// --efmi <file>: the draws of characters as the game of the EFMI mods
 	// makes them, for the parts the file lists by the hash and the number
 	// of their indices, of --characters characters in --passes passes
@@ -221,6 +224,8 @@ int main(int argc, char **argv)
 			rewrite = true;
 		else if (!strcmp(argv[i], "--bonetick"))
 			bonetick = true;
+		else if (!strcmp(argv[i], "--cbring") && i + 1 < argc)
+			cbring = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--appear") && i + 1 < argc)
 			appear = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--efmi") && i + 1 < argc)
@@ -279,6 +284,10 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (cbring < 0 || cbring > 32) {
+		printf("--cbring takes 0 to 32 places\n");
+		return 1;
+	}
 	if ((frame_limit && appear) || (min_seconds && !frame_limit)) {
 		printf("--frames cannot be combined with --appear; --min-seconds requires --frames\n");
 		return 1;
@@ -1190,6 +1199,11 @@ int main(int argc, char **argv)
 		}
 		if (bonetick && pool_path)
 			((float*)((char*)pool_mapped + 16384))[0] = (float)(frames % 200 + 20) / 255.0f;
+		if (cbring) {
+			memset((char*)pool_mapped + 2048 + constants_offset, 0, sizeof(constants));
+			constants_offset = 4096 + (frames % cbring) * 256;
+			memcpy((char*)pool_mapped + 2048 + constants_offset, constants, sizeof(constants));
+		}
 		// Some of the bones are others every frame
 		for (size_t n = 0; efmi && n < 65536; n++)
 			((float*)efmi_mapped)[(1 << 18) + n] = (float)(frames + n);

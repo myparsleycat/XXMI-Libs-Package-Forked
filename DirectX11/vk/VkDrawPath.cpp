@@ -70,7 +70,7 @@ static struct {
 	unsigned regions_hashed, regions_checked, regions_unmapped, regions_uploaded;
 	unsigned mirrored, mirrored_from_gpu;
 	UINT64 mirrored_bytes;
-	unsigned constants_shown, constants_read, constants_unmapped, constants_unbound;
+	unsigned constants_shown, constants_read, constants_unmapped, constants_unbound, constants_made, constants_reused;
 	UINT64 constants_bytes, constants_ticks;
 	unsigned views_shown, views_missing;
 	// Buffers of mods brought over for a shader of the game to read, of
@@ -1336,6 +1336,18 @@ typedef std::tuple<VkBuffer, VkDeviceSize, UINT, UINT> ConstantsKey;
 // of dx12/Bridge.h held
 static std::map<ConstantsKey, PublishedConstants> published_constants;
 
+// The game moves its constants through a ring buffer, so most offsets are new
+// every frame and a buffer of the shim was made for each. Those forgotten that
+// nothing else holds are kept here, by size and stride, to be published again
+// for another offset, and released after CONSTANTS_POOL_FRAMES unused.
+struct PooledConstants {
+	ShimBuffer *object;
+	ID3D11ShaderResourceView *srv;
+	UINT frame;
+};
+const UINT CONSTANTS_POOL_FRAMES = 16;
+static std::map<std::pair<UINT, UINT>, std::vector<PooledConstants>> constants_pool;
+
 // Where the shadow of one is read from, and the pages of it that have been
 const UINT SHADOW_PAGE = 4096;
 
@@ -1353,19 +1365,64 @@ static std::unordered_map<ShimResource*, ConstantsSource> constants_sources;
 
 static void finish_refresh_of(const ShimResource *resource);
 
-static void forget_constants(std::map<ConstantsKey, PublishedConstants>::iterator *entry)
+// The references of a view, and of a resource to its views, are the only ones
+// besides this file's
+static bool held_here_alone(ShimBuffer *object, ID3D11ShaderResourceView *srv)
+{
+	LONG views = 0;
+
+	if (srv) {
+		srv->AddRef();
+		if (srv->Release() != 1)
+			return false;
+		views = 1;
+	}
+	return object->mRef == 1 + views;
+}
+
+static void forget_constants(std::map<ConstantsKey, PublishedConstants>::iterator *entry, bool keep)
 {
 	ShimBuffer *object = (*entry)->second.object;
+	ID3D11ShaderResourceView *srv = (*entry)->second.srv;
+	const ConstantsKey &key = (*entry)->first;
 
 	finish_refresh_of(&object->r);
 	// A mod may keep it
 	object->r.shadow_pending = false;
 	object->r.upload_pending = false;
 	constants_sources.erase(&object->r);
-	if ((*entry)->second.srv)
-		(*entry)->second.srv->Release();
-	object->Release();
+	if (keep && held_here_alone(object, srv)) {
+		constants_pool[std::make_pair(std::get<2>(key), std::get<3>(key))].push_back({ object, srv, mods_frame });
+	} else {
+		if (srv)
+			srv->Release();
+		object->Release();
+	}
 	*entry = published_constants.erase(*entry);
+}
+
+static void release_pooled_constants(bool all)
+{
+	UINT frame = mods_frame;
+
+	for (auto i = constants_pool.begin(); i != constants_pool.end();) {
+		std::vector<PooledConstants> &pooled = i->second;
+		size_t old = 0;
+
+		// Oldest first, as they were put there
+		while (old < pooled.size() && (all || frame - pooled[old].frame > CONSTANTS_POOL_FRAMES))
+			old++;
+		for (size_t j = 0; j < old; j++) {
+			if (pooled[j].srv)
+				pooled[j].srv->Release();
+			pooled[j].object->Release();
+		}
+		pooled.erase(pooled.begin(), pooled.begin() + old);
+		if (pooled.empty())
+			i = constants_pool.erase(i);
+		else
+			++i;
+	}
 }
 
 static void forget_dead_constants(VkBuffer buffer)
@@ -1373,7 +1430,7 @@ static void forget_dead_constants(VkBuffer buffer)
 	auto i = published_constants.lower_bound(std::make_tuple(buffer, (VkDeviceSize)0, 0u, 0u));
 
 	while (i != published_constants.end() && std::get<0>(i->first) == buffer)
-		forget_constants(&i);
+		forget_constants(&i, true);
 }
 
 static void forget_unused_constants(bool all)
@@ -1383,10 +1440,11 @@ static void forget_unused_constants(bool all)
 
 	for (auto i = published_constants.begin(); i != published_constants.end();) {
 		if (all || frame - i->second.used_frame > CONSTANTS_KEEP_FRAMES)
-			forget_constants(&i);
+			forget_constants(&i, !all);
 		else
 			++i;
 	}
+	release_pooled_constants(all);
 }
 
 // From where a part of copy_mapped is worth a thread of its own, and how many
@@ -1944,6 +2002,21 @@ static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offse
 
 	if (found == published_constants.end()) {
 		Profiling::Spike::SelfTime create_time(Profiling::Spike::CL_PUBLISH_CREATE);
+		auto pool = constants_pool.find(std::make_pair(bytes, stride));
+
+		if (pool != constants_pool.end()) {
+			PooledConstants pooled = pool->second.back();
+
+			pool->second.pop_back();
+			if (pool->second.empty())
+				constants_pool.erase(pool);
+			found = published_constants.emplace(key, PublishedConstants{ pooled.object, pooled.srv, 0, false }).first;
+			constants_sources[&pooled.object->r].key = key;
+			stats.constants_reused++;
+		}
+	}
+	if (found == published_constants.end()) {
+		Profiling::Spike::SelfTime create_time(Profiling::Spike::CL_PUBLISH_CREATE);
 		desc.ByteWidth = (bytes + 15) & ~15u;
 		desc.Usage = D3D11_USAGE_DYNAMIC;
 		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
@@ -1969,6 +2042,7 @@ static PublishedConstants* publish_constants(VkBuffer buffer, VkDeviceSize offse
 		// What a D3D11 game's buffer of the size would have for its hash
 		register_buffer(object, crc32c_hw(0, &desc, sizeof(desc)));
 		found = published_constants.emplace(key, PublishedConstants{ object, srv, 0, false }).first;
+		stats.constants_made++;
 		constants_sources[&object->r].key = key;
 	}
 	object = found->second.object;
@@ -8498,10 +8572,10 @@ static void report()
 		uploads_mapped_here.ticks * 1000.0 / frequency.QuadPart, uploads_mapped_here.longest * 1000.0 / frequency.QuadPart,
 		(int)uploads_mapped_here.refused);
 	VkDumpNote("  Constant buffers of the game: shown %u times, read %u times (%llu KB, %.2f ms per frame), not mapped %u, no buffer seen set at the "
-		"binding %u; %Iu held. Descriptor sets: %u allocated, buffers written %u times by vkUpdateDescriptorSets and %u times "
+		"binding %u; %Iu held, %u made, %u from %Iu sizes kept for reuse. Descriptor sets: %u allocated, buffers written %u times by vkUpdateDescriptorSets and %u times "
 		"by a template; %u layouts of sets the game destroyed kept since the start\n",
 		stats.constants_shown, stats.constants_read, stats.constants_bytes >> 10, stats.constants_ticks * per_frame, stats.constants_unmapped,
-		stats.constants_unbound, published_constants.size(), sets_allocated, sets_written, sets_written_by_template,
+		stats.constants_unbound, published_constants.size(), stats.constants_made, stats.constants_reused, constants_pool.size(), sets_allocated, sets_written, sets_written_by_template,
 		(unsigned)set_layouts_kept);
 	for (const Transient &transient : transients)
 		held += transient.size;
