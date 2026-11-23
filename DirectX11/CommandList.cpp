@@ -6190,7 +6190,25 @@ DEFINE_OPERATOR(exponent_operator,      "**", (pow(lhs, rhs)));
 DEFINE_OPERATOR(multiplication_operator,"*",  (lhs * rhs));
 DEFINE_OPERATOR(division_operator,      "/",  (lhs / rhs));
 DEFINE_OPERATOR(floor_division_operator,"//", (floor(lhs / rhs)));
-DEFINE_OPERATOR(modulus_operator,       "%",  (fmod(lhs, rhs)));
+
+// fmodf is exact, and so is the integer remainder of two integers below 2^24,
+// which both floats hold exactly: the same result, with the sign of a zero
+// taken from lhs as fmodf does, at a fraction of the cost of the CRT's fmodf.
+// Ini expressions such as "DRAW_TYPE % 2" run for every draw.
+static inline float ini_fmod(float lhs, float rhs)
+{
+	if (fabsf(lhs) < 16777216.0f && fabsf(rhs) < 16777216.0f) {
+		int32_t l = (int32_t)lhs, r = (int32_t)rhs;
+
+		if (r && (float)l == lhs && (float)r == rhs) {
+			int32_t m = l % r;
+			return m ? (float)m : lhs * 0.0f;
+		}
+	}
+	return fmodf(lhs, rhs);
+}
+
+DEFINE_OPERATOR(modulus_operator,       "%",  (ini_fmod(lhs, rhs)));
 
 DEFINE_OPERATOR(addition_operator,      "+",  (lhs + rhs));
 DEFINE_OPERATOR(subtraction_operator,   "-",  (lhs - rhs));
