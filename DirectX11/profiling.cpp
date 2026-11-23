@@ -561,7 +561,7 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"D3D12: creating readback memory for upload hashes",
 	L"Vulkan: draws the mods are asked about, in all",
 	L"Vulkan: creating an image for a mod's texture",
-	L"Vulkan: recording the copy of a mod's texture for readback",
+	L"Vulkan: recording the copy of a mod's texture",
 	L"Vulkan: allocating memory for mods (driver)",
 	L"Vulkan: waiting for the D3D12 copies at submit and moving them to Vulkan memory",
 	L"command list execution (inclusive)",

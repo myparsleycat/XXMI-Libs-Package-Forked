@@ -99,7 +99,7 @@ static struct {
 	// not: a shader or the pipeline was still being made, a texture was still
 	// being brought, or it cannot be
 	unsigned patch_wanted, patch_drawn, patch_shader_pending, patch_pipeline_pending, patch_texture_pending, patch_impossible;
-	unsigned textures_made, textures_failed, textures_set;
+	unsigned textures_made, textures_failed, textures_set, textures_shared;
 	unsigned apart_draws, textures_shown;
 	UINT64 textures_bytes;
 	UINT64 wait_ticks, engine_ticks;
@@ -2765,9 +2765,11 @@ static SharedBuffer* new_shared_buffer(VkDeviceSize size)
 	external.handleTypes = type;
 	info.pNext = &external;
 	info.size = desc.Width;
-	// Filled with zeros where a copy to it was discarded, see finish_transfers
+	// Filled with zeros where a copy to it was discarded, see finish_transfers;
+	// the source of the images of mod textures, see fill_image
 	info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-		| VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		| VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+		| VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	if (api.CreateBuffer(mods_device, &info, NULL, &shared.buffer) == VK_SUCCESS) {
 		api.GetBufferMemoryRequirements(mods_device, shared.buffer, &needed);
@@ -2914,7 +2916,7 @@ static void destroy_shared_buffers(bool all)
 	shared_buffers.resize(kept);
 }
 
-static void submit_uploads(VkQueue queue);
+static void submit_uploads(VkQueue queue, VkSemaphore semaphore, UINT64 value);
 
 // What the D3D12 device copies to a shared buffer has to be there before the
 // game's command buffers read it. Waiting for that here is a wait for the GPU
@@ -3037,7 +3039,7 @@ static VkSemaphore finish_transfers(VkQueue queue, UINT64 *value)
 	copies_pending = false;
 	for (Readback &readback : readbacks)
 		readback.used = 0;
-	submit_uploads(queue);
+	submit_uploads(queue, semaphore, semaphore ? *value : 0);
 	transfers_pending = false;
 
 	stats.submits_waited += !semaphore;
@@ -3420,6 +3422,79 @@ static bool make_image(ModTexture *texture, const D3D12_RESOURCE_DESC *desc, VkF
 	return true;
 }
 
+// Has a list of the shim copy what the resource holds to a shared buffer, which
+// the image is filled from on the GPU once the fence of the shim is reached:
+// finish_transfers has the game's queue wait for it, or waits for it itself
+// when it cannot. With the readback of fill_image, a texture a mod writes every
+// frame has the thread that submits wait for the D3D12 device every frame.
+static bool fill_image_shared(const Upload &base, ShimResource *resource, const D3D12_RESOURCE_DESC *desc,
+	const std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> &layouts, const std::vector<UINT64> &row_sizes,
+	const std::vector<UINT> &rows, UINT64 total)
+{
+	const UINT64 align = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+	Upload upload = base;
+	SharedBuffer *shared;
+	VkDeviceSize at;
+	UINT64 start;
+	UINT count = (UINT)layouts.size(), i;
+
+	for (i = 0; i < count; i++) {
+		const D3D12_SUBRESOURCE_FOOTPRINT &footprint = layouts[i].Footprint;
+		// Texels a block of the format is wide and high: 4 for BC formats
+		UINT block = rows[i] ? footprint.Height / rows[i] : 0;
+		UINT64 block_bytes = block && footprint.Width >= block ? row_sizes[i] / (footprint.Width / block) : 0;
+
+		if (!block || !block_bytes || footprint.RowPitch % block_bytes)
+			return false;
+	}
+
+	shared = shared_bytes(total + align, total + align, &at);
+	if (!shared)
+		return false;
+	start = ShimAlign(at, align);
+
+	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE))
+		return false;
+	src.pResource = resource->resource;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst.pResource = shared->resource;
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+
+	for (i = 0; i < count; i++) {
+		const D3D12_SUBRESOURCE_FOOTPRINT &footprint = layouts[i].Footprint;
+		UINT block = footprint.Height / rows[i];
+		UINT64 block_bytes = row_sizes[i] / (footprint.Width / block);
+		UINT mip = i % desc->MipLevels;
+		VkBufferImageCopy region = {};
+
+		src.SubresourceIndex = i;
+		dst.PlacedFootprint = layouts[i];
+		dst.PlacedFootprint.Offset += start;
+		Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+
+		region.bufferOffset = start + layouts[i].Offset;
+		region.bufferRowLength = (uint32_t)(footprint.RowPitch / block_bytes * block);
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.mipLevel = mip;
+		region.imageSubresource.baseArrayLayer = i / desc->MipLevels;
+		region.imageSubresource.layerCount = 1;
+		region.imageExtent.width = max((uint32_t)desc->Width >> mip, 1u);
+		region.imageExtent.height = max(desc->Height >> mip, 1u);
+		region.imageExtent.depth = 1;
+		upload.regions.push_back(region);
+	}
+
+	shared_copies.push_back({ shared->buffer, start,
+		start + ShimAlign(total, 4) <= shared->size ? ShimAlign(total, 4) : VK_WHOLE_SIZE, Dx12ShimPendingFence() });
+	upload.buffer = shared->buffer;
+	uploads.push_back(std::move(upload));
+	copies_pending = true;
+	transfers_pending = true;
+	stats.textures_shared++;
+	return true;
+}
+
 // Has a list of the shim copy what the resource holds to where it can be read,
 // and from there it goes to a buffer of the game's device for the image
 static bool fill_image(ModTexture *texture, ShimResource *resource, const D3D12_RESOURCE_DESC *desc)
@@ -3439,6 +3514,18 @@ static bool fill_image(ModTexture *texture, ShimResource *resource, const D3D12_
 	dx12_shim->device->GetCopyableFootprints(desc, 0, count, 0, layouts.data(), rows.data(), row_sizes.data(), &total);
 	if (!total || total == UINT64_MAX)
 		return false;
+
+	upload.image = texture->image;
+	upload.filled = texture->filled;
+	upload.mips = desc->MipLevels;
+	upload.layers = desc->DepthOrArraySize;
+	if (fill_image_shared(upload, resource, desc, layouts, row_sizes, rows, total)) {
+		texture->filled = true;
+		texture->version = resource->version;
+		for (i = 0; i < count; i++)
+			stats.textures_bytes += row_sizes[i] * rows[i];
+		return true;
+	}
 	// A row takes no more here than there, and a subresource starts at a
 	// multiple of the size of any block of texels
 	for (i = 0; i < count; i++)
@@ -3490,10 +3577,6 @@ static bool fill_image(ModTexture *texture, ShimResource *resource, const D3D12_
 		bytes += row_sizes[i] * rows[i];
 	}
 
-	upload.image = texture->image;
-	upload.filled = texture->filled;
-	upload.mips = desc->MipLevels;
-	upload.layers = desc->DepthOrArraySize;
 	uploads.push_back(std::move(upload));
 	transfers_pending = true;
 
@@ -3554,13 +3637,17 @@ static VkImageView bring_texture(const ShimView *view, const SpirvBinding *slot)
 	return texture->view;
 }
 
-// With the lock of dx12/Bridge.h held, by the one using the queue
-static void submit_uploads(VkQueue queue)
+// With the lock of dx12/Bridge.h held, by the one using the queue. semaphore,
+// at value, is signalled once the copies of the shim to shared buffers the
+// uploads read from are done; none if they were waited for here.
+static void submit_uploads(VkQueue queue, VkSemaphore semaphore, UINT64 value)
 {
 	VkCommandPoolCreateInfo pool_info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
 	VkCommandBufferAllocateInfo cmd_info = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
 	VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 	VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+	VkD3D12FenceSubmitInfoKHR fence_values = { VK_STRUCTURE_TYPE_D3D12_FENCE_SUBMIT_INFO_KHR };
+	const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 	VkCommandBuffer cmd;
 	VkCommandPool *pool;
 
@@ -3637,6 +3724,14 @@ static void submit_uploads(VkQueue queue)
 
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &cmd;
+	if (semaphore) {
+		fence_values.waitSemaphoreValuesCount = 1;
+		fence_values.pWaitSemaphoreValues = &value;
+		submit.pNext = &fence_values;
+		submit.waitSemaphoreCount = 1;
+		submit.pWaitSemaphores = &semaphore;
+		submit.pWaitDstStageMask = &wait_stage;
+	}
 	api.QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
 }
 
@@ -8439,11 +8534,11 @@ static void report()
 			(int)patch_pipelines_failed, patch_ticks * 1000.0 / frequency.QuadPart, stats.patch_wanted, stats.patch_drawn,
 			stats.patch_shader_pending, stats.patch_pipeline_pending, stats.patch_texture_pending, stats.patch_impossible);
 	}
-	VkDumpNote("  Textures of mods for the pixel shaders of the game: set %u times, %u images made (%llu KB copied), %u could not be; "
+	VkDumpNote("  Textures of mods for the pixel shaders of the game: set %u times, %u images made (%llu KB copied, %u times on the GPU by a shared buffer), %u could not be; "
 		"%Iu held in %Iu blocks of memory; draws of mods with shaders of their own: %u; textures of the game shown by their hashes "
 		"%u times, %d hashed, %d whose upload could not be read; since the start %d uploads read by mapping their "
 		"memory here (%lld MB, %.1f ms in all, the longest %.2f ms), %d that could not be\n",
-		stats.textures_set, stats.textures_made, stats.textures_bytes >> 10, stats.textures_failed, mod_textures.size(),
+		stats.textures_set, stats.textures_made, stats.textures_bytes >> 10, stats.textures_shared, stats.textures_failed, mod_textures.size(),
 		image_blocks.size(), stats.apart_draws, stats.textures_shown, (int)images_hashed, (int)images_not_mapped,
 		(int)images_mapped_here.done, (long long)(images_mapped_here.bytes >> 20), images_mapped_here.ticks * 1000.0 / frequency.QuadPart,
 		images_mapped_here.longest * 1000.0 / frequency.QuadPart, (int)images_mapped_here.refused);
