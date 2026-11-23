@@ -7,7 +7,7 @@
 #   xh.sh ref                     makes the DLL of x64/Release the reference
 #   xh.sh check [importer...]     the same frames through ref and cur: what reached
 #                                 Direct3D must be the same call for call, frame by frame
-#   xh.sh bench [importer...]     time a frame on the game's thread: without the DLL, ref, cur
+#   xh.sh bench [importer...]     time a frame on the game's thread: without the DLL, ref, cur in turn, and cur/ref
 #   xh.sh profile <importer> [harness arguments]   where cur spends that time
 #   xh.sh diff <importer> <frame>                  the calls of a frame, ref against cur
 #   xh.sh run <importer> <cur|ref> [harness arguments]
@@ -117,19 +117,27 @@ check)
 	[ $ok = 1 ] && echo "CHECK OK" || { echo "CHECK FAILED"; exit 1; }
 	;;
 bench)
-	n=${RUNS:-3}
+	. "$here/../common/bench.inc.sh"
+	bench_value() { sed -n 's/^frame \([0-9.]*\) ms median.*/\1/p'; }
+	failed=0
 	for i in ${@:-$all}; do
 		args="frames=${BENCH_FRAMES:-900} warmup=300 $(bench_args $i) $BENCH_ARGS"
 		use_built_dll "$runs_root/$i/cur"
+		bench_run() {
+			case $1 in
+			nodll) run $i cur $args nodll 2>&1 ;;
+			*) run $i $1 $args 2>&1 ;;
+			esac
+		}
+		variants=
 		for which in nodll ref cur; do
 			dir=$which
-			extra=
-			[ $which = nodll ] && { dir=cur; extra=nodll; }
-			[ -d "$runs_root/$i/$dir" ] || continue
-			values=$(for k in $(seq $n); do run $i $dir $args $extra 2>&1 | sed -n 's/^frame \([0-9.]*\) ms median.*/\1/p'; done)
-			echo "$i $which: $(echo "$values" | sort -n | sed -n "$(( (n + 1) / 2 ))p") ms a frame   (all: $(echo $values))"
+			[ $which = nodll ] && dir=cur
+			[ -d "$runs_root/$i/$dir" ] && variants="$variants $which"
 		done
+		BENCH_LABEL="$i " bench_rounds ${RUNS:-3} $variants || failed=1
 	done
+	exit $failed
 	;;
 profile)
 	i=$1

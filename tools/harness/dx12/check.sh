@@ -329,7 +329,7 @@ picture() {
 	# the harness fails or prints no checksum
 	local out status
 	out=$(cd $1 && ./harness.exe frames=$2 $3 dump=$4 2>&1); status=$?
-	echo "$out" | grep -v "draws a frame\|of that"
+	echo "$out" | grep -v "draws a frame\|of that\|^other processes"
 	[ $status = 0 ] && echo "$out" | grep -q "^picture checksum"
 }
 

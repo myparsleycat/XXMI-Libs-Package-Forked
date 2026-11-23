@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include "../../common/crc.h"
 #include "../../common/window.h"
+#include "../../common/isolate.h"
 #include "trace.h"
 #include "../../common/profile.inc"
 
@@ -1083,6 +1084,8 @@ int main(int argc, char **argv)
 		start_profile();
 
 	CreateThread(NULL, 0, watchdog, NULL, 0, NULL);
+	isolate_frame_thread();
+	MachineLoad timed_load = machine_load_now();
 	std::vector<int> on_screen;
 	std::vector<double> draw_ms, present_ms;
 	uint64_t total_strict = 0, total_effective = 0;
@@ -1136,6 +1139,10 @@ int main(int argc, char **argv)
 			}
 		}
 
+		if (f == warmup) {
+			isolate_frame_thread();
+			timed_load = machine_load_now();
+		}
 		frame_index = (UINT)f;
 		trace_note_frame((unsigned)f);
 		profiling = profile && f >= warmup && (!appear || (profile_steady ? in_window == 5 || in_window == 6 : in_window == 0 || in_window == 1));
@@ -1189,6 +1196,7 @@ int main(int argc, char **argv)
 			fclose(text_file);
 	} else if (appear && !appearances.empty()) {
 		report_appearances(rotate);
+		print_other_processes_busy(timed_load);
 	} else if (!draw_ms.empty()) {
 		std::vector<double> sorted = draw_ms, sorted_present = present_ms;
 		std::sort(sorted.begin(), sorted.end());
@@ -1198,6 +1206,7 @@ int main(int argc, char **argv)
 			sum += v;
 		printf("frame %.4f ms median, %.4f mean, %.4f best tenth, %.4f p99; present %.4f ms median\n",
 			sorted[sorted.size() / 2], sum / draw_ms.size(), sorted[sorted.size() / 10], sorted[sorted.size() * 99 / 100], sorted_present[sorted_present.size() / 2]);
+		print_other_processes_busy(timed_load);
 	}
 	if (profile)
 		report_profile();

@@ -1,17 +1,19 @@
 #!/bin/bash
-# bench.sh [runs] [harness args]: the recording time a frame of the harness
-# without the DLL, with the one in ref and with the one in run, each the median
-# of some runs
+# bench.sh [runs] [harness args]: the median recording and presenting times a
+# frame of the harness without the DLL, with the one in ref and with the one
+# in run, the three taken in turn for each of some runs, and run/ref
 cd "$(dirname "$0")"
 runs=${1:-3}
 shift
-for dir in nodll ref run; do
-	folder=$dir
-	extra=
-	if [ $dir = nodll ]; then
-		folder=run
-		extra=nodll
-	fi
-	values=$(for i in $(seq $runs); do (cd $folder && ./harness.exe frames=4300 $extra "$@") | sed -n 's/.*recording and executing \([0-9.]*\) ms, presenting \([0-9.]*\).*/\1 \2/p'; done)
-	echo "$dir: record $(echo "$values" | awk '{print $1}' | sort -n | sed -n "$(( (runs + 1) / 2 ))p") ms, present $(echo "$values" | awk '{print $2}' | sort -n | sed -n "$(( (runs + 1) / 2 ))p") ms   (all: $(echo $values))"
-done
+harness_args=("$@")
+. ../common/bench.inc.sh
+bench_run() {
+	case $1 in
+	nodll) (cd run && ./harness.exe frames=4300 nodll "${harness_args[@]}") ;;
+	*) (cd $1 && ./harness.exe frames=4300 "${harness_args[@]}") ;;
+	esac
+}
+bench_value() { sed -n 's/.*recording and executing \([0-9.]*\) ms, presenting.*/\1/p'; }
+bench_extra() { sed -n 's/.*recording and executing [0-9.]* ms, presenting \([0-9.]*\) ms.*/\1/p'; }
+BENCH_EXTRA_NAME="ms presenting"
+bench_rounds $runs nodll ref run

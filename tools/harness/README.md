@@ -12,6 +12,32 @@ diagnostic shows its window because it checks foreground-window behavior.
 Rebuild each harness and copy the new executable into existing run folders
 to apply this behavior there; the DLL does not need rebuilding.
 
+## Timing
+
+The `cpu/dx11`, `dx12` and `vk` harnesses run their frame thread on logical
+processor 4 at high priority and keep their other threads, including the
+driver's and the DLL's, off the logical processors of that core. When Windows
+reports CPU sets, threads made later keep off them too; otherwise the
+harness prints a line saying so. Without this, those threads share the frame
+thread's core through SMT, and the frame time of the same DLL varied by up
+to 18% between runs. Set `XH_CORE=N` to use logical processor N and its
+core instead, or `XH_CORE=-1` to turn this off. Times measured with and
+without it cannot be compared.
+
+Other processes still change the frame time: in GIMI runs it rose with the
+share of the processors that they used. The harnesses print that share for
+the timed frames as `other processes: N%`. Close games and other heavy
+programs before a bench, and repeat rounds whose share is high.
+
+The harnesses report the median per-frame time. The bench commands
+(`cpu/xh.sh bench`, `cpu/dx12.sh bench`, `cpu/vk.sh bench`, `dx12/bench.sh`)
+run each variant once per round, in turn, and report each variant's median
+and the median of the per-round ratios to `ref`. The D3D12 benches also
+report the median presenting time, the Vulkan bench the median CPU cycles of
+the recording thread. A run that gives no time is shown as `-`; the other
+runs continue and the command exits with 1. `RUNS=N` sets the number of
+rounds of the `cpu` commands.
+
 | Folder | What it checks |
 |---|---|
 | `dx12` | The D3D12 shim: matching by hash, hashes carried along GPU copies, the picture against an older DLL, frame time |
@@ -71,8 +97,8 @@ the settings that harness needs. To change more settings, append
   `match_lower_mip_textures = 0` and hidden with `1`.
 - `check.sh ref`: compares the pictures of `run` and `ref` with the mod in
   `case/Mods` and with `test.ini`.
-- `bench.sh [runs] [args]`: reports the recording time per frame with no DLL,
-  with `ref` and with `run`.
+- `bench.sh [runs] [args]`: reports the median recording and presenting times
+  per frame with no DLL, with `ref` and with `run`, and `run/ref`.
 
 `case/Mods/mod/mod.ini` was made by `make_mod.py` from a hash dump of the
 harness's own buffers. It is kept fixed so that a DLL that hashes wrongly

@@ -6,7 +6,7 @@
 # the sections look for, and they are drawn with the range a section matches.
 #
 #   dx12.sh setup [importer...]            run folders dx12_cur (x64/Release) and dx12_ref (ref/d3d11.dll)
-#   dx12.sh bench [importer...]            ms a frame of recording, without the DLL, ref and cur
+#   dx12.sh bench [importer...]            ms a frame of recording, without the DLL, ref and cur in turn
 #   dx12.sh check [importer...]            the picture of ref against cur
 #   dx12.sh run <importer> <cur|ref> [arguments of the harness, e.g. profile]
 #
@@ -15,7 +15,7 @@
 # MODS=N takes the parts of the first N mods of the scene (default 12),
 # FIRST=K starts at the Kth, PARTS=N is the most parts (default 300),
 # MESHES=N the meshes of the harness (default 600). check exits with 1 when
-# the pictures differ or a run fails.
+# the pictures differ or a run fails. RUNS=N runs the bench N times (default 1).
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$here/../../.."
 dx="$here/../dx12"
@@ -83,13 +83,22 @@ setup)
 	done
 	;;
 bench)
+	. "$here/../common/bench.inc.sh"
+	bench_value() { sed -n 's/.*recording and executing \([0-9.]*\) ms, presenting.*/\1/p'; }
+	bench_extra() { sed -n 's/.*recording and executing [0-9.]* ms, presenting \([0-9.]*\) ms.*/\1/p'; }
+	BENCH_EXTRA_NAME="ms presenting"
+	failed=0
 	for i in $(importers "$@"); do
 		use_built_dll "$runs/$i/dx12_cur"
-		echo "$i nodll: $(run $i cur frames=${BENCH_FRAMES:-2300} nodll | tail -1)"
-		for name in ref cur; do
-			echo "$i $name: $(run $i $name frames=${BENCH_FRAMES:-2300} | tail -1)"
-		done
+		bench_run() {
+			case $1 in
+			nodll) run $i cur frames=${BENCH_FRAMES:-2300} nodll ;;
+			*) run $i $1 frames=${BENCH_FRAMES:-2300} ;;
+			esac
+		}
+		BENCH_LABEL="$i " bench_rounds ${RUNS:-1} nodll ref cur || failed=1
 	done
+	exit $failed
 	;;
 check)
 	ok=1
@@ -98,8 +107,8 @@ check)
 		use_built_dll "$runs/$i/dx12_cur"
 		a=$(run $i ref frames=${CHECK_FRAMES:-900} dump=check.bmp); sa=$?
 		b=$(run $i cur frames=${CHECK_FRAMES:-900} dump=check.bmp); sb=$?
-		a=$(echo "$a" | grep -v "draws a frame\|of that\|^scene")
-		b=$(echo "$b" | grep -v "draws a frame\|of that\|^scene")
+		a=$(echo "$a" | grep -v "draws a frame\|of that\|^scene\|^other processes")
+		b=$(echo "$b" | grep -v "draws a frame\|of that\|^scene\|^other processes")
 		if [ $sa = 0 ] && [ $sb = 0 ] && [ -s "$runs/$i/dx12_cur/check.bmp" ] && [ "$a" = "$b" ] && cmp -s "$runs/$i/dx12_ref/check.bmp" "$runs/$i/dx12_cur/check.bmp"; then
 			echo "$i: same picture ($(echo "$a" | head -1))"
 		else

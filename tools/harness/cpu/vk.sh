@@ -4,14 +4,15 @@
 # scenes/EFMI.scene, their index data given the hashes the sections look for.
 #
 #   vk.sh setup                 run folders vk_cur (x64/Release) and vk_ref (ref/d3d11.dll)
-#   vk.sh bench [arguments]     ms a frame of the mods' work, ref and cur
+#   vk.sh bench [arguments]     ms a frame of the mods' work, ref and cur in turn
 #   vk.sh check                 the picture and the draw counts of ref against cur
 #   vk.sh run <cur|ref> [arguments of the harness, e.g. --profile]
 #
 # MODS=N takes the parts of the first N mods of the scene (default 6),
 # FIRST=K starts at the Kth, PARTS=N is the most parts (default 400),
 # SECONDS_RUN how long a run is (default 8); a part is drawn --characters x
-# --passes times. check exits with 1 when the pictures differ or are missing.
+# --passes times. RUNS=N runs the bench N times (default 1). check exits with
+# 1 when the pictures differ or are missing.
 # check and bench copy the DLL of x64/Release into vk_cur first.
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$here/../../.."
@@ -73,9 +74,13 @@ setup)
 	;;
 bench)
 	use_built_dll "$root/vk_cur"
-	for name in ref cur; do
-		echo "$name: $(run $name "$@" | tail -3 | tr '\n' ' ')"
-	done
+	. "$here/../common/bench.inc.sh"
+	bench_args=("$@")
+	bench_run() { run $1 "${bench_args[@]}"; }
+	bench_value() { sed -n 's/^recording and submitting: \([0-9.]*\) ms a frame.*/\1/p'; }
+	bench_extra() { sed -n 's/^recording and submitting: \([0-9.]*\) million cycles.*/\1/p'; }
+	BENCH_EXTRA_NAME="million cycles of the thread"
+	bench_rounds ${RUNS:-1} ref cur || exit 1
 	;;
 check)
 	use_built_dll "$root/vk_cur"
