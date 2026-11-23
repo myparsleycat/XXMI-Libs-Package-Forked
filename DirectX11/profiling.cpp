@@ -414,6 +414,32 @@ static void update_txt_commands(LARGE_INTEGER collection_duration, LARGE_INTEGER
 	}
 }
 
+// The overlay shows only what fits on the screen. The whole text of the last
+// interval goes to d3d11_profile_<mode>.txt next to the DLL, replaced each
+// interval.
+static void write_profile_file()
+{
+	static const wchar_t *names[] = { L"", L"summary", L"command_lists", L"commands", L"cto_warning" };
+	static wchar_t dir[MAX_PATH];
+	wchar_t path[MAX_PATH];
+	size_t mode = (size_t)Profiling::mode;
+	FILE *file;
+
+	if (mode == 0 || mode >= ARRAYSIZE(names))
+		return;
+	if (!dir[0]) {
+		if (!GetModuleFileName(migoto_handle, dir, MAX_PATH) || !wcsrchr(dir, L'\\'))
+			return;
+		wcsrchr(dir, L'\\')[1] = 0;
+	}
+	_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%lsd3d11_profile_%ls.txt", dir, names[mode]);
+	file = _wfsopen(path, L"w, ccs=UTF-8", _SH_DENYNO);
+	if (!file)
+		return;
+	fputws(Profiling::text.c_str(), file);
+	fclose(file);
+}
+
 void Profiling::update_txt()
 {
 	static LARGE_INTEGER freq = {0};
@@ -455,6 +481,7 @@ void Profiling::update_txt()
 				update_txt_cto_warning();
 				break;
 		}
+		write_profile_file();
 	}
 
 	// Restart profiling for the next time interval:
