@@ -2520,7 +2520,7 @@ static DXGI_FORMAT GetTextureFormat(ID3D11Resource* resource, D3D11_RESOURCE_DIM
 	}
 }
 
-static void FillInMissingInfo(
+static D3D11_RESOURCE_DIMENSION FillInMissingInfo(
 	ResourceCopyTargetType type,
 	ID3D11Resource* resource,
 	ID3D11View* view,
@@ -2595,6 +2595,8 @@ static void FillInMissingInfo(
 		if (!*stride)
 			*stride = *buf_size;
 	}
+
+	return dimension;
 }
 
 void FrameAnalysisDumpCommand::run(CommandListState *state)
@@ -15123,7 +15125,8 @@ void ResourceCopyOperation::CopyResourceToResource(
 		}
 	}
 
-	FillInMissingInfo(src.type, src_resource, src_view, &stride, &offset, &buf_src_size, &format);
+	const D3D11_RESOURCE_DIMENSION src_dimension =
+		FillInMissingInfo(src.type, src_resource, src_view, &stride, &offset, &buf_src_size, &format);
 
 	ID3D11Resource* dst_resource = NULL;
 	ID3D11View* dst_view = NULL;
@@ -15145,9 +15148,7 @@ void ResourceCopyOperation::CopyResourceToResource(
 	// Keep size as the requested destination copy size.
 	// The copy helper calculates the exclusive source end offset from both values.
 	// A region of a texture means nothing, and the region copy only takes buffers.
-	D3D11_RESOURCE_DIMENSION src_dimension;
-	src_resource->GetType(&src_dimension);
-	bool src_region = src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION
+	const bool src_region = src.evaluation_mode == ResourceCopyTargetEvaluationMode::RESOURCE_REGION
 		&& src_dimension == D3D11_RESOURCE_DIMENSION_BUFFER;
 	if (src_region) {
 		offset = (UINT)src.member_args[0].GetValue(state);
