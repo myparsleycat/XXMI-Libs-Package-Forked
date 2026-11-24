@@ -42,8 +42,11 @@ void Dx12QueueLock(ID3D12CommandQueue *queue);
 void Dx12QueueUnlock(ID3D12CommandQueue *queue);
 // Whether the signal that takes the fence to the value has been handed to a
 // queue that gets to it with what the queues have been handed so far. Then a
-// wait for it handed to a queue now cannot be one of a circle.
-bool Dx12QueueCanWait(ID3D12Fence *fence, UINT64 value);
+// wait for it handed to waiter now cannot be one of a circle. What waiter was
+// handed so far counts as got through: it has to be before the wait anyway,
+// and whatever holds it up there would without the wait as well. Where it is
+// false and why is given, why gets what was found in the way, for a report.
+bool Dx12QueueCanWait(ID3D12CommandQueue *waiter, ID3D12Fence *fence, UINT64 value, char *why = NULL, size_t why_size = 0);
 // The place of an execution of lists among those signals and waits, taken
 // before the lists are handed to the queue, with Dx12QueueLock held
 UINT64 Dx12QueueExecutes(ID3D12CommandQueue *queue);

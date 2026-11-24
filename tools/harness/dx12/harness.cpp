@@ -133,6 +133,20 @@ static bool test;
 // records an upload of other positions there but is executed last, and the
 // first list draws A from there in between (A hidden with passes=1).
 static bool move_test;
+// side: from frame SIDE_FROM the first list goes to a second direct queue,
+// handed after a wait for a fence only the CPU signals (once the list was
+// handed) and a signal the swap chain's queue waits for, as WWMI's second
+// direct queue was seen to do. The mods' work for the list is on the swap
+// chain's queue after that wait, and the picture has to be the one without
+// side. Only the swap chain's queue may write its buffers, so the frame is
+// drawn to side_target and copied to the swap chain's buffer by the second
+// list.
+static bool side_test;
+const UINT SIDE_FROM = 300;
+static ID3D12Resource *side_target;
+static ID3D12CommandQueue *side_queue;
+static ID3D12Fence *side_fence;
+static ID3D12Fence *side_cpu_fence;
 static ID3D12Resource *race_uploads[4];
 static ID3D12CommandAllocator *race_allocators[4];
 static ID3D12GraphicsCommandList *race_lists[4];
@@ -1460,6 +1474,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "test")) test = true;
 		else if (!strcmp(argv[a], "evict")) evict_test = true;
 		else if (!strcmp(argv[a], "move")) move_test = true;
+		else if (!strcmp(argv[a], "side")) side_test = true;
 		else if (!strcmp(argv[a], "lowmip")) lowmip_test = true;
 		else if (!strncmp(argv[a], "evictstop=", 10)) evict_stop = atoi(argv[a] + 10);
 		else if (!strncmp(argv[a], "appear=", 7)) appear_frames = atoi(argv[a] + 7);
@@ -1568,7 +1583,7 @@ int main(int argc, char **argv)
 	rtv_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	view_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-	heap_desc.NumDescriptors = BACK_BUFFERS;
+	heap_desc.NumDescriptors = BACK_BUFFERS + 1;
 	CHECK(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap)));
 	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	heap_desc.NumDescriptors = TEXTURES;
@@ -1581,6 +1596,13 @@ int main(int argc, char **argv)
 	for (i = 0; i < BACK_BUFFERS; i++) {
 		CHECK(swap_chain->GetBuffer(i, IID_PPV_ARGS(&back_buffers[i])));
 		device->CreateRenderTargetView(back_buffers[i], NULL, { rtv.ptr + i * rtv_size });
+	}
+	if (side_test) {
+		D3D12_RESOURCE_DESC desc = back_buffers[0]->GetDesc();
+		D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+		CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE,
+				NULL, IID_PPV_ARGS(&side_target)));
+		device->CreateRenderTargetView(side_target, NULL, { rtv.ptr + BACK_BUFFERS * rtv_size });
 	}
 
 	CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
@@ -1694,7 +1716,8 @@ int main(int argc, char **argv)
 		D3D12_CPU_DESCRIPTOR_HANDLE cpu_start = cpu_heap->GetCPUDescriptorHandleForHeapStart();
 		D3D12_CPU_DESCRIPTOR_HANDLE gpu_cpu_start = gpu_heap->GetCPUDescriptorHandleForHeapStart();
 		D3D12_GPU_DESCRIPTOR_HANDLE gpu_start = gpu_heap->GetGPUDescriptorHandleForHeapStart();
-		D3D12_CPU_DESCRIPTOR_HANDLE target = { rtv.ptr + index * rtv_size };
+		const bool side = side_test && f >= SIDE_FROM;
+		D3D12_CPU_DESCRIPTOR_HANDLE target = { rtv.ptr + (side ? BACK_BUFFERS : index) * rtv_size };
 		UINT pass;
 
 		while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
@@ -2143,7 +2166,10 @@ int main(int argc, char **argv)
 			*slot = create_buffer(4096 + ((f + i) % 4) * 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
 		}
 
-		transition(lists[0], back_buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		if (side)
+			transition(lists[0], side_target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		else
+			transition(lists[0], back_buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		lists[0]->ClearRenderTargetView(target, clear, 0, NULL);
 
 		auto record_pass = [&](UINT pass) {
@@ -2241,7 +2267,14 @@ int main(int argc, char **argv)
 
 		if (probe_shader && f > 0)
 			draw_probe_shader(lists[1]);
-		transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+		if (side) {
+			transition(lists[1], side_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+			lists[1]->CopyResource(back_buffers[index], side_target);
+			transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+		} else {
+			transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+		}
 		CHECK(lists[0]->Close());
 		CHECK(lists[1]->Close());
 		if (evict_test) {
@@ -2250,7 +2283,24 @@ int main(int argc, char **argv)
 		}
 		if (move_test && f == 1700)
 			CHECK(queue->Wait(queue2_fence, 1));
-		queue->ExecuteCommandLists(1, (ID3D12CommandList**)&lists[0]);
+		if (side_test && f >= SIDE_FROM) {
+			if (!side_queue) {
+				D3D12_COMMAND_QUEUE_DESC desc = {};
+				desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+				CHECK(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&side_queue)));
+				CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&side_fence)));
+				CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&side_cpu_fence)));
+			}
+			CHECK(side_queue->Wait(side_cpu_fence, f));
+			CHECK(side_queue->Signal(side_fence, 2 * (UINT64)f));
+			CHECK(queue->Wait(side_fence, 2 * (UINT64)f));
+			side_queue->ExecuteCommandLists(1, (ID3D12CommandList**)&lists[0]);
+			CHECK(side_queue->Signal(side_fence, 2 * (UINT64)f + 1));
+			CHECK(queue->Wait(side_fence, 2 * (UINT64)f + 1));
+			CHECK(side_cpu_fence->Signal(f));
+		} else {
+			queue->ExecuteCommandLists(1, (ID3D12CommandList**)&lists[0]);
+		}
 		if (move_test && f == 1800) {
 			CHECK(queue->Signal(queue2_fence, 2));
 			CHECK(queue2->Wait(queue2_fence, 2));

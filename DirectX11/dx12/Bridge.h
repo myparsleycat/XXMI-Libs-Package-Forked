@@ -223,7 +223,9 @@ bool Dx12ShimPin(Dx12GraphicsCommandList *list, IUnknown *object);
 // Where that could leave the two queues waiting for each other, the lists go
 // without the wait and the mods are left out of the queue's lists from when
 // they are recorded (Dx12DrawPipelineWanted): for a number of frames that
-// doubles every time, and for as long after as it still could not wait.
+// doubles each time it could not wait again soon after, and starts over from
+// the shortest once it could wait for a few times as long, and for as long
+// after as it still could not wait.
 void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods);
 // By the original queue, NULL where there is none. Read without the lock.
 extern ID3D12CommandQueue *volatile dx12_unordered_queues[4];

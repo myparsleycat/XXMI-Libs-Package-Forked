@@ -89,11 +89,12 @@ struct ForeignQueue {
 	// The value of our own fence it was last made to wait for
 	UINT64 waited;
 	// Whether it is one of dx12_unordered_queues, the frame until which
-	// it stays one at least, and for how many frames it was made one
-	// the last time, which is twice that the next time
+	// it stays one at least, for how many frames it was made one the last
+	// time, and the frame it stopped being one, see UNORDERED_FRAMES
 	bool unordered;
 	UINT unordered_until;
 	UINT unordered_frames;
+	UINT ordered_since;
 };
 static std::vector<ForeignQueue*> foreign_queues;
 static ForeignQueue* foreign_queue(ID3D12CommandQueue *queue);
@@ -1131,8 +1132,10 @@ bool Dx12ShimUseResource(ShimResource *resource)
 const UINT64 GAME_UPLOAD_BLOCK_SIZE = 1 << 20;
 
 // For how long the lists of a queue go without the mods the first time it
-// could not be made to wait for them
-const UINT UNORDERED_FRAMES = 600;
+// could not be made to wait for them. Each time again it is twice as long,
+// unless the queue could wait for this many times as long as the last time.
+const UINT UNORDERED_FRAMES = 30;
+const UINT UNORDERED_FORGET_TIMES = 4;
 
 const size_t GAME_UPLOAD_BLOCKS_KEPT = 8;
 
@@ -1216,7 +1219,7 @@ void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pin
 ID3D12CommandQueue *volatile dx12_unordered_queues[4];
 
 // With the lock held
-static void set_queue_unordered(ForeignQueue *foreign, bool unordered)
+static void set_queue_unordered(ForeignQueue *foreign, bool unordered, const char *why = "")
 {
 	ID3D12CommandQueue *wanted = unordered ? NULL : foreign->queue;
 
@@ -1230,6 +1233,10 @@ static void set_queue_unordered(ForeignQueue *foreign, bool unordered)
 		if (unordered) {
 			Dx12LogInfo("*** ID3D12CommandQueue %p cannot be made to wait for what the mods have done for its lists, "
 				"they are left out of those for %u frames at least\n", foreign->queue, foreign->unordered_frames);
+			Dx12DumpNote("*** Frame %u: ID3D12CommandQueue %p (type %d) cannot be made to wait for what the mods have done "
+				"for its lists, they are left out of those for %u frames at least; ours is %p (type %d): %s\n",
+				dx12_frame, foreign->queue, (int)foreign->queue->GetDesc().Type, foreign->unordered_frames,
+				shim.queue, (int)shim.queue->GetDesc().Type, why);
 		} else {
 			Dx12LogInfo("ID3D12CommandQueue %p can be made to wait for the mods again\n", foreign->queue);
 		}
@@ -1241,6 +1248,7 @@ void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods
 {
 	ForeignQueue *foreign;
 	bool ordered = true;
+	char why[512] = "";
 
 	Dx12ShimLock();
 	if (dx12_shim && queue != shim.queue) {
@@ -1250,7 +1258,7 @@ void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods
 		if (foreign->waited < needed && fence->GetCompletedValue() < needed) {
 			// Our queue may be behind a wait for what this one is
 			// yet to be handed, and would then never get to it
-			if (!Dx12QueueCanWait(fence, needed)) {
+			if (!Dx12QueueCanWait(queue, fence, needed, foreign->unordered ? NULL : why, sizeof(why))) {
 				ordered = false;
 			} else if (uses_mods) {
 				HRESULT hr;
@@ -1264,6 +1272,7 @@ void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods
 					InterlockedIncrement64(&dx12_stats.queue_waits);
 				} else {
 					ordered = false;
+					_snprintf_s(why, sizeof(why), _TRUNCATE, "ID3D12CommandQueue::Wait failed with 0x%x", hr);
 				}
 			}
 		}
@@ -1272,12 +1281,17 @@ void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods
 			if (uses_mods)
 				InterlockedIncrement64(&dx12_stats.queue_waits_skipped);
 			if (!foreign->unordered) {
-				foreign->unordered_frames = foreign->unordered_frames ? min(foreign->unordered_frames * 2, 1u << 20) : UNORDERED_FRAMES;
-				set_queue_unordered(foreign, true);
+				if (!foreign->unordered_frames
+				    || dx12_frame - foreign->ordered_since >= foreign->unordered_frames * UNORDERED_FORGET_TIMES)
+					foreign->unordered_frames = UNORDERED_FRAMES;
+				else
+					foreign->unordered_frames = min(foreign->unordered_frames * 2, 1u << 20);
+				set_queue_unordered(foreign, true, why);
 			}
 			foreign->unordered_until = dx12_frame + foreign->unordered_frames;
 		} else if (foreign->unordered && (int)(dx12_frame - foreign->unordered_until) >= 0) {
 			set_queue_unordered(foreign, false);
+			foreign->ordered_since = dx12_frame;
 		}
 	}
 	Dx12ShimUnlock();
@@ -1504,6 +1518,7 @@ static ForeignQueue* foreign_queue(ID3D12CommandQueue *queue)
 	foreign->unordered = false;
 	foreign->unordered_until = 0;
 	foreign->unordered_frames = 0;
+	foreign->ordered_since = 0;
 	queue->AddRef();
 	foreign_queues.push_back(foreign);
 	return foreign;

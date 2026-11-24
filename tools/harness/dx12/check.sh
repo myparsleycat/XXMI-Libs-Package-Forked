@@ -21,7 +21,10 @@
 #   blend-stream  a custom shader's blend state on game pipelines made from
 #          pipeline state streams (harness.cpp stream) gives the picture it
 #          gives on pipelines made from descriptions
-#   refthe pictures of test and of the mod in case/Mods against those of
+#   side   a mod's per-draw copy on lists of a second direct queue whose
+#          earlier wait is for a fence only the CPU signals (harness.cpp side)
+#          gives the picture it gives on the swap chain's queue
+#   ref    the pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
 #   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
 #   dxil-iniparams  a DXIL patch reads a 1D IniParams texture on a game draw
@@ -719,6 +722,30 @@ run_blend_stream() {
 	fi
 }
 
+run_side() {
+	local mod=run/Mods/mod/mod.ini name status one side nomod
+	cp "$mod" "$mod.side-backup" || { ok=0; return; }
+	sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^ps-t0 = ResourceModDiffuse$/ResourceSideDiffuse = copy ResourceModDiffuse\nps-t0 = ResourceSideDiffuse/; }' "$mod"
+	printf '\n[ResourceSideDiffuse]\n' >> "$mod"
+	# nomod: the mesh left to the game, which the other pictures must not be
+	for name in one side nomod; do
+		[ $name = nomod ] && sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^hash = .*/hash = 00000000/; }' "$mod"
+		(cd run && timeout 60 ./harness.exe frames=600 $([ $name = side ] && echo side) dump=side-$name.bmp >side-$name.out 2>&1)
+		status=$?
+		if [ $status != 0 ]; then
+			mv "$mod.side-backup" "$mod"; echo "side: FAILED ($name: exit $status)"; ok=0; return
+		fi
+		printf -v "$name" '%s' "$(sed -n 's/^picture checksum //p' run/side-$name.out)"
+	done
+	mv "$mod.side-backup" "$mod"
+	if [[ "$one" =~ ^[0-9a-f]+$ && "$side" =~ ^[0-9a-f]+$ && "$nomod" =~ ^[0-9a-f]+$ ]] \
+	   && [ "$one" = "$side" ] && [ "$one" != "$nomod" ]; then
+		echo "side: OK"
+	else
+		echo "side: FAILED (one queue: $one, second queue: $side, without the mod: $nomod)"; ok=0
+	fi
+}
+
 run_present() {
 	local mod=run/Mods/mod/mod.ini frames=400 fail="" s0 s1 s3 snext b0 b1 b3 skips reruns bskips breruns
 	cp "$mod" "$mod.present-backup" || { ok=0; return; }
@@ -827,6 +854,7 @@ for what in ${@:-test refetch fold move lowmip filter present}; do
 	filter) run_filter ;;
 	present) run_present ;;
 	blend-stream) run_blend_stream ;;
+	side) run_side ;;
 	ref) run_ref ;;
 	root-uav) run_root_uav ;;
 	dxil-iniparams) run_dxil_iniparams '' ;;

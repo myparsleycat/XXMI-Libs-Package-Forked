@@ -382,8 +382,10 @@ static const QueuedSignal* queued_signal(ID3D12Fence *fence, UINT64 value)
 
 // Whether the queue gets through what it was handed before order without
 // anything that no queue has been handed yet
-static bool queue_reaches(ID3D12CommandQueue *queue, UINT64 order, int depth)
+static bool queue_reaches(ID3D12CommandQueue *waiter, ID3D12CommandQueue *queue, UINT64 order, int depth)
 {
+	if (queue == waiter)
+		return true;
 	for (const QueuedWait &wait : queued_waits) {
 		const QueuedSignal *signal;
 
@@ -393,7 +395,7 @@ static bool queue_reaches(ID3D12CommandQueue *queue, UINT64 order, int depth)
 		if (depth >= QUEUED_WAIT_DEPTH)
 			return false;
 		signal = queued_signal(wait.fence, wait.value);
-		if (!signal || !queue_reaches(signal->queue, signal->order, depth + 1))
+		if (!signal || !queue_reaches(waiter, signal->queue, signal->order, depth + 1))
 			return false;
 	}
 	return true;
@@ -444,7 +446,41 @@ void Dx12QueueWaits(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value)
 		reached->Release();
 }
 
-bool Dx12QueueCanWait(ID3D12Fence *fence, UINT64 value)
+// With fence_lock held: the first wait queue_reaches stops at. The queues are
+// not referenced, so only their addresses are told.
+static bool describe_block(ID3D12CommandQueue *waiter, ID3D12CommandQueue *queue, UINT64 order, int depth,
+		char *text, size_t size)
+{
+	if (queue == waiter)
+		return false;
+	for (const QueuedWait &wait : queued_waits) {
+		const QueuedSignal *signal;
+
+		if (wait.queue != queue || wait.order >= order || wait.fence->GetCompletedValue() >= wait.value)
+			continue;
+		signal = queued_signal(wait.fence, wait.value);
+		if (depth < QUEUED_WAIT_DEPTH && signal
+		    && !describe_block(waiter, signal->queue, signal->order, depth + 1, text, size))
+			continue;
+		if (*text)
+			return true;
+
+		auto found = queued_signals.find(wait.fence);
+		const QueuedSignal *last = found != queued_signals.end() && !found->second.empty() ? &found->second.back() : NULL;
+		_snprintf_s(text, size, _TRUNCATE,
+			"at depth %d, queue %p was handed a wait for fence %p to reach %llu, %llu orders back, "
+			"which is at %llu, and %s; the last signal of it handed to a queue is %llu on %p",
+			depth, queue, wait.fence, wait.value, queue_order - wait.order,
+			wait.fence->GetCompletedValue(),
+			depth >= QUEUED_WAIT_DEPTH ? "the waits go deeper than are followed"
+			: signal ? "the queue to signal it is held up in turn" : "no queue has been handed a signal of it that far",
+			last ? last->value : 0, last ? last->queue : NULL);
+		return true;
+	}
+	return false;
+}
+
+bool Dx12QueueCanWait(ID3D12CommandQueue *waiter, ID3D12Fence *fence, UINT64 value, char *why, size_t why_size)
 {
 	std::vector<ID3D12Fence*> done;
 	const QueuedSignal *signal;
@@ -456,7 +492,15 @@ bool Dx12QueueCanWait(ID3D12Fence *fence, UINT64 value)
 	AcquireSRWLockExclusive(&fence_lock);
 	forget_reached_waits(&done);
 	signal = queued_signal(fence, value);
-	reached = signal && queue_reaches(signal->queue, signal->order, 0);
+	reached = signal && queue_reaches(waiter, signal->queue, signal->order, 0);
+	if (!reached && why) {
+		*why = 0;
+		if (!signal)
+			_snprintf_s(why, why_size, _TRUNCATE, "no queue has been handed a signal of fence %p to %llu, it is at %llu",
+				fence, value, fence->GetCompletedValue());
+		else
+			describe_block(waiter, signal->queue, signal->order, 0, why, why_size);
+	}
 	ReleaseSRWLockExclusive(&fence_lock);
 
 	for (ID3D12Fence *reached_fence : done)
