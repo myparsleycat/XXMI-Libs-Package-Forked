@@ -358,6 +358,8 @@ void HackerSwapChain::RunFrameActions()
 	// incremented when we call the original present call:
 	G->frame_no++;
 	mHackerContext->ResetCallCounters();
+	// The overlay and the desktop channel bind on the context directly:
+	mHackerContext->ForgetGameBindings();
 
 	// When not hunting most keybindings won't have been registered, but
 	// still skip the below logic that only applies while hunting.

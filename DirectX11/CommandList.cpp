@@ -198,6 +198,8 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 			(*i)->run(state);
 			state->mHackerContext->ForgetCheckTextureOverrideResults((*i)->bound_type,
 					(*i)->bound_shader_type, (*i)->bound_first_slot, (*i)->bound_slot_count);
+			state->mHackerContext->ForgetGameBindings((*i)->bound_type,
+					(*i)->bound_shader_type, (*i)->bound_first_slot, (*i)->bound_slot_count);
 		} else {
 			// Forget on both sides of the command: before, since it
 			// may look up bindings it is about to change itself, and
@@ -207,8 +209,10 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 			if (state->active_check_texture_bindings)
 				forget_active_check_texture_bindings(state);
 			state->mHackerContext->ForgetCheckTextureOverrideResults();
+			state->mHackerContext->ForgetGameBindings();
 			(*i)->run(state);
 			state->mHackerContext->ForgetCheckTextureOverrideResults();
+			state->mHackerContext->ForgetGameBindings();
 		}
 		profile_command_list_cmd_end(i->get(), state, &profiling_state);
 	}
@@ -16063,6 +16067,32 @@ static void forget_active_check_texture_bindings(CommandListState *state, const 
 	}
 }
 
+// Whether the slot holds what the game bound there and that is known to match
+// nothing, see HackerContext::mGameSrvs:
+static bool game_binding_known_miss(HackerContext *context, const CheckTextureOverrideBatch::Fetch &fetch, unsigned slot)
+{
+	if (slot >= HackerContext::GAME_BINDING_SLOTS)
+		return false;
+
+	switch (fetch.type) {
+		case ResourceCopyTargetType::SHADER_RESOURCE: {
+			int stage = srv_stage(fetch.shader_type);
+			if (stage < 0 || !(context->mGameSrvsKnown[stage] & (1u << slot)))
+				return false;
+			ID3D11ShaderResourceView *view = context->mGameSrvs[stage][slot];
+			return !view || TextureOverrideViewKnownMiss(view);
+		}
+		case ResourceCopyTargetType::VERTEX_BUFFER: {
+			if (!(context->mGameVertexBuffersKnown & (1u << slot)))
+				return false;
+			ID3D11Buffer *buffer = context->mGameVertexBuffers[slot];
+			return !buffer || TextureOverrideResourceKnownMiss(buffer);
+		}
+		default:
+			return false;
+	}
+}
+
 void CheckTextureOverrideBatch::run(CommandListState *state)
 {
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_CHECK_BATCH);
@@ -16077,6 +16107,11 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 	// when the batch starts, one for a line can only come from the command
 	// lists of a match:
 	const bool none_noted = context->CheckTextureOverrideResultCount() == 0;
+	// See HackerContext::mGameSrvs. Region hashes are looked up by more than
+	// the resource, the D3D12 and Vulkan paths do not bind through the
+	// context, and frame analysis logs each lookup:
+	const bool use_game_bindings = !dx12_shim && !track_regions && !G->analyse_frame
+		&& !game_has_unwrapped_context.load(std::memory_order_relaxed);
 
 	auto run_matches = [&](CheckTextureOverrideCommand *command, TextureOverrideMatches &matches) {
 		if (bindings.fetched) {
@@ -16111,6 +16146,10 @@ void CheckTextureOverrideBatch::run(CommandListState *state)
 		}
 
 		COMMAND_LIST_LOG(state, "%S\n", command->ini_line.c_str());
+		if (use_game_bindings && game_binding_known_miss(context, fetch, fetch.first_slot + (b - fetch.first_binding))) {
+			context->NoteCheckTextureOverrideResult(command, state->call_info, matches);
+			continue;
+		}
 		const bool borrow_buffer = shim && fetch.type != ResourceCopyTargetType::SHADER_RESOURCE;
 		const uint32_t bit = 1u << check.fetch;
 		if (!borrow_buffer && !(bindings.fetched & bit)) {

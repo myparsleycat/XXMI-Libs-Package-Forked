@@ -97,6 +97,7 @@
     <ClCompile Include="HackerDXGI.cpp" />
     <ClCompile Include="HackerInputLayout.cpp" />
     <ClCompile Include="HookAddresses.c" />
+    <ClCompile Include="BindingProxy.cpp" />
     <ClCompile Include="HookedContext.cpp" />
     <ClCompile Include="HookedDevice.cpp" />
     <ClCompile Include="HookedDXGI.cpp" />
@@ -177,6 +178,7 @@
     <ClInclude Include="HackerDevice.h" />
     <ClInclude Include="HackerDXGI.h" />
     <ClInclude Include="HackerInputLayout.h" />
+    <ClInclude Include="BindingProxy.h" />
     <ClInclude Include="HookedContext.h" />
     <ClInclude Include="HookedDevice.h" />
     <ClInclude Include="HookedDXGI.h" />

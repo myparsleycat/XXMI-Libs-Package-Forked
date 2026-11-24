@@ -52,6 +52,12 @@ private:
 
 	HackerContext *mHackerContext;
 	HackerSwapChain *mHackerSwapChain;
+	// The stand-in (BindingProxy.h) of this device for the interfaces it does
+	// not implement, made when the game first asks for one:
+	IUnknown *mBindingProxy = nullptr;
+	IUnknown* GetBindingProxy();
+	friend IUnknown* ImmediateContextBindingProxy(HackerDevice *device);
+	friend IUnknown* DeviceBindingProxyOf(HackerContext *context);
 	std::unordered_map<uint64_t, HackerInputLayout*> mInputLayoutCache;
 
 	// Utility routines

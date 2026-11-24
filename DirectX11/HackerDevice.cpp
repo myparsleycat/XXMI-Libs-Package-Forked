@@ -27,6 +27,7 @@
 #include "shader.h"
 #include "DecompileHLSL.h"
 #include "HackerContext.h"
+#include "BindingProxy.h"
 #include "HackerDXGI.h"
 
 #include "D3D11Wrapper.h"
@@ -435,6 +436,34 @@ HackerContext* HackerDevice::GetHackerContext()
 {
 	LogInfo("HackerDevice::GetHackerContext returns %p\n", mHackerContext);
 	return mHackerContext;
+}
+
+IUnknown* HackerDevice::GetBindingProxy()
+{
+	if (!mBindingProxy) {
+		IUnknown *proxy = MakeDeviceBindingProxy(mRealOrigDevice1, this);
+		if (proxy && InterlockedCompareExchangePointer((void**)&mBindingProxy, proxy, NULL))
+			FreeBindingProxy(proxy);
+	}
+	return mBindingProxy;
+}
+
+IUnknown* ImmediateContextBindingProxy(HackerDevice *device)
+{
+	HackerContext *context = device->mHackerContext;
+	return context ? context->GetBindingProxy() : NULL;
+}
+
+IUnknown* DeviceBindingProxyOf(HackerContext *context)
+{
+	// With device hooks the device DirectX gives back leads to HackerDevice:
+	if (G->enable_hooks & EnableHooks::DEVICE)
+		return NULL;
+	HackerDevice *device = context->GetHackerDevice();
+	IUnknown *proxy = device ? device->GetBindingProxy() : NULL;
+	if (!proxy)
+		NoteUnwrappedContext("the device of an ID3D11DeviceContext2 or later");
+	return proxy;
 }
 
 void HackerDevice::SetHackerSwapChain(HackerSwapChain *pHackerSwapChain)
@@ -1595,6 +1624,7 @@ STDMETHODIMP_(ULONG) HackerDevice::Release(THIS)
 			mIniTexture = 0;
 			LogInfo("  releasing iniparams texture, result = %d\n", result);
 		}
+		FreeBindingProxy(mBindingProxy);
 		delete this;
 		return 0L;
 	}
@@ -1647,6 +1677,17 @@ HRESULT STDMETHODCALLTYPE HackerDevice::QueryInterface(
 	{
 		LogDebug("  failed result = %x for %p\n", hr, ppvObject);
 		return hr;
+	}
+	if (IsBindingProxyInterface(riid, false)) {
+		// With device hooks the game gets DirectX's device in any case.
+		// The reference the call took is the stand-in's:
+		IUnknown *proxy = G->enable_hooks & EnableHooks::DEVICE ? NULL : GetBindingProxy();
+		if (proxy) {
+			*ppvObject = proxy;
+			LogDebug("  return binding stand-in %p of %p\n", proxy, mRealOrigDevice1);
+			return hr;
+		}
+		NoteUnwrappedContext(NameFromIID(riid).c_str());
 	}
 
 	// No need for further checks of null ppvObject, as it could not have successfully

@@ -2412,6 +2412,20 @@ public:
 	}
 };
 
+bool TextureOverrideResourceKnownMiss(ID3D11Resource *resource)
+{
+	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())
+		return true;
+	if (texture_override_miss_slot(resource)->load(std::memory_order_relaxed) != resource)
+		return false;
+
+	// As find_texture_overrides_for_resource() counts the lookup it ends
+	// in its miss cache:
+	if (Profiling::mode == Profiling::Mode::SUMMARY)
+		Profiling::texture_override_candidates_lookup_overhead.count++;
+	return true;
+}
+
 bool TextureOverrideViewKnownMiss(ID3D11View *view)
 {
 	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())

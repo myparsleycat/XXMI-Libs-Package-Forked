@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d11_1.h>
+#include <atomic>
 #include <INITGUID.h>
 
 #include "DrawCallInfo.h"
@@ -21,6 +22,20 @@ DEFINE_GUID(IID_HackerContext,
 class HackerContext;
 
 HackerContext* HackerContextFactory(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1);
+
+// The interfaces of a context (of_context) or device that QueryInterface
+// answers with a stand-in of BindingProxy.h: through them the game reaches a
+// context without going through HackerContext. IUnknown is left out, as it is
+// the COM identity of DirectX's object; a context reached from it is like the
+// device a resource gives back (see HackerContext::mGameSrvs).
+bool IsBindingProxyInterface(REFIID riid, bool of_context);
+// Set once the game has one of them without a stand-in (none could be made, or
+// device hooks are on): HackerContext::mGameSrvs and mGameVertexBuffers are no
+// longer used then. A hooked context (hook = immediate_context for the
+// immediate one, deferred_contexts for the others) needs no stand-in, as every
+// bind reaches HackerContext through the hooks. See NoteUnwrappedContext() in
+// BindingProxy.h.
+extern std::atomic<bool> game_has_unwrapped_context;
 
 // Forward declaration to allow circular reference between HackerContext and HackerDevice. 
 // We need this to allow each to reference the other as needed.
@@ -359,7 +374,7 @@ private:
 			UINT StartSlot,
 			UINT NumViews,
 			ID3D11ShaderResourceView *const *ppShaderResourceViews)>
-	void SetShaderResources(UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews);
+	void SetShaderResources(int stage, UINT StartSlot, UINT NumViews, ID3D11ShaderResourceView *const *ppShaderResourceViews);
 
 protected:
 	// Allow FrameAnalysisContext access to these as an interim measure
@@ -541,6 +556,61 @@ public:
 		for (UINT i = first; i < first + count && i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
 			slots[i >> 6] &= ~(1ull << (i & 63));
 	}
+	// The views and vertex buffers bound through the methods of this context
+	// or its stand-in (GetBindingProxy()), held without references, for the
+	// slots whose bit is set. They are only
+	// used to skip a slot whose resource is known to match no TextureOverride
+	// (see CheckTextureOverrideBatch::run): what DirectX may have unbound since
+	// (a resource bound for output, ClearState) is null, which matches nothing
+	// either. Forgotten wherever 3DMigoto binds to these slots itself. Not used
+	// once the game could bind past both, see game_has_unwrapped_context. A
+	// context the game reaches through the device of a resource or view
+	// (GetDevice), or through an IUnknown, is DirectX's own and goes unnoticed.
+	static const unsigned GAME_BINDING_SLOTS = 32;
+	ID3D11ShaderResourceView *mGameSrvs[6][GAME_BINDING_SLOTS];
+	uint32_t mGameSrvsKnown[6] = {};
+	ID3D11Buffer *mGameVertexBuffers[GAME_BINDING_SLOTS];
+	uint32_t mGameVertexBuffersKnown = 0;
+	// The stand-in (BindingProxy.h) of this context for the interfaces it does
+	// not implement, made when the game first asks for one:
+	IUnknown *mBindingProxy = nullptr;
+	IUnknown* GetBindingProxy();
+	// Below feature level 10.1 there are 16 vertex buffer slots:
+	UINT mVertexInputSlots = D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+	// A call DirectX may have refused (slots out of range, no array) makes the
+	// slots unknown instead:
+	void NoteGameSrvs(int stage, UINT first, UINT count, ID3D11ShaderResourceView *const *views)
+	{
+		const bool valid = views && first <= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
+			&& count <= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT - first;
+		for (UINT i = 0; i < count && first + i < GAME_BINDING_SLOTS; i++) {
+			if (valid) {
+				mGameSrvs[stage][first + i] = views[i];
+				mGameSrvsKnown[stage] |= 1u << (first + i);
+			} else {
+				mGameSrvsKnown[stage] &= ~(1u << (first + i));
+			}
+		}
+	}
+	void NoteGameVertexBuffers(UINT first, UINT count, ID3D11Buffer *const *buffers, const UINT *strides, const UINT *offsets)
+	{
+		const bool valid = buffers && strides && offsets && first <= mVertexInputSlots
+			&& count <= mVertexInputSlots - first;
+		for (UINT i = 0; i < count && first + i < GAME_BINDING_SLOTS; i++) {
+			if (valid) {
+				mGameVertexBuffers[first + i] = buffers[i];
+				mGameVertexBuffersKnown |= 1u << (first + i);
+			} else {
+				mGameVertexBuffersKnown &= ~(1u << (first + i));
+			}
+		}
+	}
+	void ForgetGameBindings()
+	{
+		memset(mGameSrvsKnown, 0, sizeof(mGameSrvsKnown));
+		mGameVertexBuffersKnown = 0;
+	}
+	void ForgetGameBindings(ResourceCopyTargetType type, wchar_t shader_type, unsigned first, unsigned count);
 	InitialTexturesSnapshot& GetInitialTexturesSnapshot() { return mInitialTexturesSnapshot; }
 
 	HRESULT ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash);
