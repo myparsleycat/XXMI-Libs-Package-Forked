@@ -496,8 +496,9 @@ static void STDMETHODCALLTYPE H_Unmap(CTX *c, ID3D11Resource *res, UINT sub)
 				Res *r = resource_of(res);
 				uint64_t data = hash_surface(r, sub, i->second.data, i->second.row_pitch, i->second.depth_pitch);
 				uint64_t h = mix(mix(mix(0x4d6170, sub), i->second.type), data);
-				// A discard leaves nothing of what was there
-				if (i->second.type == D3D11_MAP_WRITE_DISCARD && r->kind == 1)
+				// A discard leaves nothing of what was there (a dynamic
+				// texture has a single subresource)
+				if (i->second.type == D3D11_MAP_WRITE_DISCARD)
 					r->content = mix(r->shape, h);
 				else
 					r->content = mix(r->content, h);
