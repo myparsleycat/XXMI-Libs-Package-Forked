@@ -56,11 +56,6 @@ D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE Dx12Device::GetCustomHeapProperties(UINT
 	return mOrig->GetCustomHeapProperties(nodeMask, heapType);
 }
 
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateHeap(const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppvHeap)
-{
-	return mOrig->CreateHeap(pDesc, riid, ppvHeap);
-}
-
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateSharedHandle(ID3D12DeviceChild *pObject, const SECURITY_ATTRIBUTES *pAttributes, DWORD Access, LPCWSTR Name, HANDLE *pHandle)
 {
 	return mOrig->CreateSharedHandle(pObject, pAttributes, Access, Name, pHandle);
@@ -134,11 +129,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::OpenExistingHeapFromFileMapping(HANDLE hFi
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC *pDesc, REFIID riid, void **ppSession)
 {
 	return mOrig->CreateProtectedResourceSession(pDesc, riid, ppSession);
-}
-
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateHeap1(const D3D12_HEAP_DESC *pDesc, ID3D12ProtectedResourceSession *pProtectedSession, REFIID riid, void **ppvHeap)
-{
-	return mOrig->CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap);
 }
 
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE Dx12Device::GetResourceAllocationInfo1(UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC *pResourceDescs, D3D12_RESOURCE_ALLOCATION_INFO1 *pResourceAllocationInfo1)

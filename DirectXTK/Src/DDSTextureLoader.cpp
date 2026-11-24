@@ -37,6 +37,8 @@ static_assert(static_cast<int>(DDS_RESOURCE_MISC_TEXTURECUBE) == static_cast<int
 
 namespace
 {
+    thread_local std::vector<D3D11_SUBRESOURCE_DATA>* deferredContents = nullptr;
+
     //--------------------------------------------------------------------------------------
     HRESULT FillInitData(_In_ size_t width,
         _In_ size_t height,
@@ -249,9 +251,13 @@ namespace
 
             ID3D11Texture2D* tex = nullptr;
             hr = d3dDevice->CreateTexture2D(&desc,
-                initData,
+                (deferredContents && initData) ? nullptr : initData,
                 &tex
             );
+            if (SUCCEEDED(hr) && tex != 0 && deferredContents && initData)
+            {
+                deferredContents->assign(initData, initData + mipCount * arraySize);
+            }
             if (SUCCEEDED(hr) && tex != 0)
             {
                 if (textureView != 0)
@@ -836,6 +842,12 @@ _Use_decl_annotations_
         texture, textureView, alphaMode);
 }
 
+void DirectX::SetDDSDeferredContents(std::vector<D3D11_SUBRESOURCE_DATA>* contents)
+{
+    deferredContents = contents;
+}
+
+//--------------------------------------------------------------------------------------
 _Use_decl_annotations_
 HRESULT DirectX::CreateDDSTextureFromMemoryEx(ID3D11Device* d3dDevice,
     const uint8_t* ddsData,

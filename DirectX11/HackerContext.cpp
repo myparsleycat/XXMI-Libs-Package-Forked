@@ -26,6 +26,7 @@
 #include "profiling.h"
 #include "GpuWatch.h"
 #include "BindingProxy.h"
+#include "ModLoading.h"
 
 #include <wrl/implements.h>
 #include <d3d11_4.h>
@@ -1056,6 +1057,7 @@ void HackerContext::BeforeDraw(DrawContext &data)
 	Profiling::Spike::Scope spike(Profiling::Spike::DRAW_PRE);
 
 	draw_number++;
+	data.call_info.load_epoch = ModLoadEpoch();
 
 	mCheckTextureOverrideResultCount = 0;
 	mCheckTextureOverrideResultsDraw = &data.call_info;
@@ -2142,6 +2144,7 @@ bool HackerContext::BeforeDispatch(DispatchContext *context)
 	if (!G->mShaderOverrideMap.empty()) {
 		ShaderOverride *shader_override;
 
+		context->call_info.load_epoch = ModLoadEpoch();
 		shader_override = LookupShaderOverride(mCurrentComputeShader);
 		if (shader_override) {
 			context->post_commands = &shader_override->post_command_list;

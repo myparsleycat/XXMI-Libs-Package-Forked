@@ -4,27 +4,59 @@
 #include <cstdint>
 #include <string>
 
+// The file a path leads to, as it was when opened: two paths to the same
+// unchanged file give the same identity
+struct FileIdentity
+{
+	uint32_t volume = 0;
+	uint64_t index = 0;
+	uint64_t size = 0;
+	uint64_t write_time = 0;
+
+	bool operator==(const FileIdentity &other) const;
+};
+
 // A whole file read into memory. Reading into a buffer kept for the next
 // file is much faster than faulting the pages of a mapped view in one by one
 // while a D3D create call copies from it, and the buffer is warm in the
 // cache for that copy. A file of several MB is read by thread pool threads
-// as well, before the constructor returns.
+// as well, before read() returns.
 class FileContents
 {
 public:
+	FileContents() {}
+	// open() and read()
 	explicit FileContents(const wchar_t *path);
 	~FileContents();
 
 	FileContents(const FileContents&) = delete;
 	FileContents& operator=(const FileContents&) = delete;
+	FileContents(FileContents &&other) noexcept :
+		data(other.data), size(other.size), error(other.error), identity(other.identity),
+		file(other.file), path(other.path), buffer(other.buffer), capacity(other.capacity)
+	{
+		other.data = nullptr;
+		other.size = 0;
+		other.file = INVALID_HANDLE_VALUE;
+		other.buffer = nullptr;
+		other.capacity = 0;
+	}
+
+	// Opens the file and fills in identity, false with error set on failure
+	bool open(const wchar_t *path);
+	// Reads all of the opened file and closes it
+	bool read();
 
 	bool valid() const { return data != nullptr; }
 
 	const uint8_t *data = nullptr;
 	size_t size = 0;
 	DWORD error = 0;
+	FileIdentity identity;
 
 private:
+	HANDLE file = INVALID_HANDLE_VALUE;
+	const wchar_t *path = nullptr;
 	uint8_t *buffer = nullptr;
 	size_t capacity = 0;
 };
@@ -70,7 +102,25 @@ struct SharedResourceKey
 // can be passed to ShareFileResource(), together with the path of the file,
 // once the resource has been created from the same data.
 ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size);
-void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, ID3D11Resource *resource);
+// Before the file is read: a resource made from this very file, unchanged
+// since, with the same key except for the content, which is left unset.
+// AddRef()ed for the caller.
+ID3D11Resource* FindSharedFileResourceByIdentity(const SharedResourceKey &key, const FileIdentity &identity);
+// A provisional entry is for a resource that may not be used yet (made on
+// the loader thread of ModLoading.h): only threads inside a
+// SharedProvisionalScope find it. Sharing the same resource again without
+// provisional makes the entry a normal one.
+void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity,
+		ID3D11Resource *resource, bool provisional = false);
+// Removes the provisional entry of a resource that was never given to its
+// section, if there is one
+void DropProvisionalShare(ID3D11Resource *resource);
+class SharedProvisionalScope
+{
+public:
+	SharedProvisionalScope();
+	~SharedProvisionalScope();
+};
 // Drops the registry's references, all of them or those on one device:
 void ReleaseSharedFileResources(ID3D11Device *device = nullptr);
 

@@ -130,6 +130,20 @@ HRESULT ShimPrivateData::SetInterface(REFGUID guid, const IUnknown *pData)
 
 void ShimDestroyResource(ShimResource *resource)
 {
+	if (resource->staged) {
+		bool counted = resource->staged->counted;
+
+		Dx12ShimRecycleStagedUpload(resource->staged->upload, resource->staged->copy_fence);
+		delete resource->staged;
+		resource->staged = nullptr;
+		// The loader can destroy a resource that has never reached present.
+		if (!counted) {
+			if (resource->resource)
+				resource->resource->Release();
+			resource->resource = NULL;
+			return;
+		}
+	}
 	Dx12ShimForgetResource(resource);
 	if (resource->mirrored)
 		VkScopeForgetResource(resource);

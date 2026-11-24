@@ -314,7 +314,22 @@ const UINT64 UPLOAD_BIG_STEP = 16 << 20;
 static std::vector<UploadPage> upload_big_active;
 static std::vector<UploadPage> upload_big_idle;
 static UINT64 upload_big_idle_bytes;
-static bool upload_not_zeroed_refused;
+static std::atomic<bool> upload_not_zeroed_refused;
+
+const UINT64 STAGED_UPLOAD_MIN = 1 << 20;
+struct IdleStagedUpload {
+	Dx12StagedUpload upload;
+	ULONGLONG returned;
+};
+struct RetiredStagedUpload {
+	Dx12StagedUpload upload;
+	UINT64 fence;
+};
+static std::mutex staged_upload_lock;
+static std::vector<IdleStagedUpload> idle_staged_uploads;
+static UINT64 idle_staged_bytes;
+static bool staged_uploads_closed;
+static std::vector<RetiredStagedUpload> retired_staged_uploads;
 
 // not_zeroed only for a buffer whose every byte the GPU reads is written
 // first, which the copies out of a big upload buffer are
@@ -339,11 +354,11 @@ static bool create_upload_buffer(UINT64 size, UploadPage *page, bool not_zeroed 
 
 	// Saves the clearing of the memory. Windows before 10 2004 refuses the
 	// flag.
-	if (not_zeroed && !upload_not_zeroed_refused) {
+	if (not_zeroed && !upload_not_zeroed_refused.load(std::memory_order_relaxed)) {
 		hr = shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &desc,
 			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer));
 		if (FAILED(hr))
-			upload_not_zeroed_refused = true;
+			upload_not_zeroed_refused.store(true, std::memory_order_relaxed);
 	}
 	if (FAILED(hr) && FAILED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
 			D3D12_RESOURCE_STATE_GENERIC_READ, NULL, IID_PPV_ARGS(&page->buffer)))) {
@@ -356,6 +371,104 @@ static bool create_upload_buffer(UINT64 size, UploadPage *page, bool not_zeroed 
 	}
 	page->va = page->buffer->GetGPUVirtualAddress();
 	return true;
+}
+
+bool Dx12ShimAcquireStagedUpload(UINT64 size, Dx12StagedUpload *upload)
+{
+	UploadPage page;
+	UINT64 capacity = size;
+
+	if (size >= STAGED_UPLOAD_MIN) {
+		std::lock_guard<std::mutex> lock(staged_upload_lock);
+		auto best = idle_staged_uploads.end();
+
+		for (auto it = idle_staged_uploads.begin(); it != idle_staged_uploads.end(); it++) {
+			if (it->upload.capacity >= size && (best == idle_staged_uploads.end()
+					|| it->upload.capacity < best->upload.capacity))
+				best = it;
+		}
+		if (best != idle_staged_uploads.end()) {
+			*upload = best->upload;
+			idle_staged_bytes -= upload->capacity;
+			idle_staged_uploads.erase(best);
+			return true;
+		}
+		if (size > UPLOAD_BIG_STEP && size <= UINT64_MAX - (UPLOAD_BIG_STEP - 1))
+			capacity = ShimAlign(size, UPLOAD_BIG_STEP);
+	}
+	if (!create_upload_buffer(capacity, &page, true))
+		return false;
+	*upload = { page.buffer, page.cpu, capacity };
+	return true;
+}
+
+static void return_staged_upload(const Dx12StagedUpload &upload)
+{
+	if (upload.capacity >= STAGED_UPLOAD_MIN) {
+		std::lock_guard<std::mutex> lock(staged_upload_lock);
+
+		if (!staged_uploads_closed && upload.capacity <= UPLOAD_BIG_KEPT - idle_staged_bytes) {
+			idle_staged_uploads.push_back({ upload, GetTickCount64() });
+			idle_staged_bytes += upload.capacity;
+			return;
+		}
+	}
+	upload.buffer->Release();
+}
+
+void Dx12ShimRecycleStagedUpload(const Dx12StagedUpload &upload, UINT64 copy_fence)
+{
+	if (!upload.buffer)
+		return;
+	if (copy_fence && !Dx12ShimFenceReached(copy_fence))
+		retired_staged_uploads.push_back({ upload, copy_fence });
+	else
+		return_staged_upload(upload);
+}
+
+static void trim_staged_uploads(ULONGLONG now)
+{
+	std::vector<IdleStagedUpload> expired;
+
+	{
+		std::lock_guard<std::mutex> lock(staged_upload_lock);
+		auto first_kept = idle_staged_uploads.begin();
+
+		while (first_kept != idle_staged_uploads.end() && now >= first_kept->returned
+				&& now - first_kept->returned >= UPLOAD_BIG_IDLE_MS) {
+			idle_staged_bytes -= first_kept->upload.capacity;
+			first_kept++;
+		}
+		expired.assign(idle_staged_uploads.begin(), first_kept);
+		idle_staged_uploads.erase(idle_staged_uploads.begin(), first_kept);
+	}
+	for (const IdleStagedUpload &entry : expired)
+		entry.upload.buffer->Release();
+}
+
+static void close_staged_upload_pool()
+{
+	std::vector<IdleStagedUpload> idle;
+
+	{
+		std::lock_guard<std::mutex> lock(staged_upload_lock);
+		staged_uploads_closed = true;
+		idle.swap(idle_staged_uploads);
+		idle_staged_bytes = 0;
+	}
+	for (const IdleStagedUpload &entry : idle)
+		entry.upload.buffer->Release();
+}
+
+static void release_retired_staged_uploads(UINT64 completed)
+{
+	retired_staged_uploads.erase(std::remove_if(retired_staged_uploads.begin(), retired_staged_uploads.end(),
+		[completed](const RetiredStagedUpload &entry) {
+			if (entry.fence > completed)
+				return false;
+			return_staged_upload(entry.upload);
+			return true;
+		}), retired_staged_uploads.end());
 }
 
 BYTE* Dx12ShimUpload(UINT64 size, UINT64 alignment, ID3D12Resource **buffer, UINT64 *offset, UINT64 *va)
@@ -893,7 +1006,7 @@ void Dx12ShimNoteFault(UINT64 va, const std::vector<const void*> &objects, void 
 // whatever else is yet to use it
 static bool resource_idle(ShimResource *resource, ULONGLONG idle_since)
 {
-	if (resource->evicted || resource->foreign || !resource->resource || resource->allocated < EVICTED_BYTES_MIN
+	if (resource->staged || resource->evicted || resource->foreign || !resource->resource || resource->allocated < EVICTED_BYTES_MIN
 	    || resource->used_time > idle_since || !Dx12ShimFenceReached(resource->used_fence)
 	    || (resource->touched_epoch == dx12_shim_epoch && (list_used || resource->state != D3D12_RESOURCE_STATE_COMMON)))
 		return false;
@@ -957,23 +1070,34 @@ static void evict_idle()
 // a millisecond or two for a texture of a few tens of MB, and so does
 // MakeResident for an evicted one. Instead a resource of a mod is made
 // resident on the GPU's time, and a queue about to execute what uses resources
-// of the mods waits there for the last that was asked for. NULL where that
+// of the mods waits there for the last that a list may use. NULL where that
 // cannot be done:
 static ID3D12Device3 *residency_device;
 static ID3D12Fence *residency_fence;
 static std::mutex residency_lock;
-static std::atomic<UINT64> residency_asked;
+static UINT64 residency_asked;
+static std::atomic<UINT64> residency_needed{0};
 
-static HRESULT enqueue_make_resident(ID3D12Pageable *pageable)
+static HRESULT enqueue_make_resident(ID3D12Pageable *pageable, UINT64 *residency)
 {
 	// The fence is signalled in the order of the values
 	std::lock_guard<std::mutex> lock(residency_lock);
 	UINT64 value = residency_asked + 1;
 	HRESULT hr = residency_device->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, &pageable, residency_fence, value);
 
-	if (SUCCEEDED(hr))
+	if (SUCCEEDED(hr)) {
 		residency_asked = value;
+		*residency = value;
+	}
 	return hr;
+}
+
+void Dx12ShimNeedResidency(UINT64 value)
+{
+	UINT64 needed = residency_needed.load(std::memory_order_relaxed);
+
+	while (needed < value && !residency_needed.compare_exchange_weak(needed, value,
+			std::memory_order_release, std::memory_order_relaxed)) {}
 }
 
 static void residency_init()
@@ -986,19 +1110,25 @@ static void residency_init()
 	}
 }
 
-HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource)
+HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource, UINT64 *residency)
 {
 	D3D12_HEAP_PROPERTIES heap = {};
-	ID3D12Pageable *pageable;
+	UINT64 value;
 	HRESULT hr;
 
+	if (residency)
+		*residency = 0;
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 	if (residency_device && SUCCEEDED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
 			desc, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(resource)))) {
-		pageable = *resource;
-		hr = enqueue_make_resident(pageable);
-		if (SUCCEEDED(hr))
+		hr = enqueue_make_resident(*resource, &value);
+		if (SUCCEEDED(hr)) {
+			if (residency)
+				*residency = value;
+			else
+				Dx12ShimNeedResidency(value);
 			return hr;
+		}
 		(*resource)->Release();
 		*resource = NULL;
 	}
@@ -1013,9 +1143,15 @@ HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource *
 // party of a few characters' mods switched in is many of them in a row.
 static HRESULT make_resident_again(ID3D12Pageable *pageable)
 {
-	if (residency_device)
-		return enqueue_make_resident(pageable);
-	return shim.device->MakeResident(1, &pageable);
+	UINT64 value;
+	HRESULT hr;
+
+	if (!residency_device)
+		return shim.device->MakeResident(1, &pageable);
+	hr = enqueue_make_resident(pageable, &value);
+	if (SUCCEEDED(hr))
+		Dx12ShimNeedResidency(value);
+	return hr;
 }
 
 bool Dx12ShimReadGameResource(ID3D12Resource *resource)
@@ -1078,7 +1214,7 @@ static void release_held_evictions()
 
 void Dx12ShimResidencyWait(ID3D12CommandQueue *queue)
 {
-	UINT64 value = residency_asked;
+	UINT64 value = residency_needed.load(std::memory_order_acquire);
 
 	if (value && residency_fence->GetCompletedValue() < value)
 		queue->Wait(residency_fence, value);
@@ -1336,6 +1472,7 @@ void Dx12ShimFramePresented()
 	if (!upload_big_idle.empty())
 		release_idle_upload_buffers(fence->GetCompletedValue(), present_time);
 	release_idle_upload_pages(fence->GetCompletedValue(), present_time);
+	trim_staged_uploads(present_time);
 	presents++;
 	evict_idle();
 	release_held_evictions();
@@ -1468,6 +1605,10 @@ void Dx12ShimDeferRelease(IUnknown *object)
 static void release_retired()
 {
 	UINT64 completed = fence->GetCompletedValue();
+
+	if (completed == UINT64_MAX)
+		close_staged_upload_pool();
+	release_retired_staged_uploads(completed);
 
 	while (!retired.empty() && retired.front().fence <= completed) {
 		retired.front().object->Release();

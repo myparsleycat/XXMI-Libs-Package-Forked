@@ -5527,6 +5527,7 @@ static VkPipeline make_variant(const PipelineRecipe *recipe, const std::vector<I
 		info.layout = layout;
 	}
 
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_MOD_PIPELINE, L"vkCreateGraphicsPipelines");
 	if (api.CreateGraphicsPipelines(mods_device, VK_NULL_HANDLE, 1, &info, NULL, &variant) != VK_SUCCESS)
 		return VK_NULL_HANDLE;
 	return variant;

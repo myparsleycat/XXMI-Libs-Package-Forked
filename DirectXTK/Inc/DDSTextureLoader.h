@@ -27,10 +27,16 @@
 #endif
 
 #include <stdint.h>
+#include <vector>
 
 
 namespace DirectX
 {
+    // While set on a thread, CreateDDSTextureFromMemoryEx makes a 2D texture
+    // without its contents and leaves them in *contents instead, pointing into
+    // the DDS data it was given
+    void __cdecl SetDDSDeferredContents(_In_opt_ std::vector<D3D11_SUBRESOURCE_DATA>* contents);
+
     enum DDS_ALPHA_MODE
     {
         DDS_ALPHA_MODE_UNKNOWN       = 0,

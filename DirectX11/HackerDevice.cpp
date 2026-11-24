@@ -29,6 +29,7 @@
 #include "HackerContext.h"
 #include "BindingProxy.h"
 #include "HackerDXGI.h"
+#include "ModLoading.h"
 
 #include "D3D11Wrapper.h"
 #include "SpriteFont.h"
@@ -2316,6 +2317,8 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	if (ppBuffer && pNewDesc && pNewDesc->ByteWidth >= MOD_LOAD_HEAVY_BYTES)
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateBuffer(pNewDesc, pInitialData, ppBuffer);
 
 	if (hr == S_OK && ppBuffer && *ppBuffer)
@@ -2366,6 +2369,8 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	if (ppTexture1D && pNewDesc && ModLoadIsHeavyTexture(pNewDesc->Width, 1, pNewDesc->ArraySize))
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateTexture1D(pNewDesc, pInitialData, ppTexture1D);
 
 	if (hr == S_OK && ppTexture1D && *ppTexture1D)
@@ -2468,6 +2473,8 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
 	// Actual creation:
+	if (ppTexture2D && pNewDesc && ModLoadIsHeavyTexture(pNewDesc->Width, pNewDesc->Height, pNewDesc->ArraySize))
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateTexture2D(pNewDesc, pInitialData, ppTexture2D);
 
 	if (ppTexture2D) LogDebug("  returns result = %x, handle = %p\n", hr, *ppTexture2D);
@@ -2539,6 +2546,8 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	if (ppTexture3D && pNewDesc && ModLoadIsHeavyTexture(pNewDesc->Width, pNewDesc->Height, pNewDesc->Depth))
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateTexture3D(pNewDesc, pInitialData, ppTexture3D);
 
 	// Register texture.

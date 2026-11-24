@@ -17,6 +17,7 @@
     <ClCompile Include="CommandList.cpp" />
     <ClCompile Include="ResourceHash.cpp" />
     <ClCompile Include="ResourceLoading.cpp" />
+    <ClCompile Include="ModLoading.cpp" />
     <ClCompile Include="BindingProxy.cpp" />
     <ClCompile Include="HookedContext.cpp" />
     <ClCompile Include="HookedDevice.cpp" />
@@ -99,6 +100,7 @@
     <ClInclude Include="CommandList.h" />
     <ClInclude Include="ResourceHash.h" />
     <ClInclude Include="ResourceLoading.h" />
+    <ClInclude Include="ModLoading.h" />
     <ClInclude Include="BindingProxy.h" />
     <ClInclude Include="HookedContext.h" />
     <ClInclude Include="HookedDevice.h" />

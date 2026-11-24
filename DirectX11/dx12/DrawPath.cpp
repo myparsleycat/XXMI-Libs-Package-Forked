@@ -4074,7 +4074,7 @@ static bool skin_output_buffer(SkinOutput *output, UINT64 bytes, UINT stride)
 	desc.SampleDesc.Count = 1;
 	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer))) {
+	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer, nullptr))) {
 		output->buffer = NULL;
 		return false;
 	}

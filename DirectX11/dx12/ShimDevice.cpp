@@ -8,6 +8,7 @@
 #include "ShimContext.h"
 #include "ShimPipeline.h"
 #include "util.h"
+#include "../ModLoading.h"
 #include "../profiling.h"
 
 #include "../globals.h"
@@ -276,13 +277,204 @@ void ShimCountResource(ShimResource *resource, int sign)
 	Dx12ShimTrackResidency(resource, sign > 0);
 }
 
+// Set on the loader thread of ModLoading.h, see Dx12StagingScope
+static thread_local bool staging;
+
+Dx12StagingScope::Dx12StagingScope()
+{
+	staging = true;
+}
+
+Dx12StagingScope::~Dx12StagingScope()
+{
+	staging = false;
+}
+
+bool Dx12IsShimDevice(ID3D11Device *device)
+{
+	return dx12_shim && device == static_cast<ID3D11Device*>(dx12_shim->shim_device);
+}
+
+static void count_staged_resource(ShimResource *resource)
+{
+	ShimResource::Staged *staged = resource->staged;
+
+	if (staged->counted)
+		return;
+	resource->allocated = staged->allocated;
+	ShimCountResource(resource, 1);
+	Dx12ShimNeedResidency(staged->residency);
+	staged->counted = true;
+}
+
+static bool begin_staged_copy(ShimResource *resource)
+{
+	count_staged_resource(resource);
+	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_DEST))
+		return false;
+	resource->staged->copy_fence = Dx12ShimPendingFence();
+	return true;
+}
+
+static bool commit_staged_texture(ShimResource *resource, UINT64 budget, bool force_progress, UINT64 *recorded)
+{
+	ShimResource::Staged *staged = resource->staged;
+	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+	bool whole_only = (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || resource->desc.SampleDesc.Count > 1;
+	bool volume = resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+	UINT block = ModLoadTextureBlockHeight(resource->desc.Format);
+
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst.pResource = resource->resource;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	src.pResource = staged->upload.buffer;
+	while (staged->next_subresource < staged->layouts.size()) {
+		UINT i = staged->next_subresource;
+		if (!staged->written[i]) {
+			staged->next_subresource++;
+			continue;
+		}
+
+		const D3D12_SUBRESOURCE_FOOTPRINT &footprint = staged->layouts[i].Footprint;
+		UINT bands = whole_only ? 1 : volume ? footprint.Depth : staged->rows[i];
+		UINT64 band_bytes = staged->row_sizes[i];
+		if (whole_only)
+			band_bytes *= (UINT64)staged->rows[i] * footprint.Depth;
+		else if (volume)
+			band_bytes *= staged->rows[i];
+
+		UINT first = staged->next_band;
+		UINT64 remaining = budget > *recorded ? budget - *recorded : 0;
+		UINT count = (UINT)std::min<UINT64>(bands - first, remaining / band_bytes);
+		if (!count) {
+			if (!force_progress || *recorded)
+				return false;
+			count = 1;
+		}
+		if (!*recorded && !begin_staged_copy(resource))
+			return false;
+
+		UINT end = first + count;
+		dst.SubresourceIndex = i;
+		src.PlacedFootprint = staged->layouts[i];
+		if (!first && end == bands) {
+			Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+		} else if (volume) {
+			D3D12_BOX box = { 0, 0, first, footprint.Width, footprint.Height, end };
+			Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, first, &src, &box);
+		} else {
+			D3D12_BOX box = { 0, first * block, 0, footprint.Width, min(footprint.Height, end * block), 1 };
+			Dx12ShimList()->CopyTextureRegion(&dst, 0, box.top, 0, &src, &box);
+		}
+		*recorded += count * band_bytes;
+		staged->next_band = end;
+		if (end != bands)
+			return false;
+		staged->next_band = 0;
+		staged->next_subresource++;
+	}
+	return true;
+}
+
+bool Dx12ShimCommitStaged(ID3D11Resource *resource11, UINT64 budget, bool force_progress, UINT64 *recorded)
+{
+	ShimResource *resource = ShimResourceOf(resource11);
+
+	*recorded = 0;
+	if (!resource || !resource->staged)
+		return true;
+
+	ShimResource::Staged *staged = resource->staged;
+	if (staged->upload.buffer) {
+		if (!staged->layouts.empty()) {
+			if (!commit_staged_texture(resource, budget, force_progress, recorded))
+				return false;
+		} else {
+			UINT64 offset = staged->buffer_offset;
+			UINT64 bytes = min(budget, staged->buffer_bytes - offset);
+
+			if (!bytes || !begin_staged_copy(resource))
+				return false;
+			Dx12ShimList()->CopyBufferRegion(resource->resource, offset, staged->upload.buffer, offset, bytes);
+			*recorded = bytes;
+			staged->buffer_offset += bytes;
+			if (staged->buffer_offset != staged->buffer_bytes)
+				return false;
+		}
+	}
+	count_staged_resource(resource);
+	Dx12ShimRecycleStagedUpload(staged->upload, staged->copy_fence);
+	resource->staged = nullptr;
+	delete staged;
+	return true;
+}
+
+UINT64 Dx12ShimStagedUploadBytes(ID3D11Resource *resource11)
+{
+	ShimResource *resource = ShimResourceOf(resource11);
+
+	if (!resource || !resource->staged || !resource->staged->upload.buffer)
+		return 0;
+	return resource->staged->upload.capacity;
+}
+
+static bool stage_buffer(ShimResource *resource, const void *data, UINT64 size)
+{
+	ShimResource::Staged *staged = resource->staged;
+
+	if (!Dx12ShimAcquireStagedUpload(size, &staged->upload))
+		return false;
+	staged->buffer_bytes = size;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"buffer bytes", size);
+		memcpy(staged->upload.cpu, data, (size_t)size);
+	}
+	return true;
+}
+
+static bool stage_texture(ShimResource *resource, const D3D11_SUBRESOURCE_DATA *initial_data, UINT subresources)
+{
+	ShimResource::Staged *staged = resource->staged;
+	UINT64 total;
+
+	staged->layouts.resize(subresources);
+	staged->rows.resize(subresources);
+	staged->row_sizes.resize(subresources);
+	staged->written.assign(subresources, false);
+	dx12_shim->device->GetCopyableFootprints(&resource->desc, 0, subresources, 0, staged->layouts.data(),
+		staged->rows.data(), staged->row_sizes.data(), &total);
+	if (total == UINT64_MAX || !Dx12ShimAcquireStagedUpload(total, &staged->upload))
+		return false;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"texture bytes", total);
+	for (UINT i = 0; i < subresources; i++) {
+		const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &layout = staged->layouts[i];
+		UINT rows = staged->rows[i];
+		UINT64 row_size = staged->row_sizes[i];
+		UINT64 row_pitch = initial_data[i].SysMemPitch ? initial_data[i].SysMemPitch : row_size;
+		UINT64 slice_pitch = initial_data[i].SysMemSlicePitch ? initial_data[i].SysMemSlicePitch : row_pitch * rows;
+
+		if (!initial_data[i].pSysMem)
+			continue;
+		for (UINT z = 0; z < layout.Footprint.Depth; z++) {
+			for (UINT y = 0; y < rows; y++) {
+				memcpy(staged->upload.cpu + layout.Offset + ((SIZE_T)z * rows + y) * layout.Footprint.RowPitch,
+					(const BYTE*)initial_data[i].pSysMem + (SIZE_T)(z * slice_pitch + y * row_pitch), (size_t)row_size);
+			}
+		}
+		staged->written[i] = true;
+	}
+	return true;
+}
+
 static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC *desc)
 {
+	UINT64 residency;
 	HRESULT hr;
 
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, L"bytes or texels wide", desc->Width);
-		hr = Dx12ShimCreateResource(desc, &resource->resource);
+		hr = Dx12ShimCreateResource(desc, &resource->resource, staging ? &residency : nullptr);
 	}
 	if (FAILED(hr)) {
 		Dx12LogInfo("*** Failed to create a resource for a mod: dimension %d, %llux%ux%u, %u mips, format %d, flags 0x%x = 0x%x\n",
@@ -293,6 +485,12 @@ static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC
 
 	resource->desc = resource->resource->GetDesc();
 	resource->state = D3D12_RESOURCE_STATE_COMMON;
+	if (staging) {
+		resource->staged = new ShimResource::Staged();
+		resource->staged->allocated = dx12_shim->device->GetResourceAllocationInfo(0, 1, &resource->desc).SizeInBytes;
+		resource->staged->residency = residency;
+		return S_OK;
+	}
 	resource->allocated = dx12_shim->device->GetResourceAllocationInfo(0, 1, &resource->desc).SizeInBytes;
 	ShimCountResource(resource, 1);
 	return S_OK;
@@ -390,7 +588,7 @@ bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 		count_spares(resource, -1);
 		break;
 	}
-	if (!fresh && FAILED(Dx12ShimCreateResource(&resource->desc, &fresh))) {
+	if (!fresh && FAILED(Dx12ShimCreateResource(&resource->desc, &fresh, nullptr))) {
 		if (!failed)
 			Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it. The lists see the write.\n");
 		failed = true;
@@ -521,8 +719,15 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDes
 			r->shadow.assign((const BYTE*)pInitialData->pSysMem, (const BYTE*)pInitialData->pSysMem + pDesc->ByteWidth);
 		r->shadow.resize((size_t)ShimAlign(pDesc->ByteWidth, 256));
 	}
-	if (!r->cpu_only && pInitialData && pInitialData->pSysMem)
-		ShimWriteBuffer(r, 0, pInitialData->pSysMem, pDesc->ByteWidth);
+	if (!r->cpu_only && pInitialData && pInitialData->pSysMem) {
+		if (r->staged) {
+			if (!stage_buffer(r, pInitialData->pSysMem, pDesc->ByteWidth)) {
+				buffer->Release();
+				return E_OUTOFMEMORY;
+			}
+		} else
+			ShimWriteBuffer(r, 0, pInitialData->pSysMem, pDesc->ByteWidth);
+	}
 	r->shadow_version = r->version;
 
 	*ppBuffer = buffer;
@@ -555,8 +760,11 @@ static HRESULT create_texture(ShimResource *r, D3D12_RESOURCE_DESC *desc, D3D11_
 	subresources = r->desc.MipLevels;
 	if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
 		subresources *= r->desc.DepthOrArraySize;
+	if (r->staged && !stage_texture(r, initial_data, subresources))
+		return E_OUTOFMEMORY;
 	for (i = 0; i < subresources; i++) {
-		if (!ShimWriteSubresource(r, i, initial_data[i].pSysMem, initial_data[i].SysMemPitch,
+		if (r->staged ? !initial_data[i].pSysMem
+		    : !ShimWriteSubresource(r, i, initial_data[i].pSysMem, initial_data[i].SysMemPitch,
 				initial_data[i].SysMemSlicePitch))
 			continue;
 		if (!i && !r->shadow.empty()) {

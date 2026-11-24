@@ -1,5 +1,6 @@
 #include "profiling.h"
 #include "globals.h"
+#include "ModLoading.h"
 
 #include <algorithm>
 #include <atomic>
@@ -321,6 +322,23 @@ static void update_txt_summary(LARGE_INTEGER collection_duration, LARGE_INTEGER 
 	);
 	Profiling::text += buf;
 
+	ModLoadStats loading;
+	ModLoadGetStats(&loading);
+	if (loading.mods) {
+		_snwprintf_s(buf, ARRAYSIZE(buf), _TRUNCATE,
+				L"\n"
+				L"Mod resource loading (since launch):\n"
+				L"          Mods waiting for files: %4u of %u\n"
+				L"     Files loaded in background: %4u of %u queued (%.0f ms)\n"
+				L"       Files loaded at first use: %4u\n"
+				L"  TextureOverride runs held back: %4u\n",
+				loading.waiting_mods, loading.mods,
+				loading.loaded, loading.queued, loading.load_ms,
+				loading.loaded_on_use,
+				loading.held_draws);
+		Profiling::text += buf;
+	}
+
 	if (G->implicit_post_checktextureoverride_used && !Profiling::cto_warning.empty())
 		Profiling::text += L"\nImplicit post checktextureoverrides were not optimised out\n";
 }
@@ -562,6 +580,10 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"D3D12: hashing a buffer the game uploads",
 	L"D3D12: recording the GPU copy of uploads to readback memory",
 	L"custom resource creation ([Resource] files, copies)",
+	L"recording split mod uploads at Present (CPU)",
+	L"creating mod resources at Present",
+	L"creating mod resources and views on use",
+	L"creating CustomShader objects on first use",
 	L"shader creation: the driver's part",
 	L"ShaderRegex",
 	L"ShaderRegex: reading the cache files",
@@ -587,6 +609,7 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"D3D12: hashing uploads the GPU copied to readback memory",
 	L"D3D12: creating readback memory for upload hashes",
 	L"Vulkan: draws the mods are asked about, in all",
+	L"Vulkan: creating a pipeline for a mod (driver)",
 	L"Vulkan: creating an image for a mod's texture",
 	L"Vulkan: recording the copy of a mod's texture",
 	L"Vulkan: allocating memory for mods (driver)",

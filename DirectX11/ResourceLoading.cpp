@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -143,28 +145,56 @@ void ReleaseIdleReadBuffers()
 	VirtualFree(released, 0, MEM_RELEASE);
 }
 
+bool FileIdentity::operator==(const FileIdentity &other) const
+{
+	return volume == other.volume && index == other.index && size == other.size && write_time == other.write_time;
+}
+
 FileContents::FileContents(const wchar_t *path)
 {
-	LARGE_INTEGER file_size;
-	HANDLE file;
-	size_t want;
+	if (open(path))
+		read();
+}
 
+bool FileContents::open(const wchar_t *path)
+{
+	BY_HANDLE_FILE_INFORMATION info;
+
+	this->path = path;
 	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
 			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, NULL);
 	if (file == INVALID_HANDLE_VALUE) {
 		error = GetLastError();
-		return;
+		return false;
 	}
 
-	if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0
-			|| (uint64_t)file_size.QuadPart > (uint64_t)SIZE_MAX) {
+	if (!GetFileInformationByHandle(file, &info)) {
 		error = GetLastError();
-		if (!error)
-			error = ERROR_FILE_INVALID;
 		CloseHandle(file);
-		return;
+		file = INVALID_HANDLE_VALUE;
+		return false;
 	}
-	want = (size_t)file_size.QuadPart;
+	identity.volume = info.dwVolumeSerialNumber;
+	identity.index = (uint64_t)info.nFileIndexHigh << 32 | info.nFileIndexLow;
+	identity.size = (uint64_t)info.nFileSizeHigh << 32 | info.nFileSizeLow;
+	identity.write_time = (uint64_t)info.ftLastWriteTime.dwHighDateTime << 32 | info.ftLastWriteTime.dwLowDateTime;
+
+	if (!identity.size || identity.size > (uint64_t)SIZE_MAX) {
+		error = ERROR_FILE_INVALID;
+		CloseHandle(file);
+		file = INVALID_HANDLE_VALUE;
+		return false;
+	}
+	return true;
+}
+
+bool FileContents::read()
+{
+	size_t want;
+
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	want = (size_t)identity.size;
 
 	if (want <= kept_read_buffer_size) {
 		std::lock_guard<std::mutex> lock(read_buffers_lock);
@@ -197,7 +227,8 @@ FileContents::FileContents(const wchar_t *path)
 			capacity = 0;
 			error = ERROR_NOT_ENOUGH_MEMORY;
 			CloseHandle(file);
-			return;
+			file = INVALID_HANDLE_VALUE;
+			return false;
 		}
 	}
 
@@ -206,15 +237,19 @@ FileContents::FileContents(const wchar_t *path)
 		error = ReadWhole(file, buffer, want);
 	}
 	CloseHandle(file);
+	file = INVALID_HANDLE_VALUE;
 	if (error)
-		return;
+		return false;
 
 	data = buffer;
 	size = want;
+	return true;
 }
 
 FileContents::~FileContents()
 {
+	if (file != INVALID_HANDLE_VALUE)
+		CloseHandle(file);
 	if (!buffer)
 		return;
 
@@ -359,24 +394,59 @@ struct SharedEntry
 {
 	SharedResourceKey key;
 	std::wstring path;
+	FileIdentity identity;
 	ID3D11Resource *resource;
+	bool provisional;
 };
 
 static std::mutex shared_resources_lock;
 // Bucketed by file size:
 static std::unordered_map<uint64_t, std::vector<SharedEntry>> shared_resources;
+static thread_local bool provisional_visible;
 
+SharedProvisionalScope::SharedProvisionalScope()
+{
+	provisional_visible = true;
+}
+
+SharedProvisionalScope::~SharedProvisionalScope()
+{
+	provisional_visible = false;
+}
+
+// Read a part at a time into a small reused buffer: a whole second copy of a
+// large file would take a large buffer of its own, allocated afresh each time
 static bool FileContentsEqual(const std::wstring &path, const void *data, size_t size)
 {
-	FileContents file(path.c_str());
+	thread_local std::unique_ptr<uint8_t[]> part;
+	const size_t part_size = 4 << 20;
+	LARGE_INTEGER file_size;
+	HANDLE file;
+	bool equal;
 
-	return file.valid() && file.size == size && !memcmp(file.data, data, size);
+	file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	equal = GetFileSizeEx(file, &file_size) && (uint64_t)file_size.QuadPart == size;
+	if (equal && !part)
+		part.reset(new (std::nothrow) uint8_t[part_size]);
+	equal = equal && part;
+
+	for (size_t done = 0; equal && done < size; ) {
+		DWORD want = (DWORD)std::min<size_t>(part_size, size - done), got = 0;
+
+		equal = ReadFile(file, part.get(), want, &got, NULL) && got == want
+			&& !memcmp(part.get(), (const uint8_t*)data + done, want);
+		done += want;
+	}
+	CloseHandle(file);
+	return equal;
 }
 
 ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size)
 {
 	std::vector<SharedEntry> candidates;
-	ID3D11Resource *match = nullptr;
 	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_SHARE, L"bytes", size);
 
 	// Hashed from the data the caller is about to upload, never from the
@@ -393,32 +463,105 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 			return nullptr;
 
 		for (const SharedEntry &entry : bucket->second) {
-			if (entry.key == key) {
-				entry.resource->AddRef();
+			if (entry.key == key && (!entry.provisional || provisional_visible))
 				candidates.push_back(entry);
-			}
 		}
 	}
 
 	// The hash only selects candidates. A candidate is shared once its
 	// file still compares equal byte for byte; one whose file has since
 	// changed or disappeared is simply not shared with:
-	for (const SharedEntry &entry : candidates) {
-		if (!match && FileContentsEqual(entry.path, data, size))
-			match = entry.resource;
-		else
-			entry.resource->Release();
+	for (const SharedEntry &candidate : candidates) {
+		if (!FileContentsEqual(candidate.path, data, size))
+			continue;
+
+		// A rejected candidate must not take its last reference to the
+		// loader thread while present is dropping a partially copied load.
+		std::lock_guard<std::mutex> lock(shared_resources_lock);
+		auto bucket = shared_resources.find(key.size);
+		if (bucket == shared_resources.end())
+			break;
+		for (const SharedEntry &entry : bucket->second) {
+			if (entry.resource == candidate.resource && entry.identity == candidate.identity && entry.path == candidate.path
+					&& entry.key == key && (!entry.provisional || provisional_visible)) {
+				entry.resource->AddRef();
+				return entry.resource;
+			}
+		}
 	}
 
-	return match;
+	return nullptr;
 }
 
-void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, ID3D11Resource *resource)
+ID3D11Resource* FindSharedFileResourceByIdentity(const SharedResourceKey &key, const FileIdentity &identity)
 {
 	std::lock_guard<std::mutex> lock(shared_resources_lock);
 
+	auto bucket = shared_resources.find(identity.size);
+	if (bucket == shared_resources.end())
+		return nullptr;
+
+	// The file is the one the entry was made from and has not been
+	// written since, so it holds the same bytes:
+	for (const SharedEntry &entry : bucket->second) {
+		if (entry.identity == identity
+				&& (!entry.provisional || provisional_visible)
+				&& entry.key.device == key.device
+				&& entry.key.loader == key.loader
+				&& entry.key.bind_flags == key.bind_flags
+				&& entry.key.misc_flags == key.misc_flags
+				&& entry.key.load_flags == key.load_flags
+				&& entry.key.byte_width == key.byte_width
+				&& entry.key.structure_stride == key.structure_stride) {
+			entry.resource->AddRef();
+			return entry.resource;
+		}
+	}
+	return nullptr;
+}
+
+void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity,
+		ID3D11Resource *resource, bool provisional)
+{
+	std::lock_guard<std::mutex> lock(shared_resources_lock);
+	std::vector<SharedEntry> &bucket = shared_resources[key.size];
+
+	if (!provisional) {
+		for (SharedEntry &entry : bucket) {
+			if (entry.resource == resource && entry.provisional) {
+				entry.provisional = false;
+				return;
+			}
+		}
+	}
 	resource->AddRef();
-	shared_resources[key.size].push_back(SharedEntry{key, path, resource});
+	bucket.push_back(SharedEntry{key, path, identity, resource, provisional});
+}
+
+void DropProvisionalShare(ID3D11Resource *resource)
+{
+	ID3D11Resource *released = nullptr;
+
+	{
+		std::lock_guard<std::mutex> lock(shared_resources_lock);
+
+		for (auto bucket = shared_resources.begin(); !released && bucket != shared_resources.end(); bucket++) {
+			std::vector<SharedEntry> &entries = bucket->second;
+			for (auto entry = entries.begin(); entry != entries.end(); entry++) {
+				if (entry->resource == resource && entry->provisional) {
+					released = resource;
+					entries.erase(entry);
+					break;
+				}
+			}
+			if (released && entries.empty()) {
+				shared_resources.erase(bucket);
+				break;
+			}
+		}
+	}
+	if (released)
+		released->Release();
 }
 
 void ReleaseSharedFileResources(ID3D11Device *device)
