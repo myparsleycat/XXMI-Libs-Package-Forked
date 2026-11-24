@@ -11,6 +11,8 @@
 #include <util.h>
 #include <WICTextureLoader.h>
 
+struct DdsTexture2D;
+
 #include "DrawCallInfo.h"
 #include "ResourceHash.h"
 #include "HackerInputLayout.h"
@@ -745,6 +747,8 @@ public:
 	int override_msaa_quality;
 	int override_byte_width;
 	int override_stride;
+	// generate_mips: -1 by the global settings, 0 never, 1 regardless of size
+	int generate_mips;
 
 	float width_multiply;
 	float height_multiply;
@@ -779,6 +783,8 @@ private:
 	// for buffers are only known once OverrideBufferDesc() has run:
 	bool ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags);
 	void LoadFromFile(ID3D11Device *mOrigDevice);
+	HRESULT CreateTextureWithGeneratedMips(ID3D11Device *mOrigDevice1, const uint8_t *file_data,
+			const DdsTexture2D &info, const std::vector<uint8_t> &levels, bool force_srgb);
 	void LoadBufferFromFile(ID3D11Device *mOrigDevice);
 	// share_file is the mapped file the data came from when its GPU
 	// resource may be shared with other sections loading identical data:

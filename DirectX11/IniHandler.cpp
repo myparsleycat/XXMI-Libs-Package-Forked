@@ -2153,6 +2153,7 @@ static CustomResource* ParseResourceSection(const wchar_t* section_name, const w
 	custom_resource->override_height = GetIniInt(section_name, L"height", -1, NULL);
 	custom_resource->override_depth = GetIniInt(section_name, L"depth", -1, NULL);
 	custom_resource->override_mips = GetIniInt(section_name, L"mips", -1, NULL);
+	custom_resource->generate_mips = GetIniInt(section_name, L"generate_mips", -1, NULL);
 	custom_resource->override_array = GetIniInt(section_name, L"array", -1, NULL);
 	custom_resource->override_msaa = GetIniInt(section_name, L"msaa", -1, NULL);
 	custom_resource->override_msaa_quality = GetIniInt(section_name, L"msaa_quality", -1, NULL);
@@ -5226,6 +5227,11 @@ void LoadConfigFile()
 	set_shader_regex_background(GetIniInt(L"Rendering", L"shader_regex_background", 0, NULL));
 	G->share_duplicate_resources = GetIniBool(L"Rendering", L"share_duplicate_resources", true, NULL);
 	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", true, NULL);
+	G->generate_texture_mips = GetIniBool(L"Rendering", L"generate_texture_mips", true, NULL);
+	G->generate_texture_mips_min_size = max(4, GetIniInt(L"Rendering", L"generate_texture_mips_min_size", 1024, NULL));
+	G->generate_texture_mips_threads = min(max(1, GetIniInt(L"Rendering", L"generate_texture_mips_threads", 1, NULL)), 8);
+	G->generate_texture_mips_cache_mb = max(0, GetIniInt(L"Rendering", L"generate_texture_mips_cache_mb", 8192, NULL));
+	G->mod_texture_max_size = max(0, GetIniInt(L"Rendering", L"mod_texture_max_size", 0, NULL));
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
 	G->match_lower_mip_textures = GetIniBool(L"Rendering", L"match_lower_mip_textures", false, NULL);

@@ -1,0 +1,3 @@
+Source: https://github.com/richgel999/bc7enc
+Commit: f66c2e489b07138f2673a2fb3d27c1aa1d565c48
+Files: bc7enc.c bc7enc.h bc7decomp.cpp bc7decomp.h rgbcx.h rgbcx_table4.h LICENSE (unmodified)

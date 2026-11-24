@@ -98,6 +98,8 @@ namespace Profiling {
 	extern unsigned views_cleared;
 	extern unsigned resources_created;
 	extern unsigned resources_shared;
+	extern unsigned mip_cache_hits;
+	extern unsigned mip_jobs_queued;
 	extern unsigned resource_pool_swaps;
 	extern unsigned max_copies_per_frame_exceeded;
 	extern unsigned injected_draw_calls;
@@ -154,6 +156,7 @@ namespace Profiling {
 			DX12_MIRROR,
 			RESOURCE_FILE_READ,
 			RESOURCE_FILE_SHARE,
+			RESOURCE_MIP_CACHE,
 			DX12_UPLOAD_COPY,
 			DX12_UPLOAD_HASH_FINISH,
 			DX12_UPLOAD_HASH_RING,

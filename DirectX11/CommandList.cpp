@@ -6,6 +6,8 @@
 
 #include <DDSTextureLoader.h>
 #include "ResourceLoading.h"
+#include "MipCache.h"
+#include "MipGen.h"
 #include <algorithm>
 #include <cstdio>
 #include <sstream>
@@ -7917,6 +7919,7 @@ CustomResource::CustomResource() :
 	override_msaa_quality(-1),
 	override_byte_width(-1),
 	override_stride(-1),
+	generate_mips(-1),
 	width_multiply(1.0f),
 	height_multiply(1.0f),
 	initial_data(NULL),
@@ -8149,11 +8152,56 @@ DirectX::WIC_LOADER_FLAGS CustomResource::GetWICFlags(const uint8_t *data, size_
 	return DirectX::WIC_LOADER_FLAGS::WIC_LOADER_DEFAULT;
 }
 
+// Mip 0 from the file, the levels below from the cache; levels larger than
+// mod_texture_max_size are left out
+HRESULT CustomResource::CreateTextureWithGeneratedMips(ID3D11Device *mOrigDevice1, const uint8_t *file_data,
+		const DdsTexture2D &info, const std::vector<uint8_t> &levels, bool force_srgb)
+{
+	uint32_t count = MipGenFullChainLevels(info.width, info.height), skip = 0, level;
+	std::vector<D3D11_SUBRESOURCE_DATA> init;
+	D3D11_TEXTURE2D_DESC desc = {};
+	const uint8_t *at = levels.data();
+	ID3D11Texture2D *tex2d;
+	HRESULT hr;
+
+	while (G->mod_texture_max_size && skip + 1 < count
+	       && max(info.width >> skip, info.height >> skip) > G->mod_texture_max_size)
+		skip++;
+
+	for (level = 0; level < count; level++) {
+		uint32_t w = max(info.width >> level, 1u), h = max(info.height >> level, 1u);
+		const uint8_t *data = level ? at : file_data + info.data_offset;
+		if (level >= skip)
+			init.push_back({ data, (UINT)MipCacheRowPitch(info.format, w), 0 });
+		if (level)
+			at += MipGenLevelBytes(info.format, w, h);
+	}
+
+	desc.Width = max(info.width >> skip, 1u);
+	desc.Height = max(info.height >> skip, 1u);
+	desc.MipLevels = count - skip;
+	desc.ArraySize = 1;
+	desc.Format = force_srgb ? MipCacheSrgbFormat(info.format) : info.format;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = bind_flags;
+	desc.MiscFlags = misc_flags;
+
+	hr = mOrigDevice1->CreateTexture2D(&desc, init.data(), &tex2d);
+	if (SUCCEEDED(hr))
+		resource = tex2d;
+	return hr;
+}
+
 void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 {
 	SharedResourceKey share_key;
 	DirectX::WIC_LOADER_FLAGS wic_flags = DirectX::WIC_LOADER_DEFAULT;
-	bool dds, share, force_srgb;
+	MipCacheLookup mip_lookup = MipCacheLookup::MISS;
+	std::vector<uint8_t> mip_levels;
+	DdsTexture2D mip_info;
+	bool dds, share, force_srgb, mip_wanted = false, mip_srgb = false;
+	uint32_t content = 0;
 	size_t dot;
 	HRESULT hr;
 
@@ -8203,6 +8251,19 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 	if (!dds)
 		wic_flags = GetWICFlags(file.data, file.size);
 
+	// A texture stored without mip levels gets generated ones once they are
+	// in the cache; until then it is loaded as it is and they are queued
+	if (dds && MipCacheEnabled() && generate_mips != 0 && override_mips == -1
+	    && !(bind_flags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT))
+	    && !written_by_command_list && !pool && pool_index == -2
+	    && ParseDdsTexture2D(file.data, file.size, &mip_info) && MipCacheWanted(mip_info, generate_mips == 1)) {
+		mip_wanted = true;
+		mip_srgb = MipCacheIsSrgb(force_srgb ? MipCacheSrgbFormat(mip_info.format) : mip_info.format);
+		content = crc32c_hw(0, file.data, file.size);
+		mip_lookup = MipCacheProbe(content, file.size, mip_info, mip_srgb);
+		MipCacheNoteLoaded(filename);
+	}
+
 	share = ShareableFromFile(bind_flags);
 	if (share) {
 		share_key.device = mOrigDevice1;
@@ -8210,7 +8271,9 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 		share_key.bind_flags = bind_flags;
 		share_key.misc_flags = misc_flags;
 		share_key.load_flags = dds ? force_srgb : wic_flags;
-		resource = FindSharedFileResource(share_key, file.data, file.size);
+		share_key.mip_variant = mip_lookup == MipCacheLookup::HIT;
+		share_key.max_size = dds ? G->mod_texture_max_size : 0;
+		resource = FindSharedFileResource(share_key, file.data, file.size, mip_wanted ? &content : nullptr);
 		if (resource) {
 			LogInfoW(L"Sharing the texture already loaded from identical %s\n", filename.c_str());
 			Profiling::resources_shared++;
@@ -8220,18 +8283,39 @@ void CustomResource::LoadFromFile(ID3D11Device *mOrigDevice1)
 		}
 	}
 
-	if (dds) {
-		LogInfoW(L"Loading custom resource %s as DDS, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
-		hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
-				file.data, file.size, 0,
-				D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
-				force_srgb, &resource, NULL, NULL);
-	} else {
-		LogInfoW(L"Loading custom resource %s as WIC, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
-		hr = DirectX::CreateWICTextureFromMemoryEx(mOrigDevice1,
-				file.data, file.size, 0,
-				D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
-				wic_flags, &resource, NULL);
+	if (mip_lookup == MipCacheLookup::HIT) {
+		mip_lookup = MipCacheLoad(content, file.size, mip_info, mip_srgb, &mip_levels);
+		if (mip_lookup == MipCacheLookup::HIT) {
+			LogInfoW(L"Loading custom resource %s as DDS with generated mip levels, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
+			hr = CreateTextureWithGeneratedMips(mOrigDevice1, file.data, mip_info, mip_levels, force_srgb);
+			if (SUCCEEDED(hr)) {
+				Profiling::mip_cache_hits++;
+			} else {
+				LogInfo("  failed with 0x%x, loading it as it is\n", hr);
+				mip_lookup = MipCacheLookup::NEVER;
+			}
+		}
+		// The key was for a texture with generated levels
+		if (mip_lookup != MipCacheLookup::HIT)
+			share = false;
+	}
+	if (mip_lookup != MipCacheLookup::HIT) {
+		if (dds) {
+			LogInfoW(L"Loading custom resource %s as DDS, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
+			// The size limit only drops levels of a texture that has them
+			hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
+					file.data, file.size, G->mod_texture_max_size,
+					D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
+					force_srgb, &resource, NULL, NULL);
+			if (SUCCEEDED(hr) && mip_wanted && mip_lookup == MipCacheLookup::MISS)
+				MipCacheQueue(filename, content, file.size, mip_srgb);
+		} else {
+			LogInfoW(L"Loading custom resource %s as WIC, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
+			hr = DirectX::CreateWICTextureFromMemoryEx(mOrigDevice1,
+					file.data, file.size, 0,
+					D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
+					wic_flags, &resource, NULL);
+		}
 	}
 	if (SUCCEEDED(hr)) {
 		device = mOrigDevice1;
@@ -8570,6 +8654,7 @@ void CustomResource::CopyMetadataFrom(const CustomResource& src)
 	override_height = src.override_height;
 	override_depth = src.override_depth;
 	override_mips = src.override_mips;
+	generate_mips = src.generate_mips;
 	override_msaa = src.override_msaa;
 	override_msaa_quality = src.override_msaa_quality;
 

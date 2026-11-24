@@ -144,10 +144,13 @@ static void describe(int stage, UINT slot, ID3D11SamplerState *game)
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
-		printf("harness.exe <run folder> [frames]\n");
+		printf("harness.exe <run folder> [frames] [wait_mips]\n");
 		return 1;
 	}
 	int frames = argc > 2 ? atoi(argv[2]) : 2;
+	bool wait_mips = argc > 3 && !strcmp(argv[3], "wait_mips");
+	FILETIME started;
+	GetSystemTimeAsFileTime(&started);
 	setvbuf(stdout, NULL, _IONBF, 0);
 
 	char dll[MAX_PATH];
@@ -310,6 +313,8 @@ int main(int argc, char **argv)
 		for (int i = 0; i < 8; i++)
 			printf(" %.3f", cs[i][0]);
 		printf("\n");
+		printf("  mips: %g levels, width %g, level 3 texel %.3f, level 0 texel %.3f\n",
+			cs[11][0], cs[11][1], cs[11][2], cs[11][3]);
 		describe(4, 0, game); describe(4, 1, game); describe(4, 2, game); describe(4, 3, game);
 		describe(5, 0, game); describe(0, 1, game); describe(1, 0, game); describe(2, 0, game);
 		describe(3, 15, game);
@@ -370,6 +375,26 @@ int main(int argc, char **argv)
 			expect("vs-s1 anisotropic defaults (16x, clamp, lod 0..FLT_MAX)", aniso && d.Filter == D3D11_FILTER_ANISOTROPIC
 				&& d.MaxAnisotropy == 16 && d.AddressU == D3D11_TEXTURE_ADDRESS_CLAMP && d.MinLOD == 0.0f && d.MaxLOD == FLT_MAX);
 		}
+	}
+
+	// The DLL writes generated mip levels on a background thread, which
+	// exiting would cut short. A load that finds a cache file also sets its
+	// write time, so run.sh tells from the log whether levels were generated.
+	if (wait_mips) {
+		char pattern[MAX_PATH];
+		bool written = false;
+		_snprintf(pattern, MAX_PATH, "%s\\cache\\mips\\*_mips.bin", argv[1]);
+		for (int waited = 0; waited < 400 && !written; waited++) {
+			WIN32_FIND_DATAA found;
+			HANDLE find = FindFirstFileA(pattern, &found);
+			if (find != INVALID_HANDLE_VALUE) {
+				written = CompareFileTime(&found.ftLastWriteTime, &started) >= 0;
+				FindClose(find);
+			}
+			if (!written)
+				Sleep(50);
+		}
+		printf("mips cache file %s\n", written ? "written" : "not written");
 	}
 
 	printf(failures ? "%d FAILED\n" : "done\n", failures);

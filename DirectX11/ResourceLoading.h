@@ -53,6 +53,9 @@ struct SharedResourceKey
 	// Buffers only, as created after the ini overrides:
 	uint32_t byte_width = 0;
 	uint32_t structure_stride = 0;
+	// Textures: 1 with generated mip levels, and the level size limit:
+	uint32_t mip_variant = 0;
+	uint32_t max_size = 0;
 
 	// Filled in by FindSharedFileResource() from the data the resource is
 	// created from. The crc32c only narrows down the candidates:
@@ -69,7 +72,9 @@ struct SharedResourceKey
 // resource is AddRef()ed for the caller. On a miss the key is complete and
 // can be passed to ShareFileResource(), together with the path of the file,
 // once the resource has been created from the same data.
-ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size);
+// content is the crc32c of data when the caller has it already.
+ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size,
+		const uint32_t *content = nullptr);
 void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, ID3D11Resource *resource);
 // Drops the registry's references, all of them or those on one device:
 void ReleaseSharedFileResources(ID3D11Device *device = nullptr);
@@ -79,3 +84,11 @@ void ReleaseSharedFileResources(ID3D11Device *device = nullptr);
 void RecordResourceFileUse(const std::wstring &path);
 void StartResourceFilePrefetch();
 void StopResourceFilePrefetch();
+// Starts reading the file into the system file cache; false if it cannot be
+// opened. bytes, if given, is increased by its size when that is known.
+bool PrefetchFileIntoCache(const std::wstring &path, uint64_t *bytes = nullptr);
+
+// For threads doing file work the game should not wait on: lowers the
+// thread's CPU and I/O priority but keeps its memory priority normal
+void BeginBackgroundWork();
+void EndBackgroundWork();

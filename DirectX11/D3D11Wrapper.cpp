@@ -3,6 +3,7 @@
 #include "log.h"
 #include "Globals.h"
 #include "IniHandler.h"
+#include "MipCache.h"
 #include "GpuWatch.h"
 #include "HookedDXGI.h"
 #include "dx12/Dx12Hooks.h"
@@ -131,6 +132,7 @@ static bool InitializeDLL()
 void DestroyDLL()
 {
 	StopResourceFilePrefetch();
+	MipCacheStop();
 	CleanUpPersistentSettingsSaves();
 }
 

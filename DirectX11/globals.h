@@ -599,6 +599,11 @@ struct Globals
 	bool gForceDetectColorSpace;
 	bool share_duplicate_resources;
 	bool prefetch_resource_files;
+	bool generate_texture_mips;
+	UINT generate_texture_mips_min_size;
+	UINT generate_texture_mips_threads;
+	UINT generate_texture_mips_cache_mb;
+	UINT mod_texture_max_size;
 
 	CRITICAL_SECTION mCriticalSection;
 
@@ -877,6 +882,11 @@ struct Globals
 		gForceDetectColorSpace(false),
 		share_duplicate_resources(true),
 		prefetch_resource_files(true),
+		generate_texture_mips(true),
+		generate_texture_mips_min_size(1024),
+		generate_texture_mips_threads(1),
+		generate_texture_mips_cache_mb(8192),
+		mod_texture_max_size(0),
 		dump_all_profiles(false),
 		gSystemTickCount(0),
 		gTime(0),

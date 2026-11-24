@@ -14,6 +14,7 @@
 #include "util.h"
 #include "globals.h"
 #include "profiling.h"
+#include "MipCache.h"
 
 #pragma region FileContents
 
@@ -295,7 +296,7 @@ MappedFile::MappedFile(const wchar_t *path)
 {
 	LARGE_INTEGER file_size;
 
-	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
 			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 	if (file == INVALID_HANDLE_VALUE)
 		return;
@@ -351,6 +352,8 @@ bool SharedResourceKey::operator==(const SharedResourceKey &other) const
 		&& load_flags == other.load_flags
 		&& byte_width == other.byte_width
 		&& structure_stride == other.structure_stride
+		&& mip_variant == other.mip_variant
+		&& max_size == other.max_size
 		&& size == other.size
 		&& content == other.content;
 }
@@ -373,7 +376,8 @@ static bool FileContentsEqual(const std::wstring &path, const void *data, size_t
 	return file.valid() && file.size == size && !memcmp(file.data, data, size);
 }
 
-ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size)
+ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size,
+		const uint32_t *content)
 {
 	std::vector<SharedEntry> candidates;
 	ID3D11Resource *match = nullptr;
@@ -383,7 +387,7 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 	// file at some later point, so an entry always describes what its
 	// resource was created from even if the file changes afterwards:
 	key.size = size;
-	key.content = crc32c_hw(0, data, size);
+	key.content = content ? *content : crc32c_hw(0, data, size);
 
 	{
 		std::lock_guard<std::mutex> lock(shared_resources_lock);
@@ -594,67 +598,83 @@ void RecordResourceFileUse(const std::wstring &path)
 }
 
 // Fallback for systems without PrefetchVirtualMemory:
-static void ReadFileIntoCache(const wchar_t *path, std::vector<uint8_t> &scratch)
+static bool ReadFileIntoCache(const wchar_t *path, std::vector<uint8_t> &scratch)
 {
-	HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+	HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
 			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 	DWORD read;
 
 	if (f == INVALID_HANDLE_VALUE)
-		return;
+		return false;
 
 	while (!prefetch_stop && ReadFile(f, scratch.data(), (DWORD)scratch.size(), &read, NULL) && read)
 		;
 	CloseHandle(f);
+	return true;
+}
+
+bool PrefetchFileIntoCache(const std::wstring &path, uint64_t *bytes)
+{
+	std::wstring open = long_path_for_open(path);
+
+	if (GetPrefetchVirtualMemory()) {
+		MappedFile file(open.c_str());
+		if (!file.valid())
+			return false;
+		file.prefetch();
+		if (bytes)
+			*bytes += file.size;
+		return true;
+	}
+	std::vector<uint8_t> scratch(1 << 20);
+	return ReadFileIntoCache(open.c_str(), scratch);
 }
 
 static void PrefetchFiles(const ResourceFileLog &log)
 {
-	std::vector<uint8_t> scratch;
 	uint64_t bytes = 0;
 	unsigned files = 0;
 	ULONGLONG start = GetTickCount64();
 
-	if (!GetPrefetchVirtualMemory())
-		scratch.resize(1 << 20);
-
 	for (const auto &entry : log) {
 		if (prefetch_stop)
 			break;
-
-		std::wstring path = long_path_for_open(entry.first);
-		if (scratch.empty()) {
-			MappedFile file(path.c_str());
-			if (!file.valid())
-				continue;
-			file.prefetch();
-			bytes += file.size;
-		} else {
-			ReadFileIntoCache(path.c_str(), scratch);
-		}
+		if (!PrefetchFileIntoCache(entry.first, &bytes))
+			continue;
 		files++;
+		MipCacheQueueFromLastSession(entry.first);
 	}
 
 	LogInfo("Prefetched %u resource files (%llu MB) into the file cache in %llu ms\n",
 			files, bytes >> 20, GetTickCount64() - start);
 }
 
-static DWORD WINAPI PrefetchThread(LPVOID param)
+// Background mode lowers the CPU, I/O and memory priority of the thread so
+// that it yields to the game's own loading. The memory priority goes back up:
+// pages read at the lowest one are the first the system takes back when the
+// game allocates, so prefetched files were gone again by the time a mod was
+// first drawn.
+void BeginBackgroundWork()
 {
-	ResourceFileLog *log = (ResourceFileLog*)param;
-
-	// Background mode lowers the CPU, I/O and memory priority of this
-	// thread so that it yields to the game's own loading. The memory
-	// priority goes back up: pages read at the lowest one are the first
-	// the system takes back when the game allocates, so they were gone
-	// again by the time a mod was first drawn.
 	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
 	if (SetThreadInformation_t set_info = GetSetThreadInformation()) {
 		MEMORY_PRIORITY_INFORMATION normal = { MEMORY_PRIORITY_NORMAL };
 		set_info(GetCurrentThread(), ThreadMemoryPriority, &normal, sizeof(normal));
 	}
-	PrefetchFiles(*log);
+}
+
+void EndBackgroundWork()
+{
 	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+}
+
+static DWORD WINAPI PrefetchThread(LPVOID param)
+{
+	ResourceFileLog *log = (ResourceFileLog*)param;
+
+	BeginBackgroundWork();
+	PrefetchFiles(*log);
+	EndBackgroundWork();
 	delete log;
 
 	// Releases the DLL reference taken in StartResourceFilePrefetch()

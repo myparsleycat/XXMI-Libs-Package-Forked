@@ -14,6 +14,10 @@
     <ClCompile Include="FrameAnalysis.cpp" />
     <ClCompile Include="..\D3D_Shaders\Assembler.cpp" />
     <ClCompile Include="..\crc32c-hw-1.0.5\src\crc32c.cpp" />
+    <ClCompile Include="..\bc7enc\bc7enc.c" />
+    <ClCompile Include="..\bc7enc\bc7decomp.cpp" />
+    <ClCompile Include="MipCache.cpp" />
+    <ClCompile Include="MipGen.cpp" />
     <ClCompile Include="CommandList.cpp" />
     <ClCompile Include="ResourceHash.cpp" />
     <ClCompile Include="ResourceLoading.cpp" />
@@ -96,6 +100,11 @@
     <ClInclude Include="..\util.h" />
     <ClInclude Include="..\version.h" />
     <ClInclude Include="..\crc32c-hw-1.0.5\include\crc32c.h" />
+    <ClInclude Include="..\bc7enc\bc7enc.h" />
+    <ClInclude Include="..\bc7enc\bc7decomp.h" />
+    <ClInclude Include="..\bc7enc\rgbcx.h" />
+    <ClInclude Include="MipCache.h" />
+    <ClInclude Include="MipGen.h" />
     <ClInclude Include="CommandList.h" />
     <ClInclude Include="ResourceHash.h" />
     <ClInclude Include="ResourceLoading.h" />

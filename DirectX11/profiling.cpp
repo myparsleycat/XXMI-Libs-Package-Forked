@@ -45,6 +45,8 @@ namespace Profiling {
 	unsigned views_cleared;
 	unsigned resources_created;
 	unsigned resources_shared;
+	unsigned mip_cache_hits;
+	unsigned mip_jobs_queued;
 	unsigned resource_pool_swaps;
 	unsigned max_copies_per_frame_exceeded;
 	unsigned injected_draw_calls;
@@ -520,6 +522,8 @@ void Profiling::clear()
 	views_cleared = 0;
 	resources_created = 0;
 	resources_shared = 0;
+	mip_cache_hits = 0;
+	mip_jobs_queued = 0;
 	resource_pool_swaps = 0;
 	max_copies_per_frame_exceeded = 0;
 	injected_draw_calls = 0;
@@ -583,6 +587,7 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"D3D12: writing a descriptor of the game to the mirror as well (driver)",
 	L"[Resource] files: reading the file",
 	L"[Resource] files: comparing with identical files already loaded",
+	L"[Resource] files: reading generated mip levels",
 	L"D3D12: copying what a mod uploads to upload memory",
 	L"D3D12: hashing uploads the GPU copied to readback memory",
 	L"D3D12: creating readback memory for upload hashes",
@@ -640,6 +645,8 @@ static const struct {
 } spike_counters[] = {
 	{L"resources [re]created", &Profiling::resources_created},
 	{L"resources shared between files", &Profiling::resources_shared},
+	{L"textures given generated mip levels", &Profiling::mip_cache_hits},
+	{L"textures queued for mip generation", &Profiling::mip_jobs_queued},
 	{L"full resource copies", &Profiling::resource_full_copies},
 	{L"inter-device resource copies", &Profiling::inter_device_copies},
 	{L"MSAA resolves", &Profiling::msaa_resolutions},
