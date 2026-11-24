@@ -7,18 +7,33 @@
 //
 //   harness.exe scene=<file> [frames=N] [warmup=N] [chars=N] [first=N] [rotate=N]
 //               [scenery=N] [passes=N] [materials=N] [ui=N]
-//               [check] [text=A-B] [keys=N] [nodll] [profile] [steady] [appear] [verbose]
+//               [check] [text=A-B] [keys=N] [nodll] [profile] [steady] [appear] [newer]
+//               [redundant] [swap] [contracts] [verbose]
 //
 // check: a clock that advances a 60th of a second a frame, no real input, and
 // the hashes of what reached Direct3D (trace.h), a line a frame in frames.txt.
 // Without it: the time a frame takes on this thread.
 // appear: every object of the scene comes on screen `chars` at a time for
 // `rotate` frames (at least 4); prints what its first frames cost over the rest.
+// newer: asks the device for ID3D11Device5 and the context for
+// ID3D11DeviceContext4, signals a fence through them after every Present, and
+// binds the vertex buffers and textures of the objects of the scene in turn
+// through the first context, that one, and the immediate context of the
+// device that one gives back (GetDevice). Everything else stays on the first.
+// redundant: binds only the slots whose binding differs from what was bound
+// there last (pixel shader t0-7, vertex buffers 0-2), as engines that keep
+// track of their bindings do, so draws find what the DLL bound in between.
+// swap: before each draw of an object of a mod, swaps the context to a second
+// state, binds scenery to the same slots there and swaps back (through
+// ID3D11DeviceContext4 every other time with newer).
+// contracts: checks once what a component handed the game's device and
+// context expects of them, through the interfaces of newer against DirectX's
+// own objects reached from a resource, and exits (with 1 if one failed).
 // Exits with 1 when Direct3D fails, the DLL cannot be hooked or a buffer cannot
 // be given its hash, since the run then does not do what the mods expect.
 #define NOMINMAX
 #include <windows.h>
-#include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <d3dcompiler.h>
 #include <dbghelp.h>
 #include <algorithm>
@@ -39,6 +54,18 @@
 
 static ID3D11Device *dev;
 static ID3D11DeviceContext *ctx;
+// What bind_object() binds the objects through in turn, see newer:
+static ID3D11DeviceContext *bind_ctx[3];
+// See redundant: what was last bound to the slots it covers, for the bits set
+static bool redundant;
+static ID3D11ShaderResourceView *bound_srvs[8];
+static ID3D11Buffer *bound_vbs[3];
+static UINT bound_vb_strides[3], bound_vb_offsets[3];
+static unsigned bound_srvs_known, bound_vbs_known;
+// See swap
+static bool swap_states;
+static ID3DDeviceContextState *other_state;
+static ID3D11DeviceContext1 *swap_ctx[2];
 static IDXGISwapChain *swap;
 static HWND window;
 
@@ -675,13 +702,67 @@ static void draw_plain(UINT count)
 	draws_made++;
 }
 
+// The t slots of the pixel shader, through what redundant keeps: whichever of
+// the two contexts c is, both are the same context of Direct3D.
+static void set_srvs(ID3D11DeviceContext *c, UINT first, UINT count, ID3D11ShaderResourceView *const *views)
+{
+	if (!redundant) {
+		c->PSSetShaderResources(first, count, views);
+		return;
+	}
+	UINT lo = count, hi = 0;
+	for (UINT i = 0; i < count; i++) {
+		UINT slot = first + i;
+		if (slot >= 8 || !(bound_srvs_known & (1u << slot)) || bound_srvs[slot] != views[i]) {
+			lo = std::min(lo, i);
+			hi = i + 1;
+		}
+	}
+	if (lo >= hi)
+		return;
+	c->PSSetShaderResources(first + lo, hi - lo, views + lo);
+	for (UINT i = lo; i < hi && first + i < 8; i++) {
+		bound_srvs[first + i] = views[i];
+		bound_srvs_known |= 1u << (first + i);
+	}
+}
+
+// Likewise the vertex buffers
+static void set_vbs(ID3D11DeviceContext *c, UINT first, UINT count, ID3D11Buffer *const *buffers, const UINT *strides_, const UINT *offsets)
+{
+	if (!redundant) {
+		c->IASetVertexBuffers(first, count, buffers, strides_, offsets);
+		return;
+	}
+	UINT lo = count, hi = 0;
+	for (UINT i = 0; i < count; i++) {
+		UINT slot = first + i;
+		if (slot >= 3 || !(bound_vbs_known & (1u << slot)) || bound_vbs[slot] != buffers[i]
+		 || bound_vb_strides[slot] != strides_[i] || bound_vb_offsets[slot] != offsets[i]) {
+			lo = std::min(lo, i);
+			hi = i + 1;
+		}
+	}
+	if (lo >= hi)
+		return;
+	c->IASetVertexBuffers(first + lo, hi - lo, buffers + lo, strides_ + lo, offsets + lo);
+	for (UINT i = lo; i < hi && first + i < 3; i++) {
+		bound_vbs[first + i] = buffers[i];
+		bound_vb_strides[first + i] = strides_[i];
+		bound_vb_offsets[first + i] = offsets[i];
+		bound_vbs_known |= 1u << (first + i);
+	}
+}
+
 static void bind_object(Object &o, UINT variant, UINT salt, bool is_mod)
 {
+	static unsigned objects_bound;
+	ID3D11DeviceContext *bind = bind_ctx[objects_bound++ % 3];
 	ID3D11Buffer *vbs[3];
 	UINT offsets[3] = { 0, 0, 0 };
 	for (int slot = 0; slot < 3; slot++)
 		vbs[slot] = o.vb[slot].empty() ? default_vb[slot] : o.vb[slot][variant % o.vb[slot].size()].buffer;
-	ctx->IASetVertexBuffers(0, 3, vbs, strides, offsets);
+	set_vbs(bind, 0, 3, vbs, strides, offsets);
 
 	ID3D11ShaderResourceView *views[8];
 	size_t n = o.textures.size();
@@ -691,7 +772,7 @@ static void bind_object(Object &o, UINT variant, UINT salt, bool is_mod)
 		else
 			views[i] = scenery_textures[(salt * 5 + i) % scenery_textures.size()];
 	}
-	ctx->PSSetShaderResources(0, is_mod ? 8 : 4, views);
+	set_srvs(bind, 0, is_mod ? 8 : 4, views);
 
 	if (!o.cbs.empty()) {
 		ID3D11Buffer *cbs[2] = { o.cbs[variant % o.cbs.size()].buffer, o.cbs[(variant + 1) % o.cbs.size()].buffer };
@@ -709,6 +790,24 @@ static void draw_object(Object &o, UINT pass, UINT index, bool is_mod)
 	}
 	update_cb(draw_cb, frame_index, index * 16 + pass);
 	bind_object(o, pass, frame_index + pass + index, is_mod);
+	if (swap_states && is_mod && !scenery.empty()) {
+		static unsigned swaps;
+		ID3D11DeviceContext1 *c = swap_ctx[swaps++ & 1];
+		ID3DDeviceContextState *previous = NULL;
+		c->SwapDeviceContextState(other_state, &previous);
+		ID3D11ShaderResourceView *views[8];
+		ID3D11Buffer *vbs[3];
+		UINT offsets[3] = { 0, 0, 0 };
+		for (int i = 0; i < 8; i++)
+			views[i] = scenery_textures[(index + i) % scenery_textures.size()];
+		for (int slot = 0; slot < 3; slot++)
+			vbs[slot] = scenery[index % scenery.size()].vb[slot][0].buffer;
+		ctx->PSSetShaderResources(0, 8, views);
+		ctx->IASetVertexBuffers(0, 3, vbs, strides, offsets);
+		c->SwapDeviceContextState(previous, NULL);
+		if (previous)
+			previous->Release();
+	}
 
 	if (o.meshes.empty()) {
 		ctx->IASetIndexBuffer(default_ib, DXGI_FORMAT_R16_UINT, 0);
@@ -717,7 +816,7 @@ static void draw_object(Object &o, UINT pass, UINT index, bool is_mod)
 	for (Mesh &mesh : o.meshes) {
 		if (mesh_on_vb0 && is_mod) {
 			UINT offset = 0;
-			ctx->IASetVertexBuffers(0, 1, &mesh.buffer, &strides[0], &offset);
+			set_vbs(ctx, 0, 1, &mesh.buffer, &strides[0], &offset);
 			ctx->IASetIndexBuffer(default_ib, DXGI_FORMAT_R16_UINT, 0);
 		} else if (!region_hashes || !is_mod) {
 			ctx->IASetIndexBuffer(mesh.buffer, DXGI_FORMAT_R16_UINT, 0);
@@ -802,7 +901,7 @@ static void frame(const std::vector<int> &on_screen, int passes, int ui_draws)
 	ctx->PSSetShader(ui_ps, NULL, 0);
 	{
 		UINT stride = 20, offset = 0;
-		ctx->IASetVertexBuffers(0, 1, &ui_vb, &stride, &offset);
+		set_vbs(ctx, 0, 1, &ui_vb, &stride, &offset);
 	}
 	for (int i = 0; i < ui_draws; i++) {
 		D3D11_MAPPED_SUBRESOURCE map;
@@ -814,7 +913,7 @@ static void frame(const std::vector<int> &on_screen, int passes, int ui_draws)
 				words[k] = frame_index * 31 + i * 7 + k;
 			ctx->Unmap(ui_vb, 0);
 		}
-		ctx->PSSetShaderResources(0, 1, &scenery_textures[(frame_index + i) % scenery_textures.size()]);
+		set_srvs(ctx, 0, 1, &scenery_textures[(frame_index + i) % scenery_textures.size()]);
 		ctx->Draw(6, i * 6);
 		draws_made++;
 	}
@@ -825,18 +924,18 @@ static void frame(const std::vector<int> &on_screen, int passes, int ui_draws)
 	ctx->PSSetShader(screen_ps, NULL, 0);
 	ctx->OMSetBlendState(blend_opaque, NULL, 0xffffffff);
 	for (int i = 0; i < 4; i++) {
-		ctx->PSSetShaderResources(0, 8, no_views);
+		set_srvs(ctx, 0, 8, no_views);
 		ctx->OMSetRenderTargets(1, &color_rtv[(i + 1) % 2], NULL);
-		ctx->PSSetShaderResources(0, 1, &color_srv[i % 2]);
+		set_srvs(ctx, 0, 1, &color_srv[i % 2]);
 		ctx->Draw(3, 0);
 		draws_made++;
 	}
-	ctx->PSSetShaderResources(0, 8, no_views);
+	set_srvs(ctx, 0, 8, no_views);
 	ctx->OMSetRenderTargets(1, &back_rtv, NULL);
-	ctx->PSSetShaderResources(0, 1, &color_srv[0]);
+	set_srvs(ctx, 0, 1, &color_srv[0]);
 	ctx->Draw(3, 0);
 	draws_made++;
-	ctx->PSSetShaderResources(0, 8, no_views);
+	set_srvs(ctx, 0, 8, no_views);
 }
 
 // appear: what the first frames of objects coming on screen cost over the
@@ -912,6 +1011,128 @@ static DWORD WINAPI watchdog(void *)
 	}
 }
 
+// See contracts
+static int contract_failures;
+#define EXPECT(cond, what) do { if (!(cond)) { printf("CONTRACT FAILED: %s\n", what); contract_failures++; } } while (0)
+
+static IUnknown* identity_of(IUnknown *object)
+{
+	IUnknown *identity = NULL;
+	if (object && SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&identity))))
+		identity->Release();
+	return identity;
+}
+
+static int check_contracts(ID3D11Device5 *device5, ID3D11DeviceContext4 *context4)
+{
+	D3D11_TEXTURE2D_DESC desc = { 4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0 };
+	ID3D11Texture2D *texture = NULL;
+	ID3D11ShaderResourceView *view = NULL;
+	CHECK(dev->CreateTexture2D(&desc, NULL, &texture), "CreateTexture2D");
+	CHECK(dev->CreateShaderResourceView(texture, NULL, &view), "CreateShaderResourceView");
+	// DirectX's own device and context: the DLL does not wrap resources
+	ID3D11Device *real_dev = NULL;
+	ID3D11DeviceContext *real_ctx = NULL;
+	ID3D11Device2 *real_dev2 = NULL;
+	ID3D11DeviceContext3 *real_ctx3 = NULL;
+	texture->GetDevice(&real_dev);
+	real_dev->GetImmediateContext(&real_ctx);
+	CHECK(real_dev->QueryInterface(IID_PPV_ARGS(&real_dev2)), "QueryInterface ID3D11Device2");
+	CHECK(real_ctx->QueryInterface(IID_PPV_ARGS(&real_ctx3)), "QueryInterface ID3D11DeviceContext3");
+
+	// One COM identity, however the object is reached
+	EXPECT(identity_of(dev) == identity_of(real_dev), "IUnknown of the device");
+	EXPECT(identity_of(device5) == identity_of(real_dev), "IUnknown of ID3D11Device5");
+	EXPECT(identity_of(ctx) == identity_of(real_ctx), "IUnknown of the context");
+	EXPECT(identity_of(context4) == identity_of(real_ctx), "IUnknown of ID3D11DeviceContext4");
+	ID3D11DeviceContext *ctx_of_device5 = NULL;
+	device5->GetImmediateContext(&ctx_of_device5);
+	EXPECT(identity_of(ctx_of_device5) == identity_of(real_ctx), "IUnknown of the immediate context of ID3D11Device5");
+
+	// The same interface pointer when asked again, however it is reached
+	ID3D11Device5 *device5_again = NULL;
+	ID3D11DeviceContext3 *ctx3_of_device5 = NULL;
+	ID3D11DeviceContext4 *context4_again = NULL;
+	CHECK(dev->QueryInterface(IID_PPV_ARGS(&device5_again)), "QueryInterface ID3D11Device5");
+	EXPECT(device5_again == device5, "ID3D11Device5 asked for twice");
+	device5->GetImmediateContext3(&ctx3_of_device5);
+	CHECK(ctx3_of_device5->QueryInterface(IID_PPV_ARGS(&context4_again)), "QueryInterface ID3D11DeviceContext4");
+	EXPECT(context4_again == context4, "ID3D11DeviceContext4 of the immediate context of ID3D11Device5");
+
+	// One reference count
+	ULONG a = ctx->AddRef(), b = context4->AddRef();
+	ULONG c = context4->Release(), d = ctx->Release();
+	EXPECT(b == a + 1 && c == a && d == a - 1, "references counted through ID3D11DeviceContext4");
+	a = dev->AddRef();
+	b = device5->AddRef();
+	c = device5->Release();
+	d = dev->Release();
+	EXPECT(b == a + 1 && c == a && d == a - 1, "references counted through ID3D11Device5");
+
+	// Calls reach DirectX's object
+	EXPECT(device5->GetFeatureLevel() == real_dev->GetFeatureLevel(), "GetFeatureLevel");
+	EXPECT(device5->GetCreationFlags() == real_dev->GetCreationFlags(), "GetCreationFlags");
+	UINT levels = 0, real_levels = 1;
+	device5->CheckMultisampleQualityLevels1(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0, &levels);
+	real_dev2->CheckMultisampleQualityLevels1(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 0, &real_levels);
+	EXPECT(levels == real_levels, "CheckMultisampleQualityLevels1");
+	D3D11_TEXTURE2D_DESC1 desc1 = { 4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 }, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0, D3D11_TEXTURE_LAYOUT_UNDEFINED };
+	ID3D11Texture2D1 *texture1 = NULL;
+	EXPECT(SUCCEEDED(device5->CreateTexture2D1(&desc1, NULL, &texture1)), "CreateTexture2D1");
+	if (texture1)
+		texture1->Release();
+	EXPECT(context4->GetType() == real_ctx->GetType(), "GetType");
+	EXPECT(context4->GetContextFlags() == real_ctx->GetContextFlags(), "GetContextFlags");
+	EXPECT(context4->IsAnnotationEnabled() == real_ctx3->IsAnnotationEnabled(), "IsAnnotationEnabled");
+	BOOL protection = 2, real_protection = 3;
+	context4->GetHardwareProtectionState(&protection);
+	real_ctx3->GetHardwareProtectionState(&real_protection);
+	EXPECT(protection == real_protection, "GetHardwareProtectionState");
+	ID3D11Fence *fence = NULL;
+	EXPECT(SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))), "CreateFence");
+	if (fence) {
+		HANDLE done = CreateEventW(NULL, FALSE, FALSE, NULL);
+		EXPECT(SUCCEEDED(context4->Signal(fence, 5)), "Signal");
+		context4->Flush1(D3D11_CONTEXT_TYPE_ALL, NULL);
+		EXPECT(SUCCEEDED(fence->SetEventOnCompletion(5, done)) && WaitForSingleObject(done, 5000) == WAIT_OBJECT_0, "the fence reaches what was signalled");
+		EXPECT(SUCCEEDED(context4->Wait(fence, 5)), "Wait");
+		CloseHandle(done);
+		fence->Release();
+	}
+
+	// What is set through it is set
+	ID3D11ShaderResourceView *got = NULL, *none = NULL;
+	context4->PSSetShaderResources(5, 1, &view);
+	real_ctx->PSGetShaderResources(5, 1, &got);
+	EXPECT(got == view, "PSSetShaderResources through ID3D11DeviceContext4");
+	if (got)
+		got->Release();
+	context4->PSSetShaderResources(5, 1, &none);
+	static const GUID data_guid = { 0x5d1f6b0e, 0x2c4a, 0x4e1b, { 0x9a, 0x3f, 0x71, 0x0c, 0x52, 0x8e, 0x44, 0x19 } };
+	UINT32 value = 0x1234, read = 0;
+	UINT size = sizeof(read);
+	context4->SetPrivateData(data_guid, sizeof(value), &value);
+	real_ctx->GetPrivateData(data_guid, &size, &read);
+	EXPECT(read == value, "SetPrivateData through ID3D11DeviceContext4");
+	context4->SetPrivateData(data_guid, 0, NULL);
+	IDXGIDevice *dxgi = NULL;
+	EXPECT(SUCCEEDED(device5->QueryInterface(IID_PPV_ARGS(&dxgi))), "IDXGIDevice of ID3D11Device5");
+	if (dxgi)
+		dxgi->Release();
+
+	device5_again->Release();
+	context4_again->Release();
+	ctx3_of_device5->Release();
+	ctx_of_device5->Release();
+	real_ctx3->Release();
+	real_dev2->Release();
+	real_ctx->Release();
+	real_dev->Release();
+	view->Release();
+	texture->Release();
+	return contract_failures;
+}
+
 static LRESULT CALLBACK window_proc(HWND w, UINT message, WPARAM wp, LPARAM lp)
 {
 	return DefWindowProcW(w, message, wp, lp);
@@ -922,7 +1143,7 @@ int main(int argc, char **argv)
 	const char *scene = NULL;
 	int frames = 600, warmup = 120, chars = 8, first = 0, rotate = 0, scenery_count = 400, passes = 3, material_count = 48, ui_draws = 60;
 	int key_every = 6;
-	bool check = false, nodll = false, profile = false, appear = false, profile_steady = false;
+	bool check = false, nodll = false, profile = false, appear = false, profile_steady = false, newer = false, contracts = false;
 	unsigned text_first = 1, text_last = 0;
 
 	for (int i = 1; i < argc; i++) {
@@ -945,6 +1166,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "profile")) profile = true;
 		else if (!strcmp(a, "appear")) appear = true;
 		else if (!strcmp(a, "steady")) profile_steady = true;
+		else if (!strcmp(a, "newer")) newer = true;
+		else if (!strcmp(a, "redundant")) redundant = true;
+		else if (!strcmp(a, "swap")) swap_states = true;
+		else if (!strcmp(a, "contracts")) contracts = newer = true;
 		else { printf("unknown argument %s\n", a); return 1; }
 	}
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -1037,6 +1262,37 @@ int main(int argc, char **argv)
 	scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 	CreateFn create = (CreateFn)GetProcAddress(lib, "D3D11CreateDeviceAndSwapChain");
 	CHECK(create(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &level, 1, D3D11_SDK_VERSION, &scd, &swap, &dev, NULL, &ctx), "D3D11CreateDeviceAndSwapChain");
+
+	ID3D11Device5 *device5 = NULL;
+	ID3D11DeviceContext4 *context4 = NULL;
+	ID3D11Fence *fence = NULL;
+	UINT64 fence_value = 0;
+	if (newer) {
+		CHECK(dev->QueryInterface(IID_PPV_ARGS(&device5)), "QueryInterface ID3D11Device5");
+		CHECK(ctx->QueryInterface(IID_PPV_ARGS(&context4)), "QueryInterface ID3D11DeviceContext4");
+		CHECK(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
+	}
+	bind_ctx[0] = bind_ctx[1] = bind_ctx[2] = ctx;
+	if (context4) {
+		ID3D11Device *device_of_context4 = NULL;
+		bind_ctx[1] = context4;
+		context4->GetDevice(&device_of_context4);
+		device_of_context4->GetImmediateContext(&bind_ctx[2]);
+		device_of_context4->Release();
+	}
+	if (contracts) {
+		int failed = check_contracts(device5, context4);
+		printf(failed ? "CONTRACTS FAILED\n" : "CONTRACTS OK\n");
+		return failed ? 1 : 0;
+	}
+	if (swap_states) {
+		ID3D11Device1 *dev1 = NULL;
+		CHECK(dev->QueryInterface(IID_PPV_ARGS(&dev1)), "QueryInterface ID3D11Device1");
+		CHECK(dev1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION, __uuidof(ID3D11Device1), NULL, &other_state), "CreateDeviceContextState");
+		dev1->Release();
+		CHECK(ctx->QueryInterface(IID_PPV_ARGS(&swap_ctx[0])), "QueryInterface ID3D11DeviceContext1");
+		swap_ctx[1] = context4 ? context4 : swap_ctx[0];
+	}
 
 	if (check)
 		trace_enable(true);
@@ -1152,6 +1408,8 @@ int main(int argc, char **argv)
 		QueryPerformanceCounter(&t1);
 		profiling = false;
 		swap->Present(0, 0);
+		if (context4)
+			context4->Signal(fence, ++fence_value);
 		QueryPerformanceCounter(&t2);
 		virtual_us += 16667;
 		InterlockedIncrement(&frames_done);

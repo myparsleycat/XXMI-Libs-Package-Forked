@@ -11,12 +11,16 @@
 #   xh.sh profile <importer> [harness arguments]   where cur spends that time
 #   xh.sh diff <importer> <frame>                  the calls of a frame, ref against cur
 #   xh.sh run <importer> <cur|ref> [harness arguments]
+#   xh.sh contracts [importer...]                  what components handed the game's device and context
+#                                                  expect of them, through ref and cur (default GIMI)
 #
 # check, bench, profile and diff copy the DLL of x64/Release into cur first.
 #
 # RUNS=5 xh.sh bench GIMI repeats more; CHECK_FRAMES, CHECK_ARGS, BENCH_FRAMES,
-# BENCH_ARGS and LINES_SHOWN (diff) likewise. XXMI_ROOT is the folder with the
-# importer folders, XH_RUNS where the run folders go (default ~/.xh).
+# BENCH_ARGS and LINES_SHOWN (diff) likewise. CHECK_ARGS="newer redundant swap"
+# checks the ways a game binds that the default frames leave out (harness.cpp).
+# XXMI_ROOT is the folder with the importer folders, XH_RUNS where the run
+# folders go (default ~/.xh).
 # check exits with 1 when a run differs or fails.
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$here/../../.."
@@ -51,6 +55,11 @@ run() {
 	local dir="$runs_root/$importer/$name" ini=game
 	[[ " $* " == *" check "* ]] && ini=check
 	[ -f "$dir/d3dx.ini.$ini" ] && cp "$dir/d3dx.ini.$ini" "$dir/d3dx.ini"
+	if [[ " $* " == *" redundant "* ]]; then
+		cp "$here/probe.ini" "$dir/harness_probe.ini"
+		sed -i 's/^\[Include\]\r\?$/&\ninclude = harness_probe.ini/' "$dir/d3dx.ini"
+		grep -q '^include = harness_probe.ini' "$dir/d3dx.ini" || { echo "$dir/d3dx.ini has no [Include] section for the probe"; return 1; }
+	fi
 	# No .start: a folder of an older setup.py whose game had no settings file
 	if [ -f "$dir/d3dx_user.ini.start" ]; then
 		cp "$dir/d3dx_user.ini.start" "$dir/d3dx_user.ini"
@@ -157,8 +166,25 @@ diff)
 run)
 	run "$@"
 	;;
+contracts)
+	ok=1
+	for i in ${@:-GIMI}; do
+		use_built_dll "$runs_root/$i/cur"
+		for which in ref cur; do
+			out=$(run $i $which contracts 2>&1); s=$?
+			if [ $s = 0 ]; then
+				echo "$i $which: $(echo "$out" | tail -1)"
+			else
+				ok=0
+				echo "$i $which: FAILED (exit code $s)"
+				echo "$out" | grep -E 'CONTRACT|FAILED' | sed 's/^/  /'
+			fi
+		done
+	done
+	[ $ok = 1 ] && echo "CONTRACTS OK" || { echo "CONTRACTS FAILED"; exit 1; }
+	;;
 *)
-	sed -n '2,21p' "$0"
+	sed -n '2,24p' "$0"
 	exit 1
 	;;
 esac
