@@ -9,13 +9,13 @@ on:
   workflow_dispatch:
 
 
-permissions:
-  contents: write
-
-
 jobs:
   build:
     runs-on: windows-2022
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
     - name: Checkout code
@@ -37,6 +37,13 @@ jobs:
         -property:Configuration=Release
         -property:Platform=x64
         -verbosity:minimal
+
+    - name: Generate build provenance
+      uses: actions/attest@v4
+      with:
+        subject-path: |
+          x64/Release/d3d11.dll
+          x64/Release/d3d11.pdb
 
     - name: Upload DLL and symbols
       uses: actions/upload-artifact@v4
