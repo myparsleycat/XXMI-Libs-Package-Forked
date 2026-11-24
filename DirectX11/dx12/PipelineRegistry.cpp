@@ -1001,9 +1001,15 @@ static void patch_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC2 *dst, const D3D1
 	dst->BackFace.StencilWriteMask = src.StencilWriteMask;
 }
 
-// Where the value is in the subobjects that have a pointer in them, which are
-// the only ones looked into
+// Where the value is in the subobjects that have a pointer in them. Values
+// aligned to less than a pointer come right after the type (stream_value).
 const size_t STREAM_VALUE = offsetof(StreamSubobject<void*>, value);
+
+template <class T>
+static T* stream_value(BYTE *subobject)
+{
+	return &reinterpret_cast<StreamSubobject<T>*>(subobject)->value;
+}
 
 // 0 for a subobject this code does not know
 static size_t subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type)
@@ -1237,12 +1243,15 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		bool blend_patched = false, sample_mask_patched = false, depth_stencil_patched = false;
 
 		for (pos = 0; !failed && pos < creation.size(); pos += size) {
-			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(creation.data() + pos);
-			BYTE *value = creation.data() + pos + STREAM_VALUE;
+			BYTE *subobject = creation.data() + pos;
+			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)subobject;
+			BYTE *value = subobject + STREAM_VALUE;
 
 			stage = subobject_stage(type);
 			size = subobject_size(type);
-			if (stage != DX12_STAGE_COUNT) {
+			if (!size) {
+				failed = "the game's pipeline state stream has a subobject this code does not know";
+			} else if (stage != DX12_STAGE_COUNT) {
 				if (!revive_shader((D3D12_SHADER_BYTECODE*)value, shaders[stage], !!(mod_stages & 1u << stage),
 						!!(variant->removed_stages & 1u << stage)))
 					failed = "the game's shaders were not kept";
@@ -1255,22 +1264,22 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 					*(ID3D12RootSignature**)value = variant->root_signature;
 				has_signature = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND && variant->blend_override) {
-				*(D3D12_BLEND_DESC*)value = variant->blend;
+				*stream_value<D3D12_BLEND_DESC>(subobject) = variant->blend;
 				blend_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK && variant->sample_mask_override) {
-				*(UINT*)value = variant->sample_mask;
+				*stream_value<UINT>(subobject) = variant->sample_mask;
 				sample_mask_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL && variant->depth_stencil_override) {
-				*(D3D12_DEPTH_STENCIL_DESC*)value = variant->depth_stencil;
+				*stream_value<D3D12_DEPTH_STENCIL_DESC>(subobject) = variant->depth_stencil;
 				depth_stencil_patched = true;
 			} else if ((type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
 			        || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) && variant->depth_stencil_override) {
 				// These versions add fields D3D11 has no equivalent for. Keep those
 				// game-specific fields and replace only the state D3D11 exposes.
 				if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
-					patch_depth_stencil_state((D3D12_DEPTH_STENCIL_DESC1*)value, variant->depth_stencil);
+					patch_depth_stencil_state(stream_value<D3D12_DEPTH_STENCIL_DESC1>(subobject), variant->depth_stencil);
 				else
-					patch_depth_stencil_state((D3D12_DEPTH_STENCIL_DESC2*)value, variant->depth_stencil);
+					patch_depth_stencil_state(stream_value<D3D12_DEPTH_STENCIL_DESC2>(subobject), variant->depth_stencil);
 				depth_stencil_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) {
 				*(D3D12_CACHED_PIPELINE_STATE*)value = {};

@@ -759,6 +759,60 @@ static void draw_probe_shader(ID3D12GraphicsCommandList *list)
 	list->DrawInstanced(3, 1, 0, 0);
 }
 
+// stream: the game's pipelines are made from a pipeline state stream laid out
+// the way Unreal Engine 4 lays out its own, with subobjects whose values are
+// not pointer aligned (blend, depth/stencil, sample mask) followed by others
+static bool stream_pipelines;
+
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, class T>
+struct alignas(void*) StreamPart {
+	D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+	T value = {};
+};
+
+static void create_game_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, ID3D12PipelineState **pipeline)
+{
+	struct {
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root_signature;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC> input_layout;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1> depth_stencil;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_stencil_format;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> render_targets;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample_desc;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, UINT> node_mask;
+	} stream;
+	ID3D12Device2 *device2;
+
+	if (!stream_pipelines) {
+		CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(pipeline)));
+		return;
+	}
+	stream.root_signature.value = desc.pRootSignature;
+	stream.input_layout.value = desc.InputLayout;
+	stream.topology.value = desc.PrimitiveTopologyType;
+	stream.vs.value = desc.VS;
+	stream.ps.value = desc.PS;
+	stream.blend.value = desc.BlendState;
+	memcpy(&stream.depth_stencil.value, &desc.DepthStencilState, sizeof(desc.DepthStencilState));
+	stream.depth_stencil_format.value = desc.DSVFormat;
+	stream.rasterizer.value = desc.RasterizerState;
+	stream.render_targets.value.NumRenderTargets = desc.NumRenderTargets;
+	memcpy(stream.render_targets.value.RTFormats, desc.RTVFormats, sizeof(desc.RTVFormats));
+	stream.sample_desc.value = desc.SampleDesc;
+	stream.sample_mask.value = desc.SampleMask;
+	stream.node_mask.value = desc.NodeMask;
+	D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = { sizeof(stream), &stream };
+	CHECK(device->QueryInterface(IID_PPV_ARGS(&device2)));
+	CHECK(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(pipeline)));
+	device2->Release();
+}
+
 static void create_pipelines()
 {
 	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
@@ -899,7 +953,7 @@ static void create_pipelines()
 		desc.NumRenderTargets = 1;
 		desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 		desc.SampleDesc.Count = 1;
-		CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelines[i])));
+		create_game_pipeline(desc, &pipelines[i]);
 		vs->Release();
 		ps->Release();
 	}
@@ -1385,6 +1439,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "dump-sampler-dxil")) dump_sampler = true;
 		else if (!strcmp(argv[a], "no-srv")) no_srv = true;
 		else if (!strcmp(argv[a], "early-depth")) early_depth = true;
+		else if (!strcmp(argv[a], "stream")) stream_pipelines = true;
 		else if (!strcmp(argv[a], "rootconst")) root_constants = true;
 		else if (!strcmp(argv[a], "rootsig11")) root_signature_11 = true;
 		else if (!strcmp(argv[a], "rootsig12")) root_signature_11 = root_signature_12 = true;

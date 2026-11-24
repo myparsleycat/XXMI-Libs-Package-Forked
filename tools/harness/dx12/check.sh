@@ -18,7 +18,10 @@
 #   present  with 1 and 3 presents frame generation would add (harness.cpp
 #          generated=N), [Present] is left out of them, or with bb run again
 #          leaving the variables and ini params as the frame did
-#   ref    the pictures of test and of the mod in case/Mods against those of
+#   blend-stream  a custom shader's blend state on game pipelines made from
+#          pipeline state streams (harness.cpp stream) gives the picture it
+#          gives on pipelines made from descriptions
+#   refthe pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
 #   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
 #   dxil-iniparams  a DXIL patch reads a 1D IniParams texture on a game draw
@@ -690,6 +693,32 @@ present_counts() {
 	sed -n 's/.*Frame generation presents: \([0-9]*\) left \[Present\] out, \([0-9]*\) ran it again$/\1 \2/p' run/present-$1.log 2>/dev/null | head -1
 }
 
+blend_picture() {
+	# blend_picture <name> <harness arguments>: the picture checksum, or
+	# "exit N" (124 when it did not finish in time)
+	local status
+	(cd run && timeout 60 ./harness.exe "${@:2}" dump=blend-$1.bmp >blend-$1.out 2>&1); status=$?
+	[ $status = 0 ] || { echo "exit $status"; return; }
+	sed -n 's/^picture checksum //p' run/blend-$1.out
+}
+
+run_blend_stream() {
+	local mod=run/Mods/mod/mod.ini frames=200 plain splain blend sblend
+	cp "$mod" "$mod.blend-backup" || { ok=0; return; }
+	plain=$(blend_picture plain frames=$frames)
+	splain=$(blend_picture stream-plain frames=$frames stream)
+	sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^drawindexed = auto$/run = CustomShaderBlendTest/; }' "$mod"
+	printf '\n[CustomShaderBlendTest]\nblend = ADD BLEND_FACTOR INV_BLEND_FACTOR\nblend_factor[0] = 0.5\nblend_factor[1] = 0.5\nblend_factor[2] = 0.5\nblend_factor[3] = 1\ndrawindexed = auto\n' >> "$mod"
+	blend=$(blend_picture blend frames=$frames)
+	sblend=$(blend_picture stream-blend frames=$frames stream)
+	mv "$mod.blend-backup" "$mod"
+	if [[ "$plain" =~ ^[0-9a-f]+$ && "$blend" =~ ^[0-9a-f]+$ ]] && [ "$plain" = "$splain" ] && [ "$blend" = "$sblend" ] && [ "$blend" != "$plain" ]; then
+		echo "blend-stream: OK"
+	else
+		echo "blend-stream: FAILED (description: $plain, blended $blend; stream: $splain, blended $sblend)"; ok=0
+	fi
+}
+
 run_present() {
 	local mod=run/Mods/mod/mod.ini frames=400 fail="" s0 s1 s3 snext b0 b1 b3 skips reruns bskips breruns
 	cp "$mod" "$mod.present-backup" || { ok=0; return; }
@@ -797,6 +826,7 @@ for what in ${@:-test refetch fold move lowmip filter present}; do
 	lowmip) run_lowmip ;;
 	filter) run_filter ;;
 	present) run_present ;;
+	blend-stream) run_blend_stream ;;
 	ref) run_ref ;;
 	root-uav) run_root_uav ;;
 	dxil-iniparams) run_dxil_iniparams '' ;;
