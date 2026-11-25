@@ -6915,6 +6915,9 @@ void Dx12DrawPathFramePresented()
 			InterlockedExchange64(&dx12_stats.upload_pages_created, 0),
 			InterlockedExchange64(&dx12_stats.upload_pages_released, 0),
 			InterlockedExchange64(&dx12_stats.resources_renamed, 0));
+		Dx12DumpNote("  DX12 buffer replacements used %lld prepared buffer spares and made %lld synchronous allocation attempts\n",
+			InterlockedExchange64(&dx12_stats.prepared_spares_used, 0),
+			InterlockedExchange64(&dx12_stats.rename_allocations, 0));
 		note_memory();
 		stats = {};
 		reported_epoch = dx12_shim_epoch;

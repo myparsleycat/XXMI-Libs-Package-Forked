@@ -761,7 +761,7 @@ run_present() {
 	s3=$(present_picture 3 frames=$frames generated=3)
 	snext=$(present_picture next frames=$((frames + 1)))
 	# Long enough for the report of the first 5 s
-	present_picture long frames=4000 generated=1 >/dev/null
+	present_picture long frames=4000 min-ms=6000 generated=1 >/dev/null
 	read skips reruns <<< "$(present_counts long)"
 	# Using the swap chain's buffer has repeats run [Present] again, which
 	# leaves the variables and ini params as the frame did: the mesh shows
@@ -770,7 +770,7 @@ run_present() {
 	b0=$(present_picture bb0 frames=$frames)
 	b1=$(present_picture bb1 frames=$frames generated=1)
 	b3=$(present_picture bb3 frames=$frames generated=3)
-	present_picture bblong frames=4000 generated=1 >/dev/null
+	present_picture bblong frames=4000 min-ms=6000 generated=1 >/dev/null
 	read bskips breruns <<< "$(present_counts bblong)"
 
 	mv "$mod.present-backup" "$mod"

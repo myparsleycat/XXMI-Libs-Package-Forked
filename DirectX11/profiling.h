@@ -3,6 +3,8 @@
 #include <wrl.h>
 #include <string>
 
+struct Dx12ResourceCreationTiming;
+
 namespace Profiling {
 	enum class Mode {
 		NONE = 0,
@@ -223,6 +225,11 @@ namespace Profiling {
 		// the recent average, whichever is given
 		void init(float threshold_ms, float relative, bool detail, const wchar_t *log_dir);
 		void add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes = 0);
+		void add_dx12_rename(INT64 start, UINT64 width, bool keep_contents, bool succeeded,
+				size_t spares_before, size_t busy_spares_checked, bool prepared_spare,
+				const Dx12ResourceCreationTiming &creation);
+		void note_dx12_spare(const wchar_t *event, UINT64 id, UINT64 width, UINT flags,
+				const wchar_t *status, const wchar_t *mod = nullptr);
 		void frame(bool mods_disabled = false);
 		void configure_mod_state(const wchar_t *variable);
 		void sample_mod_state();
@@ -239,6 +246,27 @@ namespace Profiling {
 			reason_names[index] = name;
 			InterlockedIncrement(&reason_counts[index]);
 		}
+
+		extern thread_local const wchar_t *command_line;
+
+		class CommandScope {
+			const wchar_t *previous = nullptr;
+			bool active;
+		public:
+			CommandScope(bool enabled, const wchar_t *line) : active(enabled && *line)
+			{
+				if (active) {
+					previous = command_line;
+					command_line = line;
+				}
+			}
+
+			~CommandScope()
+			{
+				if (active)
+					command_line = previous;
+			}
+		};
 
 		class Scope {
 			LARGE_INTEGER start;

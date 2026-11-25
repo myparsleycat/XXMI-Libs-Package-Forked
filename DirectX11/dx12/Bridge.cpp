@@ -24,6 +24,7 @@
 #include "../HackerContext.h"
 #include "../HackerDevice.h"
 #include "../IniHandler.h"
+#include "../ModLoading.h"
 #include "../profiling.h"
 
 Dx12Shim *dx12_shim;
@@ -1056,14 +1057,20 @@ static void evict_idle()
 	ULONGLONG idle_ms = (ULONGLONG)G->dx12_evict_idle_seconds * 1000;
 	UINT64 limit;
 
-	if (!G->dx12_evict_idle || present_time - evicted_time < EVICT_INTERVAL_MS)
+	if (present_time - evicted_time < EVICT_INTERVAL_MS)
 		return;
 	evicted_time = present_time;
+	if (!G->dx12_evict_idle) {
+		ModLoadSetDx12SparePressure(false);
+		return;
+	}
 	if (!Dx12ShimProcessMemory(&memory))
 		return;
 	limit = memory.Budget / 100 * G->dx12_evict_budget_percent;
-	if (memory.CurrentUsage > limit && present_time >= idle_ms)
-		evict(memory.CurrentUsage - limit, present_time - idle_ms);
+	const UINT64 excess = memory.CurrentUsage > limit ? memory.CurrentUsage - limit : 0;
+	const UINT64 released = ModLoadSetDx12SparePressure(excess != 0);
+	if (excess > released && present_time >= idle_ms)
+		evict(excess - released, present_time - idle_ms);
 }
 
 // CreateCommittedResource waits on the CPU until what it made is resident,
@@ -1078,12 +1085,25 @@ static std::mutex residency_lock;
 static UINT64 residency_asked;
 static std::atomic<UINT64> residency_needed{0};
 
-static HRESULT enqueue_make_resident(ID3D12Pageable *pageable, UINT64 *residency)
+static HRESULT enqueue_make_resident(ID3D12Pageable *pageable, UINT64 *residency,
+		Dx12ResourceCreationTiming *timing = nullptr)
 {
+	LARGE_INTEGER start, acquired, end;
+
+	if (timing)
+		QueryPerformanceCounter(&start);
 	// The fence is signalled in the order of the values
 	std::lock_guard<std::mutex> lock(residency_lock);
+	if (timing)
+		QueryPerformanceCounter(&acquired);
 	UINT64 value = residency_asked + 1;
 	HRESULT hr = residency_device->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, &pageable, residency_fence, value);
+	if (timing) {
+		QueryPerformanceCounter(&end);
+		timing->residency_lock_ticks += acquired.QuadPart - start.QuadPart;
+		timing->residency_request_ticks += end.QuadPart - acquired.QuadPart;
+		timing->residency_requested = true;
+	}
 
 	if (SUCCEEDED(hr)) {
 		residency_asked = value;
@@ -1110,7 +1130,25 @@ static void residency_init()
 	}
 }
 
-HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource, UINT64 *residency)
+static HRESULT create_committed_default_resource(const D3D12_HEAP_PROPERTIES &heap, D3D12_HEAP_FLAGS flags,
+		const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource, Dx12ResourceCreationTiming *timing)
+{
+	LARGE_INTEGER start, end;
+
+	if (timing)
+		QueryPerformanceCounter(&start);
+	HRESULT hr = shim.device->CreateCommittedResource(&heap, flags, desc,
+			D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(resource));
+	if (timing) {
+		QueryPerformanceCounter(&end);
+		timing->create_ticks += end.QuadPart - start.QuadPart;
+		timing->create_calls++;
+	}
+	return hr;
+}
+
+HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource,
+		UINT64 *residency, Dx12ResourceCreationTiming *timing)
 {
 	D3D12_HEAP_PROPERTIES heap = {};
 	UINT64 value;
@@ -1119,9 +1157,9 @@ HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource *
 	if (residency)
 		*residency = 0;
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-	if (residency_device && SUCCEEDED(shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
-			desc, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(resource)))) {
-		hr = enqueue_make_resident(*resource, &value);
+	if (residency_device && SUCCEEDED(create_committed_default_resource(heap, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
+			desc, resource, timing))) {
+		hr = enqueue_make_resident(*resource, &value, timing);
 		if (SUCCEEDED(hr)) {
 			if (residency)
 				*residency = value;
@@ -1133,8 +1171,14 @@ HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource *
 		*resource = NULL;
 	}
 
-	return shim.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, desc,
-			D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(resource));
+	return create_committed_default_resource(heap, D3D12_HEAP_FLAG_NONE, desc, resource, timing);
+}
+
+HRESULT Dx12ShimCreateResidentSpare(const D3D12_RESOURCE_DESC &desc, ID3D12Resource **resource)
+{
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	return create_committed_default_resource(heap, D3D12_HEAP_FLAG_NONE, &desc, resource, nullptr);
 }
 
 // Every use of an evicted resource is recorded after this and executed by a
@@ -1486,6 +1530,10 @@ bool Dx12ShimUseOnGameList(ShimResource *resource, Dx12GraphicsCommandList *list
 
 	if (Dx12ShimPin(list, resource->resource))
 		game_uses[resource->resource]++;
+	if (resource->prepare_spares_on_pin) {
+		resource->prepare_spares_on_pin = false;
+		ModLoadDx12SpareBuffer(resource->desc, resource->allocated, false);
+	}
 	return true;
 }
 

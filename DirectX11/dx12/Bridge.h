@@ -202,13 +202,23 @@ bool Dx12ShimUseResource(ShimResource *resource);
 // Adds a resource with memory of its own to those that may be evicted, or
 // takes it away
 void Dx12ShimTrackResidency(ShimResource *resource, bool tracked);
+struct Dx12ResourceCreationTiming {
+	INT64 create_ticks = 0;
+	INT64 residency_lock_ticks = 0;
+	INT64 residency_request_ticks = 0;
+	unsigned create_calls = 0;
+	bool residency_requested = false;
+};
+
 // A committed resource of the default heap in the common state, which may
 // only become resident on the GPU's time: whatever executes it on a queue
 // calls Dx12ShimResidencyWait for that queue first. A list of the game can
 // only use it with a pin on it (Dx12ShimPin), so only those wait. Given
 // residency, the value to wait for is returned there and the caller passes it
 // to Dx12ShimNeedResidency before recording a use; otherwise that is done here.
-HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource, UINT64 *residency);
+HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource,
+		UINT64 *residency, Dx12ResourceCreationTiming *timing = nullptr);
+HRESULT Dx12ShimCreateResidentSpare(const D3D12_RESOURCE_DESC &desc, ID3D12Resource **resource);
 void Dx12ShimNeedResidency(UINT64 value);
 void Dx12ShimResidencyWait(ID3D12CommandQueue *queue);
 // For a resource of the game that a list of ours is about to read, see

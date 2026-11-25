@@ -57,6 +57,7 @@ public:
 	~Dx12StagingScope();
 };
 bool Dx12IsShimDevice(ID3D11Device *device);
+bool Dx12ShimBufferDesc(const D3D11_BUFFER_DESC &buffer, D3D12_RESOURCE_DESC *desc);
 // With the shim lock held. Returns whether the resource is ready to publish.
 // Allow an indivisible copy larger than the budget only to make progress in
 // a frame that has recorded no staged copies yet.

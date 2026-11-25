@@ -31,6 +31,8 @@
 class CustomResource;
 struct ModLoad;
 struct PresentLoad;
+struct D3D12_RESOURCE_DESC;
+struct ID3D12Resource;
 
 enum ModLoadState : LONG {
 	// Being given its resource, by Substantiate() or at present
@@ -45,6 +47,7 @@ enum ModLoadState : LONG {
 struct ModLoad
 {
 	std::atomic<bool> present_pending{false};
+	bool has_present_spares = false;
 	// The first epoch whose draws no longer wait for the mod, or 0
 	std::atomic<unsigned> complete_from{0};
 	// The variables its branches go by, with their bits when it was last
@@ -72,7 +75,10 @@ unsigned ModLoadEpoch();
 
 bool ModLoadCheck(ModLoad *load, unsigned epoch, ID3D11Device *device);
 void ModLoadQueuePresent(ModLoad *load, ID3D11Device *device);
+void ModLoadRefreshPresentSpares(ModLoad *load, ID3D11Device *device);
 bool ModLoadPresentReady(const PresentLoad *load, ID3D11Device *device);
+ID3D12Resource* ModLoadDx12SpareBuffer(const D3D12_RESOURCE_DESC &desc, UINT64 allocated, bool take);
+UINT64 ModLoadSetDx12SparePressure(bool pressured);
 
 // Whether the command lists that wait for load may run in a draw of epoch.
 // Starts loading what they need if they may not.

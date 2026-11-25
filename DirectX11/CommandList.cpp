@@ -189,6 +189,7 @@ static void _RunCommandList(CommandList *command_list, CommandListState *state, 
 
 	for (i = command_list->commands.begin(); i < command_list->commands.end() && !state->aborted; i++) {
 		profile_command_list_cmd_start(i->get(), &profiling_state);
+		Profiling::Spike::CommandScope spike_command(Profiling::Spike::threshold && dx12_shim, (*i)->ini_line.c_str());
 		if ((*i)->leaves_bindings_alone) {
 			(*i)->run(state);
 		} else if ((*i)->binds_known_slots) {
@@ -782,8 +783,10 @@ static bool ParseCheckTextureOverride(const wchar_t *section,
 		// checked custom resource:
 		if (operation->target.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
 			CustomResource* checked = operation->target.GetCustomResource(nullptr);
-			if (checked)
+			if (checked) {
 				checked->written_by_command_list = true;
+				checked->command_list_assignments++;
+			}
 		}
 
 		// If the user indicated an explicit command list we will run the pre
@@ -1593,6 +1596,8 @@ static inline bool texture_override_loaded(CommandListState *state, TextureOverr
 		return true;
 	if (load->present_pending.load(std::memory_order_relaxed))
 		ModLoadQueuePresent(load, state->mOrigDevice1);
+	if (load->has_present_spares)
+		ModLoadRefreshPresentSpares(load, state->mOrigDevice1);
 	if (info) {
 		for (unsigned i = 0; i < info->load_verdict_count; i++) {
 			if (info->load_verdicts[i].load == load)
@@ -8192,6 +8197,16 @@ void CustomResource::BufferDesc(D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_
 	OverrideBufferDesc(desc);
 }
 
+bool CustomResource::DeclaredTypedBuffer(D3D11_BUFFER_DESC *desc)
+{
+	if (command_list_assignments || override_type != CustomResourceType::BUFFER
+			|| override_format == (DXGI_FORMAT)-1 || override_format == DXGI_FORMAT_UNKNOWN
+			|| (!filename.empty() && override_byte_width <= 0 && override_array <= 0))
+		return false;
+	BufferDesc(bind_flags, misc_flags, (DWORD)initial_data_size, desc);
+	return desc->ByteWidth && !(desc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED);
+}
+
 // Smaller files are made with their contents, see CustomResourceFileLoad::may_defer_contents
 static const size_t deferred_contents_bytes = 8 << 20;
 
@@ -11263,8 +11278,10 @@ static CommandListCommand* parse_resource_copy_operation(
 
 	if (dst.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
 		CustomResource* dst_custom_resource = dst.GetCustomResource(nullptr);
-		if (dst_custom_resource)
+		if (dst_custom_resource) {
 			dst_custom_resource->written_by_command_list = true;
+			dst_custom_resource->command_list_assignments++;
+		}
 	}
 
 	ResourceCopyOperation* operation = new ResourceCopyOperation();

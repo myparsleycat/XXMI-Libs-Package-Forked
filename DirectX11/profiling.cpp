@@ -1,6 +1,7 @@
 #include "profiling.h"
 #include "globals.h"
 #include "ModLoading.h"
+#include "dx12/Bridge.h"
 
 #include <algorithm>
 #include <atomic>
@@ -556,6 +557,7 @@ namespace Profiling {
 		const wchar_t *reason_names[NUM_REASONS];
 		volatile LONG reason_counts[NUM_REASONS];
 		thread_local UINT32 sample_state;
+		thread_local const wchar_t *command_line;
 	}
 }
 
@@ -698,6 +700,18 @@ static vector<SpikeEvent> spike_events;
 static unsigned spike_events_dropped;
 static SRWLOCK spike_events_lock = SRWLOCK_INIT;
 
+struct Dx12SpareEvent {
+	SYSTEMTIME time;
+	const wchar_t *event;
+	UINT64 id;
+	UINT64 width;
+	UINT flags;
+	const wchar_t *status;
+	wstring mod;
+};
+static vector<Dx12SpareEvent> dx12_spare_events;
+static unsigned dx12_spare_events_dropped;
+
 static FILE *spike_log;
 static INT64 spike_freq;
 static INT64 spike_event_min;
@@ -798,6 +812,7 @@ void Profiling::Spike::init(float threshold_ms, float relative, bool detail, con
 			L"  Included in the above: parts of those times worth singling out\n"
 			L"  Other threads: ran concurrently, only matters if the render thread waited on it\n"
 			L"  Slowest operations: individual operations that took at least 1ms\n"
+			L"  DX12 spare buffer events are logged even on frames below the spike threshold.\n"
 			L"  Nested measurements are inclusive; do not add them to their parent totals.\n"
 			L"  Byte counts describe work performed by that measurement, not GPU transfer bandwidth.\n"
 			L"  Mod state is sampled after frame actions and observed at the following Present.\n"
@@ -814,13 +829,8 @@ enable:
 	threshold = threshold_ms ? (INT64)((double)threshold_ms * freq.QuadPart / 1000.0) : INT64_MAX;
 }
 
-void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes)
+static bool spike_add_total(Category category, INT64 ticks, UINT64 bytes = 0)
 {
-	LARGE_INTEGER end;
-	wchar_t buf[32];
-
-	QueryPerformanceCounter(&end);
-	INT64 ticks = end.QuadPart - start;
 	bool other_thread = GetCurrentThreadId() != spike_present_thread.load(std::memory_order_relaxed);
 
 	SpikeTotal &total = spike_totals[category][other_thread];
@@ -828,7 +838,56 @@ void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, 
 	total.count.fetch_add(1, std::memory_order_relaxed);
 	if (bytes)
 		total.bytes.fetch_add(bytes, std::memory_order_relaxed);
+	return other_thread;
+}
 
+static void spike_add_event(SpikeEvent &&event)
+{
+	AcquireSRWLockExclusive(&spike_events_lock);
+	if (spike_events.size() < spike_max_events)
+		spike_events.push_back(std::move(event));
+	else
+		spike_events_dropped++;
+	ReleaseSRWLockExclusive(&spike_events_lock);
+}
+
+void Profiling::Spike::note_dx12_spare(const wchar_t *event, UINT64 id, UINT64 width, UINT flags,
+		const wchar_t *status, const wchar_t *mod)
+{
+	if (!threshold)
+		return;
+	Dx12SpareEvent entry = {{}, event, id, width, flags, status, mod ? mod : L""};
+	GetLocalTime(&entry.time);
+	AcquireSRWLockExclusive(&spike_events_lock);
+	if (dx12_spare_events.size() < 256)
+		dx12_spare_events.push_back(std::move(entry));
+	else
+		dx12_spare_events_dropped++;
+	ReleaseSRWLockExclusive(&spike_events_lock);
+}
+
+static void spike_log_dx12_spares(const vector<Dx12SpareEvent> &events, unsigned dropped)
+{
+	for (const auto &entry : events) {
+		const auto &time = entry.time;
+		fwprintf(spike_log, L"[%02u:%02u:%02u.%03u] DX12 spare buffer: %ls id=%llu width=0x%llx flags=0x%x status=%ls%ls%ls\n",
+				time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, entry.event, entry.id, entry.width,
+				entry.flags, entry.status, entry.mod.empty() ? L"" : L" mod=", entry.mod.c_str());
+	}
+	if (dropped)
+		fwprintf(spike_log, L"DX12 spare buffer: dropped %u events\n", dropped);
+	if (!events.empty() || dropped)
+		fflush(spike_log);
+}
+
+void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes)
+{
+	LARGE_INTEGER end;
+	wchar_t buf[32];
+
+	QueryPerformanceCounter(&end);
+	INT64 ticks = end.QuadPart - start;
+	bool other_thread = spike_add_total(category, ticks, bytes);
 	if (!name || ticks < spike_event_min)
 		return;
 
@@ -837,13 +896,7 @@ void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, 
 		_snwprintf_s(buf, ARRAYSIZE(buf), _TRUNCATE, L" %016I64x", id);
 		event.name += buf;
 	}
-
-	AcquireSRWLockExclusive(&spike_events_lock);
-	if (spike_events.size() < spike_max_events)
-		spike_events.push_back(std::move(event));
-	else
-		spike_events_dropped++;
-	ReleaseSRWLockExclusive(&spike_events_lock);
+	spike_add_event(std::move(event));
 }
 
 void Profiling::Spike::add_sampled(Category category, INT64 ticks)
@@ -886,6 +939,38 @@ void Profiling::Spike::SelfTime::end()
 static double spike_ms(INT64 ticks)
 {
 	return ticks * 1000.0 / spike_freq;
+}
+
+void Profiling::Spike::add_dx12_rename(INT64 start, UINT64 width, bool keep_contents, bool succeeded,
+		size_t spares_before, size_t busy_spares_checked, bool prepared_spare, const Dx12ResourceCreationTiming &creation)
+{
+	LARGE_INTEGER end;
+	wchar_t details[320];
+
+	QueryPerformanceCounter(&end);
+	INT64 ticks = end.QuadPart - start;
+	bool other_thread = spike_add_total(DX12_RENAME, ticks);
+	if (ticks < spike_event_min)
+		return;
+
+	bool spare_reused = busy_spares_checked < spares_before;
+	const wchar_t *spare_status = spare_reused ? L"reused" : spares_before ? L"all_busy" : L"empty";
+	_snwprintf_s(details, ARRAYSIZE(details), _TRUNCATE,
+			L"bytes or texels wide %016I64x, spare_reused=%ls, spare_status=%ls, spares_before=%Iu, "
+			L"busy_spares_checked=%Iu, prepared_spare=%ls, keep_contents=%ls, result=%ls",
+			width, spare_reused ? L"yes" : L"no", spare_status, spares_before, busy_spares_checked,
+			prepared_spare ? L"yes" : L"no", keep_contents ? L"yes" : L"no", succeeded ? L"success" : L"failed");
+	SpikeEvent event = {DX12_RENAME, other_thread, ticks, details};
+	if (creation.create_calls) {
+		_snwprintf_s(details, ARRAYSIZE(details), _TRUNCATE,
+				L", CreateCommittedResource=%.3fms (x%u), residency_lock_wait=%.3fms, EnqueueMakeResident=%.3fms (requested=%ls)",
+				spike_ms(creation.create_ticks), creation.create_calls, spike_ms(creation.residency_lock_ticks),
+				spike_ms(creation.residency_request_ticks), creation.residency_requested ? L"yes" : L"no");
+		event.name += details;
+	}
+	event.name += L", ini=";
+	event.name += command_line ? command_line : L"<outside command list>";
+	spike_add_event(std::move(event));
 }
 
 static void spike_log_totals(const wchar_t *heading, INT64 ticks[][2], unsigned count[][2], UINT64 bytes[][2],
@@ -975,7 +1060,9 @@ void Profiling::Spike::frame(bool mods_disabled)
 	unsigned counters[ARRAYSIZE(spike_counters)];
 	LONG reasons[NUM_REASONS];
 	vector<SpikeEvent> events;
+	vector<Dx12SpareEvent> spares;
 	unsigned events_dropped;
+	unsigned spares_dropped;
 	LARGE_INTEGER now;
 	SYSTEMTIME time;
 
@@ -1013,7 +1100,12 @@ void Profiling::Spike::frame(bool mods_disabled)
 	events.swap(spike_events);
 	events_dropped = spike_events_dropped;
 	spike_events_dropped = 0;
+	spares.swap(dx12_spare_events);
+	spares_dropped = dx12_spare_events_dropped;
+	dx12_spare_events_dropped = 0;
 	ReleaseSRWLockExclusive(&spike_events_lock);
+
+	spike_log_dx12_spares(spares, spares_dropped);
 
 	if (!spike_mod_state_logged || mods_disabled != spike_mods_disabled ||
 		mod_state != spike_window_mod_state || shim_disabled != spike_window_shim_disabled) {

@@ -14,6 +14,8 @@
 // Prints the median frame time of the frames after the first 300.
 //   dump=file.bmp  the last frame as a picture and its checksum
 //   capture=N,...  report pictures at these zero-based frames without BMP files
+//   pause=N,MS  pause before recording frame N and report when drawing resumes
+//   min-ms=MS   keep drawing for at least MS milliseconds
 //   key=VK         a key press the shim sees at frame keyframe
 //   uploads, churn the buffers handed out from the upload ring each frame
 //   table=N        SRVs in the pixel shaders' table; heap=N its shader visible heap
@@ -1377,6 +1379,7 @@ static void report_appearances()
 int main(int argc, char **argv)
 {
 	UINT frame_count = 3000, mesh_count = 350, passes = 3, key = 0, key_frame = 0;
+	UINT pause_frame = 0, pause_ms = 0, min_ms = 0;
 	bool load_dll = true, profile = false, profile_present = false, threaded = false, debug = false, gpu_debug = false, dump_sampler = false, probe_converter = false;
 	const char *dump = NULL;
 	std::vector<UINT> capture_frames;
@@ -1396,6 +1399,7 @@ int main(int argc, char **argv)
 
 	for (int a = 1; a < argc; a++) {
 		if (!strncmp(argv[a], "frames=", 7)) frame_count = atoi(argv[a] + 7);
+		else if (!strncmp(argv[a], "min-ms=", 7)) min_ms = strtoul(argv[a] + 7, NULL, 10);
 		else if (!strncmp(argv[a], "meshes=", 7)) mesh_count = atoi(argv[a] + 7);
 		else if (!strcmp(argv[a], "slot=vb0")) scene_on_vb0 = true;
 		else if (!strncmp(argv[a], "scene=", 6)) {
@@ -1418,6 +1422,13 @@ int main(int argc, char **argv)
 		}
 		else if (!strncmp(argv[a], "passes=", 7)) passes = atoi(argv[a] + 7);
 		else if (!strncmp(argv[a], "dump=", 5)) dump = argv[a] + 5;
+		else if (!strncmp(argv[a], "pause=", 6)) {
+			char extra;
+			if (sscanf(argv[a] + 6, "%u,%u%c", &pause_frame, &pause_ms, &extra) != 2 || !pause_ms) {
+				printf("invalid pause: %s\n", argv[a] + 6);
+				return 1;
+			}
+		}
 		else if (!strncmp(argv[a], "capture=", 8)) {
 			const char *at = argv[a] + 8;
 			for (;;) {
@@ -1704,6 +1715,14 @@ int main(int argc, char **argv)
 	LARGE_INTEGER previous_end;
 	QueryPerformanceCounter(&previous_end);
 	for (f = 0; f < frame_count; f++) {
+		if (f + 1 == frame_count && previous_end.QuadPart - start.QuadPart < freq.QuadPart * min_ms / 1000)
+			frame_count++;
+		if (pause_ms && f == pause_frame) {
+			Sleep(pause_ms);
+			SYSTEMTIME time;
+			GetLocalTime(&time);
+			printf("resumed [%02u:%02u:%02u.%03u]\n", time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+		}
 		int in_window = appear_frames && f >= 300 ? (int)((f - 300) % appear_frames) : -1;
 		visible_group = appear_frames && f >= 300 ? (int)((f - 300) / appear_frames) % appear_groups : -1;
 		if (appear_frames && profile)

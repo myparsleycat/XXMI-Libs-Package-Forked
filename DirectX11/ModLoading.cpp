@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <wrl/client.h>
 
 #include "globals.h"
 #include "CommandList.h"
@@ -60,6 +61,7 @@ struct LoadNode
 	std::vector<Resource> resources;
 	// Sections that load on use, whose files are read ahead
 	std::vector<CustomResource*> warm;
+	std::vector<ResourceCopyOperation*> buffer_copies;
 	std::vector<LoadNode*> children;
 	std::vector<Branch> branches;
 
@@ -88,6 +90,9 @@ struct ModLoadImpl : ModLoad
 	std::vector<CustomResource*> warm;
 	std::atomic<bool> warm_queued{false};
 	std::vector<const PresentLoad*> present_initializers;
+	std::vector<D3D12_RESOURCE_DESC> present_spares;
+	std::atomic<unsigned> present_spares_frame{0};
+	std::chrono::steady_clock::time_point present_spares_seen;
 	std::vector<const float*> var_list;
 	std::unique_ptr<std::atomic<uint32_t>[]> var_seen;
 	// epoch << 1 | allowed, for the draws of an epoch to agree
@@ -161,11 +166,103 @@ std::list<std::unique_ptr<Job>> waited;
 std::list<std::unique_ptr<Job>> warming;
 std::unordered_set<CustomResource*> warmed;
 std::vector<std::unique_ptr<Job>> finished;
+
+using SpareClock = std::chrono::steady_clock;
+
+struct SpareBuffer {
+	D3D12_RESOURCE_DESC desc;
+	UINT64 bytes;
+	SpareClock::time_point expires;
+	UINT64 id;
+	Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+	bool creating = false;
+	bool first_match;
+	SpareClock::time_point retry_after = (SpareClock::time_point::min)();
+	SpareClock::time_point keep_until = (SpareClock::time_point::min)();
+};
+
+struct PresentSpareState {
+	D3D12_RESOURCE_DESC desc;
+	bool deferred = false;
+};
+
+struct DeferredPresentSpare {
+	PresentSpareState *state;
+	UINT64 bytes;
+	std::wstring mod;
+	bool redetection;
+};
+
+struct SpareRequestResult {
+	ID3D12Resource *resource;
+	bool at_capacity;
+};
+
+// Never destroyed: a static destructor would release D3D12 resources under
+// the loader lock at process exit.
+std::list<SpareBuffer> &spare_buffers = *new std::list<SpareBuffer>;
+std::deque<PresentSpareState> present_spare_states;
+std::list<DeferredPresentSpare> deferred_present_spares;
+uint64_t present_spare_epoch = 1;
+uint64_t deferred_present_spares_checked;
+UINT64 spare_buffer_bytes;
+UINT64 spare_buffer_id;
+bool spare_memory_pressure;
+const size_t SPARE_BUFFER_LIMIT = 32;
+const unsigned SPARES_PER_DESC = 2;
+const UINT64 SPARE_BUFFER_BUDGET = 32ull << 20;
+const UINT64 SPARE_BUFFER_MAX_SIZE = 8ull << 20;
+const auto SPARE_BUFFER_IDLE = std::chrono::seconds(5);
+const auto SPARE_BUFFER_RETRY_DELAY = std::chrono::seconds(1);
+
+void note_spare(const SpareBuffer &spare, const wchar_t *event, const wchar_t *status, const wchar_t *mod = nullptr)
+{
+	Profiling::Spike::note_dx12_spare(event, spare.id, spare.desc.Width, spare.desc.Flags, status, mod);
+}
+
+bool same_buffer_desc(const D3D12_RESOURCE_DESC &a, const D3D12_RESOURCE_DESC &b)
+{
+	// GetDesc reports the resolved alignment for buffers created with the default.
+	const UINT64 alignment_a = a.Alignment ? a.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+	const UINT64 alignment_b = b.Alignment ? b.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+	return a.Dimension == b.Dimension && alignment_a == alignment_b && a.Width == b.Width && a.Height == b.Height
+		&& a.DepthOrArraySize == b.DepthOrArraySize && a.MipLevels == b.MipLevels && a.Format == b.Format
+		&& a.SampleDesc.Count == b.SampleDesc.Count && a.SampleDesc.Quality == b.SampleDesc.Quality
+		&& a.Layout == b.Layout && a.Flags == b.Flags;
+}
+
+auto find_present_spare_state(const D3D12_RESOURCE_DESC &desc)
+{
+	return std::find_if(present_spare_states.begin(), present_spare_states.end(),
+			[&](const PresentSpareState &entry) { return same_buffer_desc(entry.desc, desc); });
+}
+
+void discard_spare(std::list<SpareBuffer>::iterator spare, std::list<SpareBuffer> &discarded, const wchar_t *reason)
+{
+	note_spare(*spare, spare->resource ? L"expired" : L"cancelled", reason);
+	spare_buffer_bytes -= spare->bytes;
+	discarded.splice(discarded.end(), spare_buffers, spare);
+	present_spare_epoch++;
+}
+
+void keep_ready_spares(const D3D12_RESOURCE_DESC &desc, SpareClock::time_point expires)
+{
+	for (auto &entry : spare_buffers) {
+		if (entry.resource && same_buffer_desc(entry.desc, desc))
+			entry.keep_until = expires;
+	}
+}
+
+std::list<SpareBuffer>::iterator pending_spare_buffer(SpareClock::time_point now)
+{
+	return std::find_if(spare_buffers.begin(), spare_buffers.end(), [now](const SpareBuffer &entry) {
+		return !entry.creating && !entry.resource && entry.retry_after <= now;
+	});
+}
 // Loaded, waiting for a present with commit budget left, oldest first. Only
 // the presenting thread uses it.
 std::vector<std::unique_ptr<Job>> to_commit;
 bool worker_running;
-HMODULE worker_module;
 
 std::atomic<unsigned> stat_queued, stat_loaded, stat_loaded_on_use, stat_held;
 std::atomic<LONGLONG> last_game_creation{0};
@@ -199,7 +296,7 @@ Job::~Job()
 std::atomic<uint64_t> stat_load_us;
 
 // The loader thread exits after this long without work
-const DWORD WORKER_IDLE_MS = 10000;
+const auto WORKER_IDLE = std::chrono::seconds(10);
 
 // Whether the value of a condition is known now, in *ret
 bool evaluate(const Cond *cond, float *ret)
@@ -251,7 +348,8 @@ public:
 		std::vector<const float*> vars;
 		std::unordered_set<CustomResource*> unique;
 	};
-	void collect(LoadNode *node, std::unordered_set<LoadNode*> *seen, Collected *out);
+	void collect(LoadNode *node, std::unordered_set<LoadNode*> *seen, Collected *out,
+			std::vector<ResourceCopyOperation*> *buffer_copies = nullptr);
 	void check_predictions();
 	const Cond* if_condition(IfCommand *branch) const;
 	std::unordered_set<CustomResource*> unpredictable;
@@ -324,6 +422,15 @@ static CustomResource* file_resource(const ResourceCopyTarget &target)
 	return resource;
 }
 
+static CustomResource* static_copy_resource(const ResourceCopyTarget &target)
+{
+	if (target.type != ResourceCopyTargetType::CUSTOM_RESOURCE || target.custom_resource_pool
+			|| target.evaluation_mode != ResourceCopyTargetEvaluationMode::RESOURCE)
+		return nullptr;
+	auto *resource = target.StaticCustomResource();
+	return resource && !resource->pool && resource->pool_index == -2 ? resource : nullptr;
+}
+
 void Builder::target(const ResourceCopyTarget &target, LoadNode *node)
 {
 	if (CustomResource *resource = file_resource(target))
@@ -347,6 +454,11 @@ void Builder::copy(ResourceCopyOperation *op, LoadNode *node)
 	CustomResource *resource = file_resource(op->src);
 	D3D11_RESOURCE_MISC_FLAG misc_flags = (D3D11_RESOURCE_MISC_FLAG)0;
 	D3D11_BIND_FLAG bind_flags;
+
+	if (((unsigned)op->options & (unsigned)ResourceCopyOptions::COPY_TYPE_MASK) == (unsigned)ResourceCopyOptions::COPY
+			&& !(op->options & ResourceCopyOptions::MONO)
+			&& static_copy_resource(op->src) && static_copy_resource(op->dst))
+		node->buffer_copies.push_back(op);
 
 	if (!resource)
 		return;
@@ -563,24 +675,30 @@ void Builder::variables(const Cond *cond, std::vector<const float*> *vars)
 	variables(cond->rhs, vars);
 }
 
-void Builder::collect(LoadNode *node, std::unordered_set<LoadNode*> *seen, Collected *out)
+void Builder::collect(LoadNode *node, std::unordered_set<LoadNode*> *seen, Collected *out,
+		std::vector<ResourceCopyOperation*> *buffer_copies)
 {
 	if (!node || !seen->insert(node).second)
 		return;
-	for (auto &entry : node->resources) {
-		if (out->unique.insert(entry.resource).second)
-			out->sections.push_back(entry);
-	}
-	for (CustomResource *resource : node->warm) {
-		if (out->unique.insert(resource).second)
-			out->warm.push_back(resource);
+	if (buffer_copies)
+		buffer_copies->insert(buffer_copies->end(), node->buffer_copies.begin(), node->buffer_copies.end());
+	if (out) {
+		for (auto &entry : node->resources) {
+			if (out->unique.insert(entry.resource).second)
+				out->sections.push_back(entry);
+		}
+		for (CustomResource *resource : node->warm) {
+			if (out->unique.insert(resource).second)
+				out->warm.push_back(resource);
+		}
 	}
 	for (LoadNode *child : node->children)
-		collect(child, seen, out);
+		collect(child, seen, out, buffer_copies);
 	for (auto &branch : node->branches) {
-		variables(branch.condition, &out->vars);
-		collect(branch.if_true, seen, out);
-		collect(branch.if_false, seen, out);
+		if (out)
+			variables(branch.condition, &out->vars);
+		collect(branch.if_true, seen, out, buffer_copies);
+		collect(branch.if_false, seen, out, buffer_copies);
 	}
 }
 
@@ -816,6 +934,118 @@ bool activation_loads(const Cond *cond, const ActivationLoads &activations,
 	return lhs || rhs;
 }
 
+std::vector<D3D12_RESOURCE_DESC> predict_present_spares(std::vector<ResourceCopyOperation*> copies)
+{
+	struct Buffer {
+		UINT bytes;
+		DXGI_FORMAT format;
+	};
+	std::unordered_map<CustomResource*, Buffer> sources;
+	for (auto *copy : copies) {
+		auto *src = copy->src.StaticCustomResource();
+		D3D11_BUFFER_DESC desc;
+		if (src->DeclaredTypedBuffer(&desc))
+			sources.emplace(src, Buffer{desc.ByteWidth, src->override_format});
+	}
+
+	// A full copy of a typed buffer retains its byte width unless the
+	// destination overrides it. A single assignment can feed another copy.
+	std::vector<D3D12_RESOURCE_DESC> spares;
+	size_t previous_sources;
+	do {
+		previous_sources = sources.size();
+		copies.erase(std::remove_if(copies.begin(), copies.end(), [&](ResourceCopyOperation *copy) {
+			auto src = sources.find(copy->src.StaticCustomResource());
+			if (src == sources.end())
+				return false;
+
+			auto *dst = copy->dst.StaticCustomResource();
+			D3D11_RESOURCE_MISC_FLAG misc_flags;
+			D3D11_BUFFER_DESC desc = {};
+			desc.Usage = D3D11_USAGE_DEFAULT;
+			desc.ByteWidth = src->second.bytes;
+			desc.BindFlags = copy->dst.BindFlags(nullptr, &misc_flags);
+			desc.MiscFlags = misc_flags;
+			DXGI_FORMAT format = src->second.format;
+			UINT stride = 0;
+			dst->OverrideOutOfBandInfo(&format, &stride);
+			if (format == DXGI_FORMAT_UNKNOWN || (desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER))
+				return true;
+			dst->OverrideBufferDesc(&desc);
+			if (!desc.ByteWidth)
+				return true;
+			if (dst->command_list_assignments == 1 && dst->filename.empty()
+					&& dst->override_type == CustomResourceType::INVALID
+					&& !(desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED))
+				sources.emplace(dst, Buffer{desc.ByteWidth, format});
+
+			D3D12_RESOURCE_DESC spare;
+			if (Dx12ShimBufferDesc(desc, &spare))
+				spares.push_back(spare);
+			return true;
+		}), copies.end());
+	} while (sources.size() != previous_sources && !copies.empty());
+	return spares;
+}
+
+template<typename Visit>
+void visit_present_branches(CommandList *list, bool post,
+		std::array<std::unordered_set<CommandList*>, 2> &visited, const Visit &descend_true)
+{
+	list = list->ResolveCommandList();
+	if (!visited[post].insert(list).second)
+		return;
+
+	for (auto &command : list->commands) {
+		if (auto *branch = dynamic_cast<IfCommand*>(command.get())) {
+			if (descend_true(branch, post))
+				visit_present_branches(post ? branch->true_commands_post.get() : branch->true_commands_pre.get(),
+						post, visited, descend_true);
+			visit_present_branches(post ? branch->false_commands_post.get() : branch->false_commands_pre.get(),
+					post, visited, descend_true);
+		} else if (auto *run = dynamic_cast<RunExplicitCommandList*>(command.get())) {
+			if (!run->command_list_section)
+				continue;
+			if (!post || run->run_pre_and_post_together)
+				visit_present_branches(&run->command_list_section->command_list, false, visited, descend_true);
+			if (post || run->run_pre_and_post_together)
+				visit_present_branches(&run->command_list_section->post_command_list, true, visited, descend_true);
+		}
+	}
+}
+
+template<typename Visit>
+void visit_present_branches(const Visit &descend_true)
+{
+	std::array<std::unordered_set<CommandList*>, 2> visited;
+	visit_present_branches(&G->present_command_list, false, visited, descend_true);
+	visit_present_branches(&G->post_present_command_list, true, visited, descend_true);
+}
+
+bool collect_present_spares(IfCommand *branch, Builder &builder, const ActivationLoads &activations)
+{
+	std::vector<ModLoadImpl*> owners;
+	const Cond *condition = builder.if_condition(branch);
+	if (!condition || !activation_loads(condition, activations, &owners))
+		return true;
+
+	std::unordered_set<LoadNode*> seen;
+	std::vector<ResourceCopyOperation*> copies;
+	builder.collect(builder.list(branch->true_commands_pre.get()), &seen, nullptr, &copies);
+	builder.collect(builder.list(branch->true_commands_post.get()), &seen, nullptr, &copies);
+	auto spares = predict_present_spares(std::move(copies));
+	for (auto *owner : owners) {
+		for (const auto &spare : spares) {
+			auto &existing = owner->present_spares;
+			if (std::none_of(existing.begin(), existing.end(), [&](const D3D12_RESOURCE_DESC &other) {
+				return same_buffer_desc(spare, other);
+			}))
+				existing.push_back(spare);
+		}
+	}
+	return false;
+}
+
 bool initialization_latch(const Cond *cond, const CommandListVariable *var)
 {
 	if (cond->kind == Cond::AND)
@@ -850,39 +1080,32 @@ bool present_initializer(IfCommand *branch, const Cond *condition)
 	return true;
 }
 
-void collect_present_loads(CommandList *list, Builder &builder, const ActivationLoads &activations)
+bool collect_present_loads(IfCommand *branch, Builder &builder, const ActivationLoads &activations)
 {
-	for (auto &command : list->ResolveCommandList()->commands) {
-		auto *branch = dynamic_cast<IfCommand*>(command.get());
-		if (!branch)
-			continue;
+	std::vector<ModLoadImpl*> owners;
+	const Cond *condition = builder.if_condition(branch);
+	if (!condition || !activation_loads(condition, activations, &owners) || !present_initializer(branch, condition))
+		return true;
 
-		std::vector<ModLoadImpl*> owners;
-		const Cond *condition = builder.if_condition(branch);
-		if (condition && activation_loads(condition, activations, &owners) && present_initializer(branch, condition)) {
-			std::unordered_set<LoadNode*> seen;
-			Builder::Collected collected;
-			builder.collect(builder.list(branch->true_commands_pre.get()), &seen, &collected);
-			if (!collected.sections.empty()) {
-				auto load = std::make_unique<PresentLoad>();
-				load->files = std::move(collected.sections);
-				load->warm = std::move(collected.warm);
-				branch->present_load = load.get();
-				for (auto *owner : owners) {
-					auto &initializers = owner->present_initializers;
-					if (std::find(initializers.begin(), initializers.end(), load.get()) == initializers.end())
-						initializers.push_back(load.get());
-					owner->present_pending.store(true, std::memory_order_relaxed);
-				}
-				for (auto &entry : load->files)
-					entry.resource->load_reach = REACH_MOD;
-				present_loads.push_back(std::move(load));
-			}
-		} else {
-			collect_present_loads(branch->true_commands_pre.get(), builder, activations);
+	std::unordered_set<LoadNode*> seen;
+	Builder::Collected collected;
+	builder.collect(builder.list(branch->true_commands_pre.get()), &seen, &collected);
+	if (!collected.sections.empty() && !branch->present_load) {
+		auto load = std::make_unique<PresentLoad>();
+		load->files = std::move(collected.sections);
+		load->warm = std::move(collected.warm);
+		branch->present_load = load.get();
+		for (auto *owner : owners) {
+			auto &initializers = owner->present_initializers;
+			if (std::find(initializers.begin(), initializers.end(), load.get()) == initializers.end())
+				initializers.push_back(load.get());
+			owner->present_pending.store(true, std::memory_order_relaxed);
 		}
-		collect_present_loads(branch->false_commands_pre.get(), builder, activations);
+		for (auto &entry : load->files)
+			entry.resource->load_reach = REACH_MOD;
+		present_loads.push_back(std::move(load));
 	}
+	return false;
 }
 
 // Builds the waits of the current config
@@ -957,6 +1180,28 @@ void build()
 		}
 	}
 
+	ActivationLoads activations;
+	// Match the resolved addresses so [Present] in another INI can use them.
+	for (auto &entry : by_namespace) {
+		for (const wchar_t *name : {L"object_detected", L"mod_enabled"}) {
+			auto found = command_list_globals.find(L"$\\" + entry.first + L"\\" + name);
+			if (found != command_list_globals.end())
+				activations.emplace(&found->second.fval, entry.second);
+		}
+	}
+	if (!activations.empty())
+		visit_present_branches([&](IfCommand *branch, bool) { return collect_present_spares(branch, builder, activations); });
+	{
+		std::lock_guard<std::mutex> lock(queue_lock);
+		for (auto &load : loads) {
+			load->has_present_spares = !load->present_spares.empty();
+			for (const auto &spare : load->present_spares) {
+				if (find_present_spare_state(spare) == present_spare_states.end())
+					present_spare_states.push_back({spare});
+			}
+		}
+	}
+
 	prune();
 
 	for (auto &load : loads) {
@@ -984,18 +1229,8 @@ void build()
 		}
 	}
 
-	ActivationLoads activations;
-	// WWMI's registration and detection variables are namespaced globals.
-	// Match their resolved addresses so a [Present] in another INI can use them.
-	for (auto &entry : by_namespace) {
-		for (const wchar_t *name : {L"object_detected", L"mod_enabled"}) {
-			auto found = command_list_globals.find(L"$\\" + entry.first + L"\\" + name);
-			if (found != command_list_globals.end())
-				activations.emplace(&found->second.fval, entry.second);
-		}
-	}
 	if (!activations.empty())
-		collect_present_loads(&G->present_command_list, builder, activations);
+		visit_present_branches([&](IfCommand *branch, bool post) { return post || collect_present_loads(branch, builder, activations); });
 	LogInfo("Mod loading: %Iu [Present] initialization branches wait for files\n", present_loads.size());
 
 	unsigned config_sections = 0;
@@ -1025,6 +1260,7 @@ DWORD WINAPI worker_thread(LPVOID);
 void start_worker()
 {
 	HANDLE thread;
+	HMODULE worker_module;
 
 	if (worker_running)
 		return;
@@ -1033,7 +1269,7 @@ void start_worker()
 	// unload cannot unmap the code it is running
 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&worker_thread, &worker_module))
 		return;
-	thread = CreateThread(NULL, 0, worker_thread, NULL, 0, NULL);
+	thread = CreateThread(NULL, 0, worker_thread, worker_module, 0, NULL);
 	if (!thread) {
 		FreeLibrary(worker_module);
 		return;
@@ -1237,25 +1473,95 @@ void wait_for_game_creation()
 
 void worker_loop()
 {
+	auto idle_until = SpareClock::now() + WORKER_IDLE;
+	// Spares and files read ahead take turns when both wait
+	bool spare_turn = true;
 	for (;;) {
 		std::unique_ptr<Job> job;
+		std::list<SpareBuffer> expired;
+		std::list<SpareBuffer>::iterator spare;
+		bool prepare_spare = false;
 
 		{
 			std::unique_lock<std::mutex> lock(queue_lock);
-			if (!queue_wake.wait_for(lock, std::chrono::milliseconds(WORKER_IDLE_MS), [] {
-					return (!waited.empty() || !warming.empty()) && upload_bytes.load() <= UPLOAD_BYTES_MAX; })) {
-				worker_running = false;
-				return;
+			const auto now = SpareClock::now();
+			const bool waiting_for_capacity = !deferred_present_spares.empty();
+			auto next_spare_event = (SpareClock::time_point::max)();
+			for (auto it = spare_buffers.begin(); it != spare_buffers.end();) {
+				auto entry = it++;
+				const auto expires = waiting_for_capacity ? entry->expires : (std::max)(entry->expires, entry->keep_until);
+				if (now < expires) {
+					next_spare_event = (std::min)(next_spare_event, expires);
+					if (!entry->resource)
+						next_spare_event = (std::min)(next_spare_event, entry->retry_after);
+					continue;
+				}
+				discard_spare(entry, expired, now < entry->keep_until ? L"capacity" : L"idle_timeout");
 			}
-			std::list<std::unique_ptr<Job>> *queue = !waited.empty() ? &waited : &warming;
 
-			job = std::move(queue->front());
-			queue->pop_front();
+			bool can_load = upload_bytes.load() <= UPLOAD_BYTES_MAX;
+			bool can_warm = can_load && !warming.empty();
+			spare = pending_spare_buffer(now);
+			if (can_load && !waited.empty()) {
+				job = std::move(waited.front());
+				waited.pop_front();
+			} else if (spare != spare_buffers.end() && (spare_turn || !can_warm)) {
+				spare->creating = prepare_spare = true;
+				spare_turn = false;
+			} else if (can_warm) {
+				job = std::move(warming.front());
+				warming.pop_front();
+				spare_turn = true;
+			} else if (expired.empty()) {
+				if (spare_buffers.empty() && now >= idle_until) {
+					worker_running = false;
+					return;
+				}
+				queue_wake.wait_until(lock, spare_buffers.empty() ? idle_until : next_spare_event);
+			}
 		}
+
+		expired.clear();
+		if (prepare_spare) {
+			Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+			const auto desc = spare->desc;
+			bool first_match = spare->first_match;
+			wait_for_game_creation();
+			{
+				Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, first_match
+						? L"preparing a [Present] replacement buffer on first match" : L"preparing a replacement buffer",
+						desc.Width);
+				Dx12ShimCreateResidentSpare(desc, buffer.GetAddressOf());
+			}
+			bool prepared = false;
+			{
+				std::lock_guard<std::mutex> lock(queue_lock);
+				spare->creating = false;
+				if (spare_memory_pressure) {
+					discard_spare(spare, expired, L"vram_pressure");
+				} else if (buffer) {
+					prepared = true;
+					spare->resource = std::move(buffer);
+					spare->expires = SpareClock::now() + SPARE_BUFFER_IDLE;
+					note_spare(*spare, L"ready", L"created");
+				} else {
+					note_spare(*spare, L"failed", L"create_resource");
+					spare->retry_after = SpareClock::now() + SPARE_BUFFER_RETRY_DELAY;
+				}
+			}
+			if (prepared && first_match)
+				LogInfo("DX12: prepared a [Present] replacement buffer on first match, width=%016I64x, flags=0x%x\n",
+						desc.Width, (unsigned)desc.Flags);
+			idle_until = SpareClock::now() + WORKER_IDLE;
+			continue;
+		}
+		if (!job)
+			continue;
 
 		if (!job->warm_only && G->async_resource_loading)
 			wait_for_game_creation();
 		run_job(job.get());
+		idle_until = SpareClock::now() + WORKER_IDLE;
 		if (job->warm_only)
 			continue;
 
@@ -1264,14 +1570,130 @@ void worker_loop()
 	}
 }
 
-DWORD WINAPI worker_thread(LPVOID)
+DWORD WINAPI worker_thread(LPVOID module)
 {
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 	worker_loop();
 	// Without unwinding: nothing here may still own memory
-	FreeLibraryAndExitThread(worker_module, 0);
+	FreeLibraryAndExitThread(static_cast<HMODULE>(module), 0);
 }
 
+}
+
+UINT64 ModLoadSetDx12SparePressure(bool pressured)
+{
+	std::list<SpareBuffer> discarded;
+	UINT64 released = 0;
+	{
+		std::lock_guard<std::mutex> lock(queue_lock);
+		if (spare_memory_pressure == pressured)
+			return 0;
+		spare_memory_pressure = pressured;
+		if (pressured) {
+			for (auto it = spare_buffers.begin(); it != spare_buffers.end();) {
+				auto entry = it++;
+				if (entry->creating)
+					continue;
+				if (entry->resource)
+					released += entry->bytes;
+				discard_spare(entry, discarded, L"vram_pressure");
+			}
+		} else {
+			present_spare_epoch++;
+		}
+	}
+	queue_wake.notify_one();
+	return released;
+}
+
+// With queue_lock held
+static SpareRequestResult request_spares(const D3D12_RESOURCE_DESC &desc, UINT64 allocated, bool take,
+		const wchar_t *mod = nullptr, bool redetection = false)
+{
+	if (!allocated || allocated > SPARE_BUFFER_MAX_SIZE) {
+		if (mod)
+			Profiling::Spike::note_dx12_spare(L"requested", 0, desc.Width, desc.Flags, L"size_limit", mod);
+		return {};
+	}
+	if (spare_memory_pressure) {
+		if (mod)
+			Profiling::Spike::note_dx12_spare(L"requested", 0, desc.Width, desc.Flags, L"vram_limit", mod);
+		return {nullptr, true};
+	}
+
+	ID3D12Resource *result = nullptr;
+	const UINT64 bytes_before = spare_buffer_bytes;
+	unsigned matching = 0;
+	const auto expires = SpareClock::now() + SPARE_BUFFER_IDLE;
+	for (auto it = spare_buffers.begin(); it != spare_buffers.end();) {
+		auto entry = it++;
+		if (!same_buffer_desc(entry->desc, desc))
+			continue;
+		if (take && !result && entry->resource) {
+			note_spare(*entry, L"consumed", L"replacement");
+			result = entry->resource.Detach();
+			spare_buffer_bytes -= entry->bytes;
+			spare_buffers.erase(entry);
+		} else {
+			if (mod)
+				note_spare(*entry, L"requested", entry->resource ? L"already_ready" :
+						entry->creating ? L"already_creating" : L"already_queued", mod);
+			if (result && entry->resource)
+				entry->expires = expires;
+			matching++;
+		}
+	}
+	bool queued = false;
+	const wchar_t *status = mod ? (redetection ? L"queued_redetection" : L"queued_first_match")
+			: (take ? L"queued_replacement" : L"queued_pin");
+	while (matching < SPARES_PER_DESC && spare_buffers.size() < SPARE_BUFFER_LIMIT
+			&& allocated <= SPARE_BUFFER_BUDGET - spare_buffer_bytes) {
+		spare_buffers.push_back({desc, allocated, expires, ++spare_buffer_id, {}, false, mod && !redetection});
+		note_spare(spare_buffers.back(), L"requested", status, mod);
+		spare_buffer_bytes += allocated;
+		matching++;
+		queued = true;
+	}
+	bool at_capacity = matching < SPARES_PER_DESC;
+	if (mod && at_capacity)
+		Profiling::Spike::note_dx12_spare(L"requested", 0, desc.Width, desc.Flags,
+				spare_buffers.size() >= SPARE_BUFFER_LIMIT ? L"slot_limit" : L"memory_limit", mod);
+	if (queued) {
+		start_worker();
+		queue_wake.notify_one();
+	}
+	if (result && (!queued || spare_buffer_bytes < bytes_before))
+		present_spare_epoch++;
+	return {result, at_capacity};
+}
+
+static void refill_deferred_present_spares()
+{
+	if (spare_memory_pressure || deferred_present_spares.empty() || deferred_present_spares_checked == present_spare_epoch)
+		return;
+	deferred_present_spares_checked = present_spare_epoch;
+
+	for (auto it = deferred_present_spares.begin();
+			it != deferred_present_spares.end() && spare_buffers.size() < SPARE_BUFFER_LIMIT;) {
+		const auto &entry = *it;
+		if (entry.bytes <= SPARE_BUFFER_BUDGET - spare_buffer_bytes
+				&& !request_spares(entry.state->desc, entry.bytes, false, entry.mod.c_str(), entry.redetection).at_capacity) {
+			entry.state->deferred = false;
+			it = deferred_present_spares.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+ID3D12Resource* ModLoadDx12SpareBuffer(const D3D12_RESOURCE_DESC &desc, UINT64 allocated, bool take)
+{
+	if (!G->async_resource_loading || G->analyse_frame || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+			|| !allocated || allocated > SPARE_BUFFER_MAX_SIZE)
+		return nullptr;
+	std::lock_guard<std::mutex> lock(queue_lock);
+	refill_deferred_present_spares();
+	return request_spares(desc, allocated, take).resource;
 }
 
 void ModLoadNoteGameCreation()
@@ -1327,6 +1749,40 @@ void ModLoadQueuePresent(ModLoad *base, ID3D11Device *device)
 			enqueue(entry, device);
 		for (auto *resource : present->warm)
 			enqueue_warm(resource, device);
+	}
+}
+
+void ModLoadRefreshPresentSpares(ModLoad *base, ID3D11Device *device)
+{
+	auto *load = static_cast<ModLoadImpl*>(base);
+	unsigned frame = ModLoadEpoch();
+	if (load->present_spares_frame.load(std::memory_order_relaxed) == frame
+			|| !G->async_resource_loading || G->analyse_frame || !device || !Dx12IsShimDevice(device))
+		return;
+
+	std::lock_guard<std::mutex> lock(queue_lock);
+	if (load->present_spares_frame.exchange(frame, std::memory_order_relaxed) == frame)
+		return;
+
+	const auto now = SpareClock::now();
+	const bool seen = load->present_spares_seen != SpareClock::time_point{};
+	const bool request = !seen || now - load->present_spares_seen >= SPARE_BUFFER_IDLE;
+	load->present_spares_seen = now;
+	refill_deferred_present_spares();
+	for (const auto &desc : load->present_spares) {
+		keep_ready_spares(desc, now + SPARE_BUFFER_IDLE);
+		if (!request)
+			continue;
+
+		auto state = find_present_spare_state(desc);
+		if (state == present_spare_states.end() || state->deferred)
+			continue;
+		const UINT64 bytes = ShimAlign(desc.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+		if (request_spares(desc, bytes, false, load->name.c_str(), seen).at_capacity) {
+			deferred_present_spares.push_back({&*state, bytes, load->name, seen});
+			state->deferred = true;
+			queue_wake.notify_one();
+		}
 	}
 }
 
@@ -1402,6 +1858,8 @@ void ModLoadsConfigCleared()
 		std::lock_guard<std::mutex> lock(queue_lock);
 		dropped.swap(warming);
 		warmed.clear();
+		deferred_present_spares.clear();
+		present_spare_states.clear();
 	}
 }
 
@@ -1517,7 +1975,7 @@ void ModLoadsFrame(ID3D11Device *device)
 		std::lock_guard<std::mutex> lock(queue_lock);
 		done.swap(finished);
 		// The thread could not be started when the jobs were queued
-		if (!waited.empty() || !warming.empty())
+		if (!waited.empty() || !warming.empty() || !spare_buffers.empty())
 			start_worker();
 	}
 	for (auto &job : done)

@@ -133,6 +133,7 @@ struct ShimResource {
 	// rewritten between draws correct whatever order command lists are
 	// executed in.
 	bool cpu_only;
+	bool prepare_spares_on_pin = false;
 	// Contents as last written through Map or UpdateSubresource. Always
 	// there for cpu_only buffers, otherwise only for what the engine may
 	// map: subresource 0 with tightly packed rows.

@@ -771,6 +771,7 @@ public:
 	// copies or clears into. Such a resource may not share a GPU resource
 	// loaded from a file with another section, see ShareableFromFile():
 	bool written_by_command_list;
+	unsigned command_list_assignments = 0;
 
 	// Used to override description when copying or synthesise resources
 	// from scratch:
@@ -806,6 +807,7 @@ public:
 	void SetHandleInfo(ID3D11Resource* source, size_t offset, size_t data_size);
 	ResourceHandleInfo* GetHandleInfo();
 	void Substantiate(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags);
+	bool DeclaredTypedBuffer(D3D11_BUFFER_DESC *desc);
 	void OverrideBufferDesc(D3D11_BUFFER_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE1D_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE2D_DESC *desc);

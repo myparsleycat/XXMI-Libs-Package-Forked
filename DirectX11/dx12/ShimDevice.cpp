@@ -571,13 +571,38 @@ void ShimForgetSpares(ShimResource *resource)
 	spare_holders.pop_back();
 }
 
+struct RenameSpike {
+	LARGE_INTEGER start = {};
+	UINT64 width;
+	bool keep_contents;
+	size_t spares_before;
+	size_t busy_spares_checked = 0;
+	bool succeeded = false;
+	bool prepared_spare = false;
+	Dx12ResourceCreationTiming creation;
+
+	RenameSpike(UINT64 width, bool keep_contents, size_t spares_before) :
+		width(width), keep_contents(keep_contents), spares_before(spares_before)
+	{
+		if (Profiling::Spike::threshold)
+			QueryPerformanceCounter(&start);
+	}
+
+	~RenameSpike()
+	{
+		if (start.QuadPart)
+			Profiling::Spike::add_dx12_rename(start.QuadPart, width, keep_contents, succeeded,
+					spares_before, busy_spares_checked, prepared_spare, creation);
+	}
+};
+
 bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 {
 	static bool failed;
 	ID3D12Resource *old = resource->resource, *fresh = NULL;
 	D3D12_RESOURCE_BARRIER barrier = {};
 	size_t i;
-	Profiling::Spike::Scope spike(Profiling::Spike::DX12_RENAME, L"bytes or texels wide", resource->desc.Width);
+	RenameSpike spike(resource->desc.Width, keep_contents, resource->spares.size());
 
 	// One the lists are done with comes before a new one
 	for (i = 0; i < resource->spares.size(); i++) {
@@ -588,11 +613,24 @@ bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 		count_spares(resource, -1);
 		break;
 	}
-	if (!fresh && FAILED(Dx12ShimCreateResource(&resource->desc, &fresh, nullptr))) {
-		if (!failed)
-			Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it. The lists see the write.\n");
-		failed = true;
-		return false;
+	spike.busy_spares_checked = i;
+	if (!fresh) {
+		fresh = ModLoadDx12SpareBuffer(resource->desc, resource->allocated, true);
+		if (fresh) {
+			spike.prepared_spare = true;
+			InterlockedIncrement64(&dx12_stats.prepared_spares_used);
+		}
+	}
+	if (!fresh) {
+		if (resource->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+			InterlockedIncrement64(&dx12_stats.rename_allocations);
+		if (FAILED(Dx12ShimCreateResource(&resource->desc, &fresh, nullptr,
+				spike.start.QuadPart ? &spike.creation : nullptr))) {
+			if (!failed)
+				Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it. The lists see the write.\n");
+			failed = true;
+			return false;
+		}
 	}
 
 	// The fresh resource is in the common state, from where the copy
@@ -623,6 +661,7 @@ bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 	for (ShimView *view : resource->views)
 		ShimRecreateView(view);
 	InterlockedIncrement64(&dx12_stats.resources_renamed);
+	spike.succeeded = true;
 	return true;
 }
 
@@ -644,6 +683,7 @@ bool ShimBufferToGpu(ShimResource *resource)
 		return false;
 
 	resource->cpu_only = false;
+	resource->prepare_spares_on_pin = true;
 	ShimReadShadow(resource);
 	return ShimWriteBuffer(resource, 0, resource->shadow.data(), resource->shadow.size());
 }
@@ -660,9 +700,28 @@ void ShimUploadShadow(ShimResource *resource)
 	ShimWriteBuffer(resource, 0, resource->shadow.data(), min((UINT64)resource->shadow.size(), resource->desc.Width));
 }
 
-HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Buffer **ppBuffer)
+bool Dx12ShimBufferDesc(const D3D11_BUFFER_DESC &buffer, D3D12_RESOURCE_DESC *desc)
 {
 	const UINT address_binds = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER;
+	if (buffer.Usage == D3D11_USAGE_STAGING
+			|| (buffer.BindFlags && !(buffer.BindFlags & ~address_binds)
+				&& (buffer.Usage == D3D11_USAGE_DYNAMIC || (buffer.BindFlags & D3D11_BIND_CONSTANT_BUFFER))))
+		return false;
+
+	*desc = {};
+	desc->Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc->Width = ShimAlign(buffer.ByteWidth, 256);
+	desc->Height = 1;
+	desc->DepthOrArraySize = 1;
+	desc->MipLevels = 1;
+	desc->SampleDesc.Count = 1;
+	desc->Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	desc->Flags = resource_flags(buffer.BindFlags & D3D11_BIND_UNORDERED_ACCESS);
+	return true;
+}
+
+HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Buffer **ppBuffer)
+{
 	D3D12_RESOURCE_DESC desc = {};
 	ShimBuffer *buffer;
 	bool keep_contents;
@@ -684,20 +743,11 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDes
 	r = &buffer->r;
 	r->dimension = D3D11_RESOURCE_DIMENSION_BUFFER;
 
-	if (pDesc->Usage == D3D11_USAGE_STAGING)
-		r->cpu_only = true;
-	else if (pDesc->BindFlags && !(pDesc->BindFlags & ~address_binds))
-		r->cpu_only = pDesc->Usage == D3D11_USAGE_DYNAMIC || (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER);
+	r->cpu_only = !Dx12ShimBufferDesc(*pDesc, &desc);
 
 	if (!r->cpu_only) {
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc.Width = ShimAlign(pDesc->ByteWidth, 256);
-		desc.Height = 1;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		desc.Flags = resource_flags(pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS);
+		r->prepare_spares_on_pin = !pInitialData || !pInitialData->pSysMem
+			|| (pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS);
 
 		hr = create_resource(r, &desc);
 		if (FAILED(hr)) {
