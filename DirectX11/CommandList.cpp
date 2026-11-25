@@ -8311,6 +8311,17 @@ DirectX::WIC_LOADER_FLAGS CustomResource::GetWICFlags(const uint8_t *data, size_
 	return DirectX::WIC_LOADER_FLAGS::WIC_LOADER_DEFAULT;
 }
 
+DirectX::DDS_LOADER_FLAGS CustomResource::GetDDSFlags()
+{
+	switch (override_color_space) {
+	case CustomColorSpace::LINEAR:
+	case CustomColorSpace::SRGB:
+		return (DirectX::DDS_LOADER_FLAGS)override_color_space;
+	default:
+		return DirectX::DDS_LOADER_FLAGS::DDS_LOADER_DEFAULT;
+	}
+}
+
 void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_flags,
 		D3D11_RESOURCE_MISC_FLAG misc_flags, CustomResourceFileLoad *load)
 {

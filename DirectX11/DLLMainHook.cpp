@@ -8,6 +8,7 @@
 #include "dx12/Dx12Hooks.h"
 #include "vk/VkHooks.h"
 #include "desktop/Channel.h"
+#include "ReShadeRuntime.hpp"
 
 HINSTANCE migoto_handle;
 
@@ -348,6 +349,8 @@ BOOL WINAPI DllMain(
 			// so bail early if this is not the intended target
 			if (!verify_intended_target(hinstDLL))
 				return false;
+
+			InitializeHooking(hinstDLL);
 
 			// Hook d3d11.dll if we are loaded via injection either
 			// under a different name, or just not as the primary

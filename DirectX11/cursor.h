@@ -7,7 +7,6 @@ BOOL WINAPI CursorUpscalingBypass_GetClientRect(_In_ HWND hWnd, _Out_ LPRECT lpR
 BOOL WINAPI CursorUpscalingBypass_GetCursorInfo(_Inout_ PCURSORINFO pci);
 BOOL WINAPI CursorUpscalingBypass_ScreenToClient(_In_ HWND hWnd, LPPOINT lpPoint);
 
-int InstallHookLate(HINSTANCE module, const char *func, void **trampoline, void *hook);
 void InstallMouseHooks(bool hide);
 
 // Set and read the cursor past the hide_cursor hooks. The cursor the game set

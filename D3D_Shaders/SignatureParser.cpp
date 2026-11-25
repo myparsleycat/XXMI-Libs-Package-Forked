@@ -645,7 +645,7 @@ static bool parse_section(string *line, string *shader, size_t *pos, void **sect
 	return false;
 }
 
-static void serialise_shader_binary(vector<void*> *sections, uint32_t all_sections_size, vector<BYTE> *bytecode)
+static void serialise_shader_binary(vector<void*> *sections, uint32_t all_sections_size, vector<byte_t> *bytecode)
 {
 	struct dxbc_header *header = NULL;
 	uint32_t *section_offset_ptr = NULL;
@@ -678,7 +678,7 @@ static void serialise_shader_binary(vector<void*> *sections, uint32_t all_sectio
 	}
 }
 
-static HRESULT manufacture_shader_binary(const void *pShaderAsm, size_t AsmLength, vector<BYTE> *bytecode)
+static HRESULT manufacture_shader_binary(const void *pShaderAsm, size_t AsmLength, vector<byte_t> *bytecode)
 {
 	string shader_str((const char*)pShaderAsm, AsmLength);
 	string line;
@@ -737,10 +737,10 @@ out_free:
 	return hr;
 }
 
-HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<BYTE> *result_bytecode,
+HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<byte_t> *result_bytecode,
 		vector<AssemblerParseError> *parse_errors)
 {
-	vector<BYTE> manufactured_bytecode;
+	vector<byte_t> manufactured_bytecode;
 	HRESULT hr;
 
 	// Flugan's assembler normally cheats and reuses sections from the
@@ -759,11 +759,11 @@ HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<BYTE> 
 
 	return S_OK;
 }
-vector<BYTE> AssembleFluganWithOptionalSignatureParsing(vector<char> *assembly,
-		bool assemble_signatures, vector<BYTE> *orig_bytecode,
+vector<byte_t> AssembleFluganWithOptionalSignatureParsing(vector<char> *assembly,
+		bool assemble_signatures, vector<byte_t> *orig_bytecode,
 		vector<AssemblerParseError> *parse_errors)
 {
-	vector<BYTE> new_bytecode;
+	vector<byte_t> new_bytecode;
 	HRESULT hr;
 
 	if (!assemble_signatures)

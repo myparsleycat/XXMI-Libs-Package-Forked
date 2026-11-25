@@ -10,6 +10,7 @@
 #include <DirectXMath.h>
 #include <util.h>
 #include <WICTextureLoader.h>
+#include <DDSTextureLoader.h>
 
 #include "DrawCallInfo.h"
 #include "ResourceHash.h"
@@ -828,6 +829,7 @@ public:
 private:
 	bool HasPNGsRGBChunk(const uint8_t *data, size_t size);
 	DirectX::WIC_LOADER_FLAGS GetWICFlags(const uint8_t *data, size_t size);
+	DirectX::DDS_LOADER_FLAGS GetDDSFlags();
 	// bind_flags are the ones the resource is actually created with, which
 	// for buffers are only known once OverrideBufferDesc() has run:
 	bool ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags);
