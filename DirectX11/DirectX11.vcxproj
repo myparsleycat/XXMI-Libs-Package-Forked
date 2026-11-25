@@ -30,7 +30,10 @@
     <ClCompile Include="..\ThirdPartyLibs\ReShade\source\dll_log.cpp" />
     <ClCompile Include="..\ThirdPartyLibs\ReShade\source\dll_main.cpp" />
     <ClCompile Include="..\ThirdPartyLibs\ReShade\source\hook.cpp" />
-    <ClCompile Include="..\ThirdPartyLibs\ReShade\source\hook_manager.cpp" />
+    <ClCompile Include="..\ThirdPartyLibs\ReShade\source\hook_manager.cpp">
+      <!-- hook_manager.hpp uses STDMETHODCALLTYPE before hook_manager.cpp includes Windows.h, which only builds without two-phase name lookup -->
+      <ForcedIncludeFiles>Windows.h;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+    </ClCompile>
     <ClCompile Include="ByteCodeReader.cpp" />
     <ClCompile Include="CommandList.cpp" />
     <ClCompile Include="..\iid.cpp" />

@@ -115,7 +115,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
     <TargetName>dxgi</TargetName>
-    <IncludePath>$(SolutionDir)crc32c-hw-1.0.5\include;$(WindowsSDK_IncludePath);$(VC_IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)ThirdPartyLibs\CRC32C;$(WindowsSDK_IncludePath);$(VC_IncludePath)</IncludePath>
     <LibraryPath>$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -176,7 +176,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ModuleDefinitionFile>d3dxgiWrapper.def</ModuleDefinitionFile>
-      <AdditionalDependencies>..\Nektra\NktHookLib64.lib;dinput8.lib;dxgi.lib;comctl32.lib;XINPUT9_1_0.lib;d3dcompiler.lib;d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>..\ThirdPartyLibs\Nektra-lib\NktHookLib64.lib;dinput8.lib;dxgi.lib;comctl32.lib;XINPUT9_1_0.lib;d3dcompiler.lib;d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ForceSymbolReferences>D3D11CreateDevice</ForceSymbolReferences>
     </Link>
   </ItemDefinitionGroup>
@@ -238,7 +238,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <ModuleDefinitionFile>d3dxgiWrapper.def</ModuleDefinitionFile>
-      <AdditionalDependencies>..\Nektra\NktHookLib64.lib;dinput8.lib;dxgi.lib;comctl32.lib;XINPUT9_1_0.lib;d3dcompiler.lib;d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>..\ThirdPartyLibs\Nektra-lib\NktHookLib64.lib;dinput8.lib;dxgi.lib;comctl32.lib;XINPUT9_1_0.lib;d3dcompiler.lib;d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ForceSymbolReferences>D3D11CreateDevice</ForceSymbolReferences>
     </Link>
   </ItemDefinitionGroup>

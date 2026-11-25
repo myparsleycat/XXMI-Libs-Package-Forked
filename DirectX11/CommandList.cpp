@@ -5,6 +5,7 @@
 #include "CommandList.h"
 
 #include <DDSTextureLoader.h>
+#include <DirectXTex.h>
 #include "ResourceLoading.h"
 #include "ModLoading.h"
 #include <algorithm>
@@ -8213,6 +8214,94 @@ bool CustomResource::DeclaredTypedBuffer(D3D11_BUFFER_DESC *desc)
 // Smaller files are made with their contents, see CustomResourceFileLoad::may_defer_contents
 static const size_t deferred_contents_bytes = 8 << 20;
 
+static constexpr uint32_t dds_fourcc(char a, char b, char c, char d)
+{
+	return (uint32_t)(uint8_t)a | (uint32_t)(uint8_t)b << 8 | (uint32_t)(uint8_t)c << 16 | (uint32_t)(uint8_t)d << 24;
+}
+
+// Makes the 2D texture of a DDS file without its contents and points
+// *contents at the subresources inside the file data instead. S_FALSE for a
+// file this does not handle, which DirectXTK then loads with its contents.
+// Only DX10 headers and the block compressed FourCCs are taken: for those the
+// file data is the texture data as it is, the way DirectXTK reads it.
+static HRESULT CreateDDSTextureWithoutContents(ID3D11Device *device, const uint8_t *data, size_t size,
+		D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags, DirectX::DDS_LOADER_FLAGS load_flags,
+		ID3D11Resource **texture, std::vector<D3D11_SUBRESOURCE_DATA> *contents)
+{
+	static const uint32_t block_fourccs[] = {
+		dds_fourcc('D', 'X', 'T', '1'), dds_fourcc('D', 'X', 'T', '2'), dds_fourcc('D', 'X', 'T', '3'),
+		dds_fourcc('D', 'X', 'T', '4'), dds_fourcc('D', 'X', 'T', '5'),
+		dds_fourcc('A', 'T', 'I', '1'), dds_fourcc('B', 'C', '4', 'U'), dds_fourcc('B', 'C', '4', 'S'),
+		dds_fourcc('A', 'T', 'I', '2'), dds_fourcc('B', 'C', '5', 'U'), dds_fourcc('B', 'C', '5', 'S'),
+	};
+	DirectX::TexMetadata meta;
+	DirectX::DDSMetaData pixel_format;
+	D3D11_TEXTURE2D_DESC desc = {};
+	size_t offset, end, width, height, row_pitch, slice_pitch;
+	ID3D11Texture2D *tex = nullptr;
+	HRESULT hr;
+
+	if (FAILED(DirectX::GetMetadataFromDDSMemoryEx(data, size, DirectX::DDS_FLAGS_NONE, meta, &pixel_format)))
+		return S_FALSE;
+	if (!pixel_format.IsDX10() && std::find(std::begin(block_fourccs), std::end(block_fourccs), pixel_format.fourCC) == std::end(block_fourccs))
+		return S_FALSE;
+	if (meta.dimension != DirectX::TEX_DIMENSION_TEXTURE2D || meta.depth != 1
+			|| meta.mipLevels > D3D11_REQ_MIP_LEVELS
+			|| meta.arraySize > D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION
+			|| meta.width > (meta.IsCubemap() ? D3D11_REQ_TEXTURECUBE_DIMENSION : D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+			|| meta.height > (meta.IsCubemap() ? D3D11_REQ_TEXTURECUBE_DIMENSION : D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION))
+		return S_FALSE;
+
+	// Magic, DDS_HEADER and, for DX10, DDS_HEADER_DXT10
+	offset = pixel_format.IsDX10() ? 148 : 128;
+	contents->clear();
+	contents->reserve(meta.arraySize * meta.mipLevels);
+	for (size_t item = 0; item < meta.arraySize; item++) {
+		width = meta.width;
+		height = meta.height;
+		for (size_t mip = 0; mip < meta.mipLevels; mip++) {
+			if (FAILED(DirectX::ComputePitch(meta.format, width, height, row_pitch, slice_pitch))
+					|| row_pitch > UINT_MAX || slice_pitch > UINT_MAX) {
+				contents->clear();
+				return S_FALSE;
+			}
+			end = offset + slice_pitch;
+			if (end < offset || end > size) {
+				contents->clear();
+				return S_FALSE;
+			}
+			contents->push_back({data + offset, (UINT)row_pitch, (UINT)slice_pitch});
+			offset = end;
+			width = std::max<size_t>(width / 2, 1);
+			height = std::max<size_t>(height / 2, 1);
+		}
+	}
+
+	desc.Width = (UINT)meta.width;
+	desc.Height = (UINT)meta.height;
+	desc.MipLevels = (UINT)meta.mipLevels;
+	desc.ArraySize = (UINT)meta.arraySize;
+	desc.Format = meta.format;
+	if (load_flags & DirectX::DDS_LOADER_FORCE_SRGB)
+		desc.Format = DirectX::MakeSRGB(desc.Format);
+	else if (load_flags & DirectX::DDS_LOADER_IGNORE_SRGB)
+		desc.Format = DirectX::MakeLinear(desc.Format);
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = bind_flags;
+	desc.MiscFlags = misc_flags & ~D3D11_RESOURCE_MISC_TEXTURECUBE;
+	if (meta.IsCubemap())
+		desc.MiscFlags |= D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+	hr = device->CreateTexture2D(&desc, nullptr, &tex);
+	if (FAILED(hr)) {
+		contents->clear();
+		return hr;
+	}
+	*texture = tex;
+	return S_OK;
+}
+
 void CustomResource::LoadBufferFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_flags,
 		D3D11_RESOURCE_MISC_FLAG misc_flags, CustomResourceFileLoad *load)
 {
@@ -8327,8 +8416,9 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 {
 	SharedResourceKey share_key;
 	DirectX::WIC_LOADER_FLAGS wic_flags = DirectX::WIC_LOADER_DEFAULT;
+	DirectX::DDS_LOADER_FLAGS dds_flags;
 	FileContents file;
-	bool dds, share, force_srgb;
+	bool dds, share;
 	size_t dot;
 	HRESULT hr;
 
@@ -8374,7 +8464,7 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 
 	dot = filename.rfind(L'.');
 	dds = dot != wstring::npos && !_wcsicmp(filename.c_str() + dot, L".dds");
-	force_srgb = override_color_space == CustomColorSpace::SRGB;
+	dds_flags = GetDDSFlags();
 
 	share = ShareableFromFile(bind_flags);
 	if (share) {
@@ -8385,7 +8475,7 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 		// The WIC flags may depend on the contents, so only a DDS file
 		// can be matched before it is read:
 		if (dds) {
-			share_key.load_flags = force_srgb;
+			share_key.load_flags = dds_flags;
 			load->resource = FindSharedFileResourceByIdentity(share_key, file.identity);
 			if (load->resource) {
 				LogInfoW(L"Sharing the texture already loaded from %s\n", filename.c_str());
@@ -8408,7 +8498,7 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 		wic_flags = GetWICFlags(file.data, file.size);
 
 	if (share) {
-		share_key.load_flags = dds ? force_srgb : wic_flags;
+		share_key.load_flags = dds ? dds_flags : wic_flags;
 		load->resource = FindSharedFileResource(share_key, file.data, file.size);
 		if (load->resource) {
 			LogInfoW(L"Sharing the texture already loaded from identical %s\n", filename.c_str());
@@ -8421,16 +8511,19 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 
 	if (dds) {
 		LogInfoW(L"Loading custom resource %s as DDS, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
-		DirectX::SetDDSDeferredContents(load->may_defer_contents && file.size >= deferred_contents_bytes ? &load->subresources : nullptr);
-		hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
-				file.data, file.size, 0,
-				D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
-				force_srgb, &load->resource, NULL, NULL);
-		DirectX::SetDDSDeferredContents(nullptr);
-		if (FAILED(hr))
-			load->subresources.clear();
-		else if (!load->subresources.empty())
-			load->contents = std::make_unique<FileContents>(std::move(file));
+		hr = S_FALSE;
+		if (load->may_defer_contents && file.size >= deferred_contents_bytes) {
+			hr = CreateDDSTextureWithoutContents(mOrigDevice1, file.data, file.size,
+					bind_flags, misc_flags, dds_flags, &load->resource, &load->subresources);
+			if (hr == S_OK)
+				load->contents = std::make_unique<FileContents>(std::move(file));
+		}
+		if (hr == S_FALSE) {
+			hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
+					file.data, file.size, 0,
+					D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
+					dds_flags, &load->resource, NULL, NULL);
+		}
 	} else {
 		LogInfoW(L"Loading custom resource %s as WIC, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
 		hr = DirectX::CreateWICTextureFromMemoryEx(mOrigDevice1,

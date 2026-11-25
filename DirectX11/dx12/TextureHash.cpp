@@ -10,10 +10,8 @@
 #include <atomic>
 #include <map>
 
-// For GetSurfaceInfo, which is what ResourceHash.cpp sizes a texture with
-#include "DirectXTK/Src/pch.h"
-#include "DirectXTK/Src/PlatformHelpers.h"
-#include "DirectXTK/Src/LoaderHelpers.h"
+// ComputePitch and ComputeScanlines are what ResourceHash.cpp sizes a texture with
+#include <DirectXTex.h>
 
 Dx12TextureStats dx12_texture_stats;
 
@@ -385,7 +383,7 @@ void Dx12AbandonTextureUploads(std::vector<Dx12TextureUpload> *uploads)
 static void texture_uploaded(std::vector<Dx12TextureUpload> *uploads, ID3D12Resource *texture, UINT subresource, UINT x, UINT y, UINT z,
 		ID3D12Resource *buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT *footprint, const D3D12_BOX *box)
 {
-	size_t row_bytes = 0, rows = 0;
+	size_t row_bytes = 0, rows = 0, slice_bytes;
 	Dx12TextureUpload upload = {};
 	Dx12ResourceInfo info;
 	UINT64 buffer_size;
@@ -434,7 +432,8 @@ static void texture_uploaded(std::vector<Dx12TextureUpload> *uploads, ID3D12Reso
 		return;
 	}
 
-	DirectX::LoaderHelpers::GetSurfaceInfo(width, height, info.desc.Format, NULL, &row_bytes, &rows);
+	if (SUCCEEDED(DirectX::ComputePitch(info.desc.Format, width, height, row_bytes, slice_bytes)))
+		rows = DirectX::ComputeScanlines(info.desc.Format, height);
 	if (!row_bytes || !rows) {
 		InterlockedIncrement64(&dx12_texture_stats.unknown_format);
 		return;

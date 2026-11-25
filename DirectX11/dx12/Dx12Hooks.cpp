@@ -9,7 +9,6 @@
 #include "ResourceTracker.h"
 
 #include "util.h"
-#include "../cursor.h" // For InstallHookLate
 #include "../D3D11Wrapper.h"
 #include "../DLLMainHook.h"
 #include "../Globals.h"
@@ -377,6 +376,23 @@ HRESULT Dx12D3D11On12CreateDevice(PFN_D3D11ON12_CREATE_DEVICE orig, IUnknown *pD
 	return hr;
 }
 
+static void hook_export(HINSTANCE module, const char *name, void **trampoline, void *hook)
+{
+	SIZE_T hook_id;
+	DWORD err;
+	void *orig;
+
+	orig = NktHookLibHelpers::GetProcedureAddress(module, name);
+	if (!orig) {
+		LogInfo("Failed to get address of %s\n", name);
+		return;
+	}
+
+	err = cHookMgr.Hook(&hook_id, trampoline, orig, hook);
+	if (err)
+		LogInfo("Failed to hook %s: 0x%x\n", name, err);
+}
+
 void Dx12HookExports()
 {
 	static volatile LONG hooked = 0;
@@ -392,8 +408,8 @@ void Dx12HookExports()
 	if (InterlockedCompareExchange(&hooked, 1, 0) != 0)
 		return;
 
-	InstallHookLate(d3d12, "D3D12CreateDevice", (void**)&fnOrigD3D12CreateDevice, Hooked_D3D12CreateDevice);
+	hook_export(d3d12, "D3D12CreateDevice", (void**)&fnOrigD3D12CreateDevice, Hooked_D3D12CreateDevice);
 	// Not exported by the d3d12.dll of older Windows 10 builds, which do
 	// not have the device factory either.
-	InstallHookLate(d3d12, "D3D12GetInterface", (void**)&fnOrigD3D12GetInterface, Hooked_D3D12GetInterface);
+	hook_export(d3d12, "D3D12GetInterface", (void**)&fnOrigD3D12GetInterface, Hooked_D3D12GetInterface);
 }

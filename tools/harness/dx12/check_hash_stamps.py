@@ -45,14 +45,14 @@ def main():
     )
 
     root = Path("..", "..", "..", "..", "..")
-    crc = root / "crc32c-hw-1.0.5"
+    crc = root / "ThirdPartyLibs" / "CRC32C"
     msvc = Path("..", "..", "..", "common", "msvc.bat")
     fixture = Path("..", "..", "hash_stamps.cpp")
     subprocess.run(
         f'cmd.exe /d /c call {msvc} && '
         f'cl /nologo /O2 /EHsc /std:c++23 /Zc:__cplusplus /W3 /DCRC32C_STATIC=1 '
-        f'/I. /I{root} /I{crc / "include"} '
-        f'/Fe:hash_stamps.exe {fixture} {crc / "src" / "crc32c.cpp"}',
+        f'/I. /I{root} /I{crc} '
+        f'/Fe:hash_stamps.exe {fixture} {crc / "crc32c.cpp"}',
         cwd=build,
         check=True,
     )

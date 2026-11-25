@@ -5,4 +5,4 @@ if not "%~1"=="" set "cache_source=%~f1"
 cd /d "%~dp0"
 if not exist bin mkdir bin
 python make_impl.py "%cache_source%" bin\cache_impl.inc || exit /b 1
-cl /nologo /std:c++23 /Zc:__cplusplus /O2 /EHsc /MT /W3 /I..\..\.. /I..\..\..\crc32c-hw-1.0.5\include /I..\..\..\BinaryDecompiler /I..\..\..\BinaryDecompiler\include /DUNICODE /D_UNICODE /DMIGOTO_DX=11 /DCRC32C_STATIC=1 /Fe:bin\cache.exe /Fo:bin\ harness.cpp || exit /b 1
+cl /nologo /std:c++23 /Zc:__cplusplus /O2 /EHsc /MT /W3 /I..\..\.. /I..\..\..\ThirdPartyLibs\CRC32C /I..\..\..\BinaryDecompiler /I..\..\..\BinaryDecompiler\include /DUNICODE /D_UNICODE /DMIGOTO_DX=11 /DCRC32C_STATIC=1 /Fe:bin\cache.exe /Fo:bin\ harness.cpp || exit /b 1
