@@ -63,6 +63,7 @@ struct ShimState {
 };
 
 bool Dx12ShimPipelineInit();
+bool Dx12ShimSupportsShaderBindings(const ShimShader *shader);
 
 // Record everything a draw or dispatch with this state needs up to the call
 // itself. They return false if it cannot be done, having said why in the log,

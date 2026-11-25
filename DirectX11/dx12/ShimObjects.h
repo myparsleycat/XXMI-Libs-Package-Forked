@@ -491,12 +491,10 @@ struct ShimShader {
 	UINT64 hash;
 	std::vector<BYTE> bytecode;
 
-	// What the shader reads, from its reflection: highest register + 1 of
-	// each kind, a bit per register it really uses, and what kind of
-	// resource it expects where, for binding nothing. The masks are all
-	// zero where it could not be read (reflected).
 	bool reflected;
 	bool dxil;
+	bool unsupported_srv_range;
+	bool uses_acceleration_structure;
 	// The same shader compiled to DXIL (Dx12DxcCompile), for the pipelines
 	// of the game whose own shaders are: a pipeline state does not take
 	// DXBC and DXIL together. NULL if there is none. Owned.
@@ -504,6 +502,7 @@ struct ShimShader {
 	// How many render targets a pixel shader writes
 	UINT targets;
 	UINT cbv_count;
+	// Number of set bits in srv_used, for reserving the packed table.
 	UINT srv_count;
 	UINT sampler_count;
 	UINT uav_count;

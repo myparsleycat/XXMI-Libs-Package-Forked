@@ -1,4 +1,7 @@
+#include <initializer_list>
+
 #include "DirectX11/dx12/PipelineRegistry.h"
+#include "DirectX11/dx12/ShimObjects.h"
 
 struct ShimInterfaces {
     ID3D12Device *native_device;
@@ -9,6 +12,19 @@ struct ShimInterfaces {
 
 class ShimSymbols {
     HANDLE process = GetCurrentProcess();
+    struct Symbol {
+        alignas(SYMBOL_INFO) BYTE bytes[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+    };
+
+    SYMBOL_INFO *lookup(Symbol &storage, const char *name) const {
+        auto *symbol = reinterpret_cast<SYMBOL_INFO *>(storage.bytes);
+        symbol->SizeOfStruct = sizeof(*symbol);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+        if (!SymFromName(process, name, symbol))
+            throw std::runtime_error(std::string("missing shim symbol: ") + name);
+        return symbol;
+    }
+
 public:
     explicit ShimSymbols(const fs::path &dll) {
         if (!SymInitializeW(process, dll.parent_path().c_str(), FALSE))
@@ -24,13 +40,47 @@ public:
 
     template <class T>
     T find(const char *name) const {
-        alignas(SYMBOL_INFO) BYTE bytes[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
-        auto *symbol = reinterpret_cast<SYMBOL_INFO *>(bytes);
-        symbol->SizeOfStruct = sizeof(*symbol);
-        symbol->MaxNameLen = MAX_SYM_NAME;
-        if (!SymFromName(process, name, symbol))
-            throw std::runtime_error(std::string("missing shim symbol: ") + name);
-        return reinterpret_cast<T>(symbol->Address);
+        Symbol storage;
+        return reinterpret_cast<T>(lookup(storage, name)->Address);
+    }
+
+    template <class T>
+    const T *field(const char *name, std::initializer_list<const wchar_t *> members) const {
+        Symbol storage;
+        auto *symbol = lookup(storage, name);
+        DWORD type = symbol->TypeIndex;
+        DWORD64 address = symbol->Address;
+        for (const wchar_t *member : members) {
+            ULONG count = 0;
+            if (!SymGetTypeInfo(process, symbol->ModBase, type, TI_GET_CHILDRENCOUNT, &count) || !count)
+                throw std::runtime_error("missing shim type members");
+            std::vector<ULONG> buffer(count + 2);
+            auto *params = reinterpret_cast<TI_FINDCHILDREN_PARAMS *>(buffer.data());
+            params->Count = count;
+            if (!SymGetTypeInfo(process, symbol->ModBase, type, TI_FINDCHILDREN, params))
+                throw std::runtime_error("cannot read shim type members");
+            bool found = false;
+            for (ULONG index = 0; index < count; index++) {
+                ULONG child = params->ChildId[index];
+                WCHAR *child_name = nullptr;
+                if (!SymGetTypeInfo(process, symbol->ModBase, child, TI_GET_SYMNAME, &child_name))
+                    continue;
+                bool matches = !wcscmp(member, child_name);
+                LocalFree(child_name);
+                if (!matches)
+                    continue;
+                DWORD offset;
+                if (!SymGetTypeInfo(process, symbol->ModBase, child, TI_GET_OFFSET, &offset)
+                    || !SymGetTypeInfo(process, symbol->ModBase, child, TI_GET_TYPEID, &type))
+                    throw std::runtime_error("cannot locate shim type member");
+                address += offset;
+                found = true;
+                break;
+            }
+            if (!found)
+                throw std::runtime_error("missing shim type member");
+        }
+        return reinterpret_cast<const T *>(address);
     }
 };
 
@@ -79,6 +129,103 @@ static void shim_copy_probe(const ShimInterfaces &shim) {
     expect_buffer(shim, dst.Get(), expected, sizeof(expected), "an empty or out-of-range copy changed buffer contents");
     shim.context->CopySubresourceRegion(dst.Get(), 0, 0, 0, 0, src.Get(), 0, nullptr);
     expect_buffer(shim, dst.Get(), other, sizeof(other), "a valid copy failed after an invalid copy");
+}
+
+static void shim_texture_replay_probe(const ShimInterfaces &shim, const ShimSymbols &symbols) {
+    D3D11_TEXTURE3D_DESC desc = {};
+    desc.Width = desc.Height = desc.Depth = 2;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R32_UINT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture3D> texture;
+    check(shim.device->CreateTexture3D(&desc, nullptr, &texture));
+    auto *resource = ShimResourceOf(texture.Get());
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    ComPtr<ID3D12CommandQueue> other_queue;
+    check(shim.native_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&other_queue)));
+
+    {
+        const UINT source[2][3][4] = {{{1, 2}, {3, 4}}, {{5, 6}, {7, 8}}};
+        resource->present_queue = other_queue.Get();
+        shim.context->UpdateSubresource(texture.Get(), 0, nullptr, source, sizeof(source[0][0]), sizeof(source[0]));
+        resource->present_queue = nullptr;
+    }
+    expect(resource->deferred_writes.size() == 1, "the blocked texture write was not deferred");
+    const size_t deferred_bytes = resource->deferred_writes.front().data.size();
+
+    auto transition = symbols.find<decltype(&Dx12ShimTransition)>("xxmishim!Dx12ShimTransition");
+    auto list = symbols.find<decltype(&Dx12ShimList)>("xxmishim!Dx12ShimList");
+    auto submit = symbols.find<decltype(&Dx12ShimSubmitAndWait)>("xxmishim!Dx12ShimSubmitAndWait");
+    expect(transition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE, false), "the deferred texture write did not replay");
+
+    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+    src.pResource = resource->resource;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    UINT64 bytes;
+    shim.native_device->GetCopyableFootprints(&resource->desc, 0, 1, 0, &dst.PlacedFootprint, nullptr, nullptr, &bytes);
+    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC readback_desc = {};
+    readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readback_desc.Width = bytes;
+    readback_desc.Height = readback_desc.DepthOrArraySize = readback_desc.MipLevels = 1;
+    readback_desc.SampleDesc.Count = 1;
+    readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    check(shim.native_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
+    dst.pResource = readback.Get();
+    list()->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    submit();
+
+    const UINT expected[4][2] = {{1, 2}, {3, 4}, {5, 6}, {7, 8}};
+    void *mapped = nullptr;
+    check(readback->Map(0, nullptr, &mapped));
+    bool same = true;
+    for (size_t row = 0; row < ARRAYSIZE(expected); row++)
+        same &= !memcmp(static_cast<const BYTE*>(mapped) + row * dst.PlacedFootprint.Footprint.RowPitch,
+            expected[row], sizeof(expected[row]));
+    readback->Unmap(0, nullptr);
+    expect(same, "deferred texture replay lost data from padded rows or slices");
+    std::cout << deferred_bytes << " bytes held for the deferred texture\n";
+    expect(deferred_bytes == sizeof(expected), "the deferred write retained upload-page padding");
+}
+
+static void shim_game_upload_probe(const ShimInterfaces &shim, const ShimSymbols &symbols, ID3D12Device *device) {
+    auto address = symbols.find<decltype(&Dx12ShimGameBufferAddress)>("xxmishim!Dx12ShimGameBufferAddress");
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    constexpr UINT slice_bytes = 256 * 1024;
+    const GUID marker = {0x845384ef, 0x32ce, 0x4ae5, {0xbb, 0x94, 0x61, 0xb9, 0x46, 0xa4, 0xb0, 0x23}};
+    std::vector<ComPtr<ID3D11Buffer>> persistent;
+    unsigned recycled = 0;
+    for (unsigned page = 0; page < 13; page++) {
+        ComPtr<ID3D12GraphicsCommandList> list;
+        check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+        auto *proxy = reinterpret_cast<Dx12GraphicsCommandList*>(list.Get());
+        for (unsigned slice = 0; slice < 4; slice++) {
+            auto buffer = shim_buffer(shim, slice_bytes, D3D11_BIND_CONSTANT_BUFFER);
+            UINT bytes;
+            expect(address(buffer.Get(), proxy, &bytes) && bytes == slice_bytes, "game upload slice allocation failed");
+            if (slice != 0)
+                continue;
+            if (page < 8) {
+                persistent.push_back(std::move(buffer));
+            } else {
+                ID3D12Resource *upload = ShimResourceOf(buffer.Get())->game_upload;
+                unsigned previous;
+                UINT size = sizeof(previous);
+                if (SUCCEEDED(upload->GetPrivateData(marker, &size, &previous)))
+                    recycled++;
+                check(upload->SetPrivateData(marker, sizeof(page), &page));
+            }
+        }
+        check(list->Close());
+        list.Reset();
+        check(allocator->Reset());
+    }
+    std::cout << recycled << " recycled game upload pages out of five\n";
+    expect(recycled >= 3, "pinned pages displaced all game upload reuse");
 }
 
 static void shim_depth_probe(const ShimInterfaces &shim) {
@@ -137,7 +284,7 @@ static void shim_depth_probe(const ShimInterfaces &shim) {
     expect(desc.Format == texture.Format, "RTV did not inherit its texture format");
 }
 
-static void shim_bindings_probe(const ShimInterfaces &shim, const fs::path &shader_path) {
+static void shim_bindings_probe(const ShimInterfaces &shim, const ShimSymbols &symbols, const fs::path &shader_path) {
     const UINT initial[] = {17, 17, 17, 17};
     const D3D11_SUBRESOURCE_DATA data[] = {{initial, 8, 0}, {initial, 4, 0}, {initial, 8, 0}, {initial, 4, 0}};
     D3D11_TEXTURE2D_DESC texture = {};
@@ -169,27 +316,42 @@ static void shim_bindings_probe(const ShimInterfaces &shim, const fs::path &shad
 
     ID3D11ShaderResourceView *views[] = {same.Get(), nullptr, nullptr};
     ID3D11UnorderedAccessView *outputs[] = {target.Get(), result_view.Get(), nullptr, nullptr};
-    shim.context->CSSetShaderResources(0, 3, views);
+    shim.context->CSSetShaderResources(120, 1, views);
     shim.context->CSSetUnorderedAccessViews(0, 4, outputs, nullptr);
     for (int attempt = 0; attempt < 2; attempt++) {
         ComPtr<ID3D11ShaderResourceView> bound;
-        shim.context->CSGetShaderResources(0, 1, &bound);
+        shim.context->CSGetShaderResources(120, 1, &bound);
         expect(!bound, "an overlapping SRV survived UAV binding");
-        shim.context->CSSetShaderResources(0, 1, views);
+        shim.context->CSSetShaderResources(120, 1, views);
     }
     views[0] = disjoint.Get();
-    shim.context->CSSetShaderResources(0, 1, views);
+    shim.context->CSSetShaderResources(120, 1, views);
     ComPtr<ID3D11ShaderResourceView> bound;
-    shim.context->CSGetShaderResources(0, 1, &bound);
+    shim.context->CSGetShaderResources(120, 1, &bound);
     expect(bound.Get() == disjoint.Get(), "a disjoint SRV was cleared");
 
     auto bytecode = read(shader_path);
     ComPtr<ID3D11ComputeShader> shader;
     check(shim.device->CreateComputeShader(bytecode.data(), bytecode.size(), nullptr, &shader));
     shim.context->CSSetShader(shader.Get(), nullptr, 0);
-    shim.context->Dispatch(1, 1, 1);
+    auto heap = symbols.field<ID3D12DescriptorHeap *>("xxmishim!view_pages", {L"current", L"heap"});
+    auto used = symbols.field<UINT>("xxmishim!view_pages", {L"current", L"used"});
+    auto previous = *heap;
+    const UINT before = *used;
+    UINT slots = 0;
+    unsigned page_changes = 0;
+    for (int dispatch = 0; dispatch < 40; dispatch++) {
+        shim.context->Dispatch(1, 1, 1);
+        if (!dispatch)
+            slots = *heap == previous ? *used - before : *used;
+        if (previous && *heap != previous)
+            page_changes++;
+        previous = *heap;
+    }
     const UINT expected = 17;
     expect_buffer(shim, result.Get(), &expected, sizeof(expected), "dispatch did not read the disjoint mip with null buffers");
+    std::cout << slots << " view slots per dispatch, " << page_changes << " page changes\n";
+    expect(slots == 7 && !page_changes, "three sparse SRVs and four UAVs did not fit in seven slots");
     shim.context->ClearState();
 
     views[0] = same.Get();
@@ -201,6 +363,46 @@ static void shim_bindings_probe(const ShimInterfaces &shim, const fs::path &shad
     shim.context->PSSetShaderResources(0, 1, views);
     shim.context->PSGetShaderResources(0, 1, &bound);
     expect(bound.Get() == disjoint.Get(), "OM UAV binding cleared a disjoint pixel SRV");
+    shim.context->ClearState();
+}
+
+static void shim_indexed_bindings_probe(const ShimInterfaces &shim, const fs::path &shader_path) {
+    const UINT expected[] = {17, 37};
+    const D3D11_SUBRESOURCE_DATA data[] = {{&expected[0], sizeof(UINT), 0}, {&expected[1], sizeof(UINT), 0}};
+    D3D11_TEXTURE2D_DESC texture = {};
+    texture.Width = texture.Height = texture.MipLevels = texture.SampleDesc.Count = 1;
+    texture.ArraySize = ARRAYSIZE(data);
+    texture.Format = DXGI_FORMAT_R32_UINT;
+    texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> resource;
+    check(shim.device->CreateTexture2D(&texture, data, &resource));
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = texture.Format;
+    srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv.Texture2DArray.MipLevels = srv.Texture2DArray.ArraySize = 1;
+    ComPtr<ID3D11ShaderResourceView> first, second;
+    check(shim.device->CreateShaderResourceView(resource.Get(), &srv, &first));
+    srv.Texture2DArray.FirstArraySlice = 1;
+    check(shim.device->CreateShaderResourceView(resource.Get(), &srv, &second));
+    ID3D11ShaderResourceView *views[] = {first.Get(), second.Get()};
+    shim.context->CSSetShaderResources(63, ARRAYSIZE(views), views);
+
+    auto result = shim_buffer(shim, sizeof(expected), D3D11_BIND_UNORDERED_ACCESS);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = texture.Format;
+    uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = ARRAYSIZE(expected);
+    ComPtr<ID3D11UnorderedAccessView> result_view;
+    check(shim.device->CreateUnorderedAccessView(result.Get(), &uav, &result_view));
+    shim.context->CSSetUnorderedAccessViews(1, 1, result_view.GetAddressOf(), nullptr);
+
+    auto bytecode = read(shader_path);
+    ComPtr<ID3D11ComputeShader> shader;
+    check(shim.device->CreateComputeShader(bytecode.data(), bytecode.size(), nullptr, &shader));
+    shim.context->CSSetShader(shader.Get(), nullptr, 0);
+    shim.context->Dispatch(1, 1, 1);
+    expect_buffer(shim, result.Get(), expected, sizeof(expected), "a dynamically indexed array across t63 and t64 was not contiguous");
     shim.context->ClearState();
 }
 
@@ -228,7 +430,31 @@ public:
     }
 };
 
-static void shim_queue_lifetime_probe(const ShimInterfaces &shim, const ShimSymbols &symbols) {
+static void shim_unsupported_bindings_probe(const ShimInterfaces &shim, const fs::path &shader_path, bool ray_query) {
+    auto bytecode = read(shader_path);
+    ComPtr<ID3D11ComputeShader> shader;
+    check(shim.device->CreateComputeShader(bytecode.data(), bytecode.size(), nullptr, &shader));
+    if (ray_query) {
+        const auto *reflected = ShimShaderOf(shader.Get());
+        expect(reflected->srv_used[0] == 3 && reflected->srv_dimension[0] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            "the acceleration structure was missing from the reflected SRV table");
+    }
+    const UINT initial[] = {13, 29};
+    auto result = shim_buffer(shim, sizeof(initial), D3D11_BIND_UNORDERED_ACCESS, initial);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav = {};
+    uav.Format = DXGI_FORMAT_R32_UINT;
+    uav.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = ARRAYSIZE(initial);
+    ComPtr<ID3D11UnorderedAccessView> result_view;
+    check(shim.device->CreateUnorderedAccessView(result.Get(), &uav, &result_view));
+    shim.context->CSSetUnorderedAccessViews(0, 1, result_view.GetAddressOf(), nullptr);
+    shim.context->CSSetShader(shader.Get(), nullptr, 0);
+    shim.context->Dispatch(1, 1, 1);
+    expect_buffer(shim, result.Get(), initial, sizeof(initial), "a shader with an unsupported SRV binding was dispatched");
+    shim.context->ClearState();
+}
+
+static void shim_queue_lifetime_probe(const ShimInterfaces &shim, const ShimSymbols &symbols, ID3D12Device *device) {
     using QueueWaits = void (*)(ID3D12CommandQueue *, UINT64, bool);
     auto queue_waits = symbols.find<QueueWaits>("xxmishim!Dx12ShimQueueWaits");
     auto queue_released = std::make_shared<std::atomic_bool>(false);
@@ -249,6 +475,20 @@ static void shim_queue_lifetime_probe(const ShimInterfaces &shim, const ShimSymb
     auto pins_executed = symbols.find<OnExecute>("xxmishim!Dx12ShimPinsExecuted");
     auto collect = symbols.find<void (*)()>("xxmishim!Dx12ShimSubmit");
     check(shim.native_device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)));
+    const UINT initial = 13, replacement = 29;
+    auto busy = shim_buffer(shim, sizeof(UINT), D3D11_BIND_VERTEX_BUFFER, &initial);
+    auto complete = shim_buffer(shim, sizeof(UINT), D3D11_BIND_VERTEX_BUFFER, &initial);
+    auto recording = shim_buffer(shim, sizeof(UINT), D3D11_BIND_VERTEX_BUFFER, &initial);
+    ID3D12Resource *busy_before = ShimResourceOf(busy.Get())->resource;
+    ID3D12Resource *complete_before = ShimResourceOf(complete.Get())->resource;
+    ID3D12Resource *recording_before = ShimResourceOf(recording.Get())->resource;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    auto use = symbols.find<decltype(&Dx12ShimUseOnGameList)>("xxmishim!Dx12ShimUseOnGameList");
+    expect(use(ShimResourceOf(recording.Get()), reinterpret_cast<Dx12GraphicsCommandList*>(list.Get())), "could not pin the recording buffer");
+    collect();
 
     ComPtr<ID3D12Fence> gate, finished;
     check(shim.native_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
@@ -257,16 +497,27 @@ static void shim_queue_lifetime_probe(const ShimInterfaces &shim, const ShimSymb
     std::unique_ptr<void, decltype(close_event)> event(CreateEventW(nullptr, FALSE, FALSE, nullptr), close_event);
     expect(!!event, "create foreign queue event");
     check(queue->Wait(gate.Get(), 1));
-    std::vector<IUnknown *> pins = {new ReleaseNotice(pin_released)}, first;
+    busy_before->AddRef();
+    complete_before->AddRef();
+    std::vector<IUnknown *> pins = {new ReleaseNotice(pin_released), busy_before, complete_before}, first;
     pins_executed(queue.Get(), &pins, &first);
     check(queue->Signal(finished.Get(), 1));
+    shim.context->UpdateSubresource(busy.Get(), 0, nullptr, &replacement, 0, 0);
     bool held = !pin_released->load();
     check(gate->Signal(1));
     check(finished->SetEventOnCompletion(1, event.get()));
     expect(WaitForSingleObject(event.get(), 30000) == WAIT_OBJECT_0, "foreign queue did not finish");
+    shim.context->UpdateSubresource(recording.Get(), 0, nullptr, &replacement, 0, 0);
+    expect(!pin_released->load() && ShimResourceOf(recording.Get())->resource != recording_before,
+        "a recording pin did not protect its buffer without polling the foreign queue");
+    shim.context->UpdateSubresource(complete.Get(), 0, nullptr, &replacement, 0, 0);
+    expect(held && ShimResourceOf(busy.Get())->resource != busy_before, "an unfinished foreign queue pin did not protect the buffer");
+    expect(pin_released->load() && ShimResourceOf(complete.Get())->resource == complete_before,
+        "a completed foreign queue pin forced a rename before the next submission");
+    expect_buffer(shim, complete.Get(), &replacement, sizeof(replacement), "a write after foreign completion was lost");
+    check(list->Close());
     queue.Reset();
     collect();
-    expect(held && pin_released->load(), "foreign queue pin did not live through GPU completion");
 }
 
 static void shim_queue_budget_probe(const ShimInterfaces &shim, const ShimSymbols &symbols, ID3D12CommandQueue *main_queue) {
@@ -292,7 +543,8 @@ static void shim_registry_probe(const ShimSymbols &symbols, ID3D12Device *device
     auto find_pipeline = symbols.find<decltype(&Dx12FindPipeline)>("xxmishim!Dx12FindPipeline");
     auto shader = read(shader_path);
     const D3D12_DESCRIPTOR_RANGE ranges[] = {
-        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 120, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND},
     };
     D3D12_ROOT_PARAMETER table = {};
@@ -312,11 +564,11 @@ static void shim_registry_probe(const ShimSymbols &symbols, ID3D12Device *device
     expect(registered && registered->shaders[DX12_STAGE_CS] && registered->shaders[DX12_STAGE_CS]->reflected,
             "stripped DXIL resources were not reflected");
     const auto &info = *registered->shaders[DX12_STAGE_CS];
-    expect(info.srv_dimension[2] == D3D12_SRV_DIMENSION_BUFFER && info.srv_buffer[2] == 8,
+    expect(info.srv_dimension[1] == D3D12_SRV_DIMENSION_BUFFER && info.srv_buffer[1] == 8,
             "stripped DXIL structured SRV has no element stride");
     expect(info.uav_dimension[3] == D3D12_UAV_DIMENSION_BUFFER && info.uav_buffer[3] == 8,
             "stripped DXIL structured UAV has no element stride");
-    expect(info.srv_buffer[1] == DX12_BUFFER_RAW && info.uav_buffer[2] == DX12_BUFFER_RAW,
+    expect(info.srv_buffer[0] == DX12_BUFFER_RAW && info.uav_buffer[2] == DX12_BUFFER_RAW,
             "stripped DXIL raw buffers lost their descriptor kind");
 }
 
@@ -514,12 +766,20 @@ static void shim_probe(const wchar_t *mode, const fs::path &dll, const fs::path 
     try {
         if (!wcscmp(mode, L"copy"))
             shim_copy_probe(*shim);
+        else if (!wcscmp(mode, L"texture-replay"))
+            shim_texture_replay_probe(*shim, symbols);
+        else if (!wcscmp(mode, L"game-upload"))
+            shim_game_upload_probe(*shim, symbols, device.Get());
         else if (!wcscmp(mode, L"depth"))
             shim_depth_probe(*shim);
         else if (!wcscmp(mode, L"bindings"))
-            shim_bindings_probe(*shim, shader_path);
+            shim_bindings_probe(*shim, symbols, shader_path);
+        else if (!wcscmp(mode, L"bindings-indexed"))
+            shim_indexed_bindings_probe(*shim, shader_path);
+        else if (!wcscmp(mode, L"bindings-ray-query") || !wcscmp(mode, L"bindings-unsupported"))
+            shim_unsupported_bindings_probe(*shim, shader_path, !wcscmp(mode, L"bindings-ray-query"));
         else if (!wcscmp(mode, L"queue-lifetime"))
-            shim_queue_lifetime_probe(*shim, symbols);
+            shim_queue_lifetime_probe(*shim, symbols, device.Get());
         else if (!wcscmp(mode, L"queue-budget"))
             shim_queue_budget_probe(*shim, symbols, queue.Get());
         else if (present_queues)

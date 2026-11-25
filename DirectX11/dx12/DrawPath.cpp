@@ -2973,10 +2973,13 @@ static bool locate(Dx12ShaderStage stage, D3D12_DESCRIPTOR_RANGE_TYPE type, UINT
 
 static void apply_shader_resource(Dx12ShaderStage stage, UINT slot, ID3D11ShaderResourceView *srv)
 {
+	const Dx12ShaderInfo *shader = scope->shaders[stage];
 	ShimView *view = ShimViewOf(srv);
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
 	Dx12RegisterLocation location;
 
+	if (shader && shader->srv_dimension[slot] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+		return;
 	// The game's own, put back by a mod that saved it
 	if (view->resource->foreign || !view->handle.ptr)
 		return;
@@ -3075,6 +3078,41 @@ bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot)
 	return patched && (patched->samplers & 1u << slot);
 }
 
+static bool write_game_acceleration_structures(Dx12ShaderStage stage, const ShimShader *shader)
+{
+	const auto dimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+	const Dx12RootArguments &arguments = scope->list->mState.graphics;
+
+	for (UINT slot = 0; slot < SHIM_SRV_SLOTS; slot++) {
+		if (shader->srv_dimension[slot] != dimension)
+			continue;
+		if (scope->extension.signature && (scope->extension.extra.srv[stage][slot / 64] & 1ull << (slot % 64)))
+			continue;
+
+		Dx12RegisterLocation location;
+		if (!scope->signature || !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location))
+			return false;
+		if (scope->signature->parameters[location.parameter].visibility == D3D12_SHADER_VISIBILITY_ALL) {
+			for (Dx12ShaderStage other : graphics_stages) {
+				const Dx12ShaderInfo *reader = scope->shaders[other];
+				if (other == stage || !reader || ((scope->custom_stages & 1u << other) && reader->srv_dimension[slot] == dimension))
+					continue;
+				if (!reader->reflected || reader->unmasked || reader->unbounded_srv || (reader->srv[slot / 64] & 1ull << (slot % 64)))
+					return false;
+			}
+		}
+		if (!location.table) {
+			root_descriptor(&location, D3D12_ROOT_PARAMETER_TYPE_SRV, 0);
+			continue;
+		}
+		D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
+		if (!(arguments.set & (1ull << location.parameter)) || !table_descriptor(&location, &descriptor)
+		    || !Dx12ShimNullSrv((BYTE)dimension, 0, descriptor))
+			return false;
+	}
+	return true;
+}
+
 // A shader of the mod's reads zeros where the mod set none, as under D3D11,
 // and not the game's texture the table has there. Only for those and the
 // registers patches added: the game's shaders keep their own textures where a
@@ -3091,11 +3129,18 @@ static bool apply_unbound_shader_resources(const ShimState *mod)
 		if (!(scope->custom_stages & 1u << stage))
 			continue;
 		shader = mod_shader_form(mod, stage);
+		if (shader->uses_acceleration_structure && !write_game_acceleration_structures(stage, shader)) {
+			static bool reported;
+			log_once(&reported, "Could not bind null acceleration structures for a mod shader on the game's root signature. The draw uses the game's shaders.");
+			return false;
+		}
 
 		for (word = 0; word < ARRAYSIZE(mod->stages[stage].srv_unbound); word++) {
 			mask = mod->stages[stage].srv_unbound[word] & (UINT)(shader->srv_used[word / 2] >> (word % 2 * 32));
 			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
 				slot = word * 32 + bit;
+				if (shader->srv_dimension[slot] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+					continue;
 				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
 				    && table_descriptor(&location, &descriptor)
 				    && !Dx12ShimNullSrv(shader->srv_dimension[slot], shader->srv_buffer[slot], descriptor))
@@ -3235,19 +3280,18 @@ static bool write_extra_tables(const ShimState *mod, D3D12_GPU_DESCRIPTOR_HANDLE
 			cpu.ptr += dx12_shim_view_increment;
 		}
 		for (reg = 0; reg < SHIM_SRV_SLOTS; reg++) {
+			const Dx12ShaderInfo *shader = scope->shaders[stage];
+			BYTE dimension = shader ? shader->srv_dimension[reg] : 0;
 			const ShimView *view = NULL;
 
 			if (!(extension->extra.srv[stage][reg / 64] & 1ull << reg % 64))
 				continue;
-			if (bound->srv_mask[reg / 32] & 1u << reg % 32)
+			if (dimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE && (bound->srv_mask[reg / 32] & 1u << reg % 32))
 				view = ShimViewOf(bound->srvs[reg]);
 			if (view && !view->resource->foreign && view->handle.ptr && Dx12ShimUseOnGameList(view->resource, scope->list))
 				dx12_shim->device->CopyDescriptorsSimple(1, cpu, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-			else {
-				const Dx12ShaderInfo *shader = scope->shaders[stage];
-				if (!Dx12ShimNullSrv(shader ? shader->srv_dimension[reg] : 0, shader ? shader->srv_buffer[reg] : 0, cpu))
-					return false;
-			}
+			else if (!Dx12ShimNullSrv(dimension, shader ? shader->srv_buffer[reg] : 0, cpu))
+				return false;
 			cpu.ptr += dx12_shim_view_increment;
 		}
 		for (reg = 0; reg < 64; reg++) {
@@ -4999,6 +5043,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	ID3D12PipelineState *variant = NULL;
 	Dx12PipelineVariantDesc wanted = {};
 	const char *why = NULL;
+	bool unsupported_shader = false;
 	UINT stages = 0, patched_stages = 0, variant_stages;
 
 	if (scope->game_layout && mod->input_layout && mod->input_layout != scope->game_layout) {
@@ -5042,6 +5087,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 				}
 				continue;
 			}
+			if (!Dx12ShimSupportsShaderBindings(shader)) {
+				unsupported_shader = true;
+				break;
+			}
 			shader_info_of_mod(shader, &scope->mod_shaders[stage]);
 			wanted.shaders[stage] = &scope->mod_shaders[stage];
 			stages |= 1u << stage;
@@ -5055,6 +5104,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 			wanted.shaders[stage] = patched;
 			patched_stages |= 1u << stage;
 		}
+	}
+	if (unsupported_shader) {
+		wanted = {};
+		stages = patched_stages = 0;
 	}
 	// A pixel shader of a mod reads what the stage before it wrote in the
 	// D3D11 game, which the D3D12 game's may not all write
@@ -5122,10 +5175,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	if (stages && variant) {
 		stats.custom_draws++;
 		stats.custom_extended += scope->extension.signature != NULL;
-	} else if (stages || wanted.removed_stages && !variant) {
+	} else if (unsupported_shader || stages || wanted.removed_stages && !variant) {
 		stats.custom_failed++;
 		scope->custom_failed = true;
-		if (G->dx12_dump_hashes)
+		if (!unsupported_shader && G->dx12_dump_hashes)
 			note_custom_shader_failure(stages, why);
 	}
 	if (patched_stages && !variant && G->dx12_dump_hashes) {

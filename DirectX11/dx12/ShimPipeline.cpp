@@ -1,6 +1,8 @@
 #include "ShimPipeline.h"
 
+#include <array>
 #include <map>
+#include <tuple>
 #include <unordered_map>
 
 #include "ShimDevice.h"
@@ -9,11 +11,8 @@
 
 // The shaders of mods are D3D11 shaders: every stage has its own registers,
 // all in space 0, and binds by slot. The root signature for a set of them
-// mirrors that with up to three descriptor tables per stage, covering the
-// registers b0, t0 and s0 up to the highest one that stage's shader uses, and
-// one more table for the unordered access views, which D3D11 shares between
-// the stages. Which tables exist only depends on those register counts, so
-// that is what a root signature is looked up by.
+// mirrors that with up to three descriptor tables per stage and a shared
+// UAV table. An SRV table contains only the registers the shader declares.
 //
 // The order of the root parameters is the order of for_each_table.
 
@@ -21,14 +20,17 @@ const Dx12ShaderStage graphics_stages[] = { DX12_STAGE_VS, DX12_STAGE_PS, DX12_S
 const Dx12ShaderStage compute_stages[] = { DX12_STAGE_CS };
 
 struct RootKey {
-	BYTE cbvs[DX12_STAGE_COUNT];
-	BYTE srvs[DX12_STAGE_COUNT];
-	BYTE samplers[DX12_STAGE_COUNT];
+	using SrvMask = std::array<UINT64, 2>;
+	std::array<BYTE, DX12_STAGE_COUNT> cbvs;
+	std::array<BYTE, DX12_STAGE_COUNT> samplers;
+	std::array<SrvMask, DX12_STAGE_COUNT> srv_masks;
 	BYTE uavs;
+	bool input_assembler;
 
 	bool operator<(const RootKey &other) const
 	{
-		return memcmp(this, &other, sizeof(*this)) < 0;
+		return std::tie(input_assembler, uavs, cbvs, samplers, srv_masks)
+			< std::tie(other.input_assembler, other.uavs, other.cbvs, other.samplers, other.srv_masks);
 	}
 };
 
@@ -157,8 +159,8 @@ static const D3D12_SHADER_VISIBILITY stage_visibility[DX12_STAGE_COUNT] = {
 };
 
 // Calls visit(kind, stage, count) for every table of the root signature, in
-// the order of its root parameters. stage is DX12_STAGE_COUNT for the table
-// of unordered access views.
+// the order of its root parameters. SRV tables use a mask instead of a linear
+// count. stage is DX12_STAGE_COUNT for the table of unordered access views.
 template <class Visitor>
 static void for_each_table(const RootKey *key, Visitor visit)
 {
@@ -167,8 +169,8 @@ static void for_each_table(const RootKey *key, Visitor visit)
 	for (stage = 0; stage < DX12_STAGE_COUNT; stage++) {
 		if (key->cbvs[stage])
 			visit(TABLE_CBV, (Dx12ShaderStage)stage, key->cbvs[stage]);
-		if (key->srvs[stage])
-			visit(TABLE_SRV, (Dx12ShaderStage)stage, key->srvs[stage]);
+		if (key->srv_masks[stage][0] || key->srv_masks[stage][1])
+			visit(TABLE_SRV, (Dx12ShaderStage)stage, 0);
 		if (key->samplers[stage])
 			visit(TABLE_SAMPLER, (Dx12ShaderStage)stage, key->samplers[stage]);
 	}
@@ -176,13 +178,22 @@ static void for_each_table(const RootKey *key, Visitor visit)
 		visit(TABLE_UAV, DX12_STAGE_COUNT, key->uavs);
 }
 
-static ID3D12RootSignature* get_root_signature(const RootKey *key, bool input_assembler)
+template <class Visitor>
+static void for_each_srv_slot(const RootKey::SrvMask &mask, Visitor visit)
+{
+	for (UINT word = 0; word < mask.size(); word++) {
+		unsigned long bit;
+		for (UINT64 slots = mask[word]; _BitScanForward64(&bit, slots); slots &= slots - 1)
+			visit(word * 64 + bit);
+	}
+}
+
+static ID3D12RootSignature* get_root_signature(const RootKey *key)
 {
 	static const D3D12_DESCRIPTOR_RANGE_TYPE range_types[] = {
 		D3D12_DESCRIPTOR_RANGE_TYPE_CBV, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
 		D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
 	};
-	D3D12_DESCRIPTOR_RANGE ranges[DX12_STAGE_COUNT * 3 + 1] = {};
 	D3D12_ROOT_PARAMETER parameters[DX12_STAGE_COUNT * 3 + 1] = {};
 	D3D12_ROOT_SIGNATURE_DESC desc = {};
 	ID3D12RootSignature *signature = NULL;
@@ -194,19 +205,32 @@ static ID3D12RootSignature* get_root_signature(const RootKey *key, bool input_as
 	if (found != root_signatures.end())
 		return found->second;
 
+	std::vector<D3D12_DESCRIPTOR_RANGE> ranges;
 	for_each_table(key, [&](TableKind kind, Dx12ShaderStage stage, UINT registers) {
-		ranges[count].RangeType = range_types[kind];
-		ranges[count].NumDescriptors = registers;
+		size_t first = ranges.size();
+		if (kind == TABLE_SRV) {
+			for_each_srv_slot(key->srv_masks[stage], [&](UINT slot) {
+				if (ranges.size() > first && slot == ranges.back().BaseShaderRegister + ranges.back().NumDescriptors)
+					ranges.back().NumDescriptors++;
+				else
+					ranges.push_back({range_types[kind], 1, slot, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+			});
+		} else {
+			ranges.push_back({range_types[kind], registers, 0, 0, 0});
+		}
 		parameters[count].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-		parameters[count].DescriptorTable.NumDescriptorRanges = 1;
-		parameters[count].DescriptorTable.pDescriptorRanges = &ranges[count];
+		parameters[count].DescriptorTable.NumDescriptorRanges = (UINT)(ranges.size() - first);
 		parameters[count].ShaderVisibility = stage == DX12_STAGE_COUNT ? D3D12_SHADER_VISIBILITY_ALL : stage_visibility[stage];
 		count++;
 	});
+	for (UINT i = 0, first = 0; i < count; i++) {
+		parameters[i].DescriptorTable.pDescriptorRanges = &ranges[first];
+		first += parameters[i].DescriptorTable.NumDescriptorRanges;
+	}
 
 	desc.NumParameters = count;
 	desc.pParameters = parameters;
-	if (input_assembler)
+	if (key->input_assembler)
 		desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
 	hr = serialize_root_signature(&desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &blob, &error);
@@ -241,6 +265,21 @@ static DXGI_FORMAT null_buffer_format(UINT16 buffer)
 	}
 }
 
+static bool can_bind_null_acceleration_structure()
+{
+	// WARP can remove the device when a ray query traces a null TLAS.
+	static bool reported;
+	if (!dx12_shim->hardware_adapter)
+		log_once(&reported, "Null raytracing acceleration structure SRVs require a hardware adapter.");
+	return dx12_shim->hardware_adapter;
+}
+
+bool Dx12ShimSupportsShaderBindings(const ShimShader *shader)
+{
+	return !shader->unsupported_srv_range
+		&& (!shader->uses_acceleration_structure || can_bind_null_acceleration_structure());
+}
+
 bool Dx12ShimNullSrv(BYTE dimension, UINT16 buffer, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
@@ -249,6 +288,11 @@ bool Dx12ShimNullSrv(BYTE dimension, UINT16 buffer, D3D12_CPU_DESCRIPTOR_HANDLE 
 	desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	switch (desc.ViewDimension) {
+	case D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE:
+		if (!can_bind_null_acceleration_structure())
+			return false;
+		desc.Format = DXGI_FORMAT_UNKNOWN;
+		break;
 	case D3D12_SRV_DIMENSION_BUFFER:
 		if (!buffer)
 			return false;
@@ -330,6 +374,10 @@ static bool write_cbv(const ShimStageState *stage, UINT slot, D3D12_CPU_DESCRIPT
 
 static bool write_srv(const ShimShader *shader, ID3D11ShaderResourceView *srv, UINT slot, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
+	// A D3D11 view cannot supply the acceleration structure's GPU address.
+	if (shader->srv_dimension[slot] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+		return Dx12ShimNullSrv(shader->srv_dimension[slot], 0, handle);
+
 	ShimView *view = ShimViewOf(srv);
 
 	if (view && view->resource->resource)
@@ -383,7 +431,7 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 		if (kind == TABLE_SAMPLER)
 			sampler_count += registers;
 		else
-			views += registers;
+			views += kind == TABLE_SRV ? shaders[stage]->srv_count : registers;
 	});
 
 	cpu = Dx12ShimAllocViews(views, &gpu);
@@ -422,16 +470,22 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 		}
 
 		tables[count++] = gpu;
+		if (kind == TABLE_SRV) {
+			SIZE_T first = cpu.ptr;
+			for_each_srv_slot(key->srv_masks[stage], [&](UINT reg) {
+				if (!write_srv(shader, bound->srvs[reg], reg, cpu))
+					resident = false;
+				cpu.ptr += dx12_shim_view_increment;
+			});
+			gpu.ptr += cpu.ptr - first;
+			return;
+		}
 		for (slot = 0; slot < registers; slot++) {
 			// A register the shader does not use is never read,
 			// so its descriptor can stay whatever it is
 			switch (kind) {
 			case TABLE_CBV:
 				if ((shader->cbv_used & (1u << slot)) && !write_cbv(bound, slot, cpu))
-					resident = false;
-				break;
-			case TABLE_SRV:
-				if ((shader->srv_used[slot / 64] & (1ull << (slot % 64))) && !write_srv(shader, bound->srvs[slot], slot, cpu))
 					resident = false;
 				break;
 			case TABLE_UAV:
@@ -456,12 +510,13 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 	return true;
 }
 
-static void root_key(const ShimState *state, const Dx12ShaderStage *stages, size_t count, RootKey *key,
+static bool root_key(const ShimState *state, const Dx12ShaderStage *stages, size_t count, bool input_assembler, RootKey *key,
 		const ShimShader **shaders, UINT64 *uav_used)
 {
 	size_t i;
 
-	memset(key, 0, sizeof(*key));
+	*key = {};
+	key->input_assembler = input_assembler;
 	memset(shaders, 0, DX12_STAGE_COUNT * sizeof(*shaders));
 	*uav_used = 0;
 
@@ -471,12 +526,15 @@ static void root_key(const ShimState *state, const Dx12ShaderStage *stages, size
 		shaders[stages[i]] = shader;
 		if (!shader)
 			continue;
+		if (!Dx12ShimSupportsShaderBindings(shader))
+			return false;
 		key->cbvs[stages[i]] = (BYTE)shader->cbv_count;
-		key->srvs[stages[i]] = (BYTE)shader->srv_count;
+		key->srv_masks[stages[i]] = {shader->srv_used[0], shader->srv_used[1]};
 		key->samplers[stages[i]] = (BYTE)shader->sampler_count;
 		key->uavs = max(key->uavs, (BYTE)shader->uav_count);
 		*uav_used |= shader->uav_used;
 	}
+	return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -683,7 +741,8 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 	}
 
 	memset(&key, 0, sizeof(key));
-	root_key(state, graphics_stages, ARRAYSIZE(graphics_stages), &root, shaders, &uav_used);
+	if (!root_key(state, graphics_stages, ARRAYSIZE(graphics_stages), true, &root, shaders, &uav_used))
+		return false;
 	for (Dx12ShaderStage stage : graphics_stages)
 		key.ids[stage] = shaders[stage] ? shaders[stage]->id : 0;
 	key.ids[DX12_STAGE_COUNT] = state->input_layout ? static_cast<ShimInputLayout*>(state->input_layout)->mId : 0;
@@ -741,7 +800,7 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 
 	{
 		Profiling::Spike::SelfTime pipeline_time(Profiling::Spike::CL_PREPARE_DRAW_PIPELINE);
-		signature = get_root_signature(&root, true);
+		signature = get_root_signature(&root);
 		pipeline = signature ? get_pipeline(state, &key, shaders, signature) : NULL;
 	}
 	if (!pipeline)
@@ -837,12 +896,13 @@ bool Dx12ShimPrepareDispatch(const ShimState *state)
 	UINT64 uav_used;
 	RootKey root;
 
-	root_key(state, compute_stages, ARRAYSIZE(compute_stages), &root, shaders, &uav_used);
+	if (!root_key(state, compute_stages, ARRAYSIZE(compute_stages), false, &root, shaders, &uav_used))
+		return false;
 	shader = shaders[DX12_STAGE_CS];
 	if (!shader)
 		return false;
 
-	signature = get_root_signature(&root, false);
+	signature = get_root_signature(&root);
 	if (!signature)
 		return false;
 

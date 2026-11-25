@@ -74,6 +74,7 @@ struct Dx12Shim {
 	ShimContext *shim_context;
 	HackerDevice *hacker_device;
 	HackerContext *hacker_context;
+	bool hardware_adapter;
 };
 
 // NULL until Dx12ShimCreate succeeded
@@ -96,7 +97,7 @@ extern std::atomic<bool> dx12_d3d11_presented;
 // was created keeps the extended rendering paths from taking over.
 bool Dx12IsD3D11Game();
 
-bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue);
+bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue, bool hardware_adapter);
 // For when the swap chain being presented is on another queue than before
 bool Dx12ShimSetQueue(ID3D12CommandQueue *queue);
 
@@ -151,6 +152,8 @@ extern UINT dx12_shim_epoch;
 
 // Releases the object once nothing recorded so far can still be using it
 void Dx12ShimDeferRelease(IUnknown *object);
+// With the shim lock held, releases completed references without waiting or retiring queues.
+bool Dx12ShimReclaimRetired();
 
 // Memory the GPU can read, valid for the commands of this submission. *buffer
 // and *offset say where it is for a copy, *va for a view.
@@ -189,7 +192,8 @@ void Dx12ShimFreeDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE type, D3D12_CPU_DESCRIPTO
 // use it leaves out. overwrite is for a write that will cover all of the
 // resource, which then need not keep what it held if it is renamed for it.
 bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite = false);
-bool Dx12ShimTransitionSubresource(ShimResource *resource, UINT subresource, D3D12_RESOURCE_STATES state);
+bool Dx12ShimTransitionSubresource(ShimResource *resource, UINT subresource, D3D12_RESOURCE_STATES state,
+		bool overwrite = false);
 bool Dx12ShimTransitionView(const ShimView *view, D3D12_RESOURCE_STATES state, UINT planes = UINT_MAX, bool *retry = nullptr);
 bool Dx12ShimTransitionDepthStencil(const ShimView *view);
 void Dx12ShimSetState(ShimResource *resource, D3D12_RESOURCE_STATES state);

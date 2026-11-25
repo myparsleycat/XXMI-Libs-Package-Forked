@@ -20,6 +20,7 @@ public:
 
 	// The creation queue anchors the swap chain's device queries.
 	Dx12CommandQueue *mQueue;
+	const bool mHardwareAdapter;
 
 	Dx12SwapChain(Dx12CommandQueue *queue, IDXGISwapChain *orig);
 

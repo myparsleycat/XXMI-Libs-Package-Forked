@@ -96,16 +96,16 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CheckFormatSupport(DXGI_FORMAT Format, UIN
 
 // The earlier writes this one covers are dropped, so that a resource written
 // every frame while it stays evicted keeps one
-static void defer_write(ShimResource *resource, UINT subresource, UINT64 offset, UINT row_pitch, const void *data, UINT64 size)
+static void defer_write(ShimResource *resource, UINT subresource, UINT64 offset, UINT row_pitch, std::vector<BYTE> data)
 {
 	auto &writes = resource->deferred_writes;
 	bool buffer = resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
 
 	writes.erase(std::remove_if(writes.begin(), writes.end(), [&](const ShimResource::DeferredWrite &write) {
 		return write.subresource == subresource
-			&& (!buffer || (write.offset >= offset && write.offset + write.data.size() <= offset + size));
+			&& (!buffer || (write.offset >= offset && write.offset + write.data.size() <= offset + data.size()));
 	}), writes.end());
-	writes.push_back({ subresource, offset, row_pitch, std::vector<BYTE>((const BYTE*)data, (const BYTE*)data + size) });
+	writes.push_back({ subresource, offset, row_pitch, std::move(data) });
 }
 
 bool ShimApplyDeferredWrites(ShimResource *resource)
@@ -159,7 +159,8 @@ bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UI
 	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_DEST)) {
 		if (!allow_defer)
 			return false;
-		defer_write(resource, 0, offset, 0, data, size);
+		const BYTE *bytes = static_cast<const BYTE*>(data);
+		defer_write(resource, 0, offset, 0, std::vector<BYTE>(bytes, bytes + size));
 		resource->version++;
 		return true;
 	}
@@ -184,13 +185,22 @@ void ShimFootprint(ShimResource *resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *l
 		*total = resource->footprint_total;
 }
 
+static void copy_texture_rows(BYTE *dst, SIZE_T dst_pitch, const BYTE *src, SIZE_T src_pitch, SIZE_T src_slice_pitch,
+		SIZE_T row_size, UINT rows, UINT depth)
+{
+	for (UINT z = 0; z < depth; z++) {
+		for (UINT y = 0; y < rows; y++)
+			memcpy(dst + ((SIZE_T)z * rows + y) * dst_pitch, src + z * src_slice_pitch + y * src_pitch, row_size);
+	}
+}
+
 bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *data, UINT row_pitch, UINT slice_pitch,
 		bool allow_defer)
 {
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
 	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
 	UINT64 row_size, total, upload_offset;
-	UINT rows, y, z;
+	UINT rows;
 	BYTE *upload;
 
 	if (!resource->resource || !data)
@@ -207,35 +217,33 @@ bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *
 	if (!upload)
 		return false;
 
-	if (!row_pitch)
-		row_pitch = (UINT)row_size;
-	if (!slice_pitch)
-		slice_pitch = row_pitch * rows;
+	const BYTE *bytes = static_cast<const BYTE*>(data);
+	const SIZE_T src_pitch = row_pitch ? row_pitch : (SIZE_T)row_size;
+	const SIZE_T src_slice_pitch = slice_pitch ? slice_pitch : src_pitch * rows;
+	// The transition may give the resource another D3D12 resource.
+	if (!Dx12ShimTransitionSubresource(resource, subresource, D3D12_RESOURCE_STATE_COPY_DEST, true)) {
+		if (!allow_defer)
+			return false;
+		std::vector<BYTE> packed((size_t)row_size * rows * layout.Footprint.Depth);
+		copy_texture_rows(packed.data(), (SIZE_T)row_size, bytes, src_pitch, src_slice_pitch,
+			(SIZE_T)row_size, rows, layout.Footprint.Depth);
+		defer_write(resource, subresource, 0, (UINT)row_size, std::move(packed));
+		resource->version++;
+		return true;
+	}
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"texture bytes", total);
-		for (z = 0; z < layout.Footprint.Depth; z++) {
-			for (y = 0; y < rows; y++) {
-				memcpy(upload + ((SIZE_T)z * rows + y) * layout.Footprint.RowPitch,
-					(const BYTE*)data + (SIZE_T)z * slice_pitch + (SIZE_T)y * row_pitch, (size_t)row_size);
-			}
-		}
+		copy_texture_rows(upload, layout.Footprint.RowPitch, bytes, src_pitch, src_slice_pitch,
+			(SIZE_T)row_size, rows, layout.Footprint.Depth);
 	}
 
+	dst.pResource = resource->resource;
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 	dst.SubresourceIndex = subresource;
 	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	src.PlacedFootprint = layout;
 	src.PlacedFootprint.Offset = upload_offset;
 
-	// The transition may give the resource another D3D12 resource
-	if (!Dx12ShimTransitionSubresource(resource, subresource, D3D12_RESOURCE_STATE_COPY_DEST)) {
-		if (!allow_defer)
-			return false;
-		defer_write(resource, subresource, 0, layout.Footprint.RowPitch, upload, total);
-		resource->version++;
-		return true;
-	}
-	dst.pResource = resource->resource;
 	Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
 	return true;
 }
@@ -244,8 +252,7 @@ bool ShimFlushWrite(ShimResource *resource)
 {
 	// First, as writing goes through Dx12ShimTransition itself
 	resource->write_pending = false;
-	// The rows of a shadow are as far apart as those of the upload
-	if (ShimWriteSubresource(resource, 0, resource->shadow.data(), 0, 0))
+	if (ShimWriteSubresource(resource, 0, resource->shadow.data(), 0, 0, false))
 		return true;
 	resource->write_pending = true;
 	return false;
@@ -611,19 +618,20 @@ bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 	static bool failed;
 	ID3D12Resource *old = resource->resource, *fresh = NULL;
 	D3D12_RESOURCE_BARRIER barrier = {};
-	size_t i;
 	RenameSpike spike(resource->desc.Width, keep_contents, resource->spares.size());
 
 	// One the lists are done with comes before a new one
-	for (i = 0; i < resource->spares.size(); i++) {
-		if (!spare_unused(resource->spares[i].resource))
-			continue;
-		fresh = resource->spares[i].resource;
-		resource->spares.erase(resource->spares.begin() + i);
+	auto unused = [](const ShimResource::Spare &spare) { return spare_unused(spare.resource); };
+	auto &spares = resource->spares;
+	auto spare = std::find_if(spares.begin(), spares.end(), unused);
+	if (spare == spares.end() && !spares.empty() && Dx12ShimReclaimRetired())
+		spare = std::find_if(spares.begin(), spares.end(), unused);
+	spike.busy_spares_checked = spare - spares.begin();
+	if (spare != spares.end()) {
+		fresh = spare->resource;
+		spares.erase(spare);
 		count_spares(resource, -1);
-		break;
 	}
-	spike.busy_spares_checked = i;
 	if (!fresh) {
 		fresh = ModLoadDx12SpareBuffer(resource->desc, resource->allocated, true);
 		if (fresh) {
@@ -1478,7 +1486,6 @@ static void reflect_declarations(ShimShader *shader)
 			dimension = token >> 11 & 0x1f;
 			if (reg < SHIM_SRV_SLOTS && dimension && dimension < ARRAYSIZE(dimensions)) {
 				shader->srv_used[reg / 64] |= 1ull << (reg % 64);
-				shader->srv_count = max(shader->srv_count, reg + 1);
 				shader->srv_dimension[reg] = dimensions[dimension];
 				if (dimension == 1 && operand + 2 < code + length)
 					shader->srv_buffer[reg] = Dx12BufferBinding(D3D_SIT_TEXTURE, (D3D_RESOURCE_RETURN_TYPE)(operand[2] & 15), 0);
@@ -1488,7 +1495,6 @@ static void reflect_declarations(ShimShader *shader)
 		case DCL_RESOURCE_STRUCTURED:
 			if (reg < SHIM_SRV_SLOTS) {
 				shader->srv_used[reg / 64] |= 1ull << (reg % 64);
-				shader->srv_count = max(shader->srv_count, reg + 1);
 				shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_BUFFER;
 				shader->srv_buffer[reg] = opcode == DCL_RESOURCE_RAW ? (UINT16)DX12_BUFFER_RAW
 					: Dx12BufferBinding(D3D_SIT_STRUCTURED, D3D_RETURN_TYPE_MIXED, operand + 2 < code + length ? operand[2] : 0);
@@ -1549,6 +1555,31 @@ static bool reflect_bindings(Reflection *reflection, ShimShader *shader)
 		if (FAILED(reflection->GetResourceBindingDesc(i, &bind)))
 			continue;
 
+		if (bind.Type == D3D_SIT_TBUFFER || bind.Type == D3D_SIT_TEXTURE || bind.Type == D3D_SIT_STRUCTURED
+		    || bind.Type == D3D_SIT_BYTEADDRESS || bind.Type == D3D_SIT_RTACCELERATIONSTRUCTURE) {
+			shader->uses_acceleration_structure |= bind.Type == D3D_SIT_RTACCELERATIONSTRUCTURE;
+			if (!bind.BindCount || bind.BindPoint >= SHIM_SRV_SLOTS || bind.BindCount > SHIM_SRV_SLOTS - bind.BindPoint) {
+				shader->unsupported_srv_range = true;
+				Dx12LogInfo("*** Unsupported SRV range in mod %s shader: %s at t%u, count %u (limit: %u slots)\n",
+					dx12_stage_names[shader->stage], bind.Name ? bind.Name : "(unnamed)",
+					bind.BindPoint, bind.BindCount, SHIM_SRV_SLOTS);
+			}
+			for (reg = bind.BindPoint; reg < SHIM_SRV_SLOTS && reg - bind.BindPoint < max(1u, bind.BindCount); reg++) {
+				shader->srv_used[reg / 64] |= 1ull << (reg % 64);
+				shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_BUFFER;
+				if (bind.Type == D3D_SIT_RTACCELERATIONSTRUCTURE)
+					shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+				else if (bind.Type == D3D_SIT_TEXTURE && bind.Dimension != D3D_SRV_DIMENSION_BUFFEREX)
+					shader->srv_dimension[reg] = (BYTE)bind.Dimension;
+				if (shader->srv_dimension[reg] == D3D12_SRV_DIMENSION_BUFFER) {
+					UINT16 binding = Dx12BufferBinding(bind.Type, bind.ReturnType, bind.NumSamples);
+					if (binding)
+						shader->srv_buffer[reg] = binding;
+				}
+			}
+			continue;
+		}
+
 		for (reg = bind.BindPoint; reg < SHIM_SRV_SLOTS && reg - bind.BindPoint < max(1u, bind.BindCount); reg++) {
 			switch (bind.Type) {
 			case D3D_SIT_CBUFFER:
@@ -1561,23 +1592,6 @@ static bool reflect_bindings(Reflection *reflection, ShimShader *shader)
 				if (reg < SHIM_SAMPLER_SLOTS) {
 					shader->sampler_used |= 1u << reg;
 					shader->sampler_count = max(shader->sampler_count, reg + 1);
-				}
-				break;
-			case D3D_SIT_TBUFFER:
-			case D3D_SIT_TEXTURE:
-			case D3D_SIT_STRUCTURED:
-			case D3D_SIT_BYTEADDRESS:
-				if (reg < SHIM_SRV_SLOTS) {
-					shader->srv_used[reg / 64] |= 1ull << (reg % 64);
-					shader->srv_count = max(shader->srv_count, reg + 1);
-					shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_BUFFER;
-					if (bind.Type == D3D_SIT_TEXTURE && bind.Dimension != D3D_SRV_DIMENSION_BUFFEREX)
-						shader->srv_dimension[reg] = (BYTE)bind.Dimension;
-					if (shader->srv_dimension[reg] == D3D12_SRV_DIMENSION_BUFFER) {
-						UINT16 binding = Dx12BufferBinding(bind.Type, bind.ReturnType, bind.NumSamples);
-						if (binding)
-							shader->srv_buffer[reg] = binding;
-					}
 				}
 				break;
 			case D3D_SIT_UAV_RWTYPED:
@@ -1644,6 +1658,10 @@ static void reflect_shader(ShimShader *shader)
 	if (!read) {
 		Dx12LogInfo("*** No reflection for a %s %s shader of a mod, it will be given no resources\n",
 			shader->dxil ? "DXIL" : "DXBC", dx12_stage_names[shader->stage]);
+	}
+	for (UINT64 slots : shader->srv_used) {
+		for (; slots; slots &= slots - 1)
+			shader->srv_count++;
 	}
 }
 

@@ -182,7 +182,7 @@ static bool begin(Dx12SwapChain *swap_chain)
 	ID3D12CommandQueue *queue = current_present_queue(swap_chain);
 	if (!queue)
 		return false;
-	if (!dx12_shim && !Dx12ShimCreate(swap_chain->mQueue->mDevice, swap_chain->mQueue))
+	if (!dx12_shim && !Dx12ShimCreate(swap_chain->mQueue->mDevice, swap_chain->mQueue, swap_chain->mHardwareAdapter))
 		return false;
 
 	if (swap_chain->mQueue->mDevice->mOrig != dx12_shim->device || !Dx12ShimSetQueue(queue))

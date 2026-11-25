@@ -18,9 +18,21 @@ static const IID *const swap_chain_iids[] = {
 	&__uuidof(IDXGISwapChain3), &__uuidof(IDXGISwapChain4),
 };
 
+static bool hardware_adapter(IDXGISwapChain *swap_chain, LUID luid)
+{
+	Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+	DXGI_ADAPTER_DESC1 desc;
+
+	return SUCCEEDED(swap_chain->GetParent(IID_PPV_ARGS(&factory)))
+		&& SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))
+		&& SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE);
+}
+
 Dx12SwapChain::Dx12SwapChain(Dx12CommandQueue *queue, IDXGISwapChain *orig) :
 	mRef(1),
-	mQueue(queue)
+	mQueue(queue),
+	mHardwareAdapter(hardware_adapter(orig, queue->mDevice->mOrig->GetAdapterLuid()))
 {
 	mVersion = Dx12QueryNewest(orig, swap_chain_iids, ARRAYSIZE(swap_chain_iids), (void**)&mOrig);
 	mQueue->AddRef();

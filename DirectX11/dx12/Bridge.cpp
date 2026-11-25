@@ -1,6 +1,7 @@
 #include "Bridge.h"
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -108,6 +109,7 @@ static SRWLOCK unordered_queues_lock = SRWLOCK_INIT;
 static std::unordered_map<ID3D12CommandQueue*, ForeignQueue*> unordered_queues;
 static std::atomic<bool> have_unordered_queues{false};
 static void release_retired();
+static bool reclaim_foreign_pins(ForeignQueue *foreign);
 
 static std::vector<ShimResource*> touched;
 
@@ -115,26 +117,42 @@ static std::vector<ShimResource*> touched;
 // counting only what Dx12ShimUseOnGameList pinned. An execution on another
 // queue than ours counts too until that queue is done with it: what we write
 // after handing it the list is not after it for the GPU.
-static std::unordered_map<IUnknown*, UINT> game_uses;
+struct GameUses {
+	UINT pending;
+	UINT foreign;
+};
+static std::unordered_map<IUnknown*, GameUses> game_uses;
 
 // With the lock held
-static void end_game_use(IUnknown *object)
+static void end_game_use(IUnknown *object, UINT GameUses::*kind)
 {
 	auto found = game_uses.find(object);
 
-	if (found != game_uses.end() && !--found->second)
+	if (found == game_uses.end() || !(found->second.*kind))
+		return;
+	--(found->second.*kind);
+	if (!found->second.pending && !found->second.foreign)
 		game_uses.erase(found);
 }
 
-static void end_game_uses(const std::vector<IUnknown*> *pins)
+static void end_game_uses(const std::vector<IUnknown*> *pins, UINT GameUses::*kind)
 {
 	for (IUnknown *object : *pins)
-		end_game_use(object);
+		end_game_use(object, kind);
 }
 
 static bool game_list_uses(IUnknown *object)
 {
-	return !game_uses.empty() && game_uses.count(object);
+	auto found = game_uses.find(object);
+	if (found == game_uses.end())
+		return false;
+	if (found->second.pending)
+		return true;
+	for (ForeignQueue *foreign : foreign_queues) {
+		if (!foreign->uses.empty() && reclaim_foreign_pins(foreign) && !game_uses.count(object))
+			return false;
+	}
+	return true;
 }
 
 static CRITICAL_SECTION shim_lock;
@@ -641,7 +659,8 @@ struct DescriptorPages {
 static DescriptorPages view_pages = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, VIEW_PAGE_SIZE };
 static DescriptorPages sampler_pages = { D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, SAMPLER_PAGE_SIZE };
 
-static std::map<std::vector<SIZE_T>, UINT> sampler_tables;
+using SamplerTableKey = std::pair<UINT, std::array<SIZE_T, SHIM_SAMPLER_SLOTS>>;
+static std::map<SamplerTableKey, UINT> sampler_tables;
 static ID3D12DescriptorHeap *bound_view_heap;
 static ID3D12DescriptorHeap *bound_sampler_heap;
 
@@ -716,14 +735,14 @@ D3D12_GPU_DESCRIPTOR_HANDLE Dx12ShimSamplerTable(const D3D12_CPU_DESCRIPTOR_HAND
 	DescriptorPage *page = &sampler_pages.current;
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu = {};
-	std::vector<SIZE_T> key(count);
+	SamplerTableKey key = {count, {}};
 	UINT i, start;
 
-	if (!page->heap || page->used + count > sampler_pages.size)
+	if (!page->heap || count > key.second.size() || page->used + count > sampler_pages.size)
 		return gpu;
 
 	for (i = 0; i < count; i++)
-		key[i] = samplers[i].ptr;
+		key.second[i] = samplers[i].ptr;
 
 	auto found = sampler_tables.find(key);
 	if (found != sampler_tables.end()) {
@@ -733,7 +752,7 @@ D3D12_GPU_DESCRIPTOR_HANDLE Dx12ShimSamplerTable(const D3D12_CPU_DESCRIPTOR_HAND
 		page->used += count;
 		cpu.ptr = page->cpu.ptr + (SIZE_T)start * sampler_pages.increment;
 		shim.device->CopyDescriptors(1, &cpu, &count, count, samplers, NULL, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-		sampler_tables[key] = start;
+		sampler_tables.emplace(key, start);
 	}
 
 	gpu.ptr = page->gpu.ptr + (UINT64)start * sampler_pages.increment;
@@ -920,13 +939,13 @@ bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, boo
 	return true;
 }
 
-bool Dx12ShimTransitionSubresource(ShimResource *resource, UINT subresource, D3D12_RESOURCE_STATES state)
+bool Dx12ShimTransitionSubresource(ShimResource *resource, UINT subresource, D3D12_RESOURCE_STATES state, bool overwrite)
 {
 	UINT count = texture_plane_size(resource) * ShimPlaneCount(resource);
 	if (subresource >= count)
 		return false;
 	if (count == 1)
-		return Dx12ShimTransition(resource, state);
+		return Dx12ShimTransition(resource, state, overwrite);
 	if (!prepare_transition(resource, !!(state & ~READ_STATES), false))
 		return false;
 	split_states(resource, count);
@@ -1537,7 +1556,7 @@ void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pin
 {
 	Dx12ShimLock();
 	if (dx12_shim && queue == shim.queue) {
-		end_game_uses(first);
+		end_game_uses(first, &GameUses::pending);
 		// What another thread recorded since the queue proxy had our
 		// list executed was promised the value signalled next
 		Dx12ShimSubmit();
@@ -1550,10 +1569,10 @@ void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pin
 
 		InterlockedIncrement64(&dx12_stats.pin_lates);
 		for (IUnknown *object : *pins) {
-			game_uses[object]++;
+			game_uses[object].foreign++;
 			foreign->unsignalled.push_back(object);
 		}
-		end_game_uses(first);
+		end_game_uses(first, &GameUses::pending);
 		if (!signal_foreign_queue(foreign)) {
 			if (!foreign->unordered) {
 				foreign->unordered_frames = UNORDERED_FRAMES;
@@ -1672,7 +1691,7 @@ void Dx12ShimPinsInherited(Dx12GraphicsCommandList *list, Dx12GraphicsCommandLis
 		// executed again by another list, with what it was recorded
 		// with.
 		if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&resource)))) {
-			game_uses[object]++;
+			game_uses[object].pending++;
 			resource->Release();
 		}
 	}
@@ -1683,7 +1702,7 @@ void Dx12ShimPinsAbandoned(std::vector<IUnknown*> *pins, bool executed)
 {
 	if (!executed) {
 		Dx12ShimLock();
-		end_game_uses(pins);
+		end_game_uses(pins, &GameUses::pending);
 		Dx12ShimUnlock();
 	}
 	for (IUnknown *object : *pins)
@@ -1711,7 +1730,7 @@ bool Dx12ShimUseOnGameList(ShimResource *resource, Dx12GraphicsCommandList *list
 		return false;
 
 	if (Dx12ShimPin(list, resource->resource))
-		game_uses[resource->resource]++;
+		game_uses[resource->resource].pending++;
 	if (resource->prepare_spares_on_pin) {
 		resource->prepare_spares_on_pin = false;
 		ModLoadDx12SpareBuffer(resource->desc, resource->allocated, false);
@@ -1736,10 +1755,13 @@ static bool upload_for_game_lists(ShimResource *resource, UINT64 bytes, bool alo
 		if (!game_upload.buffer || game_upload.used + bytes > GAME_UPLOAD_BLOCK_SIZE) {
 			if (!next_game_upload(&page))
 				return false;
-			if (game_upload.buffer && game_upload_full.size() < GAME_UPLOAD_BLOCKS_KEPT)
+			if (game_upload.buffer) {
+				if (game_upload_full.size() == GAME_UPLOAD_BLOCKS_KEPT) {
+					game_upload_full.front().buffer->Release();
+					game_upload_full.erase(game_upload_full.begin());
+				}
 				game_upload_full.push_back(game_upload);
-			else if (game_upload.buffer)
-				game_upload.buffer->Release();
+			}
 			game_upload = page;
 		}
 		page = game_upload;
@@ -1832,6 +1854,49 @@ void Dx12ShimDeferRelease(IUnknown *object)
 	retired.push_back({ object, Dx12ShimPendingFence() });
 }
 
+static bool release_completed(std::deque<Retired> &entries, UINT64 completed)
+{
+	bool released = false;
+	while (!entries.empty() && entries.front().fence <= completed) {
+		IUnknown *object = entries.front().object;
+		entries.pop_front();
+		object->Release();
+		released = true;
+	}
+	return released;
+}
+
+static bool release_foreign_pins(ForeignQueue *foreign, UINT64 completed)
+{
+	while (!foreign->uses.empty() && foreign->uses.front().fence <= completed) {
+		end_game_use(foreign->uses.front().object, &GameUses::foreign);
+		foreign->uses.pop_front();
+	}
+	return release_completed(foreign->retired, completed);
+}
+
+static bool reclaim_foreign_pins(ForeignQueue *foreign)
+{
+	if (!foreign->fence || foreign->retired.empty())
+		return false;
+	UINT64 completed = foreign->fence->GetCompletedValue();
+	return completed != UINT64_MAX && completed >= foreign->retired.front().fence
+		&& release_foreign_pins(foreign, completed);
+}
+
+bool Dx12ShimReclaimRetired()
+{
+	bool released = false;
+	if (!retired.empty() && retired.front().fence <= last_shim_signal) {
+		UINT64 completed = fence->GetCompletedValue();
+		if (completed != UINT64_MAX)
+			released = release_completed(retired, completed);
+	}
+	for (ForeignQueue *foreign : foreign_queues)
+		released |= reclaim_foreign_pins(foreign);
+	return released;
+}
+
 static void release_retired()
 {
 	UINT64 completed = fence->GetCompletedValue();
@@ -1840,10 +1905,7 @@ static void release_retired()
 		close_staged_upload_pool();
 	release_retired_staged_uploads(completed);
 
-	while (!retired.empty() && retired.front().fence <= completed) {
-		retired.front().object->Release();
-		retired.pop_front();
-	}
+	release_completed(retired, completed);
 
 	bool device_removed = completed == UINT64_MAX;
 	for (auto entry = foreign_queues.begin(); entry != foreign_queues.end();) {
@@ -1854,16 +1916,9 @@ static void release_retired()
 			signal_foreign_queue(foreign);
 		UINT64 finished = device_removed ? UINT64_MAX
 			: foreign->fence && !foreign->retired.empty() ? foreign->fence->GetCompletedValue() : 0;
-		while (!foreign->uses.empty() && foreign->uses.front().fence <= finished) {
-			end_game_use(foreign->uses.front().object);
-			foreign->uses.pop_front();
-		}
-		while (!foreign->retired.empty() && foreign->retired.front().fence <= finished) {
-			foreign->retired.front().object->Release();
-			foreign->retired.pop_front();
-		}
+		release_foreign_pins(foreign, finished);
 		if (device_removed) {
-			end_game_uses(&foreign->unsignalled);
+			end_game_uses(&foreign->unsignalled, &GameUses::foreign);
 			for (IUnknown *object : foreign->unsignalled)
 				object->Release();
 			foreign->unsignalled.clear();
@@ -2173,7 +2228,7 @@ bool Dx12ShimSetQueue(ID3D12CommandQueue *queue)
 	return true;
 }
 
-bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue)
+bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue, bool hardware_adapter)
 {
 	static bool failed;
 	Allocator allocator = {};
@@ -2194,6 +2249,7 @@ bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue)
 	// Our objects are created on the original device: they are not the
 	// game's, so nothing about them belongs in what the proxies record.
 	shim.device = device->mOrig;
+	shim.hardware_adapter = hardware_adapter;
 	shim.queue = queue->mOrig;
 
 	if (shim.queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
