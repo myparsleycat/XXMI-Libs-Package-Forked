@@ -2,6 +2,9 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
+#include <dbghelp.h>
+#include <atomic>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -28,7 +31,8 @@ static void compile(const char *s, const char *model, const fs::path &out) {
 }
 static HWND window() {
     WNDCLASSW wc = {}; wc.lpfnWndProc = DefWindowProcW; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"ScopeReproHidden";
-    if (!RegisterClassW(&wc)) throw std::runtime_error("RegisterClass");
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        throw std::runtime_error("RegisterClass");
     HWND w = CreateWindowW(wc.lpszClassName, L"Offline scope reproduction", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
     if (!w) throw std::runtime_error("CreateWindow"); return w;
 }
@@ -113,9 +117,21 @@ static Pixels dx11(HWND w, const fs::path &dir) {
     c->VSSetShader(vs.Get(), nullptr, 0); c->PSSetShader(ps.Get(), nullptr, 0); c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST); c->IASetIndexBuffer(ib.Get(), DXGI_FORMAT_R32_UINT, 0); c->DrawIndexedInstanced(3, 1, 3, 0, 0);
     c->CopyResource(rb.Get(), target.Get()); D3D11_MAPPED_SUBRESOURCE mapped = {}; check(c->Map(rb.Get(), 0, D3D11_MAP_READ, 0, &mapped)); Pixels result = pixels((unsigned char *)mapped.pData, mapped.RowPitch); c->Unmap(rb.Get(), 0); check(swap->Present(0, 0)); check(d->GetDeviceRemovedReason()); return result;
 }
+#include "shim.inc"
+
 int wmain(int argc, wchar_t **argv) { try {
     if (argc == 3 && !wcscmp(argv[1], L"compile")) { fs::path out = argv[2]; compile(vs_source, "vs_5_0", out / "vs.bin"); compile(ps_source, "ps_5_0", out / "ps.bin"); return 0; }
     if (argc != 4) throw std::runtime_error("usage: scope_repro <dx11|dx12> <DLL|none> <shader-directory>");
+    if (!wcscmp(argv[1], L"compile-shim")) {
+        auto source = read(argv[2]);
+        source.push_back(0);
+        compile(source.data(), "cs_5_0", argv[3]);
+        return 0;
+    }
+    if (!wcsncmp(argv[1], L"shim-", 5)) {
+        shim_probe(argv[1] + 5, argv[2], argv[3]);
+        return 0;
+    }
     if (wcscmp(argv[1], L"dx11") && wcscmp(argv[1], L"dx12")) throw std::runtime_error("API must be dx11 or dx12");
     if (wcscmp(argv[2], L"none") && !LoadLibraryExW(argv[2], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) throw std::runtime_error("DLL load");
     HWND w = window(); Pixels p = !wcscmp(argv[1], L"dx12") ? dx12(w, argv[3]) : dx11(w, argv[3]); DestroyWindow(w);

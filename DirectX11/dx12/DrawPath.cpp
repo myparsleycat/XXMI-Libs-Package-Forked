@@ -34,7 +34,7 @@
 #include "../vk/VkScope.h"
 
 volatile bool dx12_draw_path_active;
-volatile UINT dx12_draw_generation = 1;
+std::atomic<UINT> dx12_draw_generation{1};
 bool dx12_mods_disabled;
 static bool mods_faulted;
 
@@ -3079,7 +3079,7 @@ bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot)
 // and not the game's texture the table has there. Only for those and the
 // registers patches added: the game's shaders keep their own textures where a
 // mod sets none.
-static void apply_unbound_shader_resources(const ShimState *mod)
+static bool apply_unbound_shader_resources(const ShimState *mod)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
 	Dx12RegisterLocation location;
@@ -3097,8 +3097,9 @@ static void apply_unbound_shader_resources(const ShimState *mod)
 			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
 				slot = word * 32 + bit;
 				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
-				    && table_descriptor(&location, &descriptor))
-					Dx12ShimNullSrv(shader->srv_dimension[slot], descriptor);
+				    && table_descriptor(&location, &descriptor)
+				    && !Dx12ShimNullSrv(shader->srv_dimension[slot], shader->srv_buffer[slot], descriptor))
+					return false;
 			}
 		}
 	}
@@ -3115,11 +3116,13 @@ static void apply_unbound_shader_resources(const ShimState *mod)
 			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
 				slot = word * 32 + bit;
 				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
-				    && table_descriptor(&location, &descriptor))
-					Dx12ShimNullSrv(scope->shaders[stage]->srv_dimension[slot], descriptor);
+				    && table_descriptor(&location, &descriptor)
+				    && !Dx12ShimNullSrv(scope->shaders[stage]->srv_dimension[slot], scope->shaders[stage]->srv_buffer[slot], descriptor))
+					return false;
 			}
 		}
 	}
+	return true;
 }
 
 // What the mod has bound to the slot, as a view of the game's list. False for
@@ -3241,15 +3244,18 @@ static bool write_extra_tables(const ShimState *mod, D3D12_GPU_DESCRIPTOR_HANDLE
 			if (view && !view->resource->foreign && view->handle.ptr && Dx12ShimUseOnGameList(view->resource, scope->list))
 				dx12_shim->device->CopyDescriptorsSimple(1, cpu, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 			else {
-				BYTE dimension = scope->shaders[stage] ? scope->shaders[stage]->srv_dimension[reg] : D3D_SRV_DIMENSION_TEXTURE2D;
-				Dx12ShimNullSrv(dimension ? dimension : D3D_SRV_DIMENSION_TEXTURE2D, cpu);
+				const Dx12ShaderInfo *shader = scope->shaders[stage];
+				if (!Dx12ShimNullSrv(shader ? shader->srv_dimension[reg] : 0, shader ? shader->srv_buffer[reg] : 0, cpu))
+					return false;
 			}
 			cpu.ptr += dx12_shim_view_increment;
 		}
 		for (reg = 0; reg < 64; reg++) {
 			if (!(extension->extra.uav[stage] & 1ull << reg))
 				continue;
-			Dx12ShimNullUav(scope->shaders[stage] ? scope->shaders[stage]->uav_dimension[reg] : 0, cpu);
+			const Dx12ShaderInfo *shader = scope->shaders[stage];
+			if (!Dx12ShimNullUav(shader ? shader->uav_dimension[reg] : 0, shader ? shader->uav_buffer[reg] : 0, cpu))
+				return false;
 			cpu.ptr += dx12_shim_view_increment;
 		}
 	}
@@ -4793,10 +4799,12 @@ static void shader_info_of_mod(const ShimShader *shader, Dx12ShaderInfo *info)
 	info->srv[0] = shader->srv_used[0];
 	info->srv[1] = shader->srv_used[1];
 	memcpy(info->srv_dimension, shader->srv_dimension, sizeof(info->srv_dimension));
+	memcpy(info->srv_buffer, shader->srv_buffer, sizeof(info->srv_buffer));
 	info->cbv = shader->cbv_used;
 	info->uav = shader->uav_used;
 	info->samplers = shader->sampler_used;
 	memcpy(info->uav_dimension, shader->uav_dimension, min(sizeof(info->uav_dimension), sizeof(shader->uav_dimension)));
+	memcpy(info->uav_buffer, shader->uav_buffer, min(sizeof(info->uav_buffer), sizeof(shader->uav_buffer)));
 	info->targets = shader->targets;
 	info->bytecode = shader->bytecode.data();
 }
@@ -5205,8 +5213,18 @@ static void apply_overrides(bool mod_draw)
 		for (mask = bound->cb_mask; _BitScanForward(&bit, mask); mask &= mask - 1)
 			apply_constant_buffer(stages[i], bit, bound);
 	}
-	if (scope->custom_stages || scope->patched_stages)
-		apply_unbound_shader_resources(mod);
+	if ((scope->custom_stages || scope->patched_stages) && !apply_unbound_shader_resources(mod)) {
+		restore_overrides();
+		use_root_signature(nullptr);
+		list->SetPipelineState(game->pipeline);
+		scope->variant = nullptr;
+		scope->extension.signature = nullptr;
+		scope->custom_stages = scope->patched_stages = 0;
+		scope->custom_failed = true;
+		for (auto stage : graphics_stages)
+			scope->shaders[stage] = scope->pipeline->shaders[stage];
+		return;
+	}
 	bind_changed_tables();
 
 	if (scope->compute)

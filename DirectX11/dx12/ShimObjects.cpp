@@ -180,6 +180,117 @@ void ShimDestroyView(ShimView *view)
 		view->resource11->Release();
 }
 
+UINT ShimTextureArraySize(const D3D12_RESOURCE_DESC &desc)
+{
+	return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize;
+}
+
+UINT ShimPlaneCount(ShimResource *resource)
+{
+	if (resource->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+		return 1;
+	if (!resource->plane_count) {
+		D3D12_FEATURE_DATA_FORMAT_INFO info = {resource->desc.Format};
+		resource->plane_count = SUCCEEDED(dx12_shim->device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof(info)))
+			&& info.PlaneCount ? info.PlaneCount : 1;
+	}
+	return resource->plane_count;
+}
+
+template <class View>
+static void array_range(ShimView::Range &range, const View &view)
+{
+	range.slice = view.FirstArraySlice;
+	range.slices = view.ArraySize;
+}
+
+template <class View>
+static void mip_range(ShimView::Range &range, const View &view)
+{
+	range.mip = view.MostDetailedMip;
+	range.mips = view.MipLevels;
+}
+
+void ShimSetViewRange(ShimView *view)
+{
+	auto &range = view->range;
+	const auto &desc = view->resource->desc;
+
+	switch (view->kind) {
+	case ShimView::SRV: {
+		const auto &srv = view->desc12.srv;
+		switch (srv.ViewDimension) {
+		case D3D12_SRV_DIMENSION_TEXTURE1D: mip_range(range, srv.Texture1D); break;
+		case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: mip_range(range, srv.Texture1DArray); array_range(range, srv.Texture1DArray); break;
+		case D3D12_SRV_DIMENSION_TEXTURE2D: mip_range(range, srv.Texture2D); break;
+		case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: mip_range(range, srv.Texture2DArray); array_range(range, srv.Texture2DArray); break;
+		case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: array_range(range, srv.Texture2DMSArray); break;
+		case D3D12_SRV_DIMENSION_TEXTURE3D: mip_range(range, srv.Texture3D); break;
+		case D3D12_SRV_DIMENSION_TEXTURECUBE: mip_range(range, srv.TextureCube); range.slices = 6; break;
+		case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+			mip_range(range, srv.TextureCubeArray);
+			range.slice = srv.TextureCubeArray.First2DArrayFace;
+			range.slices = srv.TextureCubeArray.NumCubes == UINT_MAX ? UINT_MAX : srv.TextureCubeArray.NumCubes * 6;
+			break;
+		}
+		if (srv.Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT || srv.Format == DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)
+			range.planes = 2;
+		break;
+	}
+	case ShimView::UAV: {
+		const auto &uav = view->desc12.uav;
+		switch (uav.ViewDimension) {
+		case D3D12_UAV_DIMENSION_TEXTURE1D: range.mip = uav.Texture1D.MipSlice; break;
+		case D3D12_UAV_DIMENSION_TEXTURE1DARRAY: range.mip = uav.Texture1DArray.MipSlice; array_range(range, uav.Texture1DArray); break;
+		case D3D12_UAV_DIMENSION_TEXTURE2D: range.mip = uav.Texture2D.MipSlice; break;
+		case D3D12_UAV_DIMENSION_TEXTURE2DARRAY: range.mip = uav.Texture2DArray.MipSlice; array_range(range, uav.Texture2DArray); break;
+		case D3D12_UAV_DIMENSION_TEXTURE3D: range.mip = uav.Texture3D.MipSlice; break;
+		}
+		break;
+	}
+	case ShimView::RTV: {
+		const auto &rtv = view->desc12.rtv;
+		switch (rtv.ViewDimension) {
+		case D3D12_RTV_DIMENSION_TEXTURE1D: range.mip = rtv.Texture1D.MipSlice; break;
+		case D3D12_RTV_DIMENSION_TEXTURE1DARRAY: range.mip = rtv.Texture1DArray.MipSlice; array_range(range, rtv.Texture1DArray); break;
+		case D3D12_RTV_DIMENSION_TEXTURE2D: range.mip = rtv.Texture2D.MipSlice; break;
+		case D3D12_RTV_DIMENSION_TEXTURE2DARRAY: range.mip = rtv.Texture2DArray.MipSlice; array_range(range, rtv.Texture2DArray); break;
+		case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY: array_range(range, rtv.Texture2DMSArray); break;
+		case D3D12_RTV_DIMENSION_TEXTURE3D: range.mip = rtv.Texture3D.MipSlice; break;
+		}
+		break;
+	}
+	case ShimView::DSV: {
+		const auto &dsv = view->desc12.dsv;
+		switch (dsv.ViewDimension) {
+		case D3D12_DSV_DIMENSION_TEXTURE1D: range.mip = dsv.Texture1D.MipSlice; break;
+		case D3D12_DSV_DIMENSION_TEXTURE1DARRAY: range.mip = dsv.Texture1DArray.MipSlice; array_range(range, dsv.Texture1DArray); break;
+		case D3D12_DSV_DIMENSION_TEXTURE2D: range.mip = dsv.Texture2D.MipSlice; break;
+		case D3D12_DSV_DIMENSION_TEXTURE2DARRAY: range.mip = dsv.Texture2DArray.MipSlice; array_range(range, dsv.Texture2DArray); break;
+		case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY: array_range(range, dsv.Texture2DMSArray); break;
+		}
+		if (dsv.Format == DXGI_FORMAT_D24_UNORM_S8_UINT || dsv.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+			range.planes |= 2;
+		view->read_only_planes = dsv.Flags & range.planes;
+		break;
+	}
+	}
+
+	if (view->resource->dimension != D3D11_RESOURCE_DIMENSION_BUFFER) {
+		UINT slices = ShimTextureArraySize(desc);
+		range.mips = range.mip < desc.MipLevels ? min(range.mips, desc.MipLevels - range.mip) : 0;
+		range.slices = range.slice < slices ? min(range.slices, slices - range.slice) : 0;
+	}
+}
+
+bool ShimViewsOverlap(const ShimView *a, const ShimView *b, UINT planes)
+{
+	return a && b && a->resource == b->resource && (a->range.planes & b->range.planes & planes)
+		&& a->range.mips && b->range.mips && a->range.slices && b->range.slices
+		&& a->range.mip < b->range.mip + b->range.mips && b->range.mip < a->range.mip + a->range.mips
+		&& a->range.slice < b->range.slice + b->range.slices && b->range.slice < a->range.slice + a->range.slices;
+}
+
 void ShimRecreateView(ShimView *view)
 {
 	ID3D12Resource *resource = view->resource->resource;

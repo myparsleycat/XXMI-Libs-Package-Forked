@@ -29,11 +29,12 @@ public:
 
 // For telling whether a queue can be made to wait for a fence without two
 // queues ending up waiting for each other. That takes knowing every signal and
-// wait the queues were handed: the proxies note the game's, and whoever else
-// hands a queue a wait, or a signal another queue is made to wait for, has to
-// as well (a signal after the queue has it, a wait before).
+// wait the queues were handed. Register a signal after the queue accepts it.
+// Dx12QueueWait registers the wait before calling the queue so reachability
+// checks on other queues can see it.
 void Dx12QueueSignalled(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value);
-void Dx12QueueWaits(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value);
+void Dx12ForgetQueueOrdering(ID3D12CommandQueue *queue);
+HRESULT Dx12QueueWait(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value);
 // Held from noting a signal, a wait or an execution with buffer writes until
 // the queue has it, or the other way round, so that they are noted in the
 // order the queue has them, which Dx12QueueAfter goes by. Taken after the

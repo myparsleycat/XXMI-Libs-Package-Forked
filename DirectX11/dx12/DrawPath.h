@@ -1,6 +1,7 @@
 #pragma once
 
 #include <d3d11_1.h>
+#include <atomic>
 
 #include "Dx12CommandList.h"
 
@@ -46,7 +47,7 @@
 // threads recording, like dx12_draw_generation, which changes when what was
 // worked out for a pipeline state no longer holds.
 extern volatile bool dx12_draw_path_active;
-extern volatile UINT dx12_draw_generation;
+extern std::atomic<UINT> dx12_draw_generation;
 
 bool Dx12DrawPipelineWanted(Dx12GraphicsCommandList *list);
 

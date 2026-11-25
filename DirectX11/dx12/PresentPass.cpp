@@ -43,6 +43,7 @@ static D3D11_VIEWPORT viewport;
 // buffers alive: the game could never resize its swap chain otherwise. When
 // the buffers go, the wrappers are left without a resource.
 static ShimTexture2D *back_buffers[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+static ID3D12Resource *suspended_buffers[DXGI_MAX_SWAP_CHAIN_BUFFERS];
 
 ID3D11Resource* Dx12ShimBackBuffer()
 {
@@ -50,11 +51,14 @@ ID3D11Resource* Dx12ShimBackBuffer()
 	UINT index;
 
 	// Every swap chain that can present for D3D12 is an IDXGISwapChain3
-	if (!presenting || presenting->mVersion < 3)
+	if (!presenting || presenting->mVersion < 3 || presenting->Resizing())
 		return NULL;
 
 	index = presenting->mOrig->GetCurrentBackBufferIndex();
 	if (index >= ARRAYSIZE(back_buffers))
+		return NULL;
+	ID3D12CommandQueue *queue = presenting->PresentQueue(index);
+	if (!queue || queue != dx12_shim->queue)
 		return NULL;
 
 	if (!back_buffers[index]) {
@@ -63,6 +67,7 @@ ID3D11Resource* Dx12ShimBackBuffer()
 		// Between frames is the only time we record anything that
 		// can use it, and then it is in the state to be presented in
 		back_buffers[index] = ShimWrapTexture2D(buffer, D3D12_RESOURCE_STATE_PRESENT);
+		back_buffers[index]->r.present_queue = queue;
 		buffer->Release();
 	}
 
@@ -70,55 +75,119 @@ ID3D11Resource* Dx12ShimBackBuffer()
 	return back_buffers[index];
 }
 
-static void submit()
+static bool needs_present_state(const ShimTexture2D *buffer)
+{
+	return buffer && buffer->r.resource
+		&& (buffer->r.state != D3D12_RESOURCE_STATE_PRESENT || !buffer->r.subresource_states.empty());
+}
+
+static void restore_present_state()
 {
 	for (ShimTexture2D *buffer : back_buffers) {
-		if (buffer)
-			Dx12ShimTransition(&buffer->r, D3D12_RESOURCE_STATE_PRESENT);
+		if (needs_present_state(buffer))
+			Dx12ShimSetState(&buffer->r, D3D12_RESOURCE_STATE_PRESENT);
 	}
+}
+
+static void submit()
+{
+	restore_present_state();
 	Dx12ShimSubmit();
 	Dx12LogDebugMessages();
 }
 
-void Dx12SwapChainBuffersReleased(Dx12SwapChain *swap_chain, bool destroyed)
+HRESULT Dx12SwapChainBuffersIdle(Dx12SwapChain *swap_chain)
 {
 	Dx12ShimLock();
-	if (swap_chain != presenting) {
-		Dx12ShimUnlock();
-		return;
+	HRESULT hr = S_OK;
+	if (swap_chain == presenting) {
+		restore_present_state();
+		hr = Dx12ShimSubmitAndWait();
+		Dx12LogDebugMessages();
 	}
+	Dx12ShimUnlock();
+	return hr;
+}
 
-	// Nothing that refers to the buffers may be left to execute
-	submit();
-	Dx12ShimSubmitAndWait();
+void Dx12SwapChainBuffersSuspended(Dx12SwapChain *swap_chain)
+{
+	if (swap_chain != presenting)
+		return;
+	for (UINT i = 0; i < ARRAYSIZE(back_buffers); i++) {
+		if (auto *buffer = back_buffers[i]) {
+			suspended_buffers[i] = buffer->r.resource;
+			buffer->r.resource = nullptr;
+			buffer->r.touched_epoch = 0;
+		}
+	}
+}
 
-	for (ShimTexture2D *&buffer : back_buffers) {
+static void discard_back_buffers(Dx12SwapChain *swap_chain, bool restore)
+{
+	for (UINT i = 0; i < ARRAYSIZE(back_buffers); i++) {
+		ShimTexture2D *&buffer = back_buffers[i];
+		ID3D12Resource *previous = suspended_buffers[i];
+		suspended_buffers[i] = nullptr;
 		if (!buffer)
 			continue;
+		// Existing views can be used again only if DXGI kept the same buffer.
+		ID3D12Resource *current;
+		if (restore && previous && SUCCEEDED(swap_chain->mOrig->GetBuffer(i, IID_PPV_ARGS(&current)))) {
+			if (current == previous)
+				buffer->r.resource = current;
+			current->Release();
+			if (buffer->r.resource)
+				continue;
+		}
 		buffer->r.resource = NULL;
+		buffer->r.present_queue = nullptr;
 		buffer->Release();
 		buffer = NULL;
 	}
+}
 
-	resolution_known = false;
-	if (destroyed)
+void Dx12SwapChainBuffersResized(Dx12SwapChain *swap_chain, HRESULT hr)
+{
+	if (swap_chain != presenting)
+		return;
+	discard_back_buffers(swap_chain, FAILED(hr) && SUCCEEDED(swap_chain->mQueue->mDevice->mOrig->GetDeviceRemovedReason()));
+	if (SUCCEEDED(hr))
+		resolution_known = false;
+}
+
+void Dx12SwapChainBuffersReleased(Dx12SwapChain *swap_chain)
+{
+	Dx12ShimLock();
+	if (swap_chain == presenting) {
+		discard_back_buffers(swap_chain, false);
+		resolution_known = false;
 		presenting = NULL;
+	}
 	Dx12ShimUnlock();
+}
+
+static ID3D12CommandQueue *current_present_queue(Dx12SwapChain *swap_chain)
+{
+	if (swap_chain->mVersion < 3 || swap_chain->Resizing())
+		return nullptr;
+	return swap_chain->PresentQueue(swap_chain->mOrig->GetCurrentBackBufferIndex());
 }
 
 static bool begin(Dx12SwapChain *swap_chain)
 {
 	DXGI_SWAP_CHAIN_DESC desc;
 
+	if ((presenting && swap_chain != presenting) || swap_chain->mQueue->mOrig->GetDesc().NodeMask > 1)
+		return false;
+	ID3D12CommandQueue *queue = current_present_queue(swap_chain);
+	if (!queue)
+		return false;
 	if (!dx12_shim && !Dx12ShimCreate(swap_chain->mQueue->mDevice, swap_chain->mQueue))
 		return false;
 
-	if (!presenting && swap_chain->mQueue->mDevice->mOrig == dx12_shim->device) {
-		presenting = swap_chain;
-		Dx12ShimSetQueue(swap_chain->mQueue);
-	}
-	if (swap_chain != presenting)
+	if (swap_chain->mQueue->mDevice->mOrig != dx12_shim->device || !Dx12ShimSetQueue(queue))
 		return false;
+	presenting = swap_chain;
 
 	if (!resolution_known && SUCCEEDED(swap_chain->mOrig->GetDesc(&desc))) {
 		resolution_known = true;
@@ -243,7 +312,7 @@ static void set_params(const std::vector<DirectX::XMFLOAT4> &params)
 static bool back_buffer_used()
 {
 	for (ShimTexture2D *buffer : back_buffers) {
-		if (buffer && buffer->r.state != D3D12_RESOURCE_STATE_PRESENT)
+		if (needs_present_state(buffer))
 			return true;
 	}
 	return false;
@@ -413,10 +482,11 @@ static void frame_actions()
 	}
 }
 
-void Dx12PresentBegin(Dx12SwapChain *swap_chain)
+bool Dx12PresentBegin(Dx12SwapChain *swap_chain)
 {
 	Dx12ShimLock();
-	if (begin(swap_chain)) {
+	bool active = begin(swap_chain);
+	if (active) {
 		if (resolution_known)
 			dx12_shim->shim_context->RSSetViewports(1, &viewport);
 		frame_actions();
@@ -426,15 +496,21 @@ void Dx12PresentBegin(Dx12SwapChain *swap_chain)
 		Dx12FrameDumpFramePresented();
 	}
 	Dx12ShimUnlock();
+	return active;
 }
 
 void Dx12PresentEnd(Dx12SwapChain *swap_chain)
 {
 	Dx12ShimLock();
 	if (dx12_shim && swap_chain == presenting && !dx12_mods_disabled) {
+		ID3D12CommandQueue *queue = current_present_queue(swap_chain);
+		bool queue_ready = queue && Dx12ShimSetQueue(queue);
 		G->bb_is_upscaling_bb = !!G->SCREEN_UPSCALING && G->upscaling_command_list_using_explicit_bb_flip;
-		// A repeat of [Present] ran its post already
-		if (!present_repeated) {
+		if (!queue_ready) {
+			// Post commands can use the next back buffer and need its present queue.
+			present_seen_valid = false;
+		} else if (!present_repeated) {
+			// A repeat of [Present] ran its post already
 			variable_write_log = frame_writes_open ? &frame_writes : NULL;
 			pool_undo_log = frame_writes_open ? &frame_pools : NULL;
 			RunCommandList(dx12_shim->hacker_device, dx12_shim->hacker_context, &G->post_present_command_list, NULL, true);

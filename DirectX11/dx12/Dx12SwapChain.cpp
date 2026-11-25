@@ -1,7 +1,8 @@
 #include "Dx12SwapChain.h"
 
-#include <vector>
+#include <algorithm>
 
+#include "Bridge.h"
 #include "Dx12CommandQueue.h"
 #include "Dx12Device.h"
 #include "DrawPath.h"
@@ -91,7 +92,8 @@ ULONG STDMETHODCALLTYPE Dx12SwapChain::Release()
 	}
 
 	Dx12LogInfo("Dx12SwapChain %p destroyed\n", this);
-	Dx12SwapChainBuffersReleased(this, true);
+	Dx12SwapChainBuffersIdle(this);
+	Dx12SwapChainBuffersReleased(this);
 	delete this;
 	orig->Release();
 	queue->Release();
@@ -116,6 +118,7 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::GetDevice(REFIID riid, void **ppDevice)
 HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
 	HRESULT hr;
+	bool active;
 
 	if (Flags & DXGI_PRESENT_TEST)
 		return mOrig->Present(SyncInterval, Flags);
@@ -123,7 +126,7 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	Profiling::Spike::frame(dx12_mods_disabled);
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
-		Dx12PresentBegin(this);
+		active = Dx12PresentBegin(this);
 		Dx12FramePresented();
 	}
 	{
@@ -131,13 +134,15 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		hr = mOrig->Present(SyncInterval, Flags);
 	}
 	Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
-	Dx12PresentEnd(this);
+	if (active)
+		Dx12PresentEnd(this);
 	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present1(UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters)
 {
 	HRESULT hr;
+	bool active;
 
 	if (PresentFlags & DXGI_PRESENT_TEST)
 		return mOrig->Present1(SyncInterval, PresentFlags, pPresentParameters);
@@ -145,7 +150,7 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present1(UINT SyncInterval, UINT Presen
 	Profiling::Spike::frame(dx12_mods_disabled);
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_PRE);
-		Dx12PresentBegin(this);
+		active = Dx12PresentBegin(this);
 		Dx12FramePresented();
 	}
 	{
@@ -153,43 +158,107 @@ HRESULT STDMETHODCALLTYPE Dx12SwapChain::Present1(UINT SyncInterval, UINT Presen
 		hr = mOrig->Present1(SyncInterval, PresentFlags, pPresentParameters);
 	}
 	Profiling::Spike::Scope spike(Profiling::Spike::PRESENT_POST);
-	Dx12PresentEnd(this);
+	if (active)
+		Dx12PresentEnd(this);
 	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Dx12SwapChain::ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
-	Dx12SwapChainBuffersReleased(this, false);
-	return mOrig->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+	HRESULT hr = BeginResize();
+	if (FAILED(hr))
+		return hr;
+	hr = mOrig->ResizeBuffers(BufferCount, Width, Height, NewFormat, SwapChainFlags);
+	// DXGI assigns every buffer to the creation queue on ResizeBuffers.
+	FinishResize(hr, {}, true);
+	return hr;
 }
 
 HRESULT STDMETHODCALLTYPE Dx12SwapChain::ResizeBuffers1(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT *pCreationNodeMask, IUnknown *const *ppPresentQueue)
 {
-	std::vector<Dx12CommandQueue*> proxies;
-	std::vector<IUnknown*> queues;
-	HRESULT hr;
-	UINT i;
+	using Microsoft::WRL::ComPtr;
+	std::vector<ComPtr<ID3D12CommandQueue>> queues;
+	std::vector<IUnknown*> originals;
+	HRESULT hr = BeginResize();
+	if (FAILED(hr))
+		return hr;
 
-	Dx12SwapChainBuffersReleased(this, false);
-
-	if (!ppPresentQueue)
-		return mOrig->ResizeBuffers1(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue);
-
-	// DXGI needs the original queues, like when creating a swap chain
-	for (i = 0; i < BufferCount; i++) {
-		Dx12CommandQueue *proxy = Dx12QueryProxy<Dx12CommandQueue>(ppPresentQueue[i]);
-
-		queues.push_back(proxy ? proxy->mOrig : ppPresentQueue[i]);
-		if (proxy)
-			proxies.push_back(proxy);
+	UINT count = BufferCount;
+	if (ppPresentQueue && !count) {
+		DXGI_SWAP_CHAIN_DESC1 desc;
+		hr = mOrig->GetDesc1(&desc);
+		if (SUCCEEDED(hr))
+			count = desc.BufferCount;
+	}
+	if (SUCCEEDED(hr) && ppPresentQueue && (!count || count > DXGI_MAX_SWAP_CHAIN_BUFFERS))
+		hr = E_INVALIDARG;
+	if (FAILED(hr)) {
+		FinishResize(hr, {}, false);
+		return hr;
 	}
 
-	hr = mOrig->ResizeBuffers1(BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, queues.data());
-
-	for (Dx12CommandQueue *proxy : proxies)
-		proxy->Release();
-
+	bool queues_known = true;
+	if (ppPresentQueue) {
+		UINT node = max(1u, mQueue->mOrig->GetDesc().NodeMask);
+		for (UINT i = 0; i < count; i++) {
+			IUnknown *unknown = ppPresentQueue[i];
+			ComPtr<Dx12CommandQueue> proxy;
+			proxy.Attach(Dx12QueryProxy<Dx12CommandQueue>(unknown));
+			ComPtr<ID3D12CommandQueue> queue;
+			if (proxy)
+				queue = proxy->mOrig;
+			else if (unknown)
+				unknown->QueryInterface(IID_PPV_ARGS(&queue));
+			originals.push_back(queue ? queue.Get() : unknown);
+			ComPtr<ID3D12Device> device;
+			if (!queue || FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || device.Get() != mQueue->mDevice->mOrig
+			    || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT || max(1u, queue->GetDesc().NodeMask) != node
+			    || (pCreationNodeMask && max(1u, pCreationNodeMask[i]) != node))
+				queues_known = false;
+			queues.push_back(std::move(queue));
+		}
+	}
+	hr = mOrig->ResizeBuffers1(count, Width, Height, Format, SwapChainFlags, pCreationNodeMask,
+			ppPresentQueue ? originals.data() : nullptr);
+	FinishResize(hr, std::move(queues), queues_known);
 	return hr;
+}
+
+HRESULT Dx12SwapChain::BeginResize()
+{
+	Dx12ShimLock();
+	HRESULT hr = mResizing ? DXGI_ERROR_WAS_STILL_DRAWING : Dx12SwapChainBuffersIdle(this);
+	if (SUCCEEDED(hr)) {
+		mResizing = true;
+		Dx12SwapChainBuffersSuspended(this);
+	}
+	Dx12ShimUnlock();
+	return hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT) ? DXGI_ERROR_NOT_CURRENTLY_AVAILABLE : hr;
+}
+
+void Dx12SwapChain::FinishResize(HRESULT hr, std::vector<Microsoft::WRL::ComPtr<ID3D12CommandQueue>> queues,
+		bool queues_known)
+{
+	Dx12ShimLock();
+	Dx12SwapChainBuffersResized(this, hr);
+	if (SUCCEEDED(hr)) {
+		mPresentQueuesKnown = queues_known;
+		if (!mPresentQueuesKnown || std::all_of(queues.begin(), queues.end(),
+				[&](const auto &queue) { return queue.Get() == mQueue->mOrig; }))
+			queues.clear();
+		mPresentQueues.swap(queues);
+	}
+	mResizing = false;
+	Dx12ShimUnlock();
+}
+
+ID3D12CommandQueue *Dx12SwapChain::PresentQueue(UINT buffer_index) const
+{
+	if (mResizing || !mPresentQueuesKnown)
+		return nullptr;
+	if (mPresentQueues.empty())
+		return mQueue->mOrig;
+	return buffer_index < mPresentQueues.size() ? mPresentQueues[buffer_index].Get() : nullptr;
 }
 
 #include "generated/Dx12SwapChain.fwd.inl"

@@ -29,6 +29,14 @@ extern const char *const dx12_stage_names[DX12_STAGE_COUNT];
 
 const UINT DX12_CB_SIZES = 16;
 
+enum : UINT16 {
+	DX12_BUFFER_RAW = 0xffff,
+	DX12_BUFFER_UINT = 0xfffe,
+	DX12_BUFFER_SINT = 0xfffd,
+	DX12_BUFFER_FLOAT = 0xfffc,
+};
+UINT16 Dx12BufferBinding(D3D_SHADER_INPUT_TYPE type, D3D_RESOURCE_RETURN_TYPE component, UINT stride);
+
 // One per distinct bytecode, never freed
 struct Dx12ShaderInfo {
 	UINT64 hash;
@@ -53,10 +61,12 @@ struct Dx12ShaderInfo {
 	// The dimensions of SRVs added to a patched DXIL shader, and of SRVs in
 	// a mod shader, for a null descriptor where the draw binds nothing.
 	BYTE srv_dimension[128] = {};
+	UINT16 srv_buffer[128] = {};
 	UINT64 cbv;
 	UINT64 uav;
 	UINT samplers;
 	BYTE uav_dimension[64] = {};
+	UINT16 uav_buffer[64] = {};
 	// How many bytes the shader declares for the constant buffers b0-b15 of
 	// space 0, which is all that tells where a buffer bound by address
 	// ends. 0 where it has none or that could not be read.

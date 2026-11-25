@@ -4,8 +4,8 @@
 #include <string>
 
 // DXIL is LLVM 3.7 bitcode. This reads as much of the bitstream as it takes
-// to follow the named metadata node dx.resources to the sizes of the constant
-// buffers:
+// to follow the named metadata node dx.resources to constant buffer sizes
+// and structured buffer strides:
 //
 //   !dx.resources = !{ !{ SRVs, UAVs, CBuffers, Samplers } }
 //   CBuffers = !{ !{ i32 id, T* undef, !"name", i32 space, i32 register,
@@ -27,6 +27,7 @@ const unsigned MODULE_GLOBALVAR = 7, MODULE_FUNCTION = 8, MODULE_ALIAS = 9;
 const unsigned CST_SETTYPE = 1, CST_NULL = 2, CST_INTEGER = 4;
 const unsigned METADATA_STRING = 1, METADATA_VALUE = 2, METADATA_NODE = 3, METADATA_NAME = 4, METADATA_DISTINCT_NODE = 5,
 	METADATA_KIND = 6, METADATA_NAMED_NODE = 10;
+const UINT DXIL_STRUCTURED_BUFFER = 12, DXIL_ELEMENT_STRIDE_TAG = 1;
 
 const size_t MAX_RECORD = 1 << 20;
 const unsigned MAX_DEPTH = 8;
@@ -365,9 +366,9 @@ static UINT32 load32(const BYTE *data)
 
 }
 
-bool Dx12ReadDxilCBuffers(const BYTE *data, size_t size, std::vector<Dx12DxilCBuffer> *buffers)
+bool Dx12ReadDxilResources(const BYTE *data, size_t size, Dx12DxilResources *result)
 {
-	std::vector<Dx12DxilCBuffer> found;
+	Dx12DxilResources found;
 	const MetadataEntry *resources, *list, *buffer;
 	Dx12DxilCBuffer cbuffer;
 	UINT64 offset, length;
@@ -392,7 +393,7 @@ bool Dx12ReadDxilCBuffers(const BYTE *data, size_t size, std::vector<Dx12DxilCBu
 	auto named = reader.named.find("dx.resources");
 	if (named == reader.named.end()) {
 		// A shader without any resources
-		buffers->clear();
+		*result = {};
 		return true;
 	}
 	// A named node lists entries by their number
@@ -409,10 +410,40 @@ bool Dx12ReadDxilCBuffers(const BYTE *data, size_t size, std::vector<Dx12DxilCBu
 			    || !reader.integer(buffer->operands[5], &cbuffer.count)
 			    || !reader.integer(buffer->operands[6], &cbuffer.bytes))
 				return false;
-			found.push_back(cbuffer);
+			found.cbuffers.push_back(cbuffer);
 		}
 	}
 
-	buffers->swap(found);
+	for (UINT i = 0; i < 2; i++) {
+		list = reader.node(resources->operands[i]);
+		if (!list)
+			continue;
+		// The resource kind is at operand 6. The tag list follows two SRV
+		// fields or four UAV fields, with element stride under tag 1.
+		const size_t tag_list = i ? 10 : 8;
+		for (UINT64 operand : list->operands) {
+			buffer = reader.node(operand);
+			UINT kind;
+			if (!buffer || buffer->operands.size() <= tag_list
+			    || !reader.integer(buffer->operands[6], &kind) || kind != DXIL_STRUCTURED_BUFFER)
+				continue;
+			const MetadataEntry *tags = reader.node(buffer->operands[tag_list]);
+			Dx12DxilStructuredBuffer structured = {};
+			if (!tags || !reader.integer(buffer->operands[3], &structured.space)
+			    || !reader.integer(buffer->operands[4], &structured.reg)
+			    || !reader.integer(buffer->operands[5], &structured.count))
+				continue;
+			for (size_t j = 0; j + 1 < tags->operands.size(); j += 2) {
+				UINT tag;
+				if (reader.integer(tags->operands[j], &tag) && tag == DXIL_ELEMENT_STRIDE_TAG
+				    && reader.integer(tags->operands[j + 1], &structured.stride)) {
+					structured.uav = i != 0;
+					found.structured.push_back(structured);
+					break;
+				}
+			}
+		}
+	}
+	*result = std::move(found);
 	return true;
 }

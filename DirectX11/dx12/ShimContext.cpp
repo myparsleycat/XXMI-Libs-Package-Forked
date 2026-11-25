@@ -232,19 +232,24 @@ void ShimContext::GetConstantBuffers(Dx12ShaderStage stage, UINT start, UINT cou
 // D3D11 does not let a resource be read by a shader while it is being
 // rendered to: whichever was bound first gives way. Mods rely on that to swap
 // a texture between the two roles without unbinding it.
-bool ShimContext::IsOutput(ShimResource *resource)
+bool ShimContext::IsOutput(const ShimView *input)
 {
-	ShimView *view;
-
-	for (ID3D11RenderTargetView *rtv : mState->rtvs) {
-		if (rtv && ShimViewOf(rtv)->resource == resource)
+	for (auto *rtv : mState->rtvs)
+		if (ShimViewsOverlap(input, ShimViewOf(rtv), UINT_MAX))
 			return true;
-	}
-	view = ShimViewOf(mState->dsv);
-	return view && !view->read_only && view->resource == resource;
+	if (mState->cs_uavs_set)
+		for (auto *uav : mState->cs_uavs)
+			if (ShimViewsOverlap(input, ShimViewOf(uav), UINT_MAX))
+				return true;
+	if (mState->om_uavs_set)
+		for (auto *uav : mState->om_uavs)
+			if (ShimViewsOverlap(input, ShimViewOf(uav), UINT_MAX))
+				return true;
+	const ShimView *dsv = ShimViewOf(mState->dsv);
+	return dsv && ShimViewsOverlap(input, dsv, ~dsv->read_only_planes);
 }
 
-void ShimContext::UnbindInput(ShimResource *resource)
+void ShimContext::UnbindInput(const ShimView *output)
 {
 	unsigned long bit;
 	UINT word, mask, slot;
@@ -253,7 +258,7 @@ void ShimContext::UnbindInput(ShimResource *resource)
 		for (word = 0; word < ARRAYSIZE(stage.srv_mask); word++) {
 			for (mask = stage.srv_mask[word]; _BitScanForward(&bit, mask); mask &= mask - 1) {
 				slot = word * 32 + bit;
-				if (ShimViewOf(stage.srvs[slot])->resource != resource)
+				if (!ShimViewsOverlap(ShimViewOf(stage.srvs[slot]), output, ~output->read_only_planes))
 					continue;
 				assign(stage.srvs[slot], (ID3D11ShaderResourceView*)NULL);
 				stage.srv_mask[word] &= ~(1u << bit);
@@ -272,7 +277,7 @@ void ShimContext::SetShaderResources(Dx12ShaderStage stage, UINT start, UINT cou
 
 	for (i = 0; i < count && start + i < SHIM_SRV_SLOTS; i++) {
 		view = views ? views[i] : NULL;
-		if (view && IsOutput(ShimViewOf(view)->resource))
+		if (view && IsOutput(ShimViewOf(view)))
 			view = NULL;
 		assign(state->srvs[start + i], view);
 		if (view) {
@@ -379,12 +384,48 @@ SHIM_STAGE_METHODS(HS, DX12_STAGE_HS, ID3D11HullShader)
 SHIM_STAGE_METHODS(DS, DX12_STAGE_DS, ID3D11DomainShader)
 SHIM_STAGE_METHODS(CS, DX12_STAGE_CS, ID3D11ComputeShader)
 
+template <class View>
+static void unbind_output(View *&bound, const ShimView *output)
+{
+	if (ShimViewsOverlap(ShimViewOf(bound), output, UINT_MAX))
+		assign(bound, (View*)NULL);
+}
+
+static bool conflicting_outputs(const ShimView *const *views, UINT count)
+{
+	for (UINT i = 0; i < count; i++)
+		for (UINT j = 0; views[i] && j < i; j++)
+			if (ShimViewsOverlap(views[i], views[j], UINT_MAX))
+				return true;
+	return false;
+}
+
 void STDMETHODCALLTYPE ShimContext::CSSetUnorderedAccessViews(UINT StartSlot, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUnorderedAccessViews, const UINT *pUAVInitialCounts)
 {
-	UINT i;
+	const ShimView *outputs[SHIM_UAV_SLOTS];
 
-	for (i = 0; i < NumUAVs && StartSlot + i < SHIM_UAV_SLOTS; i++)
+	if (StartSlot >= SHIM_UAV_SLOTS || NumUAVs > SHIM_UAV_SLOTS - StartSlot)
+		return;
+	for (UINT i = 0; i < NumUAVs; i++)
+		outputs[i] = ppUnorderedAccessViews ? ShimViewOf(ppUnorderedAccessViews[i]) : nullptr;
+	if (conflicting_outputs(outputs, NumUAVs))
+		return;
+
+	for (UINT i = 0; i < NumUAVs; i++) {
+		const ShimView *view = outputs[i];
+		if (view) {
+			UnbindInput(view);
+			for (auto &rtv : mState->rtvs)
+				unbind_output(rtv, view);
+			unbind_output(mState->dsv, view);
+			for (auto &uav : mState->om_uavs)
+				unbind_output(uav, view);
+			for (UINT slot = 0; slot < SHIM_UAV_SLOTS; slot++)
+				if (slot < StartSlot || slot - StartSlot >= NumUAVs)
+					unbind_output(mState->cs_uavs[slot], view);
+		}
 		assign(mState->cs_uavs[StartSlot + i], ppUnorderedAccessViews ? ppUnorderedAccessViews[i] : NULL);
+	}
 	mState->cs_uavs_set = true;
 	mChanged = true;
 }
@@ -514,40 +555,81 @@ void ShimContext::SetRenderTargets(UINT count, ID3D11RenderTargetView *const *vi
 	mChanged = true;
 	for (i = 0; i < ARRAYSIZE(mState->rtvs); i++) {
 		assign(mState->rtvs[i], i < count && views ? views[i] : NULL);
-		if (mState->rtvs[i])
-			UnbindInput(ShimViewOf(mState->rtvs[i])->resource);
+		view = ShimViewOf(mState->rtvs[i]);
+		if (!view)
+			continue;
+		UnbindInput(view);
+		for (auto &uav : mState->cs_uavs)
+			unbind_output(uav, view);
+		for (auto &uav : mState->om_uavs)
+			unbind_output(uav, view);
 	}
 
 	assign(mState->dsv, depth_stencil);
 	view = ShimViewOf(depth_stencil);
-	if (view && !view->read_only)
-		UnbindInput(view->resource);
+	if (view) {
+		UnbindInput(view);
+		for (auto &uav : mState->cs_uavs)
+			unbind_output(uav, view);
+		for (auto &uav : mState->om_uavs)
+			unbind_output(uav, view);
+	}
+	for (i = 0; i < count; i++)
+		assign(mState->om_uavs[i], (ID3D11UnorderedAccessView*)NULL);
 }
 
 void STDMETHODCALLTYPE ShimContext::OMSetRenderTargets(UINT NumViews, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView)
 {
-	UINT i;
-
-	SetRenderTargets(NumViews, ppRenderTargetViews, pDepthStencilView);
-	for (i = 0; mState->om_uavs_set && i < SHIM_UAV_SLOTS; i++)
-		assign(mState->om_uavs[i], (ID3D11UnorderedAccessView*)NULL);
-	mState->om_uavs_set = false;
+	OMSetRenderTargetsAndUnorderedAccessViews(NumViews, ppRenderTargetViews, pDepthStencilView, NumViews, 0, NULL, NULL);
 }
 
 void STDMETHODCALLTYPE ShimContext::OMSetRenderTargetsAndUnorderedAccessViews(UINT NumRTVs, ID3D11RenderTargetView *const *ppRenderTargetViews, ID3D11DepthStencilView *pDepthStencilView, UINT UAVStartSlot, UINT NumUAVs, ID3D11UnorderedAccessView *const *ppUnorderedAccessViews, const UINT *pUAVInitialCounts)
 {
-	UINT i;
+	bool keep_targets = NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL;
+	bool keep_uavs = NumUAVs == D3D11_KEEP_UNORDERED_ACCESS_VIEWS;
+	const ShimView *outputs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT + 1 + SHIM_UAV_SLOTS];
+	UINT count = 0;
 
-	if (NumRTVs != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
+	if (!keep_targets) {
+		if (NumRTVs > ARRAYSIZE(mState->rtvs))
+			return;
+		outputs[count++] = ShimViewOf(pDepthStencilView);
+		for (UINT i = 0; ppRenderTargetViews && i < NumRTVs; i++)
+			outputs[count++] = ShimViewOf(ppRenderTargetViews[i]);
+	}
+	if (!keep_uavs) {
+		if (UAVStartSlot > SHIM_UAV_SLOTS || NumUAVs > SHIM_UAV_SLOTS - UAVStartSlot
+		    || (!keep_targets && NumUAVs && UAVStartSlot < NumRTVs))
+			return;
+		for (UINT i = 0; ppUnorderedAccessViews && i < NumUAVs; i++)
+			outputs[count++] = ShimViewOf(ppUnorderedAccessViews[i]);
+	}
+	if (conflicting_outputs(outputs, count))
+		return;
+
+	if (!keep_targets)
 		SetRenderTargets(NumRTVs, ppRenderTargetViews, pDepthStencilView);
-	if (NumUAVs == D3D11_KEEP_UNORDERED_ACCESS_VIEWS)
+	if (keep_uavs)
 		return;
 	mChanged = true;
-	mState->om_uavs_set = true;
+	mState->om_uavs_set = NumUAVs != 0;
 
-	for (i = 0; i < SHIM_UAV_SLOTS; i++) {
-		assign(mState->om_uavs[i], i >= UAVStartSlot && i - UAVStartSlot < NumUAVs && ppUnorderedAccessViews
-			? ppUnorderedAccessViews[i - UAVStartSlot] : NULL);
+	if (keep_targets && NumUAVs)
+		for (UINT i = UAVStartSlot; i < ARRAYSIZE(mState->rtvs); i++)
+			assign(mState->rtvs[i], (ID3D11RenderTargetView*)NULL);
+	for (UINT i = 0; i < SHIM_UAV_SLOTS; i++) {
+		auto *uav = i >= UAVStartSlot && i - UAVStartSlot < NumUAVs && ppUnorderedAccessViews
+			? ppUnorderedAccessViews[i - UAVStartSlot] : NULL;
+		const ShimView *view = ShimViewOf(uav);
+		if (view) {
+			UnbindInput(view);
+			for (auto &existing : mState->cs_uavs)
+				unbind_output(existing, view);
+			if (keep_targets)
+				for (auto &rtv : mState->rtvs)
+					unbind_output(rtv, view);
+		}
+		assign(mState->om_uavs[i], uav);
 	}
 }
 
@@ -814,7 +896,7 @@ void STDMETHODCALLTYPE ShimContext::ClearRenderTargetView(ID3D11RenderTargetView
 {
 	ShimView *view = ShimViewOf(pRenderTargetView);
 
-	if (!view || !Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_RENDER_TARGET))
+	if (!view || !Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_RENDER_TARGET))
 		return;
 
 	Dx12ShimList()->ClearRenderTargetView(view->handle, ColorRGBA, 0, NULL);
@@ -824,7 +906,11 @@ void STDMETHODCALLTYPE ShimContext::ClearDepthStencilView(ID3D11DepthStencilView
 {
 	ShimView *view = ShimViewOf(pDepthStencilView);
 
-	if (!view || !Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_DEPTH_WRITE))
+	if (!view)
+		return;
+	ClearFlags &= view->range.planes;
+	if (!ClearFlags || (ClearFlags & view->read_only_planes)
+	    || !Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_DEPTH_WRITE, ClearFlags))
 		return;
 
 	// D3D12_CLEAR_FLAGS has the values of D3D11_CLEAR_FLAG
@@ -844,7 +930,7 @@ static bool prepare_uav_clear(ShimView *view, D3D12_GPU_DESCRIPTOR_HANDLE *gpu)
 	if (!cpu.ptr)
 		return false;
 	// Before the descriptor is read: the transition may write it again
-	if (!Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+	if (!Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
 		return false;
 	dx12_shim->device->CopyDescriptorsSimple(1, cpu, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
@@ -909,6 +995,19 @@ static bool is_buffer(ShimResource *resource)
 	return resource->dimension == D3D11_RESOURCE_DIMENSION_BUFFER;
 }
 
+static bool empty_box(const D3D11_BOX *box)
+{
+	return box && (box->left >= box->right || box->top >= box->bottom || box->front >= box->back);
+}
+
+static UINT subresource_count(const ShimResource *resource)
+{
+	if (resource->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+		return 1;
+	return resource->desc.MipLevels * (resource->dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D
+			? 1u : resource->desc.DepthOrArraySize);
+}
+
 static UINT texture_shadow_pitch(ShimResource *resource, UINT *rows)
 {
 	UINT64 row_size;
@@ -926,10 +1025,15 @@ static HRESULT fetch_readback(ShimResource *resource, UINT byte_width, bool wait
 	if (!resource->readback_pending)
 		return resource->readback_lost ? E_FAIL : S_OK;
 
-	if (!Dx12ShimFenceReached(resource->readback_fence)) {
+	UINT64 completed = Dx12ShimFence(nullptr)->GetCompletedValue();
+	if (completed == UINT64_MAX)
+		return DXGI_ERROR_DEVICE_REMOVED;
+	if (completed < resource->readback_fence) {
 		if (!wait)
 			return DXGI_ERROR_WAS_STILL_DRAWING;
-		Dx12ShimSubmitAndWait();
+		HRESULT hr = Dx12ShimSubmitAndWait();
+		if (FAILED(hr))
+			return hr;
 	}
 
 	resource->readback_pending = false;
@@ -1007,7 +1111,7 @@ void STDMETHODCALLTYPE ShimContext::UpdateSubresource(ID3D11Resource *pDstResour
 	bool shadow_whole;
 	UINT offset, size;
 
-	if (!resource || !pSrcData)
+	if (!resource || !pSrcData || empty_box(pDstBox) || DstSubresource >= subresource_count(resource))
 		return;
 
 	if (!is_buffer(resource)) {
@@ -1201,7 +1305,8 @@ void STDMETHODCALLTYPE ShimContext::CopySubresourceRegion(ID3D11Resource *pDstRe
 	ShimResource *dst = ShimResourceOf(pDstResource), *src = ShimResourceOf(pSrcResource);
 	D3D12_TEXTURE_COPY_LOCATION dst_location = {}, src_location = {};
 
-	if (!dst || !src || is_buffer(dst) != is_buffer(src))
+	if (!dst || !src || is_buffer(dst) != is_buffer(src) || empty_box(pSrcBox)
+	    || DstSubresource >= subresource_count(dst) || SrcSubresource >= subresource_count(src))
 		return;
 
 	if (is_buffer(dst)) {
@@ -1212,18 +1317,28 @@ void STDMETHODCALLTYPE ShimContext::CopySubresourceRegion(ID3D11Resource *pDstRe
 		return;
 	}
 
-	if (dst == src || !Dx12ShimTransition(src, D3D12_RESOURCE_STATE_COPY_SOURCE)
-	    || !Dx12ShimTransition(dst, D3D12_RESOURCE_STATE_COPY_DEST))
+	if (dst->dimension != src->dimension || (dst == src && DstSubresource == SrcSubresource))
 		return;
 
-	dst_location.pResource = dst->resource;
 	dst_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	dst_location.SubresourceIndex = DstSubresource;
-	src_location.pResource = src->resource;
 	src_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-	src_location.SubresourceIndex = SrcSubresource;
-	// D3D12_BOX is the same struct as D3D11_BOX
-	Dx12ShimList()->CopyTextureRegion(&dst_location, DstX, DstY, DstZ, &src_location, (const D3D12_BOX*)pSrcBox);
+	if (!src->resource || !dst->resource)
+		return;
+	UINT planes = ShimPlaneCount(src);
+	if (planes != ShimPlaneCount(dst))
+		return;
+	for (UINT plane = 0; plane < planes; plane++) {
+		if (!Dx12ShimTransitionSubresource(dst, DstSubresource + plane * subresource_count(dst), D3D12_RESOURCE_STATE_COPY_DEST)
+		    || !Dx12ShimTransitionSubresource(src, SrcSubresource + plane * subresource_count(src), D3D12_RESOURCE_STATE_COPY_SOURCE))
+			return;
+	}
+	dst_location.pResource = dst->resource;
+	src_location.pResource = src->resource;
+	for (UINT plane = 0; plane < planes; plane++) {
+		dst_location.SubresourceIndex = DstSubresource + plane * subresource_count(dst);
+		src_location.SubresourceIndex = SrcSubresource + plane * subresource_count(src);
+		Dx12ShimList()->CopyTextureRegion(&dst_location, DstX, DstY, DstZ, &src_location, (const D3D12_BOX*)pSrcBox);
+	}
 }
 
 void STDMETHODCALLTYPE ShimContext::CopySubresourceRegion1(ID3D11Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, UINT DstZ, ID3D11Resource *pSrcResource, UINT SrcSubresource, const D3D11_BOX *pSrcBox, UINT CopyFlags)

@@ -9,12 +9,14 @@ class Dx12SwapChain;
 // post one after. The commands those record are executed on the swap chain's
 // queue right away, so they land on the finished frame and at the start of
 // the next one like they do on D3D11.
-void Dx12PresentBegin(Dx12SwapChain *swap_chain);
+bool Dx12PresentBegin(Dx12SwapChain *swap_chain);
 void Dx12PresentEnd(Dx12SwapChain *swap_chain);
 
-// The game is about to release the buffers of the swap chain, for a resize or
-// for good
-void Dx12SwapChainBuffersReleased(Dx12SwapChain *swap_chain, bool destroyed);
+HRESULT Dx12SwapChainBuffersIdle(Dx12SwapChain *swap_chain);
+// With the shim lock held on either side of the native resize.
+void Dx12SwapChainBuffersSuspended(Dx12SwapChain *swap_chain);
+void Dx12SwapChainBuffersResized(Dx12SwapChain *swap_chain, HRESULT hr);
+void Dx12SwapChainBuffersReleased(Dx12SwapChain *swap_chain);
 
 // Draws the hunting overlay and the notices to the buffer that will be
 // presented next. Needs the shim's lock, which the command lists run under.

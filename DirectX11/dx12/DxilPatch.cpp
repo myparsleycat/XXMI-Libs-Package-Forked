@@ -654,6 +654,21 @@ DxilPatchOutcome DxilPatchShader(const Dx12ShaderInfo *shader, const std::vector
 		return DxilPatchOutcome::FAILED;
 	}
 	UINT64 requirements = reflection->GetRequiresFlags();
+	D3D12_SHADER_DESC desc;
+	if (SUCCEEDED(reflection->GetDesc(&desc))) {
+		for (UINT i = 0; i < desc.BoundResources; i++) {
+			D3D12_SHADER_INPUT_BIND_DESC bind;
+			if (FAILED(reflection->GetResourceBindingDesc(i, &bind)) || bind.Space)
+				continue;
+			if (bind.Type != D3D_SIT_STRUCTURED && bind.Type != D3D_SIT_BYTEADDRESS
+			    && bind.Type != D3D_SIT_TBUFFER && !(bind.Type == D3D_SIT_TEXTURE && bind.Dimension == D3D_SRV_DIMENSION_BUFFER))
+				continue;
+			for (UINT slot = bind.BindPoint; slot < 128 && slot - bind.BindPoint < max(1u, bind.BindCount); slot++) {
+				patched->srv_dimension[slot] = D3D12_SRV_DIMENSION_BUFFER;
+				patched->srv_buffer[slot] = Dx12BufferBinding(bind.Type, bind.ReturnType, bind.NumSamples);
+			}
+		}
+	}
 	reflection->Release();
 	if (requirements & (D3D_SHADER_REQUIRES_RESOURCE_DESCRIPTOR_HEAP_INDEXING
 	    | D3D_SHADER_REQUIRES_SAMPLER_DESCRIPTOR_HEAP_INDEXING)) {
@@ -734,6 +749,10 @@ const Dx12ShaderInfo* DxilGameShader(const Dx12ShaderInfo *shader, bool link_gro
 				if (patched.uav & 1ull << reg)
 					entry->shader.uav_dimension[reg] = D3D12_UAV_DIMENSION_BUFFER;
 			for (UINT reg = 0; reg < 128; reg++) {
+				if (patched.srv_dimension[reg] == D3D12_SRV_DIMENSION_BUFFER) {
+					entry->shader.srv_dimension[reg] = patched.srv_dimension[reg];
+					entry->shader.srv_buffer[reg] = patched.srv_buffer[reg];
+				}
 				if (patched.srv[reg / 64] & 1ull << (reg % 64)) {
 					entry->shader.srv[reg / 64] |= 1ull << (reg % 64);
 					entry->shader.srv_dimension[reg] = patched.srv_dimension[reg];

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <wrl/client.h>
 
 #include "DeviceRemoved.h"
 #include "Dx12CommandList.h"
@@ -65,6 +66,7 @@ static void (*before_submit)();
 
 static ID3D12Fence *fence;
 static UINT64 fence_signalled;
+static UINT64 last_shim_signal;
 static HANDLE fence_event;
 // Mods are off after the first, so there are few
 static std::vector<UINT64> discarded;
@@ -78,31 +80,33 @@ static std::deque<Retired> retired;
 // What the lists executed on another queue than ours pinned is held until a
 // fence of our own that queue signals says they are done with it
 struct ForeignQueue {
-	// Referenced
 	ID3D12CommandQueue *queue;
-	// NULL if none could be made, which is not tried again
-	ID3D12Fence *fence;
-	UINT64 signalled;
+	ID3D12Fence *fence = nullptr;
+	UINT64 signalled = 0;
+	std::atomic<bool> gone{false};
+	bool owns_queue = false;
+	Microsoft::WRL::ComPtr<ID3D12CommandQueue> retry_queue;
+	ULONGLONG retry_signal_after = 0;
+	std::vector<IUnknown*> unsignalled;
 	std::deque<Retired> retired;
 	// Not referenced, each is in retired with the same value: what its
 	// lists use of our resources until it is done with them, see game_uses
 	std::deque<Retired> uses;
 	// The value of our own fence it was last made to wait for
-	UINT64 waited;
-	// Whether it is one of dx12_unordered_queues, the frame until which
+	UINT64 waited = 0;
+	// Whether the queue is unordered, the frame until which
 	// it stays one at least, for how many frames it was made one the last
 	// time, and the frame it stopped being one, see UNORDERED_FRAMES
-	bool unordered;
-	UINT unordered_until;
-	UINT unordered_frames;
-	UINT ordered_since;
+	bool unordered = false;
+	UINT unordered_until = 0;
+	UINT unordered_frames = 0;
+	UINT ordered_since = 0;
 };
 static std::vector<ForeignQueue*> foreign_queues;
 static ForeignQueue* foreign_queue(ID3D12CommandQueue *queue);
-// What was pinned by lists executed on a queue that could not be given a
-// fence: nothing tells when that queue is done with it, so it is kept for
-// good rather than handed out again too soon
-static std::vector<IUnknown*> stranded;
+static SRWLOCK unordered_queues_lock = SRWLOCK_INIT;
+static std::unordered_map<ID3D12CommandQueue*, ForeignQueue*> unordered_queues;
+static std::atomic<bool> have_unordered_queues{false};
 static void release_retired();
 
 static std::vector<ShimResource*> touched;
@@ -697,13 +701,14 @@ D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimAllocViews(UINT count, D3D12_GPU_DESCRIPTOR_
 	return cpu;
 }
 
-void Dx12ShimReserveSamplers(UINT count)
+bool Dx12ShimReserveSamplers(UINT count)
 {
 	ID3D12DescriptorHeap *heap = sampler_pages.current.heap;
 
-	reserve_descriptors(&sampler_pages, count);
+	bool reserved = !count || reserve_descriptors(&sampler_pages, count);
 	if (sampler_pages.current.heap != heap)
 		sampler_tables.clear();
+	return reserved;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE Dx12ShimSamplerTable(const D3D12_CPU_DESCRIPTOR_HANDLE *samplers, UINT count)
@@ -814,55 +819,171 @@ static bool read_only(D3D12_RESOURCE_STATES state)
 	return state && !(state & ~READ_STATES);
 }
 
-bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite)
+static bool prepare_transition(ShimResource *resource, bool write, bool overwrite, bool *retry = nullptr)
 {
-	D3D12_RESOURCE_BARRIER barrier = {};
-
-	if (!resource->resource || !Dx12ShimUseResource(resource))
+	if (resource->present_queue && resource->present_queue != shim.queue)
 		return false;
-
-	if (!resource->deferred_writes.empty() && !ShimApplyDeferredWrites(resource))
+	if (!resource->resource || !Dx12ShimUseResource(resource)
+	    || (!resource->deferred_writes.empty() && !ShimApplyDeferredWrites(resource))
+	    || (resource->write_pending && !ShimFlushWrite(resource))) {
+		if (retry)
+			*retry = ShimNotReady(resource);
 		return false;
-	if (resource->write_pending)
-		ShimFlushWrite(resource);
+	}
 
 	// What is about to be written is in use by lists of the game that
 	// were recorded before and will be executed after: they keep it as it
 	// is, see Bridge.h
-	if ((state & ~READ_STATES) && !resource->foreign && game_list_uses(resource->resource))
-		ShimRenameResource(resource, !overwrite);
-	if (state & ~READ_STATES)
+	if (write && !resource->foreign && game_list_uses(resource->resource)
+	    && !ShimRenameResource(resource, !overwrite)) {
+		if (retry)
+			*retry = true;
+		return false;
+	}
+	if (write)
 		resource->version++;
 
-	if (!resource->foreign && resource->touched_epoch != dx12_shim_epoch) {
+	if ((!resource->foreign || resource->present_queue) && resource->touched_epoch != dx12_shim_epoch) {
 		resource->touched_epoch = dx12_shim_epoch;
-		touched.push_back(resource);
+		if (resource->present_queue)
+			Dx12ShimDeferRelease(resource->resource);
+		else
+			touched.push_back(resource);
 	}
+	return true;
+}
 
-	if (resource->state == state) {
-		if (state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-			barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-			barrier.UAV.pResource = resource->resource;
-			Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_BARRIER);
-			Dx12ShimList()->ResourceBarrier(1, &barrier);
-		}
-		return true;
-	}
+static void uav_barrier(ShimResource *resource)
+{
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+	barrier.UAV.pResource = resource->resource;
+	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_BARRIER);
+	Dx12ShimList()->ResourceBarrier(1, &barrier);
+}
 
-	if (read_only(resource->state) && read_only(state)) {
-		if ((resource->state & state) == state)
-			return true;
-		state |= resource->state;
-	}
+static bool transition_state(ShimResource *resource, UINT index, D3D12_RESOURCE_STATES &before,
+		D3D12_RESOURCE_STATES state)
+{
+	D3D12_RESOURCE_BARRIER barrier = {};
+
+	if (read_only(before) && read_only(state))
+		state |= before;
+	if (before == state)
+		return state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Transition.pResource = resource->resource;
-	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	barrier.Transition.StateBefore = resource->state;
+	barrier.Transition.Subresource = index;
+	barrier.Transition.StateBefore = before;
 	barrier.Transition.StateAfter = state;
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_D3D12_BARRIER);
 	Dx12ShimList()->ResourceBarrier(1, &barrier);
-	resource->state = state;
+	before = state;
+	return false;
+}
+
+void Dx12ShimSetState(ShimResource *resource, D3D12_RESOURCE_STATES state)
+{
+	auto &states = resource->subresource_states;
+	bool uav = false;
+	if (states.empty()) {
+		uav = transition_state(resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, resource->state, state);
+	} else {
+		for (UINT i = 0; i < states.size(); i++)
+			uav |= transition_state(resource, i, states[i], state);
+		if (std::all_of(states.begin(), states.end(), [&](auto entry) { return entry == states.front(); })) {
+			resource->state = states.front();
+			states.clear();
+		}
+	}
+	if (uav)
+		uav_barrier(resource);
+}
+
+static UINT texture_plane_size(const ShimResource *resource)
+{
+	return resource->desc.MipLevels * ShimTextureArraySize(resource->desc);
+}
+
+static void split_states(ShimResource *resource, UINT count)
+{
+	if (resource->subresource_states.empty())
+		resource->subresource_states.assign(count, resource->state);
+}
+
+bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite)
+{
+	if (!prepare_transition(resource, !!(state & ~READ_STATES), overwrite))
+		return false;
+	Dx12ShimSetState(resource, state);
+	return true;
+}
+
+bool Dx12ShimTransitionSubresource(ShimResource *resource, UINT subresource, D3D12_RESOURCE_STATES state)
+{
+	UINT count = texture_plane_size(resource) * ShimPlaneCount(resource);
+	if (subresource >= count)
+		return false;
+	if (count == 1)
+		return Dx12ShimTransition(resource, state);
+	if (!prepare_transition(resource, !!(state & ~READ_STATES), false))
+		return false;
+	split_states(resource, count);
+	if (transition_state(resource, subresource, resource->subresource_states[subresource], state))
+		uav_barrier(resource);
+	return true;
+}
+
+static void transition_view(ShimResource *resource, const ShimView::Range &range, UINT planes, D3D12_RESOURCE_STATES state)
+{
+	UINT plane_size = texture_plane_size(resource);
+	UINT plane_count = ShimPlaneCount(resource);
+	if (range.mips * range.slices == plane_size && planes == (1u << plane_count) - 1) {
+		Dx12ShimSetState(resource, state);
+		return;
+	}
+	split_states(resource, plane_size * plane_count);
+	bool uav = false;
+	for (UINT plane = 0; plane < plane_count; plane++) {
+		if (!(planes & (1u << plane)))
+			continue;
+		for (UINT slice = range.slice; slice < range.slice + range.slices; slice++) {
+			for (UINT mip = range.mip; mip < range.mip + range.mips; mip++) {
+				UINT index = plane * plane_size + slice * resource->desc.MipLevels + mip;
+				uav |= transition_state(resource, index, resource->subresource_states[index], state);
+			}
+		}
+	}
+	if (uav)
+		uav_barrier(resource);
+}
+
+bool Dx12ShimTransitionView(const ShimView *view, D3D12_RESOURCE_STATES state, UINT planes, bool *retry)
+{
+	ShimResource *resource = view->resource;
+	planes &= view->range.planes;
+	if (!planes || !view->range.mips || !view->range.slices)
+		return false;
+	if (!prepare_transition(resource, !!(state & ~READ_STATES), false, retry))
+		return false;
+	if (resource->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+		Dx12ShimSetState(resource, state);
+	else
+		transition_view(resource, view->range, planes, state);
+	return true;
+}
+
+bool Dx12ShimTransitionDepthStencil(const ShimView *view)
+{
+	UINT writable = view->range.planes & ~view->read_only_planes;
+	if (!view->read_only_planes)
+		return Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+	if (!writable)
+		return Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_DEPTH_READ);
+	if (!Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_DEPTH_WRITE, writable))
+		return false;
+	transition_view(view->resource, view->range, view->read_only_planes, D3D12_RESOURCE_STATE_DEPTH_READ);
 	return true;
 }
 
@@ -1009,7 +1130,8 @@ static bool resource_idle(ShimResource *resource, ULONGLONG idle_since)
 {
 	if (resource->staged || resource->evicted || resource->foreign || !resource->resource || resource->allocated < EVICTED_BYTES_MIN
 	    || resource->used_time > idle_since || !Dx12ShimFenceReached(resource->used_fence)
-	    || (resource->touched_epoch == dx12_shim_epoch && (list_used || resource->state != D3D12_RESOURCE_STATE_COMMON)))
+	    || (resource->touched_epoch == dx12_shim_epoch
+		&& (list_used || !resource->subresource_states.empty() || resource->state != D3D12_RESOURCE_STATE_COMMON)))
 		return false;
 	resource->resource->AddRef();
 	return resource->resource->Release() == 1;
@@ -1316,6 +1438,7 @@ const UINT64 GAME_UPLOAD_BLOCK_SIZE = 1 << 20;
 // unless the queue could wait for this many times as long as the last time.
 const UINT UNORDERED_FRAMES = 30;
 const UINT UNORDERED_FORGET_TIMES = 4;
+const ULONGLONG FOREIGN_SIGNAL_RETRY_MS = 100;
 
 const size_t GAME_UPLOAD_BLOCKS_KEPT = 8;
 
@@ -1358,6 +1481,58 @@ bool Dx12ShimPin(Dx12GraphicsCommandList *list, IUnknown *object)
 	return true;
 }
 
+static HRESULT signal_shim_queue(UINT64 value)
+{
+	Dx12QueueLock(shim.queue);
+	HRESULT hr = shim.queue->Signal(fence, value);
+	if (SUCCEEDED(hr)) {
+		last_shim_signal = value;
+		Dx12QueueSignalled(shim.queue, fence, value);
+	}
+	Dx12QueueUnlock(shim.queue);
+	if (FAILED(hr))
+		Dx12LogInfo("*** Shim queue could not signal fence %llu (0x%x)\n", value, hr);
+	return hr;
+}
+
+static void set_queue_unordered(ForeignQueue *foreign, bool unordered, const char *why = "");
+
+static bool submit_foreign_signal(ForeignQueue *foreign)
+{
+	if (!foreign->fence) {
+		ID3D12Device *device;
+		if (FAILED(foreign->queue->GetDevice(IID_PPV_ARGS(&device))))
+			return false;
+		HRESULT hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&foreign->fence));
+		device->Release();
+		if (FAILED(hr))
+			return false;
+	}
+	UINT64 next = foreign->signalled + 1;
+	if (FAILED(foreign->queue->Signal(foreign->fence, next)))
+		return false;
+	foreign->signalled = next;
+	return true;
+}
+
+static bool signal_foreign_queue(ForeignQueue *foreign)
+{
+	if (foreign->unsignalled.empty())
+		return true;
+	if (!submit_foreign_signal(foreign)) {
+		// Only the original queue can signal completion of those executions.
+		foreign->retry_queue = foreign->queue;
+		foreign->retry_signal_after = GetTickCount64() + FOREIGN_SIGNAL_RETRY_MS;
+		return false;
+	}
+	for (IUnknown *object : foreign->unsignalled) {
+		foreign->uses.push_back({object, foreign->signalled});
+		foreign->retired.push_back({object, foreign->signalled});
+	}
+	foreign->unsignalled.clear();
+	return true;
+}
+
 void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pins, std::vector<IUnknown*> *first)
 {
 	Dx12ShimLock();
@@ -1366,10 +1541,7 @@ void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pin
 		// What another thread recorded since the queue proxy had our
 		// list executed was promised the value signalled next
 		Dx12ShimSubmit();
-		Dx12QueueLock(shim.queue);
-		shim.queue->Signal(fence, ++fence_signalled);
-		Dx12QueueSignalled(shim.queue, fence, fence_signalled);
-		Dx12QueueUnlock(shim.queue);
+		signal_shim_queue(++fence_signalled);
 		InterlockedIncrement64(&dx12_stats.pin_signals);
 		for (IUnknown *object : *pins)
 			retired.push_back({ object, fence_signalled });
@@ -1377,50 +1549,59 @@ void Dx12ShimPinsExecuted(ID3D12CommandQueue *queue, std::vector<IUnknown*> *pin
 		ForeignQueue *foreign = foreign_queue(queue);
 
 		InterlockedIncrement64(&dx12_stats.pin_lates);
-		if (foreign->fence) {
-			queue->Signal(foreign->fence, ++foreign->signalled);
-			for (IUnknown *object : *pins) {
-				game_uses[object]++;
-				foreign->uses.push_back({ object, foreign->signalled });
-				foreign->retired.push_back({ object, foreign->signalled });
+		for (IUnknown *object : *pins) {
+			game_uses[object]++;
+			foreign->unsignalled.push_back(object);
+		}
+		end_game_uses(first);
+		if (!signal_foreign_queue(foreign)) {
+			if (!foreign->unordered) {
+				foreign->unordered_frames = UNORDERED_FRAMES;
+				set_queue_unordered(foreign, true, "the queue could not signal a fence for its pins");
 			}
-			end_game_uses(first);
-		} else {
-			// Never is not an option for these: every write would
-			// take another resource, kept for good as well
-			end_game_uses(first);
-			stranded.insert(stranded.end(), pins->begin(), pins->end());
+			foreign->unordered_until = dx12_frame + foreign->unordered_frames;
 		}
 	}
 	pins->clear();
 	Dx12ShimUnlock();
 }
 
-ID3D12CommandQueue *volatile dx12_unordered_queues[4];
-
-// With the lock held
-static void set_queue_unordered(ForeignQueue *foreign, bool unordered, const char *why = "")
+bool Dx12ShimQueueUnordered(ID3D12CommandQueue *queue)
 {
-	ID3D12CommandQueue *wanted = unordered ? NULL : foreign->queue;
+	if (!queue || !have_unordered_queues.load())
+		return false;
+	AcquireSRWLockShared(&unordered_queues_lock);
+	auto found = unordered_queues.find(queue);
+	bool unordered = found != unordered_queues.end() && !found->second->gone.load();
+	ReleaseSRWLockShared(&unordered_queues_lock);
+	return unordered;
+}
 
-	for (ID3D12CommandQueue *volatile &slot : dx12_unordered_queues) {
-		if (slot != wanted)
-			continue;
-		slot = unordered ? foreign->queue : NULL;
-		foreign->unordered = unordered;
-		// What the lists had worked out for their draws went by this
-		dx12_draw_generation++;
-		if (unordered) {
-			Dx12LogInfo("*** ID3D12CommandQueue %p cannot be made to wait for what the mods have done for its lists, "
-				"they are left out of those for %u frames at least\n", foreign->queue, foreign->unordered_frames);
-			Dx12DumpNote("*** Frame %u: ID3D12CommandQueue %p (type %d) cannot be made to wait for what the mods have done "
-				"for its lists, they are left out of those for %u frames at least; ours is %p (type %d): %s\n",
-				dx12_frame, foreign->queue, (int)foreign->queue->GetDesc().Type, foreign->unordered_frames,
-				shim.queue, (int)shim.queue->GetDesc().Type, why);
-		} else {
-			Dx12LogInfo("ID3D12CommandQueue %p can be made to wait for the mods again\n", foreign->queue);
-		}
+static void set_queue_unordered(ForeignQueue *foreign, bool unordered, const char *why)
+{
+	if (foreign->unordered == unordered)
 		return;
+	AcquireSRWLockExclusive(&unordered_queues_lock);
+	if (unordered) {
+		unordered_queues[foreign->queue] = foreign;
+	} else {
+		auto found = unordered_queues.find(foreign->queue);
+		if (found != unordered_queues.end() && found->second == foreign)
+			unordered_queues.erase(found);
+	}
+	have_unordered_queues = !unordered_queues.empty();
+	ReleaseSRWLockExclusive(&unordered_queues_lock);
+	foreign->unordered = unordered;
+	dx12_draw_generation++;
+	if (foreign->gone.load())
+		return;
+	if (unordered) {
+		Dx12LogInfo("*** ID3D12CommandQueue %p cannot safely use mod resources for at least %u frames: %s\n",
+			foreign->queue, foreign->unordered_frames, why);
+		Dx12DumpNote("*** Frame %u: ID3D12CommandQueue %p cannot safely use mod resources for at least %u frames: %s\n",
+			dx12_frame, foreign->queue, foreign->unordered_frames, why);
+	} else {
+		Dx12LogInfo("ID3D12CommandQueue %p can be made to wait for the mods again\n", foreign->queue);
 	}
 }
 
@@ -1433,20 +1614,21 @@ void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods
 	Dx12ShimLock();
 	if (dx12_shim && queue != shim.queue) {
 		foreign = foreign_queue(queue);
+		if (!signal_foreign_queue(foreign)) {
+			ordered = false;
+			strcpy_s(why, "the queue could not signal a fence for its pins");
+		}
 		// Nothing was recorded since for a value not signalled yet
 		needed = needed ? min(needed, fence_signalled) : fence_signalled;
-		if (foreign->waited < needed && fence->GetCompletedValue() < needed) {
+		if (ordered && foreign->waited < needed && fence->GetCompletedValue() < needed) {
 			// Our queue may be behind a wait for what this one is
 			// yet to be handed, and would then never get to it
+			if (last_shim_signal < needed)
+				signal_shim_queue(fence_signalled);
 			if (!Dx12QueueCanWait(queue, fence, needed, foreign->unordered ? NULL : why, sizeof(why))) {
 				ordered = false;
 			} else if (uses_mods) {
-				HRESULT hr;
-
-				Dx12QueueLock(queue);
-				Dx12QueueWaits(queue, fence, needed);
-				hr = queue->Wait(fence, needed);
-				Dx12QueueUnlock(queue);
+				HRESULT hr = Dx12QueueWait(queue, fence, needed);
 				if (SUCCEEDED(hr)) {
 					foreign->waited = needed;
 					InterlockedIncrement64(&dx12_stats.queue_waits);
@@ -1663,52 +1845,71 @@ static void release_retired()
 		retired.pop_front();
 	}
 
-	for (ForeignQueue *foreign : foreign_queues) {
-		if (!foreign->fence || foreign->retired.empty())
-			continue;
-		completed = foreign->fence->GetCompletedValue();
-		while (!foreign->uses.empty() && foreign->uses.front().fence <= completed) {
+	bool device_removed = completed == UINT64_MAX;
+	for (auto entry = foreign_queues.begin(); entry != foreign_queues.end();) {
+		ForeignQueue *foreign = *entry;
+		bool gone = foreign->gone.load();
+		if (!device_removed && foreign->retry_queue && !foreign->unsignalled.empty()
+		    && GetTickCount64() >= foreign->retry_signal_after)
+			signal_foreign_queue(foreign);
+		UINT64 finished = device_removed ? UINT64_MAX
+			: foreign->fence && !foreign->retired.empty() ? foreign->fence->GetCompletedValue() : 0;
+		while (!foreign->uses.empty() && foreign->uses.front().fence <= finished) {
 			end_game_use(foreign->uses.front().object);
 			foreign->uses.pop_front();
 		}
-		while (!foreign->retired.empty() && foreign->retired.front().fence <= completed) {
+		while (!foreign->retired.empty() && foreign->retired.front().fence <= finished) {
 			foreign->retired.front().object->Release();
 			foreign->retired.pop_front();
 		}
+		if (device_removed) {
+			end_game_uses(&foreign->unsignalled);
+			for (IUnknown *object : foreign->unsignalled)
+				object->Release();
+			foreign->unsignalled.clear();
+		}
+		// Releasing the last queue reference can wait for pending GPU work.
+		if (foreign->unsignalled.empty() && foreign->retired.empty())
+			foreign->retry_queue.Reset();
+		if (gone || device_removed)
+			set_queue_unordered(foreign, false);
+		if ((!gone && !(foreign->owns_queue && !foreign->unordered))
+		    || !foreign->retired.empty() || !foreign->unsignalled.empty()) {
+			++entry;
+			continue;
+		}
+		entry = foreign_queues.erase(entry);
+		if (foreign->fence)
+			foreign->fence->Release();
+		if (foreign->owns_queue)
+			foreign->queue->Release();
+		delete foreign;
 	}
+}
+
+static const GUID foreign_queue_guid = {0x6e272c1c, 0xd74b, 0x4c39, {0x93, 0x3e, 0xf9, 0x35, 0x81, 0x76, 0x7e, 0x60}};
+
+static void foreign_queue_destroyed(void *context)
+{
+	auto *foreign = static_cast<ForeignQueue *>(context);
+	Dx12ForgetQueueOrdering(foreign->queue);
+	foreign->gone.store(true);
+	dx12_draw_generation++;
 }
 
 static ForeignQueue* foreign_queue(ID3D12CommandQueue *queue)
 {
-	ForeignQueue *foreign;
-	ID3D12Device *device;
-	ID3D12Fence *queue_fence = NULL;
-
 	for (ForeignQueue *known : foreign_queues) {
-		if (known->queue == queue)
+		if (known->queue == queue && !known->gone.load())
 			return known;
 	}
 
-	if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))) {
-		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue_fence))))
-			queue_fence = NULL;
-		device->Release();
-	}
-	if (queue_fence)
-		Dx12LogInfo("Lists executed on ID3D12CommandQueue %p use what mods gave them, which a fence of ours on it now guards\n", queue);
-	else
-		Dx12LogInfo("*** Failed to create a fence for ID3D12CommandQueue %p, what its lists use of the mods is kept for good\n", queue);
-
-	foreign = new ForeignQueue();
+	auto *foreign = new ForeignQueue();
 	foreign->queue = queue;
-	foreign->fence = queue_fence;
-	foreign->signalled = 0;
-	foreign->waited = 0;
-	foreign->unordered = false;
-	foreign->unordered_until = 0;
-	foreign->unordered_frames = 0;
-	foreign->ordered_since = 0;
-	queue->AddRef();
+	if (!Dx12NotifyDestruction(queue, foreign_queue_guid, foreign_queue_destroyed, foreign)) {
+		queue->AddRef();
+		foreign->owns_queue = true;
+	}
 	foreign_queues.push_back(foreign);
 	return foreign;
 }
@@ -1835,7 +2036,7 @@ void Dx12ShimSubmit()
 	// By index: the first transition of a resource in a submission is
 	// what adds it, which none of these is
 	for (size_t i = 0; i < touched.size(); i++)
-		Dx12ShimTransition(touched[i], D3D12_RESOURCE_STATE_COMMON);
+		Dx12ShimSetState(touched[i], D3D12_RESOURCE_STATE_COMMON);
 	touched.clear();
 
 	if (early_open) {
@@ -1860,10 +2061,7 @@ void Dx12ShimSubmit()
 		Dx12ShimResidencyWait(shim.queue);
 		shim.queue->ExecuteCommandLists(count, lists);
 	}
-	Dx12QueueLock(shim.queue);
-	shim.queue->Signal(fence, ++fence_signalled);
-	Dx12QueueSignalled(shim.queue, fence, fence_signalled);
-	Dx12QueueUnlock(shim.queue);
+	signal_shim_queue(++fence_signalled);
 	allocators[current_allocator].fence = fence_signalled;
 	if (early_open)
 		early_allocators[current_early_allocator].fence = fence_signalled;
@@ -1889,41 +2087,90 @@ void Dx12ShimFlush()
 	Dx12ShimUnlock();
 }
 
-void Dx12ShimSubmitAndWait()
+HRESULT Dx12ShimSubmitAndWait()
 {
 	Dx12ShimSubmit();
 
-	if (fence->GetCompletedValue() >= fence_signalled)
-		return;
+	UINT64 completed = fence->GetCompletedValue();
+	if (completed == UINT64_MAX)
+		return DXGI_ERROR_DEVICE_REMOVED;
+	if (completed >= fence_signalled)
+		return S_OK;
 
-	Profiling::Spike::Scope spike(Profiling::Spike::DX12_GPU_WAIT, L"for a mod to read back or a swap chain to resize");
+	HRESULT hr = last_shim_signal < fence_signalled ? signal_shim_queue(fence_signalled) : S_OK;
+	if (SUCCEEDED(hr)) {
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_GPU_WAIT, L"for a mod to read back or a swap chain to resize");
 
-	if (FAILED(fence->SetEventOnCompletion(fence_signalled, fence_event))
-	    || WaitForSingleObject(fence_event, 10000) != WAIT_OBJECT_0)
-		Dx12LogInfo("*** Gave up waiting for the GPU to reach fence value %llu\n", fence_signalled);
+		hr = fence->SetEventOnCompletion(fence_signalled, fence_event);
+		if (SUCCEEDED(hr)) {
+			const ULONGLONG deadline = GetTickCount64() + 10000;
+			DWORD remaining = 10000;
+			for (;;) {
+				DWORD result = WaitForSingleObject(fence_event, remaining);
+				if (result != WAIT_OBJECT_0) {
+					hr = HRESULT_FROM_WIN32(result == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT);
+					break;
+				}
 
+				// A registration from an earlier timed-out wait can still signal this event.
+				if (fence->GetCompletedValue() >= fence_signalled)
+					break;
+				ULONGLONG now = GetTickCount64();
+				if (now >= deadline)
+					break;
+				remaining = (DWORD)(deadline - now);
+			}
+		}
+	}
+	completed = fence->GetCompletedValue();
 	release_retired();
+	if (completed == UINT64_MAX || (FAILED(hr) && FAILED(shim.device->GetDeviceRemovedReason())))
+		return DXGI_ERROR_DEVICE_REMOVED;
+	if (completed >= fence_signalled)
+		return S_OK;
+	if (SUCCEEDED(hr))
+		hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+	Dx12LogInfo("*** Gave up waiting for the GPU to reach fence value %llu (0x%x)\n", fence_signalled, hr);
+	return hr;
 }
 
 ID3D12Fence* Dx12ShimFence(UINT64 *signalled)
 {
-	*signalled = fence_signalled;
+	if (signalled)
+		*signalled = fence_signalled;
 	return fence;
 }
 
-void Dx12ShimSetQueue(Dx12CommandQueue *queue)
+bool Dx12ShimSetQueue(ID3D12CommandQueue *queue)
 {
-	if (shim.queue == queue->mOrig)
-		return;
+	if (shim.queue == queue)
+		return true;
 
-	// The fence must have been signalled by the old queue before the new
-	// one may signal a higher value
-	Dx12ShimSubmitAndWait();
+	Dx12ShimSubmit();
+	UINT64 completed = fence->GetCompletedValue();
+	if (completed == UINT64_MAX)
+		return false;
+	ForeignQueue *foreign = foreign_queue(queue);
+	if (!signal_foreign_queue(foreign))
+		return false;
+	if (completed < fence_signalled) {
+		if (last_shim_signal < fence_signalled && FAILED(signal_shim_queue(fence_signalled)))
+			return false;
+		if (!Dx12QueueCanWait(queue, fence, fence_signalled))
+			return false;
+		if (FAILED(Dx12QueueWait(queue, fence, fence_signalled)))
+			return false;
+	}
 
-	Dx12LogInfo("Shim commands now go to ID3D12CommandQueue %p\n", queue->mOrig);
-	shim.queue->Release();
-	shim.queue = queue->mOrig;
-	shim.queue->AddRef();
+	set_queue_unordered(foreign, false);
+	queue->AddRef();
+	ID3D12CommandQueue *previous = shim.queue;
+	shim.queue = queue;
+	if (completed < fence_signalled)
+		retired.push_back({previous, fence_signalled});
+	else
+		previous->Release();
+	return true;
 }
 
 bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue)

@@ -63,6 +63,7 @@ class HackerDevice;
 class ShimContext;
 class ShimDevice;
 struct ShimResource;
+struct ShimView;
 
 struct Dx12Shim {
 	ID3D12Device *device;
@@ -97,7 +98,7 @@ bool Dx12IsD3D11Game();
 
 bool Dx12ShimCreate(Dx12Device *device, Dx12CommandQueue *queue);
 // For when the swap chain being presented is on another queue than before
-void Dx12ShimSetQueue(Dx12CommandQueue *queue);
+bool Dx12ShimSetQueue(ID3D12CommandQueue *queue);
 
 void Dx12ShimNotImplemented(const char *method, bool *reported);
 
@@ -128,8 +129,8 @@ ID3D12GraphicsCommandList* Dx12ShimEarlyList();
 void Dx12ShimBeforeSubmit(void (*callback)());
 // Has the queue execute what was recorded, if anything
 void Dx12ShimSubmit();
-// The same, and does not return before the GPU is done with it
-void Dx12ShimSubmitAndWait();
+// Waits for the submitted work to finish or returns a failure HRESULT.
+HRESULT Dx12ShimSubmitAndWait();
 // The fence the queue signals after what was submitted, and the last value it
 // was told to. Shared where supported, for a Vulkan device to wait for.
 ID3D12Fence* Dx12ShimFence(UINT64 *signalled);
@@ -170,7 +171,7 @@ void Dx12ShimRecycleStagedUpload(const Dx12StagedUpload &upload, UINT64 copy_fen
 // next Dx12ShimBindHeaps sets on the list.
 D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimAllocViews(UINT count, D3D12_GPU_DESCRIPTOR_HANDLE *gpu);
 // Makes sure the next count calls of Dx12ShimSamplerTable end up in one heap
-void Dx12ShimReserveSamplers(UINT count);
+bool Dx12ShimReserveSamplers(UINT count);
 // A table of count samplers, reused if the same table was asked for before
 D3D12_GPU_DESCRIPTOR_HANDLE Dx12ShimSamplerTable(const D3D12_CPU_DESCRIPTOR_HANDLE *samplers, UINT count);
 void Dx12ShimBindHeaps();
@@ -188,6 +189,10 @@ void Dx12ShimFreeDescriptor(D3D12_DESCRIPTOR_HEAP_TYPE type, D3D12_CPU_DESCRIPTO
 // use it leaves out. overwrite is for a write that will cover all of the
 // resource, which then need not keep what it held if it is renamed for it.
 bool Dx12ShimTransition(ShimResource *resource, D3D12_RESOURCE_STATES state, bool overwrite = false);
+bool Dx12ShimTransitionSubresource(ShimResource *resource, UINT subresource, D3D12_RESOURCE_STATES state);
+bool Dx12ShimTransitionView(const ShimView *view, D3D12_RESOURCE_STATES state, UINT planes = UINT_MAX, bool *retry = nullptr);
+bool Dx12ShimTransitionDepthStencil(const ShimView *view);
+void Dx12ShimSetState(ShimResource *resource, D3D12_RESOURCE_STATES state);
 void Dx12ShimForgetResource(ShimResource *resource);
 
 // D3D12 keeps what mods load in the GPU's memory for good, where D3D11 has
@@ -250,13 +255,7 @@ bool Dx12ShimPin(Dx12GraphicsCommandList *list, IUnknown *object);
 // the shortest once it could wait for a few times as long, and for as long
 // after as it still could not wait.
 void Dx12ShimQueueWaits(ID3D12CommandQueue *queue, UINT64 needed, bool uses_mods);
-// By the original queue, NULL where there is none. Read without the lock.
-extern ID3D12CommandQueue *volatile dx12_unordered_queues[4];
-static inline bool Dx12ShimQueueUnordered(ID3D12CommandQueue *queue)
-{
-	return queue && (dx12_unordered_queues[0] == queue || dx12_unordered_queues[1] == queue
-		|| dx12_unordered_queues[2] == queue || dx12_unordered_queues[3] == queue);
-}
+bool Dx12ShimQueueUnordered(ID3D12CommandQueue *queue);
 // For the queue proxy, after it has handed lists to the queue: pins is what
 // the lists use, referenced once for this execution, and first the pins of
 // the lists executed for the first time since they were recorded

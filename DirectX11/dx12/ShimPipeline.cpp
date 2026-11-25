@@ -230,7 +230,18 @@ static ID3D12RootSignature* get_root_signature(const RootKey *key, bool input_as
 // -----------------------------------------------------------------------------
 // Descriptors
 
-void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+static DXGI_FORMAT null_buffer_format(UINT16 buffer)
+{
+	switch (buffer) {
+	case DX12_BUFFER_RAW: return DXGI_FORMAT_R32_TYPELESS;
+	case DX12_BUFFER_UINT: return DXGI_FORMAT_R32_UINT;
+	case DX12_BUFFER_SINT: return DXGI_FORMAT_R32_SINT;
+	case DX12_BUFFER_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+	default: return DXGI_FORMAT_UNKNOWN;
+	}
+}
+
+bool Dx12ShimNullSrv(BYTE dimension, UINT16 buffer, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
 
@@ -239,7 +250,13 @@ void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	switch (desc.ViewDimension) {
 	case D3D12_SRV_DIMENSION_BUFFER:
-		desc.Format = DXGI_FORMAT_R32_UINT;
+		if (!buffer)
+			return false;
+		desc.Format = null_buffer_format(buffer);
+		if (buffer == DX12_BUFFER_RAW)
+			desc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+		if (desc.Format == DXGI_FORMAT_UNKNOWN)
+			desc.Buffer.StructureByteStride = buffer;
 		break;
 	case D3D12_SRV_DIMENSION_TEXTURE2DMS:
 		break;
@@ -258,19 +275,29 @@ void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 		break;
 	}
 	dx12_shim->device->CreateShaderResourceView(NULL, &desc, handle);
+	return true;
 }
 
-void Dx12ShimNullUav(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+bool Dx12ShimNullUav(BYTE dimension, UINT16 buffer, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
 	D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
 
 	desc.ViewDimension = dimension ? (D3D12_UAV_DIMENSION)dimension : D3D12_UAV_DIMENSION_TEXTURE2D;
-	desc.Format = desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
-	if (desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY || desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	if (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+		if (!buffer)
+			return false;
+		desc.Format = null_buffer_format(buffer);
+		if (buffer == DX12_BUFFER_RAW)
+			desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+		if (desc.Format == DXGI_FORMAT_UNKNOWN)
+			desc.Buffer.StructureByteStride = buffer;
+	} else if (desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY || desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY)
 		desc.Texture2DArray.ArraySize = 1;
 	else if (desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D)
 		desc.Texture3D.WSize = 1;
 	dx12_shim->device->CreateUnorderedAccessView(NULL, NULL, &desc, handle);
+	return true;
 }
 
 // The write_ functions are false if what is bound is not ready, see
@@ -307,44 +334,39 @@ static bool write_srv(const ShimShader *shader, ID3D11ShaderResourceView *srv, U
 
 	if (view && view->resource->resource)
 		ShimUploadShadow(view->resource);
-	if (!view || !Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
-		Dx12ShimNullSrv(shader->srv_dimension[slot], handle);
-		return !view || !ShimNotReady(view->resource);
+	if (!view || !Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
+		return Dx12ShimNullSrv(shader->srv_dimension[slot], shader->srv_buffer[slot], handle)
+			&& (!view || !ShimNotReady(view->resource));
 	}
 
 	dx12_shim->device->CopyDescriptorsSimple(1, handle, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	return true;
 }
 
-static bool write_uav(ID3D11UnorderedAccessView *uav, BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+static bool write_uav(const ShimView *view, const ShimShader *shader, UINT slot, D3D12_CPU_DESCRIPTOR_HANDLE handle)
 {
-	ShimView *view = ShimViewOf(uav);
-
-	if (!view || !Dx12ShimTransition(view->resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
-		Dx12ShimNullUav(dimension, handle);
-		return !view || !ShimNotReady(view->resource);
-	}
+	if (!view)
+		return shader && Dx12ShimNullUav(shader->uav_dimension[slot], shader->uav_buffer[slot], handle);
 
 	dx12_shim->device->CopyDescriptorsSimple(1, handle, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	return true;
 }
 
-static BYTE uav_dimension(const ShimShader *const *shaders, UINT slot)
+static const ShimShader* uav_shader(const ShimShader *const *shaders, UINT slot)
 {
 	int stage;
 
 	for (stage = 0; stage < DX12_STAGE_COUNT; stage++) {
 		if (shaders[stage] && (shaders[stage]->uav_used & (1ull << slot)))
-			return shaders[stage]->uav_dimension[slot];
+			return shaders[stage];
 	}
-	return 0;
+	return nullptr;
 }
 
 // Fills in the tables for the shaders and gives them to the root signature
 // that has to be set on the list already. Records the transitions of what
-// they refer to on the way. False if something bound is not ready
-// (ShimNotReady): what the shaders make of a null view in its place is not
-// to be drawn, nor kept as what a dispatch computed.
+// they refer to on the way. A pending write or failed rename leaves the draw
+// or dispatch for later, since a null view would give different results.
 static bool bind_tables(const ShimState *state, const RootKey *key, const ShimShader *const *shaders,
 		UINT64 uav_used, bool compute)
 {
@@ -354,6 +376,7 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu, samplers[SHIM_SAMPLER_SLOTS];
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu;
 	UINT views = 0, sampler_count = 0, count = 0, i;
+	const ShimView *uav_views[SHIM_UAV_SLOTS] = {};
 	bool resident = true;
 
 	for_each_table(key, [&](TableKind kind, Dx12ShaderStage stage, UINT registers) {
@@ -366,7 +389,22 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 	cpu = Dx12ShimAllocViews(views, &gpu);
 	if (views && !cpu.ptr)
 		return false;
-	Dx12ShimReserveSamplers(sampler_count);
+	if (!Dx12ShimReserveSamplers(sampler_count))
+		return false;
+
+	UINT64 uavs_remaining = uav_used;
+	unsigned long uav_slot;
+	while (_BitScanForward64(&uav_slot, uavs_remaining)) {
+		uavs_remaining &= uavs_remaining - 1;
+		const ShimView *view = ShimViewOf(uavs[uav_slot]);
+		if (!view)
+			continue;
+		bool retry = false;
+		if (Dx12ShimTransitionView(view, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, UINT_MAX, &retry))
+			uav_views[uav_slot] = view;
+		else if (retry)
+			return false;
+	}
 
 	for_each_table(key, [&](TableKind kind, Dx12ShaderStage stage, UINT registers) {
 		const ShimStageState *bound = stage == DX12_STAGE_COUNT ? NULL : &state->stages[stage];
@@ -378,7 +416,8 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 				samplers[slot] = bound->samplers[slot]
 					? static_cast<ShimSamplerState*>(bound->samplers[slot])->mHandle : default_sampler;
 			}
-			tables[count++] = Dx12ShimSamplerTable(samplers, registers);
+			tables[count] = Dx12ShimSamplerTable(samplers, registers);
+			resident = tables[count++].ptr && resident;
 			return;
 		}
 
@@ -396,7 +435,7 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 					resident = false;
 				break;
 			case TABLE_UAV:
-				if ((uav_used & (1ull << slot)) && !write_uav(uavs[slot], uav_dimension(shaders, slot), cpu))
+				if ((uav_used & (1ull << slot)) && !write_uav(uav_views[slot], uav_shader(shaders, slot), slot, cpu))
 					resident = false;
 				break;
 			}
@@ -686,6 +725,11 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 		// D3D11 does no depth or stencil test without a depth buffer
 		key.depth_stencil.DepthEnable = FALSE;
 		key.depth_stencil.StencilEnable = FALSE;
+	} else {
+		if (dsv->read_only_planes & D3D11_DSV_READ_ONLY_DEPTH)
+			key.depth_stencil.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+		if (dsv->read_only_planes & D3D11_DSV_READ_ONLY_STENCIL)
+			key.depth_stencil.StencilWriteMask = 0;
 	}
 	// The members D3D12 does not have in its pipeline description
 	key.rasterizer.ScissorEnable = FALSE;
@@ -738,10 +782,10 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 		}
 
 		for (i = 0; i < key.rtv_count; i++) {
-			if (state->rtvs[i] && !Dx12ShimTransition(ShimViewOf(state->rtvs[i])->resource, D3D12_RESOURCE_STATE_RENDER_TARGET))
+			if (state->rtvs[i] && !Dx12ShimTransitionView(ShimViewOf(state->rtvs[i]), D3D12_RESOURCE_STATE_RENDER_TARGET))
 				return false;
 		}
-		if (dsv && !Dx12ShimTransition(dsv->resource, dsv->read_only ? D3D12_RESOURCE_STATE_DEPTH_READ : D3D12_RESOURCE_STATE_DEPTH_WRITE))
+		if (dsv && !Dx12ShimTransitionDepthStencil(dsv))
 			return false;
 	}
 

@@ -43,8 +43,8 @@ public:
 	void SetSamplers(Dx12ShaderStage stage, UINT start, UINT count, ID3D11SamplerState *const *samplers);
 	void GetSamplers(Dx12ShaderStage stage, UINT start, UINT count, ID3D11SamplerState **samplers);
 
-	bool IsOutput(ShimResource *resource);
-	void UnbindInput(ShimResource *resource);
+	bool IsOutput(const ShimView *input);
+	void UnbindInput(const ShimView *output);
 	void SetRenderTargets(UINT count, ID3D11RenderTargetView *const *views, ID3D11DepthStencilView *depth_stencil);
 
 #include "generated/ShimContext.decl.inl"

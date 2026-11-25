@@ -17,6 +17,7 @@ struct DxilPatched {
 	std::vector<BYTE> bytecode;
 	UINT64 srv[2] = {};
 	BYTE srv_dimension[128] = {};
+	UINT16 srv_buffer[128] = {};
 	UINT64 uav = 0;
 	UINT samplers = 0;
 	std::vector<const ShaderRegexGroup*> groups;

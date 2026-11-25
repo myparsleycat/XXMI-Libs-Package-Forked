@@ -1,5 +1,8 @@
 #pragma once
 
+#include <vector>
+#include <wrl/client.h>
+
 #include "Dx12Common.h"
 
 class Dx12CommandQueue;
@@ -15,15 +18,26 @@ public:
 	int mVersion;
 	volatile LONG mRef;
 
-	// The queue the swap chain presents on, which is what DXGI calls its
-	// device for D3D12
+	// The creation queue anchors the swap chain's device queries.
 	Dx12CommandQueue *mQueue;
 
 	Dx12SwapChain(Dx12CommandQueue *queue, IDXGISwapChain *orig);
 
 	bool Supports(REFIID riid);
+	// Borrowed with the shim lock held.
+	ID3D12CommandQueue *PresentQueue(UINT buffer_index) const;
+	bool Resizing() const { return mResizing; }
 
 #include "generated/Dx12SwapChain.decl.inl"
+
+private:
+	std::vector<Microsoft::WRL::ComPtr<ID3D12CommandQueue>> mPresentQueues;
+	bool mPresentQueuesKnown = true;
+	bool mResizing = false;
+
+	HRESULT BeginResize();
+	void FinishResize(HRESULT hr, std::vector<Microsoft::WRL::ComPtr<ID3D12CommandQueue>> queues,
+			bool queues_known);
 };
 
 // Replaces a swap chain DXGI just created on the original of queue with its

@@ -53,15 +53,13 @@ void Dx12CommandQueue::Abandon()
 // {7E3A61C4-2B9D-4F58-A0E7-5C14D8B2F396}
 static const GUID queue_destroyed_guid = { 0x7e3a61c4, 0x2b9d, 0x4f58, { 0xa0, 0xe7, 0x5c, 0x14, 0xd8, 0xb2, 0xf3, 0x96 } };
 
-static void forget_recent_signals(ID3D12CommandQueue *queue);
-
 static void queue_destroyed(void *context)
 {
 	Dx12CommandQueue *queue = (Dx12CommandQueue*)context;
 	Dx12Device *device = queue->mDevice;
 
 	Dx12LogInfo("Dx12CommandQueue %p destroyed\n", queue);
-	forget_recent_signals(queue->mOrig);
+	Dx12ForgetQueueOrdering(queue->mOrig);
 	delete queue;
 	device->Release();
 }
@@ -333,9 +331,10 @@ static void fence_destroyed(void *object)
 	ReleaseSRWLockExclusive(&fence_lock);
 }
 
-static void forget_recent_signals(ID3D12CommandQueue *queue)
+void Dx12ForgetQueueOrdering(ID3D12CommandQueue *queue)
 {
 	std::array<RecentSignal, RECENT_SIGNALS> recent = {};
+	std::vector<ID3D12Fence*> waits;
 
 	AcquireSRWLockExclusive(&fence_lock);
 	auto found = recent_signals.find(queue);
@@ -343,12 +342,25 @@ static void forget_recent_signals(ID3D12CommandQueue *queue)
 		recent = found->second;
 		recent_signals.erase(found);
 	}
+	queued_waits.erase(std::remove_if(queued_waits.begin(), queued_waits.end(), [&](const QueuedWait &wait) {
+		if (wait.queue != queue)
+			return false;
+		waits.push_back(wait.fence);
+		return true;
+	}), queued_waits.end());
+	for (auto &entry : queued_signals) {
+		auto &signals = entry.second;
+		signals.erase(std::remove_if(signals.begin(), signals.end(),
+				[&](const QueuedSignal &signal) { return signal.queue == queue; }), signals.end());
+	}
 	ReleaseSRWLockExclusive(&fence_lock);
 
 	for (const RecentSignal &signal : recent) {
 		if (signal.fence)
 			signal.fence->Release();
 	}
+	for (ID3D12Fence *fence : waits)
+		fence->Release();
 }
 
 // With fence_lock held. The fences in done are for releasing without it:
@@ -429,21 +441,36 @@ void Dx12QueueSignalled(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 va
 		Dx12NotifyDestruction(fence, fence_destroyed);
 }
 
-void Dx12QueueWaits(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value)
+HRESULT Dx12QueueWait(ID3D12CommandQueue *queue, ID3D12Fence *fence, UINT64 value)
 {
 	std::vector<ID3D12Fence*> done;
+	UINT64 order = 0;
 
-	if (fence->GetCompletedValue() >= value)
-		return;
-
-	fence->AddRef();
-	AcquireSRWLockExclusive(&fence_lock);
-	forget_reached_waits(&done);
-	queued_waits.push_back({ fence, value, queue, ++queue_order });
-	ReleaseSRWLockExclusive(&fence_lock);
+	Dx12QueueLock(queue);
+	if (fence && fence->GetCompletedValue() < value) {
+		fence->AddRef();
+		AcquireSRWLockExclusive(&fence_lock);
+		forget_reached_waits(&done);
+		order = ++queue_order;
+		queued_waits.push_back({ fence, value, queue, order });
+		ReleaseSRWLockExclusive(&fence_lock);
+	}
+	HRESULT hr = queue->Wait(fence, value);
+	if (FAILED(hr) && order) {
+		AcquireSRWLockExclusive(&fence_lock);
+		auto found = std::find_if(queued_waits.begin(), queued_waits.end(),
+				[order](const QueuedWait &wait) { return wait.order == order; });
+		if (found != queued_waits.end()) {
+			done.push_back(found->fence);
+			queued_waits.erase(found);
+		}
+		ReleaseSRWLockExclusive(&fence_lock);
+	}
+	Dx12QueueUnlock(queue);
 
 	for (ID3D12Fence *reached : done)
 		reached->Release();
+	return hr;
 }
 
 // With fence_lock held: the first wait queue_reaches stops at. The queues are
@@ -600,14 +627,7 @@ HRESULT STDMETHODCALLTYPE Dx12CommandQueue::Signal(ID3D12Fence *pFence, UINT64 V
 
 HRESULT STDMETHODCALLTYPE Dx12CommandQueue::Wait(ID3D12Fence *pFence, UINT64 Value)
 {
-	HRESULT hr;
-
-	Dx12QueueLock(mOrig);
-	if (pFence)
-		Dx12QueueWaits(mOrig, pFence, Value);
-	hr = mOrig->Wait(pFence, Value);
-	Dx12QueueUnlock(mOrig);
-	return hr;
+	return Dx12QueueWait(mOrig, pFence, Value);
 }
 
 #include "generated/Dx12CommandQueue.fwd.inl"
