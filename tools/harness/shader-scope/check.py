@@ -91,6 +91,7 @@ skip_early_includes_load = false
 include_recursive = Mods
 [Rendering]
 extended_rendering = true
+async_resource_loading = false
 shader_hash = 3dmigoto
 [Hunting]
 hunting = 0
