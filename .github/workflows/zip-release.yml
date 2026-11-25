@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-2025-vs2026
     permissions:
       contents: write
       id-token: write
@@ -24,14 +24,14 @@ jobs:
         # generate-version.ps1, which the build runs, reads the version from the tags
         fetch-depth: 0
 
-    - name: Add MSBuild for VS2022 to PATH
+    - name: Add MSBuild for VS 2026 to PATH
       uses: microsoft/setup-msbuild@v2
       with:
-        vs-version: '[17.0,18.0)'
+        vs-version: '[18.12,19.0)'
 
     - name: Build d3d11.dll
       run: >
-        msbuild StereoVisionHacks.sln
+        msbuild StereovisionHacks.sln
         -target:DirectX11:Rebuild
         -maxCpuCount
         -property:Configuration=Release

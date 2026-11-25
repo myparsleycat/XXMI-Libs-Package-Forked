@@ -11,7 +11,7 @@ if not exist "%dxc%" goto no_dxc
 "%dxc%" -nologo -T ps_6_0 -E ps -Fo bin\draw_ps.cso draw.hlsl || exit /b 1
 "%dxc%" -nologo -T vs_6_0 -E vs -D BINDINGS -Fo bin\draw_vs_bindings.cso draw.hlsl || exit /b 1
 "%dxc%" -nologo -T ps_6_0 -E ps -D BINDINGS -Fo bin\draw_ps_bindings.cso draw.hlsl || exit /b 1
-cl /nologo /O2 /EHsc /W3 /Zi /D_CRT_SECURE_NO_WARNINGS /Fe:bin\skin.exe /Fo:bin\ /Fd:bin\skin.pdb skin.cpp
+cl /nologo /std:c++23 /Zc:__cplusplus /O2 /EHsc /W3 /Zi /D_CRT_SECURE_NO_WARNINGS /Fe:bin\skin.exe /Fo:bin\ /Fd:bin\skin.pdb skin.cpp
 exit /b %errorlevel%
 
 :no_dxc

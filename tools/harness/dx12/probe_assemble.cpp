@@ -29,9 +29,9 @@ int main()
 	pos++;
 	source.insert(pos, "mov o0.x, l(1.000000)\n");
 	assembly.assign(source.begin(), source.end());
-	vector<byte> bytecode(original.begin(), original.end());
+	vector<BYTE> bytecode(original.begin(), original.end());
 	vector<AssemblerParseError> errors;
-	vector<byte> patched = assembler(&assembly, bytecode, &errors);
+	vector<BYTE> patched = assembler(&assembly, bytecode, &errors);
 	if (patched.empty() || !errors.empty()) {
 		for (const auto &error : errors) printf("%s\n", error.what());
 		return 1;

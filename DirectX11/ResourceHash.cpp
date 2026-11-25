@@ -1,5 +1,7 @@
 #include "ResourceHash.h"
 
+#include <bit>
+
 #include <INITGUID.h>
 #include "log.h"
 #include "util.h"
@@ -2943,7 +2945,7 @@ uint8_t* ResourceHandleInfo::GetCachedData() {
 struct LazyDataCache {
 	static const size_t PAGE = 256;
 
-	std::function<void(uint8_t *dst, size_t offset, size_t size)> read;
+	std::move_only_function<void(uint8_t *dst, size_t offset, size_t size)> read;
 	size_t size;
 	std::vector<bool> pages;
 
@@ -2956,6 +2958,8 @@ uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
 	size_t page, first, start = cached_data_offset + offset;
 
 	if (lazy && size && start < lazy->size) {
+		if (!lazy->read)
+			throw std::bad_function_call{};
 		size = min(size, lazy->size - start);
 		for (page = start / LazyDataCache::PAGE; page * LazyDataCache::PAGE < start + size;) {
 			if (lazy->pages[page]) {
@@ -2972,7 +2976,7 @@ uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
 	return GetCachedData();
 }
 
-void ResourceHandleInfo::SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read)
+void ResourceHandleInfo::SetLazyDataCache(size_t size, std::move_only_function<void(uint8_t *dst, size_t offset, size_t size)> read)
 {
 	if (cached_data && cached_data.use_count() == 1 && !cached_data_offset && cached_data_size == size) {
 		LazyDataCache *existing = std::get_deleter<LazyDataCache>(cached_data);
@@ -3741,5 +3745,5 @@ unsigned HammingDistance(uint64_t a, uint64_t b)
 	if ((a == 0) != (b == 0))
 		return 64;
 
-	return static_cast<unsigned>(__popcnt64(a ^ b));
+	return std::popcount(a ^ b);
 }

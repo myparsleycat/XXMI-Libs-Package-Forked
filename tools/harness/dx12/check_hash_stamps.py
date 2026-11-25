@@ -50,7 +50,7 @@ def main():
     fixture = Path("..", "..", "hash_stamps.cpp")
     subprocess.run(
         f'cmd.exe /d /c call {msvc} && '
-        f'cl /nologo /O2 /EHsc /std:c++17 /W3 /DCRC32C_STATIC=1 '
+        f'cl /nologo /O2 /EHsc /std:c++23 /Zc:__cplusplus /W3 /DCRC32C_STATIC=1 '
         f'/I. /I{root} /I{crc / "include"} '
         f'/Fe:hash_stamps.exe {fixture} {crc / "src" / "crc32c.cpp"}',
         cwd=build,

@@ -314,7 +314,7 @@ struct special_purpose_register
 	// may interact with this, but this is at least passing all test cases.
 	unsigned comps_enum;
 
-	char *name;
+	const char *name;
 };
 
 static struct special_purpose_register special_purpose_registers[] = {
@@ -2856,11 +2856,11 @@ static inline void replace_cb_offsets_with_indices(string *line)
 }
 
 #if MIGOTO_DX == 9
-HRESULT disassemblerDX9(vector<byte> *buffer, vector<byte> *ret, const char *comment)
+HRESULT disassemblerDX9(vector<BYTE> *buffer, vector<BYTE> *ret, const char *comment)
 {
 	char* asmBuffer;
 	size_t asmSize;
-	vector<byte> asmBuf;
+	vector<BYTE> asmBuf;
 	ID3DBlob* pDissassembly = NULL;
 	LPD3DXBUFFER pD3DXDissassembly = NULL;
 	HRESULT ok = D3DDisassemble(buffer->data(), buffer->size(), D3D_DISASM_ENABLE_DEFAULT_VALUE_PRINTS, comment, &pDissassembly);
@@ -2882,11 +2882,9 @@ HRESULT disassemblerDX9(vector<byte> *buffer, vector<byte> *ret, const char *com
 	}
 	vector<string> lines = stringToLinesDX9(asmBuffer, asmSize);
 	ret->clear();
-	for (size_t i = 0; i < lines.size(); i++) {
-		for (size_t j = 0; j < lines[i].size(); j++) {
-			ret->insert(ret->end(), lines[i][j]);
-		}
-		ret->insert(ret->end(), '\n');
+	for (const auto &line : lines) {
+		ret->append_range(line);
+		ret->push_back('\n');
 	}
 	if (pDissassembly)
 		pDissassembly->Release();
@@ -2896,12 +2894,12 @@ HRESULT disassemblerDX9(vector<byte> *buffer, vector<byte> *ret, const char *com
 }
 #endif
 
-HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *comment,
+HRESULT disassembler(vector<BYTE> *buffer, vector<BYTE> *ret, const char *comment,
 		int hexdump, bool d3dcompiler_46_compat,
 		bool disassemble_undecipherable_data,
 		bool patch_cb_offsets)
 {
-	byte fourcc[4];
+	BYTE fourcc[4];
 	DWORD fHash[4];
 	DWORD one;
 	DWORD fSize;
@@ -2912,7 +2910,7 @@ HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *commen
 	// TODO: Add robust error checking here (buffer is at least as large as
 	// the header, etc). I've added a check for numChunks < 1 as that
 	// would lead to codeByteStart being used uninitialised
-	byte* pPosition = buffer->data();
+	BYTE* pPosition = buffer->data();
 	std::memcpy(fourcc, pPosition, 4);
 	pPosition += 4;
 	std::memcpy(fHash, pPosition, 16);
@@ -2930,7 +2928,7 @@ HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *commen
 
 	char* asmBuffer;
 	size_t asmSize;
-	vector<byte> asmBuf;
+	vector<BYTE> asmBuf;
 	ID3DBlob* pDissassembly = NULL;
 
 	// We disable debug info in the disassembler as it interferes with our
@@ -2945,7 +2943,7 @@ HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *commen
 	asmBuffer = (char*)pDissassembly->GetBufferPointer();
 	asmSize = pDissassembly->GetBufferSize();
 
-	byte* codeByteStart;
+	BYTE* codeByteStart;
 	int codeChunk = 0;
 	for (DWORD i = 1; i <= numChunks; i++) {
 		codeChunk = numChunks - i;
@@ -2962,7 +2960,7 @@ HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *commen
 	string s2;
 	vector<DWORD> o;
 	for (DWORD i = 0; i < lines.size(); i++) {
-		uint32_t line_byte_offset = (uint32_t)((byte*)codeStart - buffer->data());
+		uint32_t line_byte_offset = (uint32_t)((BYTE*)codeStart - buffer->data());
 		string s = lines[i];
 
 		if (!memcmp(s.c_str(), "//", 2)) {
@@ -3059,9 +3057,9 @@ HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *commen
 	for (size_t i = 0; i < lines.size(); i++)
 		asmTextSize += lines[i].size();
 	ret->reserve(asmTextSize);
-	for (size_t i = 0; i < lines.size(); i++) {
-		ret->insert(ret->end(), lines[i].begin(), lines[i].end());
-		ret->insert(ret->end(), '\n');
+	for (const auto &line : lines) {
+		ret->append_range(line);
+		ret->push_back('\n');
 	}
 
 	pDissassembly->Release();
@@ -3096,7 +3094,7 @@ static void preprocessLine(string &line)
 // For anyone confused about what this hash function is doing, there is a
 // clearer implementation here, with details of how this differs from MD5:
 // https://github.com/DarkStarSword/3d-fixes/blob/master/dx11shaderanalyse.py
-static vector<DWORD> ComputeHash(byte const* input, DWORD size)
+static vector<DWORD> ComputeHash(BYTE const* input, DWORD size)
 {
 	DWORD esi;
 	DWORD ebx;
@@ -3228,10 +3226,10 @@ static vector<DWORD> ComputeHash(byte const* input, DWORD size)
 
 // origByteCode is modified in this function, so passing it by value!
 // asmFile is not modified, so passing it by pointer -DarkStarSword
-vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode,
+vector<BYTE> assembler(vector<char> *asmFile, vector<BYTE> origBytecode,
 		vector<AssemblerParseError> *parse_errors)
 {
-	byte fourcc[4];
+	BYTE fourcc[4];
 	DWORD fHash[4];
 	DWORD one;
 	DWORD fSize;
@@ -3241,7 +3239,7 @@ vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode,
 	// TODO: Add robust error checking here (origBytecode is at least as large as
 	// the header, etc). I've added a check for numChunks < 1 as that
 	// would lead to codeByteStart being used uninitialised
-	byte* pPosition = origBytecode.data();
+	BYTE* pPosition = origBytecode.data();
 	std::memcpy(fourcc, pPosition, 4);
 	pPosition += 4;
 	std::memcpy(fHash, pPosition, 16);
@@ -3261,7 +3259,7 @@ vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode,
 	size_t asmSize;
 	asmBuffer = asmFile->data();
 	asmSize = asmFile->size();
-	byte* codeByteStart;
+	BYTE* codeByteStart;
 	int codeChunk = 0;
 	for (DWORD i = 1; i <= numChunks; i++) {
 		codeChunk = numChunks - i;
@@ -3332,7 +3330,7 @@ vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode,
 	origBytecode.erase(it, it + codeSize);
 	size_t newCodeSize = 4 * o.size();
 	codeStart[1] = (DWORD)newCodeSize;
-	vector<byte> newCode(newCodeSize);
+	vector<BYTE> newCode(newCodeSize);
 	o[1] = (DWORD)o.size();
 	memcpy(newCode.data(), o.data(), newCodeSize);
 	it = origBytecode.begin() + chunkOffsets[codeChunk] + 8;
@@ -3342,7 +3340,7 @@ vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode,
 		dwordBuffer[8 + i] += (DWORD)(newCodeSize - codeSize);
 	}
 	dwordBuffer[6] = (DWORD)origBytecode.size();
-	vector<DWORD> hash = ComputeHash((byte const*)origBytecode.data() + 20, (DWORD)origBytecode.size() - 20);
+	vector<DWORD> hash = ComputeHash((BYTE const*)origBytecode.data() + 20, (DWORD)origBytecode.size() - 20);
 	dwordBuffer[1] = hash[0];
 	dwordBuffer[2] = hash[1];
 	dwordBuffer[3] = hash[2];
@@ -3350,9 +3348,9 @@ vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode,
 	return origBytecode;
 }
 #if MIGOTO_DX == 9
-vector<byte> assemblerDX9(vector<char> *asmFile)
+vector<BYTE> assemblerDX9(vector<char> *asmFile)
 {
-	vector<byte> ret;
+	vector<BYTE> ret;
 	LPD3DXBUFFER pAssembly;
 	HRESULT hr = D3DXAssembleShader(asmFile->data(), (UINT)asmFile->size(), NULL, NULL, 0, &pAssembly, NULL);
 	if (!FAILED(hr)) {

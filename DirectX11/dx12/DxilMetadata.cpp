@@ -1,6 +1,7 @@
 #include "DxilMetadata.h"
 
 #include <map>
+#include <ranges>
 #include <string>
 
 // DXIL is LLVM 3.7 bitcode. This reads as much of the bitstream as it takes
@@ -48,7 +49,7 @@ struct MetadataEntry {
 };
 
 struct Reader {
-	const BYTE *data;
+	std::span<const BYTE> data;
 	UINT64 bits;
 	UINT64 pos;
 	bool failed;
@@ -366,7 +367,7 @@ static UINT32 load32(const BYTE *data)
 
 }
 
-bool Dx12ReadDxilResources(const BYTE *data, size_t size, Dx12DxilResources *result)
+bool Dx12ReadDxilResources(std::span<const BYTE> data, Dx12DxilResources *result)
 {
 	Dx12DxilResources found;
 	const MetadataEntry *resources, *list, *buffer;
@@ -376,14 +377,14 @@ bool Dx12ReadDxilResources(const BYTE *data, size_t size, Dx12DxilResources *res
 
 	// Program header: version, size in words, "DXIL", version of DXIL,
 	// then offset and size of the bitcode, the offset counting from "DXIL"
-	if (size < 24 || memcmp(data + 8, "DXIL", 4))
+	if (data.size() < 24 || memcmp(data.data() + 8, "DXIL", 4))
 		return false;
-	offset = (UINT64)load32(data + 16) + 8;
-	length = load32(data + 20);
-	if (offset > size || length > size - offset || length < 4)
+	offset = (UINT64)load32(data.data() + 16) + 8;
+	length = load32(data.data() + 20);
+	if (offset > data.size() || length > data.size() - offset || length < 4)
 		return false;
 
-	reader.data = data + offset;
+	reader.data = data.subspan(static_cast<size_t>(offset), static_cast<size_t>(length));
 	reader.bits = length * 8;
 	if (reader.fixed(32) != 0xdec04342)
 		return false;
@@ -433,10 +434,12 @@ bool Dx12ReadDxilResources(const BYTE *data, size_t size, Dx12DxilResources *res
 			    || !reader.integer(buffer->operands[4], &structured.reg)
 			    || !reader.integer(buffer->operands[5], &structured.count))
 				continue;
-			for (size_t j = 0; j + 1 < tags->operands.size(); j += 2) {
+			for (auto pair : tags->operands | std::views::chunk(2)) {
+				if (pair.size() != 2)
+					break;
 				UINT tag;
-				if (reader.integer(tags->operands[j], &tag) && tag == DXIL_ELEMENT_STRIDE_TAG
-				    && reader.integer(tags->operands[j + 1], &structured.stride)) {
+				if (reader.integer(pair[0], &tag) && tag == DXIL_ELEMENT_STRIDE_TAG
+				    && reader.integer(pair[1], &structured.stride)) {
 					structured.uav = i != 0;
 					found.structured.push_back(structured);
 					break;

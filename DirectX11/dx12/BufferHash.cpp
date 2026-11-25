@@ -39,7 +39,7 @@ struct BufferRange {
 
 static SRWLOCK lock = SRWLOCK_INIT;
 // Ranges of one resource by their offset. They do not overlap.
-static std::unordered_map<ID3D12Resource*, std::map<UINT64, BufferRange>> ranges;
+static std::unordered_map<ID3D12Resource*, std::map<UINT64, BufferRange>> buffer_ranges;
 static UINT64 range_versions;
 
 // Handed out to pending ranges, see BufferRange::check
@@ -140,7 +140,7 @@ uint32_t Dx12BufferDescHash(const Dx12BufferHash *hash, UINT bind_flags)
 // With the lock held
 static std::map<UINT64, BufferRange>& ranges_of(ID3D12Resource *resource)
 {
-	auto inserted = ranges.try_emplace(resource);
+	auto inserted = buffer_ranges.try_emplace(resource);
 
 	if (inserted.second)
 		InterlockedIncrement(with_ranges(resource));
@@ -218,8 +218,8 @@ static void note_move(Dx12BufferWrite *write)
 {
 	// Gathered before anything is erased, as the source may be the
 	// destination's resource
-	auto source = ranges.find(write->src);
-	if (source != ranges.end()) {
+	auto source = buffer_ranges.find(write->src);
+	if (source != buffer_ranges.end()) {
 		const std::map<UINT64, BufferRange> &map = source->second;
 		for (auto i = map.lower_bound(write->src_offset); i != map.end() && i->first + i->second.bytes <= write->src_offset + write->bytes; ++i) {
 			if (i->second.valid || i->second.pending)
@@ -236,9 +236,9 @@ static void note_move(Dx12BufferWrite *write)
 static bool write_placed(const Dx12BufferWrite *write, ID3D12CommandQueue *queue, UINT64 order)
 {
 	UINT64 at = write->dst_offset, end = write->dst_offset + write->bytes;
-	auto map = ranges.find(write->dst);
+	auto map = buffer_ranges.find(write->dst);
 
-	if (map == ranges.end())
+	if (map == buffer_ranges.end())
 		return false;
 	auto first = map->second.lower_bound(at), i = first;
 	for (; at < end; ++i) {
@@ -257,9 +257,9 @@ static bool write_placed(const Dx12BufferWrite *write, ID3D12CommandQueue *queue
 // get one
 static bool hash_under(const Dx12BufferWrite *write)
 {
-	auto map = ranges.find(write->dst);
+	auto map = buffer_ranges.find(write->dst);
 
-	if (map == ranges.end())
+	if (map == buffer_ranges.end())
 		return false;
 	auto i = map->second.lower_bound(write->dst_offset);
 	if (i != map->second.begin()) {
@@ -283,9 +283,9 @@ static bool hash_under(const Dx12BufferWrite *write)
 // changes its range's hash or check without a new version.
 static bool source_kept(Dx12BufferWrite *write, ID3D12CommandQueue *queue, bool *changed)
 {
-	auto map = ranges.find(write->src);
+	auto map = buffer_ranges.find(write->src);
 
-	if (write->ranges.empty() || map == ranges.end())
+	if (write->ranges.empty() || map == buffer_ranges.end())
 		return false;
 	for (const Dx12BufferWrite::Range &range : write->ranges) {
 		auto i = map->second.find(range.offset);
@@ -412,9 +412,9 @@ static void note_dump(Dx12BufferWrite *write, std::vector<MovedHash> *dumps, UIN
 // executed before, which nothing has written over since
 static BufferRange* upload_in_place(const Dx12BufferWrite *write)
 {
-	auto map = ranges.find(write->dst);
+	auto map = buffer_ranges.find(write->dst);
 
-	if (map == ranges.end())
+	if (map == buffer_ranges.end())
 		return NULL;
 	auto i = map->second.find(write->dst_offset);
 	if (i == map->second.end() || i->second.version != write->version || i->second.bytes != write->bytes)
@@ -545,11 +545,11 @@ void Dx12BufferHashDone(const Dx12BufferUpload *upload, const uint32_t *data_has
 	AcquireSRWLockExclusive(&lock);
 	while (!work.empty()) {
 		MovedRange at = work.back();
-		auto map = ranges.find(at.resource);
+		auto map = buffer_ranges.find(at.resource);
 		BufferRange *range = NULL;
 
 		work.pop_back();
-		if (map != ranges.end()) {
+		if (map != buffer_ranges.end()) {
 			auto i = map->second.find(at.offset);
 			if (i != map->second.end() && i->second.version == at.version && i->second.check == at.check)
 				range = &i->second;
@@ -696,8 +696,8 @@ void Dx12CopyBufferRegion(Dx12ListBufferWrites *writes, ID3D12Resource *dst, UIN
 	}
 
 	AcquireSRWLockExclusive(&lock);
-	auto resource = ranges.find(dst);
-	if (resource != ranges.end()) {
+	auto resource = buffer_ranges.find(dst);
+	if (resource != buffer_ranges.end()) {
 		auto range = resource->second.find(dst_offset);
 		if (range != resource->second.end() && range->second.version == write.version) {
 			if (write.hashed) {
@@ -746,8 +746,8 @@ bool Dx12FindBufferHash(ID3D12Resource *resource, UINT64 offset, Dx12BufferHash 
 		return false;
 
 	AcquireSRWLockShared(&lock);
-	auto i = ranges.find(resource);
-	if (i != ranges.end()) {
+	auto i = buffer_ranges.find(resource);
+	if (i != buffer_ranges.end()) {
 		auto range = i->second.find(offset);
 		if (range != i->second.end() && range->second.valid) {
 			hash->bytes = range->second.bytes;
@@ -811,8 +811,8 @@ bool Dx12FindListBufferHash(const Dx12ListBufferWrites *writes, ID3D12Resource *
 void Dx12DescribeBufferRange(ID3D12Resource *resource, UINT64 offset, char *text, size_t size)
 {
 	AcquireSRWLockShared(&lock);
-	auto i = ranges.find(resource);
-	if (i == ranges.end()) {
+	auto i = buffer_ranges.find(resource);
+	if (i == buffer_ranges.end()) {
 		_snprintf_s(text, size, _TRUNCATE, "no copy into the buffer was seen");
 	} else {
 		auto next = i->second.upper_bound(offset);
@@ -853,7 +853,7 @@ void Dx12DescribeBufferRange(ID3D12Resource *resource, UINT64 offset, char *text
 void Dx12ForgetBufferHashes(ID3D12Resource *resource)
 {
 	AcquireSRWLockExclusive(&lock);
-	if (ranges.erase(resource)) {
+	if (buffer_ranges.erase(resource)) {
 		InterlockedDecrement(with_ranges(resource));
 		InterlockedIncrement64(resource_stamp(resource));
 	}

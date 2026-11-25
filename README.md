@@ -7,7 +7,7 @@
 
 * Legacy projects have been removed from the solution.
 * All stereoscopic (3D) features have been stripped, making this fork effectively a "2Dmigoto".
-* Codebase has been updated for compatibility with **Visual Studio 2022**.
+* The build requires **Visual Studio 2026 18.12 or later** with **MSVC 14.52 or later** and Windows SDK **10.0.26100.0**. The DLL targets Windows 10 or later. The x64 Zip Release build of InjectorLib uses the Visual Studio LLVM component with Clang 22 or later.
 
 ## New features
 

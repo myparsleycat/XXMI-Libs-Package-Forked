@@ -84,13 +84,13 @@ struct token_operand
 };
 
 vector<string> stringToLines(const char* start, size_t size);
-HRESULT disassembler(vector<byte> *buffer, vector<byte> *ret, const char *comment,
+HRESULT disassembler(vector<BYTE> *buffer, vector<BYTE> *ret, const char *comment,
 		int hexdump = 0, bool d3dcompiler_46_compat = false,
 		bool disassemble_undecipherable_data = false,
 		bool patch_cb_offsets = false);
-HRESULT disassemblerDX9(vector<byte> *buffer, vector<byte> *ret, const char *comment);
-vector<byte> assembler(vector<char> *asmFile, vector<byte> origBytecode, vector<AssemblerParseError> *parse_errors = NULL);
-vector<byte> assemblerDX9(vector<char> *asmFile);
+HRESULT disassemblerDX9(vector<BYTE> *buffer, vector<BYTE> *ret, const char *comment);
+vector<BYTE> assembler(vector<char> *asmFile, vector<BYTE> origBytecode, vector<AssemblerParseError> *parse_errors = NULL);
+vector<BYTE> assemblerDX9(vector<char> *asmFile);
 void writeLUT();
-HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<byte> *result_bytecode, vector<AssemblerParseError> *parse_errors = NULL);
-vector<byte> AssembleFluganWithOptionalSignatureParsing(vector<char> *assembly, bool assemble_signatures, vector<byte> *orig_bytecode, vector<AssemblerParseError> *parse_errors = NULL);
+HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<BYTE> *result_bytecode, vector<AssemblerParseError> *parse_errors = NULL);
+vector<BYTE> AssembleFluganWithOptionalSignatureParsing(vector<char> *assembly, bool assemble_signatures, vector<BYTE> *orig_bytecode, vector<AssemblerParseError> *parse_errors = NULL);

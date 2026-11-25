@@ -11,4 +11,4 @@ set "glslang=%VULKAN_SDK%\Bin\glslangValidator.exe"
 "%glslang%" -V -S frag -o bin\ps.spv shader.frag >nul || exit /b 1
 "%glslang%" -V -S vert -o bin\efmi_vs.spv efmi.vert >nul || exit /b 1
 "%glslang%" -V -S frag -o bin\efmi_ps.spv efmi.frag >nul || exit /b 1
-cl /nologo /O2 /EHsc /W3 /Zi /I..\..\..\Vulkan-Headers\include /Fe:bin\harness.exe /Fo:bin\ /Fd:bin\harness.pdb harness.cpp user32.lib
+cl /nologo /std:c++23 /Zc:__cplusplus /O2 /EHsc /W3 /Zi /I..\..\..\Vulkan-Headers\include /Fe:bin\harness.exe /Fo:bin\ /Fd:bin\harness.pdb harness.cpp user32.lib

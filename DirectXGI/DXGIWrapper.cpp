@@ -35,7 +35,8 @@
 
 
 bool gLogDebug = false;
-FILE *LogFile = 0;
+LogVerbosity gLogVerbosity = LogVerbosity::DISABLED;
+FILE *LogFile = nullptr;
 
 static bool gInitialized = false;
 
@@ -70,15 +71,19 @@ void InitializeDLL()
 		if (GetPrivateProfileInt(L"Logging", L"calls", 1, dir))
 		{
 			LogFile = _fsopen("dxgi_log.txt", "w", _SH_DENYNO);
+			if (LogFile)
+				gLogVerbosity = LogVerbosity::INFO;
 			LogInfo("\n *** DXGI DLL starting init  -  %s\n\n", LogTime().c_str());
 		}
 
 		gLogDebug = GetPrivateProfileInt(L"Logging", L"debug", 0, dir) == 1;
+		if (LogFile && gLogDebug)
+			gLogVerbosity = LogVerbosity::DEBUG;
 
 		// Unbuffered logging to remove need for fflush calls, and r/w access to make it easy
 		// to open active files.
 		int unbuffered = -1;
-		if (GetPrivateProfileInt(L"Logging", L"unbuffered", 0, dir))
+		if (LogFile && GetPrivateProfileInt(L"Logging", L"unbuffered", 0, dir))
 		{
 			unbuffered = setvbuf(LogFile, NULL, _IONBF, 0);
 			LogInfo("  unbuffered=1  return: %d\n", unbuffered);

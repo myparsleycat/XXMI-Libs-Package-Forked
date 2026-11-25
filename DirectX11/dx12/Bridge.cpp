@@ -1783,7 +1783,8 @@ static bool upload_for_game_lists(ShimResource *resource, UINT64 bytes, bool alo
 	return true;
 }
 
-UINT64 Dx12ShimGameBufferAddress(ID3D11Buffer *buffer, Dx12GraphicsCommandList *list, UINT *size)
+// The shader-scope harness calls this through the Release PDB.
+__declspec(noinline) UINT64 Dx12ShimGameBufferAddress(ID3D11Buffer *buffer, Dx12GraphicsCommandList *list, UINT *size)
 {
 	ShimResource *resource = ShimResourceOf(buffer);
 	UINT64 bytes;

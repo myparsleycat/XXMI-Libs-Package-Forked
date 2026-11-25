@@ -5,6 +5,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+$msvc = Join-Path $root 'tools/harness/common/msvc.bat'
 $vcVarsPath = (Resolve-Path -LiteralPath $VcVars).Path
 if (-not $CacheSource) { $CacheSource = Join-Path $root 'DirectX11/vk/SpirvPatchCache.cpp' }
 $cacheSourcePath = (Resolve-Path -LiteralPath $CacheSource).Path
@@ -28,8 +29,8 @@ foreach ($header in @('DirectX11/ShaderRegex.h', 'DirectX11/globals.h',
 $source = Join-Path $PSScriptRoot 'spirv_patch_cache.cpp'
 $cache = Join-Path $vk 'SpirvPatchCache.cpp'
 $exe = Join-Path $runDir 'spirv_patch_cache.exe'
-$command = 'call "{0}" >nul && cl /nologo /std:c++14 /EHsc /W4 /O2 /I"{1}" "{2}" "{3}" /Fe"{4}" /link /INCREMENTAL:NO' -f `
-    $vcVarsPath, $fixture, $source, $cache, $exe
+$command = 'call "{0}" >nul && call "{5}" && cl /nologo /std:c++23 /Zc:__cplusplus /EHsc /W4 /O2 /I"{1}" "{2}" "{3}" /Fe"{4}" /link /INCREMENTAL:NO' -f `
+    $vcVarsPath, $fixture, $source, $cache, $exe, $msvc
 Write-Host "Cache source: $cacheSourcePath"
 Write-Host "Artifacts: $runDir"
 Push-Location -LiteralPath $runDir

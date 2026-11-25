@@ -7,4 +7,4 @@ if not "%~2"=="" set "bindings_context=%~f2"
 cd /d "%~dp0"
 if not exist bin mkdir bin
 python make_bindings.py "%bindings_draw%" "%bindings_context%" bin\bindings_types.inc bin\bindings_impl.inc || exit /b 1
-cl /nologo /O2 /EHsc /MT /std:c++17 /W3 /I..\..\.. /I..\..\..\Vulkan-Headers\include /Fe:bin\bindings.exe /Fo:bin\ bindings.cpp || exit /b 1
+cl /nologo /std:c++23 /Zc:__cplusplus /O2 /EHsc /MT /W3 /I..\..\.. /I..\..\..\Vulkan-Headers\include /Fe:bin\bindings.exe /Fo:bin\ bindings.cpp || exit /b 1

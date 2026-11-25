@@ -8,6 +8,7 @@
 #include "ResourceLoading.h"
 #include "ModLoading.h"
 #include <algorithm>
+#include <bit>
 #include <cstdio>
 #include <sstream>
 #include "HackerDevice.h"
@@ -1271,7 +1272,7 @@ static bool ParseFrameAnalysisDump(const wchar_t *section,
 	FrameAnalysisDumpCommand *operation = new FrameAnalysisDumpCommand();
 	wchar_t *buf;
 	size_t size = val->size() + 1;
-	wchar_t *target = NULL;
+	const wchar_t *target = NULL;
 
 	// parse_enum_option_string replaces spaces with NULLs, so it can't
 	// operate on the buffer in the wstring directly. I could potentially
@@ -1280,7 +1281,7 @@ static bool ParseFrameAnalysisDump(const wchar_t *section,
 	buf = new wchar_t[size];
 	wcscpy_s(buf, size, val->c_str());
 
-	operation->analyse_options = parse_enum_option_string<wchar_t *, FrameAnalysisOptions>
+	operation->analyse_options = parse_enum_option_string<const wchar_t *, FrameAnalysisOptions, wchar_t*>
 		(FrameAnalysisOptionNames, buf, &target);
 
 	if (!target)
@@ -1998,7 +1999,7 @@ static UINT get_index_count_from_current_ib(ID3D11DeviceContext *mOrigContext1)
 	return 0;
 }
 
-void DrawCommand::do_indirect_draw_call(CommandListState *state, char *name,
+void DrawCommand::do_indirect_draw_call(CommandListState *state, const char *name,
 		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
 		ID3D11Buffer *pBufferForArgs,
 		UINT AlignedByteOffsetForArgs))
@@ -2435,7 +2436,7 @@ FrameAnalysisChangeOptionsCommand::FrameAnalysisChangeOptionsCommand(wstring *va
 	buf = new wchar_t[size];
 	wcscpy_s(buf, size, val->c_str());
 
-	analyse_options = parse_enum_option_string<wchar_t *, FrameAnalysisOptions>
+	analyse_options = parse_enum_option_string<const wchar_t *, FrameAnalysisOptions, wchar_t*>
 		(FrameAnalysisOptionNames, buf, NULL);
 
 	delete [] buf;
@@ -5902,6 +5903,8 @@ static void tokenise(const wstring* expression, CommandListSyntaxTree* tree, con
 			continue;
 
 		operand = make_shared<CommandListOperand>(friendly_pos, token);
+		bool has_variable_prefix, has_prefix;
+		size_t len, len_target;
 
 		// Numeric Literal
 		if (std::isdigit(remain[0]) || remain[0] == L'.')
@@ -5923,7 +5926,7 @@ static void tokenise(const wstring* expression, CommandListSyntaxTree* tree, con
 			throw CommandListSyntaxError(L"Float not recognized: " + remain, friendly_pos);
 		}
 
-		bool has_variable_prefix = remain[0] == L'$';
+		has_variable_prefix = remain[0] == L'$';
 
 		// Variable
 		if (has_variable_prefix)
@@ -5967,9 +5970,9 @@ static void tokenise(const wstring* expression, CommandListSyntaxTree* tree, con
 			throw CommandListSyntaxError(L"Variable not recognized: " + remain, friendly_pos);
 		}
 
-		bool has_prefix = has_variable_prefix || remain[0] == L'@' || remain[0] == L'#';
+		has_prefix = has_variable_prefix || remain[0] == L'@' || remain[0] == L'#';
 
-		size_t len = 0;
+		len = 0;
 
 		// Other Tokens
 		if (!has_prefix)
@@ -6029,7 +6032,7 @@ static void tokenise(const wstring* expression, CommandListSyntaxTree* tree, con
 		
 		// More loose match with hyphens, brackets and UTF-8.
 		// Allows strings like `Pool\path like\namespace\chars_UTF-8[$index]->Call($PoolFoo[$index], 1)`.
-		size_t len_target = FindResourceCopyTargetTokenEnd(remain, has_prefix ? 1 : 0);
+		len_target = FindResourceCopyTargetTokenEnd(remain, has_prefix ? 1 : 0);
 		if (len_target)
 		{
 			token = remain.substr(0, len_target);
@@ -9787,6 +9790,16 @@ void CustomResourcePool::ExpireElements()
 #pragma endregion CustomResourcePool
 
 
+MemberArg::MemberArg() = default;
+MemberArg::~MemberArg() = default;
+MemberArg::MemberArg(MemberArg&&) noexcept = default;
+MemberArg& MemberArg::operator=(MemberArg&&) noexcept = default;
+
+ResourceCopyTarget::ResourceCopyTarget() = default;
+ResourceCopyTarget::~ResourceCopyTarget() = default;
+ResourceCopyTarget::ResourceCopyTarget(ResourceCopyTarget&&) noexcept = default;
+ResourceCopyTarget& ResourceCopyTarget::operator=(ResourceCopyTarget&&) noexcept = default;
+
 float MemberArg::GetValue(CommandListState* state)
 {
 	if (expression)
@@ -11490,11 +11503,11 @@ CommandListCommand* parse_pool_variable_operation(
 			if (ParseFloatToken(*val, value, len))
 				RegisterUnknownSetting(key, value);
 		}
-		return false;
+		return nullptr;
 	}
 
 	if (val->empty())
-		return false;
+		return nullptr;
 
 	PoolVariableOperation* command = new PoolVariableOperation();
 
@@ -15765,8 +15778,7 @@ void HackerContext::GuardShaderResources(bool compute)
 			UINT64 candidates = bound[word] & declared[word];
 			bound[word] &= ~candidates;
 			while (candidates) {
-				unsigned long bit;
-				_BitScanForward64(&bit, candidates);
+				unsigned bit = std::countr_zero(candidates);
 				candidates &= candidates - 1;
 				unbind_texture_over_buffer(mOrigContext1, shader_types[stage], word * 64 + bit, shader_hash);
 			}

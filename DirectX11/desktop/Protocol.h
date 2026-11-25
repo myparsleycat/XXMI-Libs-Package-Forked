@@ -6,7 +6,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace DesktopProtocol {
@@ -365,20 +367,19 @@ public:
 private:
 	void put(const void *v, size_t n)
 	{
-		const uint8_t *p = (const uint8_t*)v;
-		buf.insert(buf.end(), p, p + n);
+		buf.append_range(std::span(static_cast<const uint8_t*>(v), n));
 	}
 };
 
 // Decodes a payload. The first short read or invalid value makes failed stick
 // and every later read gives zero.
 class Reader {
+	std::span<const uint8_t> remaining;
+
 public:
-	const uint8_t *p;
-	size_t left;
 	bool failed = false;
 
-	Reader(const uint8_t *data, size_t size) : p(data), left(size) {}
+	Reader(const uint8_t *data, size_t size) : remaining(data, size) {}
 
 	void u8(const char*, uint8_t &v) { take(&v, 1); }
 	void u16(const char*, uint16_t &v) { take(&v, 2); }
@@ -419,7 +420,7 @@ public:
 		}
 		// Bound the count by the bytes left, so that a corrupt count
 		// cannot make us allocate far more than the frame holds
-		if (failed || (uint64_t)n * min_size > left) {
+		if (failed || (uint64_t)n * min_size > remaining.size()) {
 			failed = true;
 			v.clear();
 			return;
@@ -438,19 +439,18 @@ public:
 	}
 
 	// True when the payload was read without error and to its end
-	bool finish() { return !failed && left == 0; }
+	bool finish() { return !failed && remaining.empty(); }
 
 private:
 	void take(void *v, size_t n)
 	{
-		if (failed || left < n) {
+		if (failed || remaining.size() < n) {
 			failed = true;
 			memset(v, 0, n);
 			return;
 		}
-		memcpy(v, p, n);
-		p += n;
-		left -= n;
+		memcpy(v, remaining.data(), n);
+		remaining = remaining.subspan(n);
 	}
 };
 
@@ -700,7 +700,7 @@ template <class M> bool EncodeFrame(MessageType type, uint32_t request_id, M &me
 	if (w.failed || w.buf.size() > MAX_FRAME_SIZE)
 		return false;
 	uint32_t length = (uint32_t)w.buf.size() - 4;
-	uint16_t t = (uint16_t)type, flags = 0;
+	uint16_t t = std::to_underlying(type), flags = 0;
 	memcpy(&w.buf[0], &length, 4);
 	memcpy(&w.buf[4], &t, 2);
 	memcpy(&w.buf[6], &flags, 2);

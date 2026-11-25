@@ -52,7 +52,7 @@ void Writer::str(const char*, const std::string &v)
 	}
 	uint16_t n = (uint16_t)v.size();
 	put(&n, 2);
-	buf.insert(buf.end(), v.begin(), v.end());
+	buf.append_range(v);
 }
 
 void Reader::boolean(const char*, bool &v)
@@ -69,17 +69,17 @@ void Reader::str(const char*, std::string &v)
 	uint16_t n = 0;
 	u16(NULL, n);
 	v.clear();
-	if (failed || left < n) {
+	if (failed || remaining.size() < n) {
 		failed = true;
 		return;
 	}
-	if (!ValidUtf8((const char*)p, n)) {
+	const char *text = reinterpret_cast<const char*>(remaining.data());
+	if (!ValidUtf8(text, n)) {
 		failed = true;
 		return;
 	}
-	v.assign((const char*)p, n);
-	p += n;
-	left -= n;
+	v.assign(text, n);
+	remaining = remaining.subspan(n);
 }
 
 bool ParseHeader(const uint8_t header[HEADER_SIZE], FrameHeader *out)

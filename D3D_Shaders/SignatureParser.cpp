@@ -43,7 +43,7 @@ static string next_line(string *shader, size_t *pos)
 struct format_type {
 	uint32_t format;
 	uint32_t min_precision;
-	char *name;
+	const char *name;
 };
 
 static struct format_type format_names[] = {
@@ -74,7 +74,7 @@ static void parse_format(char *format, uint32_t *format_number, uint32_t *min_pr
 
 struct svt {
 	uint32_t val;
-	char *short_name;
+	const char *short_name;
 };
 
 static struct svt system_value_abbreviations[] = {
@@ -182,7 +182,7 @@ static uint32_t pad(uint32_t size, uint32_t multiple)
 	return (multiple - size % multiple) % multiple;
 }
 
-static void* serialise_signature_section(char *section24, char *section28, char *section32, int entry_size,
+static void* serialise_signature_section(const char *section24, const char *section28, const char *section32, int entry_size,
 		vector<struct sgn_entry_unserialised> *entries, uint32_t name_len)
 {
 	void *section;
@@ -278,7 +278,7 @@ static void* serialise_signature_section(char *section24, char *section28, char 
 	return section;
 }
 
-static void* parse_signature_section(char *section24, char *section28, char *section32, string *shader, size_t *pos, bool invert_used, uint64_t sfi)
+static void* parse_signature_section(const char *section24, const char *section28, const char *section32, string *shader, size_t *pos, bool invert_used, uint64_t sfi)
 {
 	string line;
 	size_t old_pos = *pos;
@@ -445,7 +445,7 @@ static void* serialise_subshader_feature_info_section(uint64_t flags)
 struct gf_sfi {
 	uint64_t sfi;
 	int len;
-	char *gf;
+	const char *gf;
 };
 
 static struct gf_sfi global_flag_sfi_map[] = {
@@ -462,7 +462,7 @@ static struct gf_sfi global_flag_sfi_map[] = {
 	// "allResourcesBound"
 };
 
-static char *subshader_feature_comments[] = {
+static const char *const subshader_feature_comments[] = {
 	// d3dcompiler_46:
 	"Double-precision floating point",
 	//"Early depth-stencil", // d3dcompiler46/47 produces this output for [force, but it does *NOT* map to an SFI flag
@@ -553,7 +553,7 @@ static uint64_t parse_subshader_feature_info_comment(string *shader, size_t *pos
 	return flags;
 }
 
-static void* manufacture_empty_section(char *section_name)
+static void* manufacture_empty_section(const char *section_name)
 {
 	void *section;
 
@@ -631,7 +631,7 @@ static bool parse_section(string *line, string *shader, size_t *pos, void **sect
 		*section = parse_signature_section("ISGN", NULL, "ISG1", shader, pos, false, *sfi);
 	} else if (!strncmp(line->c_str(), "// Output signature:", 20)) {
 		LogInfo("Parsing Output Signature section...\n");
-		char *section24 = "OSGN";
+		const char *section24 = "OSGN";
 		if (is_geometry_shader_5(shader, *pos))
 			section24 = NULL;
 		*section = parse_signature_section(section24, "OSG5", "OSG1", shader, pos, true, *sfi);
@@ -645,7 +645,7 @@ static bool parse_section(string *line, string *shader, size_t *pos, void **sect
 	return false;
 }
 
-static void serialise_shader_binary(vector<void*> *sections, uint32_t all_sections_size, vector<byte> *bytecode)
+static void serialise_shader_binary(vector<void*> *sections, uint32_t all_sections_size, vector<BYTE> *bytecode)
 {
 	struct dxbc_header *header = NULL;
 	uint32_t *section_offset_ptr = NULL;
@@ -678,7 +678,7 @@ static void serialise_shader_binary(vector<void*> *sections, uint32_t all_sectio
 	}
 }
 
-static HRESULT manufacture_shader_binary(const void *pShaderAsm, size_t AsmLength, vector<byte> *bytecode)
+static HRESULT manufacture_shader_binary(const void *pShaderAsm, size_t AsmLength, vector<BYTE> *bytecode)
 {
 	string shader_str((const char*)pShaderAsm, AsmLength);
 	string line;
@@ -737,10 +737,10 @@ out_free:
 	return hr;
 }
 
-HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<byte> *result_bytecode,
+HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<BYTE> *result_bytecode,
 		vector<AssemblerParseError> *parse_errors)
 {
-	vector<byte> manufactured_bytecode;
+	vector<BYTE> manufactured_bytecode;
 	HRESULT hr;
 
 	// Flugan's assembler normally cheats and reuses sections from the
@@ -759,11 +759,11 @@ HRESULT AssembleFluganWithSignatureParsing(vector<char> *assembly, vector<byte> 
 
 	return S_OK;
 }
-vector<byte> AssembleFluganWithOptionalSignatureParsing(vector<char> *assembly,
-		bool assemble_signatures, vector<byte> *orig_bytecode,
+vector<BYTE> AssembleFluganWithOptionalSignatureParsing(vector<char> *assembly,
+		bool assemble_signatures, vector<BYTE> *orig_bytecode,
 		vector<AssemblerParseError> *parse_errors)
 {
-	vector<byte> new_bytecode;
+	vector<BYTE> new_bytecode;
 	HRESULT hr;
 
 	if (!assemble_signatures)

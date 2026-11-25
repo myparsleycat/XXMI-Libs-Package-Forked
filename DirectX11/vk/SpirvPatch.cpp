@@ -3,8 +3,11 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <expected>
 #include <fstream>
 #include <set>
+#include <span>
+#include <utility>
 #include <unordered_map>
 
 #include "SpirvConvert.h"
@@ -139,8 +142,7 @@ const char* image_dim_name(uint32_t dim)
 }
 
 struct Module {
-	const uint32_t *code;
-	size_t words;
+	std::span<const uint32_t> code;
 	std::vector<Instruction> instructions;
 	// The canonical names of ids, without the leading %
 	std::unordered_map<uint32_t, std::string> names;
@@ -152,11 +154,11 @@ struct Module {
 	uint32_t entry;
 	bool image_query, glsl;
 
-	const uint32_t* operands(const Instruction &in) const { return code + in.at + 1; }
+	const uint32_t* operands(const Instruction &in) const { return code.data() + in.at + 1; }
 
 	void name(uint32_t id, const std::string &wanted)
 	{
-		if (names.count(id) || !taken.insert(wanted).second)
+		if (names.contains(id) || !taken.insert(wanted).second)
 			return;
 		names[id] = wanted;
 	}
@@ -168,26 +170,23 @@ struct Module {
 	}
 };
 
-bool parse(const uint32_t *code, size_t words, Module *module, std::string *why)
+std::expected<Module, const char*> parse(std::span<const uint32_t> code, const char *entry_name, uint32_t execution_model)
 {
-	size_t at;
-	uint32_t count;
+	if (code.size() < 5 || code[0] != 0x07230203)
+		return std::unexpected("not SPIR-V");
 
-	if (words < 5 || code[0] != 0x07230203) {
-		*why = "not SPIR-V";
-		return false;
+	Module module{};
+	module.code = code;
+	module.entry_name = entry_name;
+	module.execution_model = execution_model;
+	for (size_t at = 5; at < code.size();) {
+		uint32_t count = code[at] >> 16;
+		if (!count || count > code.size() - at)
+			return std::unexpected("an instruction runs past the end");
+		module.instructions.push_back({ at, code[at] & 0xffff, count });
+		at += count;
 	}
-	module->code = code;
-	module->words = words;
-	for (at = 5; at < words; at += count) {
-		count = code[at] >> 16;
-		if (!count || at + count > words) {
-			*why = "an instruction runs past the end";
-			return false;
-		}
-		module->instructions.push_back({ at, code[at] & 0xffff, count });
-	}
-	return true;
+	return module;
 }
 
 std::string literal_string(const uint32_t *words, size_t count)
@@ -538,21 +537,18 @@ bool group_wants(const ShaderRegexGroup &group, const char *stage, const std::st
 }
 
 // How the module passes the validator, if it does at all
-bool layout_rules_of(const uint32_t *code, size_t words, SpirvLayoutRules *rules, std::string *why)
+std::expected<SpirvLayoutRules, std::string> layout_rules_of(std::span<const uint32_t> code)
 {
 	std::string error, first;
-	int i;
 
-	for (i = 0; i < SPIRV_LAYOUT_COUNT; i++) {
-		if (SpirvValidate(code, words, (SpirvLayoutRules)i, &error)) {
-			*rules = (SpirvLayoutRules)i;
-			return true;
-		}
+	for (int i = 0; i < SPIRV_LAYOUT_COUNT; i++) {
+		auto rules = static_cast<SpirvLayoutRules>(i);
+		if (SpirvValidate(code.data(), code.size(), rules, &error))
+			return rules;
 		if (first.empty())
 			first = error;
 	}
-	*why = "the shader as it is does not pass the validator: " + first;
-	return false;
+	return std::unexpected("the shader as it is does not pass the validator: " + first);
 }
 
 struct Candidate {
@@ -560,18 +556,14 @@ struct Candidate {
 	const ShaderRegexGroup *group;
 };
 
-SpirvPatchOutcome patch(const uint32_t *code, size_t words, const char *stage, const char *entry,
+SpirvPatchOutcome patch(std::span<const uint32_t> code, const char *stage, const char *entry,
 		const std::vector<Candidate> &candidates, unsigned ini_params, bool keep_text, SpirvPatched *patched, std::string *why)
 {
 	std::vector<SpirvDeclaration> declarations;
 	std::vector<std::string> lines;
 	std::string raw, text, error, out;
-	SpirvLayoutRules rules;
-	Module module;
 	size_t start, end;
 
-	module.entry_name = entry;
-	module.execution_model = !strcmp(stage, "vs") ? EXECUTION_MODEL_VERTEX : EXECUTION_MODEL_FRAGMENT;
 	*patched = SpirvPatched();
 	why->clear();
 	for (const Candidate &candidate : candidates) {
@@ -581,12 +573,15 @@ SpirvPatchOutcome patch(const uint32_t *code, size_t words, const char *stage, c
 				declarations.push_back(declaration);
 		}
 	}
-	std::sort(declarations.begin(), declarations.end(), [](const SpirvDeclaration &a, const SpirvDeclaration &b) {
-		return SpirvPatchBinding(a) < SpirvPatchBinding(b); });
+	std::ranges::sort(declarations, {}, SpirvPatchBinding);
 
-	if (!parse(code, words, &module, why))
+	auto parsed = parse(code, entry, !strcmp(stage, "vs") ? EXECUTION_MODEL_VERTEX : EXECUTION_MODEL_FRAGMENT);
+	if (!parsed) {
+		*why = parsed.error();
 		return SpirvPatchOutcome::FAILED;
-	if (!SpirvDisassemble(code, words, false, &raw, &error)) {
+	}
+	Module &module = *parsed;
+	if (!SpirvDisassemble(code.data(), code.size(), false, &raw, &error)) {
 		*why = "could not be disassembled: " + error;
 		return SpirvPatchOutcome::FAILED;
 	}
@@ -650,8 +645,11 @@ SpirvPatchOutcome patch(const uint32_t *code, size_t words, const char *stage, c
 	if (keep_text)
 		patched->after = out;
 
-	if (!layout_rules_of(code, words, &rules, why))
+	auto rules = layout_rules_of(code);
+	if (!rules) {
+		*why = std::move(rules).error();
 		return SpirvPatchOutcome::FAILED;
+	}
 	if (!SpirvAssemble(out, code[1], true, &patched->code, &error)) {
 		*why = "could not be assembled: " + error;
 		return SpirvPatchOutcome::FAILED;
@@ -667,7 +665,7 @@ SpirvPatchOutcome patch(const uint32_t *code, size_t words, const char *stage, c
 			patched->code[start + 3] = 0;
 		}
 	}
-	if (!SpirvValidate(patched->code.data(), patched->code.size(), rules, &error)) {
+	if (!SpirvValidate(patched->code.data(), patched->code.size(), *rules, &error)) {
 		*why = "the patched shader does not pass the validator: " + error;
 		return SpirvPatchOutcome::FAILED;
 	}
@@ -743,7 +741,7 @@ SpirvPatchOutcome SpirvPatchShader(const uint32_t *code, size_t words, const cha
 		*why = "no group is for it";
 		return SpirvPatchOutcome::NO_MATCH;
 	}
-	return patch(code, words, stage, entry, candidates, ini_params, keep_text, patched, why);
+	return patch({ code, words }, stage, entry, candidates, ini_params, keep_text, patched, why);
 }
 
 std::vector<uint32_t> SpirvPatchedCode(const SpirvPatched &patched, uint32_t set)
@@ -779,7 +777,6 @@ extern "C" __declspec(dllexport) int VkSpirvPatchFile(const wchar_t *in_path, in
 	std::vector<uint32_t> code;
 	std::string error, text, line;
 	std::vector<std::string> fields;
-	SpirvLayoutRules rules;
 	ShaderRegexGroup group;
 	SpirvPatched patched;
 	SpirvPatchOutcome outcome;
@@ -811,9 +808,10 @@ extern "C" __declspec(dllexport) int VkSpirvPatchFile(const wchar_t *in_path, in
 		return answer(again == code ? 0 : 1, again == code ? "same" : "different words");
 	}
 	if (mode == 1) {
-		if (!layout_rules_of(code.data(), code.size(), &rules, &error))
-			return answer(-1, error);
-		return answer((int)rules, "valid");
+		auto rules = layout_rules_of(code);
+		if (!rules)
+			return answer(-1, rules.error());
+		return answer(static_cast<int>(*rules), "valid");
 	}
 
 	auto words_of = [](const char *list) {
@@ -896,7 +894,7 @@ extern "C" __declspec(dllexport) int VkSpirvPatchFile(const wchar_t *in_path, in
 	std::string stage = group.shader_models.empty() ? "ps" : group.shader_models.begin()->substr(0, 2);
 	if (!group_wants(group, stage.c_str(), declared_for))
 		return answer(1, "the Pattern subsections do not match what it declares");
-	outcome = patch(code.data(), code.size(), stage.c_str(), NULL, { { 0, &group } }, ini_params, true, &patched, &error);
+	outcome = patch(code, stage.c_str(), NULL, { { 0, &group } }, ini_params, true, &patched, &error);
 	if (out_path && *out_path && !patched.before.empty()) {
 		std::wstring out = out_path;
 		std::ofstream(out + L".before.spvasm", std::ios::binary) << patched.before;

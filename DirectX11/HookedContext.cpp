@@ -140,7 +140,7 @@ static bool install_context1_hooks(ID3D11DeviceContext1 *context)
 
 	static bool installed = false;
 	if (!installed) {
-		size_t hook_id;
+		SIZE_T hook_id;
 #define INSTALL(name) \
 		orig_vtable.name = context1->lpVtbl->name; \
 		cHookMgr.Hook(&hook_id, (void**)&orig_vtable.name, context1->lpVtbl->name, CONTEXT1_METHOD(name)::Hook);

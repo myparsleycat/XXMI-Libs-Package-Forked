@@ -4,6 +4,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <bit>
 #include <deque>
 #include <map>
 #include <set>
@@ -1276,7 +1277,8 @@ static bool unhashed_buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64
 	LONG64 word;
 	bool own;
 
-	if (*boring_unhashed_slot(kind, bytes, &word) != word)
+	const auto slot = boring_unhashed_slot(kind, bytes, &word);
+	if (*slot != word)
 		return false;
 	return Dx12FindBuffer(va, &resource, &offset) && !Dx12FindListBufferHash(writes, resource, offset, &hash, &own);
 }
@@ -1337,7 +1339,8 @@ static Published* publish_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 	asked.ib_va = 0;
 	asked.ib_bytes = 0;
 	asked.ib_format = 0;
-	slot = buffer_cache_way(buffer_cache_slot(&asked, va, bytes, kind, stride, indices, &tag), &asked, tag, false);
+	auto bucket = buffer_cache_slot(&asked, va, bytes, kind, stride, indices, &tag);
+	slot = buffer_cache_way(bucket, &asked, tag, false);
 	cached = slot ? &slot->data : NULL;
 
 	// In this order: the pointers are only good with the generation
@@ -1476,8 +1479,10 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 				remember_buffer(&asked, has_hash, &data, &lookup);
 				if (asked.generation) {
 					asked.boring = TextureOverrideCandidatesEmpty(entry->resource);
-					if (asked.boring && !has_hash)
-						InterlockedExchange64(boring_unhashed_slot(kind, bytes, &word), word);
+					if (asked.boring && !has_hash) {
+						auto unhashed_slot = boring_unhashed_slot(kind, bytes, &word);
+						InterlockedExchange64(unhashed_slot, word);
+					}
 				} else
 					stats.lookups_unstamped++;
 				// What could not be remembered still replaces
@@ -1695,8 +1700,10 @@ static PublishedConstants* publish_constants(Dx12ShaderStage stage, UINT slot, U
 		set_resource_hash(entry->buffer, D3D11_RESOURCE_DIMENSION_BUFFER, hash, 0, NULL);
 		entry->boring = TextureOverrideCandidatesEmpty(entry->buffer);
 	}
-	if (entry->boring)
-		InterlockedExchange64(boring_constants_slot(stage, slot, bytes, &word), word);
+	if (entry->boring) {
+		auto cached = boring_constants_slot(stage, slot, bytes, &word);
+		InterlockedExchange64(cached, word);
+	}
 	return entry;
 }
 
@@ -2262,7 +2269,6 @@ static void game_wrote_buffers(Dx12GraphicsCommandList *list, UINT64 written_sco
 	UINT64 mask = shader && shader->reflected && !shader->unmasked ? shader->uav : ~0ull, offset;
 	Dx12DescriptorSlot view;
 	ID3D12Resource *resource;
-	unsigned long slot;
 
 	if (!signature) {
 		for (auto &entry : published) {
@@ -2271,7 +2277,8 @@ static void game_wrote_buffers(Dx12GraphicsCommandList *list, UINT64 written_sco
 		}
 		return;
 	}
-	for (; _BitScanForward64(&slot, mask); mask &= mask - 1) {
+	for (; mask; mask &= mask - 1) {
+		UINT slot = std::countr_zero(mask);
 		if (!Dx12ResolveRegister(&list->mState, signature, DX12_STAGE_CS, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, slot, &view))
 			continue;
 		resource = view.resource;
@@ -6303,7 +6310,8 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 
 		if (!shader || cb >= DX12_CB_SIZES || !shader->cb_bytes[cb])
 			continue;
-		if (*boring_constants_slot(stage, cb, shader->cb_bytes[cb], &word) != word)
+		auto cached = boring_constants_slot(stage, cb, shader->cb_bytes[cb], &word);
+		if (*cached != word)
 			return SLOW_CB;
 	}
 

@@ -3,6 +3,8 @@
 #include <windows.h>
 
 #include <set>
+#include <span>
+#include <utility>
 #include <vector>
 
 #include "SpirvTools.h"
@@ -60,19 +62,22 @@ bool path_of(const SpirvPatchCacheKey &key, wchar_t *path)
 		dx12_stage_names[key.stage], (uint32_t)SpirvPatchCacheHash(key.entry.data(), key.entry.size())) > 0;
 }
 
-template <typename T>
-void append(std::vector<BYTE> *out, const T *data, size_t count)
+template <typename T, size_t Extent>
+void append(std::vector<BYTE> &out, std::span<T, Extent> values)
 {
-	out->insert(out->end(), (const BYTE*)data, (const BYTE*)(data + count));
+	if (!values.empty())
+		out.append_range(std::span(reinterpret_cast<const BYTE*>(values.data()), values.size_bytes()));
 }
 
-template <typename T>
-bool take(const BYTE **at, const BYTE *end, T *data, size_t count)
+template <typename T, size_t Extent>
+bool take(std::span<const BYTE> &input, std::span<T, Extent> values)
 {
-	if ((size_t)(end - *at) < count * sizeof(T))
+	if (values.size() > input.size() / sizeof(T))
 		return false;
-	memcpy(data, *at, count * sizeof(T));
-	*at += count * sizeof(T);
+	if (!values.empty()) {
+		memcpy(values.data(), input.data(), values.size_bytes());
+		input = input.subspan(values.size_bytes());
+	}
 	return true;
 }
 
@@ -96,15 +101,15 @@ bool SpirvPatchCacheLoad(const SpirvPatchCacheKey &key, SpirvPatchOutcome *outco
 {
 	std::vector<BYTE> data;
 	wchar_t path[MAX_PATH];
-	const BYTE *at, *end;
+	std::span<const BYTE> payload;
 	std::string entry;
-	Header header;
+	Header header{};
 	LARGE_INTEGER size;
 	HANDLE file;
 	DWORD read;
 	bool usable = false, valid = false;
 
-	if (!path_of(key, path) || rejected_paths.count(path))
+	if (!path_of(key, path) || rejected_paths.contains(path))
 		return false;
 	// Sharing deletion for another process to write over it meanwhile
 	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -118,15 +123,14 @@ bool SpirvPatchCacheLoad(const SpirvPatchCacheKey &key, SpirvPatchOutcome *outco
 
 	if (valid) {
 		memcpy(&header, data.data(), sizeof(header));
-		at = data.data() + sizeof(header);
-		end = data.data() + data.size();
+		payload = std::span(data).subspan(sizeof(header));
 		valid = header.magic == MAGIC && header.format == FORMAT
-			&& header.checksum == SpirvPatchCacheHash(at, end - at);
+			&& header.checksum == SpirvPatchCacheHash(payload.data(), payload.size());
 	}
 	// One for another configuration is written over once patched, not
 	// deleted: it would be of no use either way
 	valid = valid && header.entry_bytes + (uint64_t)header.code_words * 4 + (uint64_t)header.set_words * 4
-		+ (uint64_t)header.declaration_count * 8 + header.groups_bytes == (uint64_t)(end - at);
+		+ (uint64_t)header.declaration_count * 8 + header.groups_bytes == payload.size();
 	if (valid && header.environment == environment() && header.shader == key.shader && header.code == key.code
 	    && header.groups == key.groups && header.declarations == key.declarations && header.stage == (uint32_t)key.stage
 	    && header.ini_params == key.ini_params) {
@@ -138,24 +142,29 @@ bool SpirvPatchCacheLoad(const SpirvPatchCacheKey &key, SpirvPatchOutcome *outco
 		made.set_words.resize(header.set_words);
 		made.declarations.resize(header.declaration_count);
 		names.resize(header.groups_bytes);
-		valid = take(&at, end, &entry[0], entry.size()) && take(&at, end, made.code.data(), made.code.size());
+		valid = take(payload, std::span(entry)) && take(payload, std::span(made.code));
 		for (size_t &word : made.set_words) {
 			uint32_t taken;
-			valid = valid && take(&at, end, &taken, 1);
+			if (!valid || !take(payload, std::span(&taken, 1)) || taken >= made.code.size()) {
+				valid = false;
+				break;
+			}
 			word = taken;
-			valid = valid && word < made.code.size();
 		}
 		for (SpirvDeclaration &declaration : made.declarations) {
 			uint32_t taken[2];
-			valid = valid && take(&at, end, taken, 2);
-			declaration.kind = (SpirvDeclarationKind)taken[0];
+			if (!valid || !take(payload, std::span(taken))) {
+				valid = false;
+				break;
+			}
+			declaration.kind = static_cast<SpirvDeclarationKind>(taken[0]);
 			declaration.reg = taken[1];
 		}
-		valid = valid && take(&at, end, &names[0], names.size()) && at == end;
-		if (header.outcome == (uint32_t)SpirvPatchOutcome::PATCHED)
+		valid = valid && take(payload, std::span(names)) && payload.empty();
+		if (header.outcome == static_cast<uint32_t>(std::to_underlying(SpirvPatchOutcome::PATCHED)))
 			valid = valid && !made.code.empty() && made.code[0] == SPIRV_MAGIC;
 		else
-			valid = valid && header.outcome == (uint32_t)SpirvPatchOutcome::NO_MATCH && made.code.empty();
+			valid = valid && header.outcome == static_cast<uint32_t>(std::to_underlying(SpirvPatchOutcome::NO_MATCH)) && made.code.empty();
 		usable = valid && entry == key.entry;
 		if (usable) {
 			*outcome = (SpirvPatchOutcome)header.outcome;
@@ -190,25 +199,25 @@ void SpirvPatchCacheSave(const SpirvPatchCacheKey &key, SpirvPatchOutcome outcom
 	header.declarations = key.declarations;
 	header.stage = key.stage;
 	header.ini_params = key.ini_params;
-	header.outcome = (uint32_t)outcome;
+	header.outcome = std::to_underlying(outcome);
 	header.entry_bytes = (uint32_t)key.entry.size();
 	header.groups_bytes = (uint32_t)groups.size();
-	append(&data, key.entry.data(), key.entry.size());
+	append(data, std::span(key.entry));
 	if (outcome == SpirvPatchOutcome::PATCHED) {
 		header.code_words = (uint32_t)patched.code.size();
 		header.set_words = (uint32_t)patched.set_words.size();
 		header.declaration_count = (uint32_t)patched.declarations.size();
-		append(&data, patched.code.data(), patched.code.size());
+		append(data, std::span(patched.code));
 		for (size_t word : patched.set_words) {
 			uint32_t written_word = (uint32_t)word;
-			append(&data, &written_word, 1);
+			append(data, std::span(&written_word, 1));
 		}
 		for (const SpirvDeclaration &declaration : patched.declarations) {
 			uint32_t fields[2] = { (uint32_t)declaration.kind, declaration.reg };
-			append(&data, fields, 2);
+			append(data, std::span(fields));
 		}
 	}
-	append(&data, groups.data(), groups.size());
+	append(data, std::span(groups));
 	header.checksum = SpirvPatchCacheHash(data.data() + sizeof(Header), data.size() - sizeof(Header));
 	memcpy(data.data(), &header, sizeof(header));
 

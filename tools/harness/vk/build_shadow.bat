@@ -7,4 +7,4 @@ if not "%~2"=="" set "upload_source=%~f2"
 cd /d "%~dp0"
 if not exist bin mkdir bin
 python make_shadow.py "%shadow_source%" "%upload_source%" bin\shadow_impl.inc || exit /b 1
-cl /nologo /O2 /EHsc /MT /std:c++17 /W3 /Fe:bin\shadow.exe /Fo:bin\ shadow.cpp || exit /b 1
+cl /nologo /std:c++23 /Zc:__cplusplus /O2 /EHsc /MT /W3 /Fe:bin\shadow.exe /Fo:bin\ shadow.cpp || exit /b 1

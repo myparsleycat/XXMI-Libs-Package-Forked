@@ -19,6 +19,7 @@ using namespace std;
 
 FILE *LogFile = stderr; // Log to stderr by default
 bool gLogDebug = false;
+LogVerbosity gLogVerbosity = LogVerbosity::INFO;
 
 static void PrintHelp(int argc, char *argv[])
 {
@@ -182,6 +183,7 @@ void parse_args(int argc, char *argv[])
 			}
 			if (!strcmp(arg, "-v") || !strcmp(arg, "--verbose")) {
 				gLogDebug = true;
+				gLogVerbosity = LogVerbosity::DEBUG;
 				continue;
 			}
 			LogInfo("Unrecognised argument: %s\n", arg);
@@ -264,7 +266,7 @@ static int validate_section(char section[4], unsigned char *old_section, unsigne
 static int validate_assembly(string *assembly, vector<char> *old_shader)
 {
 	vector<char> assembly_vec(assembly->begin(), assembly->end());
-	vector<byte> new_shader;
+	vector<BYTE> new_shader;
 	struct dxbc_header *old_dxbc_header = NULL, *new_dxbc_header = NULL;
 	struct section_header *old_section_header = NULL, *new_section_header = NULL;
 	uint32_t *old_section_offset_ptr = NULL, *new_section_offset_ptr = NULL;
@@ -570,13 +572,13 @@ static int process(string const *filename)
 
 	if (args.assemble) {
 		LogInfo("Assembling %s...\n", filename->c_str());
-		vector<byte> new_bytecode;
+		vector<BYTE> new_bytecode;
 		if (args.reflection_reference.empty()) {
 			hret = AssembleFluganWithSignatureParsing(&srcData, &new_bytecode);
 			if (FAILED(hret))
 				return EXIT_FAILURE;
 		} else {
-			vector<byte> refData;
+			vector<BYTE> refData;
 			if (ReadInput(&refData, &args.reflection_reference))
 				return EXIT_FAILURE;
 			new_bytecode = AssembleFluganWithOptionalSignatureParsing(&srcData, false, &refData);

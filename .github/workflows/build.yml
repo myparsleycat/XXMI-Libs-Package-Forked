@@ -1,0 +1,54 @@
+name: Build and test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Win32, x64]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - uses: microsoft/setup-msbuild@v2
+      with:
+        vs-version: '[18.12,19.0)'
+
+    - name: Build solution
+      run: >-
+        msbuild StereovisionHacks.sln
+        -target:Rebuild
+        -maxCpuCount
+        -property:Configuration=Release
+        -property:Platform=${{ matrix.platform }}
+        -verbosity:minimal
+
+    - name: Run CPU regression checks
+      if: matrix.platform == 'x64'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+
+        & ./tools/harness/cpu/dx11/build.bat
+        python tools/harness/cpu/dx11/desktop/vectors.py tools/harness/cpu/dx11/bin/vectors.exe testdata/desktop-channel/v1
+        & ./tools/harness/cache/build.bat
+        & ./tools/harness/cache/bin/cache.exe --bounded
+        python tools/harness/dx12/check_hash_stamps.py
+        python -m unittest discover -s tools/harness/shader-scope -p test_check.py
+
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+        $vs = & $vswhere -latest -products '*' -version '[18.12,19.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        $vcvars = Join-Path $vs 'VC/Auxiliary/Build/vcvars64.bat'
+        & ./TestShaders/vulkan/check_retained_objects.ps1 -VcVars $vcvars -Output build/vk-retained
+        & ./TestShaders/vulkan/check_spirv_patch_cache.ps1 -VcVars $vcvars -Output build/vk-cache

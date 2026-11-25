@@ -367,7 +367,7 @@ bool Dx12ReflectShaderResources(const void *bytecode, size_t size, Dx12ShaderInf
 	if (find_part(container, "PSV0", &part)) {
 		info->reflected = reflect_psv0(part, info);
 		Dx12DxilResources resources;
-		if (find_part(container, "DXIL", &part) && Dx12ReadDxilResources(part.data, part.size, &resources)) {
+		if (find_part(container, "DXIL", &part) && Dx12ReadDxilResources({ part.data, part.size }, &resources)) {
 			for (const auto &cbuffer : resources.cbuffers) {
 				if (!cbuffer.space && cbuffer.reg < DX12_CB_SIZES)
 					info->cb_bytes[cbuffer.reg] = cbuffer.bytes;

@@ -73,7 +73,7 @@ private:
 				 __out_opt ID3D11Shader **ppShader)
 		 >
 	HRESULT ReplaceShaderFromShaderFixes(UINT64 hash, const void *pShaderBytecode, SIZE_T BytecodeLength,
-		ID3D11ClassLinkage *pClassLinkage, ID3D11Shader **ppShader, wchar_t *shaderType);
+		ID3D11ClassLinkage *pClassLinkage, ID3D11Shader **ppShader, const wchar_t *shaderType);
 
 	template <class ID3D11Shader,
 		 HRESULT (__stdcall ID3D11Device::*OrigCreateShader)(THIS_
@@ -83,7 +83,7 @@ private:
 				 __out_opt ID3D11Shader **ppShader)
 		 >
 	HRESULT ProcessShaderNotFoundInShaderFixes(UINT64 hash, const void *pShaderBytecode, SIZE_T BytecodeLength,
-			ID3D11ClassLinkage *pClassLinkage, ID3D11Shader **ppShader, wchar_t *shaderType);
+			ID3D11ClassLinkage *pClassLinkage, ID3D11Shader **ppShader, const wchar_t *shaderType);
 
 	bool NeedOriginalShader(UINT64 hash);
 
@@ -94,7 +94,7 @@ private:
 				 __in_opt ID3D11ClassLinkage *pClassLinkage,
 				 __out_opt ID3D11Shader **ppShader)
 			 >
-	void KeepOriginalShader(UINT64 hash, wchar_t *shaderType, ID3D11Shader *pShader,
+	void KeepOriginalShader(UINT64 hash, const wchar_t *shaderType, ID3D11Shader *pShader,
 		const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D11ClassLinkage *pClassLinkage);
 
 	void CreatePinkHuntingResources();
@@ -116,7 +116,7 @@ private:
 		__in_opt  ID3D11ClassLinkage *pClassLinkage,
 		/* [annotation] */
 		__out_opt  ID3D11Shader **ppShader,
-		wchar_t *shaderType);
+		const wchar_t *shaderType);
 
 	HackerInputLayout* FindCachedInputLayout(uint64_t hash);
 	void CacheInputLayout(uint64_t hash, HackerInputLayout* layout);
@@ -236,7 +236,7 @@ public:
 		/* [annotation] */
 		_Out_opt_  ID3D11InputLayout **ppInputLayout);
 
-	HRESULT HackerDevice::CreateInputLayoutInternal(
+	HRESULT CreateInputLayoutInternal(
 		const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs,
 		UINT NumElements,
 		const void* pShaderBytecodeWithInputSignature,

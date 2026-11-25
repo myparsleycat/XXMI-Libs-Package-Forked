@@ -1,5 +1,7 @@
 #include "ShimPipeline.h"
 
+#include <bit>
+
 #include <array>
 #include <map>
 #include <tuple>
@@ -182,9 +184,8 @@ template <class Visitor>
 static void for_each_srv_slot(const RootKey::SrvMask &mask, Visitor visit)
 {
 	for (UINT word = 0; word < mask.size(); word++) {
-		unsigned long bit;
-		for (UINT64 slots = mask[word]; _BitScanForward64(&bit, slots); slots &= slots - 1)
-			visit(word * 64 + bit);
+		for (UINT64 slots = mask[word]; slots; slots &= slots - 1)
+			visit(word * 64 + std::countr_zero(slots));
 	}
 }
 
@@ -441,8 +442,8 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 		return false;
 
 	UINT64 uavs_remaining = uav_used;
-	unsigned long uav_slot;
-	while (_BitScanForward64(&uav_slot, uavs_remaining)) {
+	while (uavs_remaining) {
+		UINT uav_slot = std::countr_zero(uavs_remaining);
 		uavs_remaining &= uavs_remaining - 1;
 		const ShimView *view = ShimViewOf(uavs[uav_slot]);
 		if (!view)

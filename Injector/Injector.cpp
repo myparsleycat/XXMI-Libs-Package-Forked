@@ -16,7 +16,7 @@ static void wait_keypress(const char *msg)
 	getchar();
 }
 
-static void wait_exit(int code=0, char *msg="\nPress enter to close...\n")
+static void wait_exit(int code=0, const char *msg="\nPress enter to close...\n")
 {
 	wait_keypress(msg);
 	exit(code);
@@ -42,7 +42,7 @@ static bool check_file_description(const char *buf, const char *module_path)
 		WORD wCodePage;
 	} *translate_query;
 	char id[50];
-	char *file_description = "";
+	const char *file_description = "";
 	unsigned int query_size, file_desc_size;
 	HRESULT hr;
 	unsigned i;

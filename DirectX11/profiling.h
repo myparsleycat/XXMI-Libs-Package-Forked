@@ -41,6 +41,8 @@ namespace Profiling {
 		overhead->cpu.QuadPart += end_time.QuadPart - state->start_time.QuadPart;
 	}
 
+	extern Mode mode;
+
 	template<class T>
 	static inline typename T::iterator lookup_map(T &map, typename T::key_type key, Profiling::Overhead *overhead)
 	{
@@ -53,7 +55,7 @@ namespace Profiling {
 		auto ret = map.find(key);
 		if (Profiling::mode == Profiling::Mode::SUMMARY) {
 			Profiling::end(&state, overhead);
-			if (ret != end(map))
+			if (ret != map.end())
 				overhead->hits++;
 		}
 		return ret;
@@ -63,7 +65,6 @@ namespace Profiling {
 	void update_cto_warning(bool warn);
 	void clear();
 
-	extern Mode mode;
 	extern Overhead present_overhead;
 	extern Overhead overlay_overhead;
 	extern Overhead draw_overhead;

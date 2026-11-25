@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <print>
 #include <string>
 #include <vector>
 
@@ -23,7 +24,7 @@ typedef uint32_t (*GetJson)(void *decoder, uint32_t size, char *json);
 int main(int argc, char **argv)
 {
 	if (argc != 3) {
-		fprintf(stderr, "usage: decode <GFSDK_Aftermath_Lib.x64.dll> <dump.nv-gpudmp>\n");
+		std::print(stderr, "usage: decode <GFSDK_Aftermath_Lib.x64.dll> <dump.nv-gpudmp>\n");
 		return 2;
 	}
 
@@ -50,19 +51,19 @@ int main(int argc, char **argv)
 	void *decoder = NULL;
 	uint32_t result = create(AFTERMATH_VERSION, dump.data(), (uint32_t)dump.size(), &decoder);
 	if (result != AFTERMATH_SUCCESS) {
-		fprintf(stderr, "CreateDecoder: 0x%x\n", result);
+		std::println(stderr, "CreateDecoder: 0x{:x}", result);
 		return 1;
 	}
 	uint32_t size = 0;
 	result = generate(decoder, DECODE_ALL_INFO, FORMAT_UTF8, NULL, NULL, NULL, NULL, &size);
 	if (result != AFTERMATH_SUCCESS) {
-		fprintf(stderr, "GenerateJSON: 0x%x\n", result);
+		std::println(stderr, "GenerateJSON: 0x{:x}", result);
 		return 1;
 	}
 	std::vector<char> json(size);
 	result = get(decoder, size, json.data());
 	if (result != AFTERMATH_SUCCESS) {
-		fprintf(stderr, "GetJSON: 0x%x\n", result);
+		std::println(stderr, "GetJSON: 0x{:x}", result);
 		return 1;
 	}
 

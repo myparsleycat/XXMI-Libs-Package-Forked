@@ -315,7 +315,7 @@ private:
 		void (__stdcall ID3D11DeviceContext::*GetShaderVS2013BUGWORKAROUND)(ID3D11Shader**, ID3D11ClassInstance**, UINT*),
 		void (__stdcall ID3D11DeviceContext::*SetShaderVS2013BUGWORKAROUND)(ID3D11Shader*, ID3D11ClassInstance*const*, UINT)
 	>
-	bool DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, wchar_t *shader_type);
+	bool DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, const wchar_t *shader_type);
 	void UpdateDeferredShaderGeneration();
 	void DeferredShaderReplacementBeforeDraw();
 	void DeferredShaderReplacementBeforeDispatch();
@@ -433,7 +433,7 @@ public:
 	void HookContext();
 
 	// public to allow CommandList access
-	virtual void FrameAnalysisLog(char *fmt, ...) {};
+	virtual void FrameAnalysisLog(const char *fmt, ...) {};
 	virtual void FrameAnalysisTrigger(FrameAnalysisOptions new_options) {};
 	virtual void FrameAnalysisDump(ID3D11Resource *resource, FrameAnalysisOptions options,
 		const wchar_t *target, DXGI_FORMAT format, UINT stride, UINT offset) {};

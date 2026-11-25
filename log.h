@@ -2,6 +2,7 @@
 
 using namespace std;
 
+#include <cstdint>
 #include <string>
 #include <ctime>
 
@@ -14,6 +15,19 @@ enum class LogVerbosity : int8_t {
 	INFO = 2,
 	DEBUG = 3,
 };
+
+enum LogLevel {
+	LOG_DIRE,
+	LOG_WARNING,
+	LOG_WARNING_MONOSPACE,
+	LOG_NOTICE,
+	LOG_INFO,
+
+	NUM_LOG_LEVELS
+};
+
+void LogOverlayW(LogLevel level, const wchar_t *fmt, ...);
+void LogOverlay(LogLevel level, const char *fmt, ...);
 
 extern FILE* LogFile;
 extern LogVerbosity gLogVerbosity;

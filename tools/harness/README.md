@@ -52,7 +52,7 @@ rounds of the `cpu` commands.
 
 ## Requirements
 
-- Visual Studio 2022 with the C++ tools (any edition) and the Windows SDK
+- Visual Studio 2026 18.12 or later with MSVC Build Tools 14.52 or later and Windows SDK 10.0.26100.0
   (`dxc.exe` for `skin`)
 - The Vulkan SDK with `VULKAN_SDK` set (`glslangValidator` for `vk`)
 - Python 3.12 or later as `python`

@@ -1000,17 +1000,15 @@ static HRESULT create_swap_chain(CreateSwapChain_t orig,
 	if (FAILED(hr))
 	{
 		LogInfo("->Failed result %#x\n\n", hr);
-		goto out_release;
+	} else {
+		IDXGISwapChain *retChain = ppSwapChain ? *ppSwapChain : nullptr;
+		LogInfo("  CreateSwapChain returned handle = %p\n", retChain);
+		analyse_iunknown(retChain);
+
+		wrap_swap_chain(hackerDevice, ppSwapChain, pDesc, &origSwapChainDesc);
+
+		LogInfo("->IDXGIFactory::CreateSwapChain return result %#x\n\n", hr);
 	}
-
-	IDXGISwapChain *retChain = ppSwapChain ? *ppSwapChain : nullptr;
-	LogInfo("  CreateSwapChain returned handle = %p\n", retChain);
-	analyse_iunknown(retChain);
-
-	wrap_swap_chain(hackerDevice, ppSwapChain, pDesc, &origSwapChainDesc);
-
-	LogInfo("->IDXGIFactory::CreateSwapChain return result %#x\n\n", hr);
-out_release:
 	if (hackerDevice)
 		hackerDevice->Release();
 	return hr;

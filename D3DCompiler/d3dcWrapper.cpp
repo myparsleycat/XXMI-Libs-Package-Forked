@@ -11,7 +11,8 @@
 
 // Standalone DLL needs its own log file reference, as log.h just exports them.
 bool gLogDebug = false;
-FILE *LogFile = 0;
+LogVerbosity gLogVerbosity = LogVerbosity::DISABLED;
+FILE *LogFile = nullptr;
 
 static bool gInitialized = false;
 
@@ -31,15 +32,16 @@ void InitializeDLL()
 		GetModuleFileName(0, dir, MAX_PATH);
 		wcsrchr(dir, L'\\')[1] = 0;
 		wcscat(dir, L"d3dx.ini");
-		LogFile = GetPrivateProfileInt(L"Logging", L"calls", 0, dir) ? (FILE *)-1 : 0;
-		if (LogFile) fopen_s(&LogFile, "D3DCompiler_" COMPILER_DLL_VERSION "_log.txt", "w");
+		if (GetPrivateProfileInt(L"Logging", L"calls", 0, dir)
+		    && fopen_s(&LogFile, "D3DCompiler_" COMPILER_DLL_VERSION "_log.txt", "w") == 0)
+			gLogVerbosity = LogVerbosity::INFO;
 
 		LogInfo("\nD3DCompiler_" COMPILER_DLL_VERSION " starting init  -  %s\n\n", LogTime().c_str());
 
 		// Unbuffered logging to remove need for fflush calls, and r/w access to make it easy
 		// to open active files.
 		int unbuffered = -1;
-		if (GetPrivateProfileInt(L"Logging", L"unbuffered", 0, dir))
+		if (LogFile && GetPrivateProfileInt(L"Logging", L"unbuffered", 0, dir))
 		{
 			unbuffered = setvbuf(LogFile, NULL, _IONBF, 0);
 			LogInfo("  unbuffered=1  return: %d\n", unbuffered);

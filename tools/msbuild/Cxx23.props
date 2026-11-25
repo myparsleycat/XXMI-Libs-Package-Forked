@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemDefinitionGroup Condition="'$(PlatformToolset)' != 'ClangCL'">
+    <ClCompile>
+      <LanguageStandard>stdcpp23</LanguageStandard>
+      <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(PlatformToolset)' == 'ClangCL'">
+    <ClCompile>
+      <AdditionalOptions>/std:c++23preview %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <Target Name="CheckCpp23Toolset" BeforeTargets="PrepareForBuild" Condition="'$(PlatformToolset)' == 'v145' And '$(DesignTimeBuild)' != 'true'">
+    <Error Condition="$([MSBuild]::VersionLessThan('$(MSBuildVersion)', '18.12')) Or '$(VCToolsVersion)' == '' Or $([MSBuild]::VersionLessThan('$(VCToolsVersion)', '14.52'))"
+           Text="C++23 builds require Visual Studio 2026 18.12 or later and MSVC Build Tools 14.52 or later." />
+  </Target>
+  <!-- Microsoft.Cpp.Default.props defaults LLVMToolsVersion to the version of the LLVM component bundled with Visual Studio. -->
+  <!-- A custom LLVMInstallDir needs LLVMToolsVersion set to match. -->
+  <Target Name="CheckCpp23ClangCl" BeforeTargets="PrepareForBuild" Condition="'$(PlatformToolset)' == 'ClangCL' And '$(DesignTimeBuild)' != 'true'">
+    <Error Condition="'$(LLVMToolsVersion)' == '' Or $([MSBuild]::VersionLessThan('$(LLVMToolsVersion)', '22.0'))"
+           Text="C++23 ClangCL builds require the Visual Studio LLVM component with Clang 22 or later (found '$(LLVMToolsVersion)')." />
+  </Target>
+</Project>

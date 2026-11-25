@@ -16,8 +16,9 @@ struct ID3D11ShaderResourceView {
 	void Release() { refs--; }
 };
 namespace Profiling { namespace Spike {
-	enum Category { VK_SRV_LOOKUP };
+	enum Category { VK_SRV_LOOKUP, CL_VK_SRV };
 	struct Scope { explicit Scope(Category) {} };
+	struct SelfTime { explicit SelfTime(Category) {} };
 } }
 #include "bin/bindings_types.inc"
 

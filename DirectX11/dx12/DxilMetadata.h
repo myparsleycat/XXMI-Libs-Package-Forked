@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include <vector>
 
 #include "Dx12Common.h"
@@ -23,4 +24,4 @@ struct Dx12DxilResources {
 };
 
 // Reads sizes and strides from the DXIL part of the container. PSV0 omits them.
-bool Dx12ReadDxilResources(const BYTE *data, size_t size, Dx12DxilResources *result);
+bool Dx12ReadDxilResources(std::span<const BYTE> data, Dx12DxilResources *result);

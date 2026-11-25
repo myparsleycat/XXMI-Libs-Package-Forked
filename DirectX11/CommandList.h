@@ -242,7 +242,7 @@ public:
 
 	bool SetSourceCommandList(CommandList* source);
 	CommandList* ResolveCommandList();
-	bool CommandList::noop();
+	bool noop();
 
 	CommandList() :
 		post(false),
@@ -1183,12 +1183,17 @@ struct MemberArg
 		Filter,
 	};
 
+	MemberArg();
+	~MemberArg();
+	MemberArg(MemberArg&&) noexcept;
+	MemberArg& operator=(MemberArg&&) noexcept;
+
 	Type type = Type::None;
 
 	unique_ptr<CommandListExpression> expression;
 
 	std::wstring constant_string;
-	uint64_t constant_hash;
+	uint64_t constant_hash = 0;
 	std::unique_ptr<ResourceCopyTarget> resource;
 	std::unique_ptr<ResourceFilterTarget> filter;
 
@@ -1305,24 +1310,29 @@ class ResourceCopyTarget : public SyntaxTarget
 public:
     using MemberInfo = SyntaxTarget::MemberInfo<ResourceCopyTargetEvaluationMode>;
 
+	ResourceCopyTarget();
+	~ResourceCopyTarget();
+	ResourceCopyTarget(ResourceCopyTarget&&) noexcept;
+	ResourceCopyTarget& operator=(ResourceCopyTarget&&) noexcept;
+
 	ResourceCopyTargetType type = ResourceCopyTargetType::INVALID;
 	ResourceCopyTargetEvaluationMode evaluation_mode = ResourceCopyTargetEvaluationMode::RESOURCE;
 	wchar_t shader_type = L'\0';
 	unsigned slot = 0;
 
 	CustomResourcePool* custom_resource_pool = nullptr;
-	std::unique_ptr<CommandListExpression> pool_dynamic_index_expression = nullptr;
+	std::unique_ptr<CommandListExpression> pool_dynamic_index_expression;
 
 	// Pipeline slot given as an expression (ps-t[$i]); slot is resolved
 	// at runtime and must stay below max_slot:
-	std::unique_ptr<CommandListExpression> slot_expression = nullptr;
+	std::unique_ptr<CommandListExpression> slot_expression;
 	unsigned max_slot = 0;
 
 	// Inclusive bounds for SLOT_RANGE (ps-t[$a:$b]) and POOL_RANGE
 	// (PoolFoo[$a:$b]) targets. Null for a bare "ps-t" / "PoolFoo" side,
 	// which inherits the other side's bounds:
-	std::unique_ptr<CommandListExpression> range_start = nullptr;
-	std::unique_ptr<CommandListExpression> range_end = nullptr;
+	std::unique_ptr<CommandListExpression> range_start;
+	std::unique_ptr<CommandListExpression> range_end;
 
 	ResourceFilter* slot_filter = nullptr;
 
@@ -2338,11 +2348,11 @@ public:
 	CommandListExpression args[5];
 	ResourceCopyTarget indirect_buffer;
 
-	DrawCommand::DrawCommand() :
+	DrawCommand() :
 		type(DrawCommandType::INVALID)
 	{}
 
-	void do_indirect_draw_call(CommandListState *state, char *name,
+	void do_indirect_draw_call(CommandListState *state, const char *name,
 		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
 		ID3D11Buffer *pBufferForArgs,
 		UINT AlignedByteOffsetForArgs));

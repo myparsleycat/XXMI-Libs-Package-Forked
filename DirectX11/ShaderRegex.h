@@ -90,7 +90,7 @@ struct ShaderBindings
 struct OriginalShaderInfo;
 
 bool apply_shader_regex_groups(std::string *asm_text, const wchar_t *shader_type, std::string *shader_model, UINT64 hash, std::wstring *tagline, std::vector<uint32_t> *match_ids_out = NULL, bool link = true);
-void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode);
+void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<BYTE> *bytecode);
 bool unlink_shader_regex_command_lists_and_filter_index(UINT64 shader_hash);
 // For the shader of a D3D12 game, which there is no assembly text of for a
 // pattern to match: links the groups that name any shader model of its type

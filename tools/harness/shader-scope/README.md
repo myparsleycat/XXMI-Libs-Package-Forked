@@ -18,8 +18,8 @@ python tools\harness\shader-scope\check.py --exe C:\temp\scope-build\harness.exe
 
 The check copies the DLL/dependencies into isolated test folders. It does not
 change the supplied DLL, installed importer, or global configuration. The
-output directory must not already exist. It needs Python 3.12+, VS2022 C++,
-the Windows SDK, and working D3D11/D3D12 WARP runtimes. No physical input is sent.
+output directory must not already exist. It needs Python 3.12+, VS 2026 18.12 or later with MSVC 14.52 or later,
+Windows SDK 10.0.26100.0, and working D3D11/D3D12 WARP runtimes. No physical input is sent.
 
 The original red triangle uses indices 3..5. A mesh override submits a red
 triangle from indices 0..2 of its replacement buffer; indices 3..5 of that

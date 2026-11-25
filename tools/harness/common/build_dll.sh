@@ -5,8 +5,8 @@
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$here/../../.."
 vswhere="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-msbuild=$("$vswhere" -latest -products '*' -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | head -1 | tr -d '\r')
-[ -n "$msbuild" ] || { echo "MSBuild not found: install Visual Studio 2022 with the C++ tools"; exit 1; }
+msbuild=$("$vswhere" -latest -products '*' -version '[18.12,19.0)' -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'MSBuild\**\Bin\MSBuild.exe' | head -1 | tr -d '\r')
+[ -n "$msbuild" ] || { echo "MSBuild not found: install Visual Studio 2026 18.12 or later with the C++ tools"; exit 1; }
 target=DirectX11
 [ "$1" = rebuild ] && target=DirectX11:Rebuild
 cd "$repo" || exit 1

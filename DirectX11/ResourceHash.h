@@ -489,7 +489,7 @@ struct ResourceHandleInfo
 	// A cache whose data is read from where the resource has it only when
 	// it is asked for, a page at a time. read is given the offset in the
 	// data and has to fill all it is asked for.
-	void SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read);
+	void SetLazyDataCache(size_t size, std::move_only_function<void(uint8_t *dst, size_t offset, size_t size)> read);
 
 	void CacheRegionHash(const RegionHashKeyL2& key, uint32_t hash);
 	uint32_t GetCachedRegionHash(const RegionHashKeyL2& key);
@@ -760,7 +760,7 @@ static void LogDebugViewDesc(DescType *desc)
 // -----------------------------------------------------------------------------------------------
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476202(v=vs.85).aspx
-static wchar_t *ResourceDimensions[] = {
+static const wchar_t *const ResourceDimensions[] = {
 	L"UNKNOWN",
 	L"BUFFER",
 	L"TEXTURE1D",
@@ -769,13 +769,13 @@ static wchar_t *ResourceDimensions[] = {
 };
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476259(v=vs.85).aspx
-static wchar_t *ResourceUsage[] = {
+static const wchar_t *const ResourceUsage[] = {
 	L"DEFAULT",
 	L"IMMUTABLE",
 	L"DYNAMIC",
 	L"STAGING"
 };
-static wchar_t *TexResourceUsage(UINT usage)
+static const wchar_t *TexResourceUsage(UINT usage)
 {
 	if (usage < sizeof(ResourceUsage) / sizeof(ResourceUsage[0]))
 		return ResourceUsage[usage];

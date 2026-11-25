@@ -9,6 +9,7 @@
 #include "ByteCodeReader.h"
 
 #include <algorithm>
+#include <string_view>
 #include <condition_variable>
 #include <deque>
 #include <iterator>
@@ -33,14 +34,14 @@ struct ShaderRegexResult {
 	std::wstring shader_type;
 	bool patched = false;
 	std::vector<uint32_t> match_ids;
-	std::vector<byte> patched_bytecode;
+	std::vector<BYTE> patched_bytecode;
 	std::wstring tagline;
 };
 static std::unordered_map<UINT64, ShaderRegexResult> shader_regex_results;
 
 static std::mutex shader_regex_analysis_lock;
 
-static void log_pcre2_error_nonl(int err, char *fmt, ...)
+static void log_pcre2_error_nonl(int err, const char *fmt, ...)
 {
 	PCRE2_UCHAR buf[120]; // doco says "120 code units is ample"
 	va_list ap;
@@ -569,7 +570,8 @@ bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
 	static std::unordered_set<std::wstring> reported_legacy;
 	static std::mutex reported_mutex;
 	const char *shader_type = dx12_stage_names[shader->stage];
-	size_t length = strlen(shader_type);
+	std::string_view stage(shader_type);
+	size_t length = stage.size();
 	bool linked = false;
 	std::unique_lock<std::mutex> report_guard(reported_mutex, std::defer_lock);
 	if (G->dx12_dump_hashes && shader->dxil)
@@ -583,7 +585,7 @@ bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
 		ShaderRegexGroup *group = &entry.second;
 		if (report_guard.owns_lock() && !group->spirv() && !group->dxil() && !group->patterns.empty()) {
 			bool stage_matches = std::any_of(group->shader_models.begin(), group->shader_models.end(), [&](const std::string &model) {
-				return model.size() > length && model.compare(0, length, shader_type) == 0 && model[length] == '_';
+				return model.size() > length && model.starts_with(stage) && model[length] == '_';
 			});
 			if (stage_matches && reported_legacy.insert(group->ini_section).second)
 				Dx12DumpNote("DXIL does not apply legacy Pattern/Replace in [%S]; a DxilPattern is required for shader changes.\n", group->ini_section.c_str());
@@ -595,7 +597,7 @@ bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
 			continue;
 
 		for (const std::string &model : group->shader_models) {
-			if (model.compare(0, length, shader_type) || model[length] != '_')
+			if (model.size() <= length || !model.starts_with(stage) || model[length] != '_')
 				continue;
 			group->link_command_lists_and_filter_index(shader->hash);
 			linked = true;
@@ -609,7 +611,8 @@ bool link_shader_regex_groups_dx12(const Dx12ShaderInfo *shader)
 
 bool link_shader_regex_groups_declared(const char *shader_type, UINT64 hash, std::string *declarations)
 {
-	size_t length = strlen(shader_type);
+	std::string_view stage(shader_type);
+	size_t length = stage.size();
 	bool linked = false;
 
 	for (auto &entry : shader_regex_groups) {
@@ -622,7 +625,7 @@ bool link_shader_regex_groups_declared(const char *shader_type, UINT64 hash, std
 		if (group->command_list.noop() && group->post_command_list.noop() && group->filter_index == FLT_MAX)
 			continue;
 		if (std::none_of(group->shader_models.begin(), group->shader_models.end(), [&](const std::string &model) {
-			return !model.compare(0, length, shader_type) && model[length] == '_'; }))
+			return model.size() > length && model.starts_with(stage) && model[length] == '_'; }))
 			continue;
 
 		for (auto &pattern : group->patterns) {
@@ -702,7 +705,7 @@ static ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shad
 	wchar_t path[MAX_PATH];
 	uint32_t *match_ids;
 	DWORD size, size2;
-	byte *buf = NULL;
+	BYTE *buf = NULL;
 	size_t suffix;
 	uint32_t i;
 
@@ -721,7 +724,7 @@ static ShaderRegexCache load_shader_regex_cache(UINT64 hash, const wchar_t *shad
 	if (size < sizeof(ShaderRegexCacheHeader))
 		goto out;
 
-	buf = new byte[size];
+	buf = new BYTE[size];
 
 	if (!ReadFile(meta_f, buf, size, &size2, NULL) || size != size2)
 		goto out;
@@ -853,7 +856,7 @@ static void save_shader_regex_cache_meta(UINT64 hash, const wchar_t *shader_type
 	}
 }
 
-void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<byte> *bytecode)
+void save_shader_regex_cache_bin(UINT64 hash, const wchar_t *shader_type, vector<BYTE> *bytecode)
 {
 	wchar_t path[MAX_PATH];
 	FILE *f = NULL;
@@ -1276,7 +1279,7 @@ static ShaderRegexResult copy_shader_regex_result_without_bytecode(const ShaderR
 }
 
 static ID3D11DeviceChild* create_patched_shader(ID3D11Device *device, const wstring &type,
-		ID3D11ClassLinkage *linkage, const std::vector<byte> &patched_bytecode)
+		ID3D11ClassLinkage *linkage, const std::vector<BYTE> &patched_bytecode)
 {
 	const void *bytecode = patched_bytecode.data();
 	SIZE_T size = patched_bytecode.size();
@@ -1411,7 +1414,7 @@ static DWORD WINAPI shader_regex_thread(void *param)
 			shader = create_patched_shader(device, shader_type, NULL, result.patched_bytecode);
 			if (!shader)
 				LogInfo("    *** Creating replacement shader for %S %016I64x failed\n", shader_type.c_str(), hash);
-			std::vector<byte>().swap(result.patched_bytecode);
+			std::vector<BYTE>().swap(result.patched_bytecode);
 		}
 
 		{

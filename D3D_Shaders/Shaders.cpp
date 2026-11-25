@@ -2,6 +2,7 @@
 //
 
 #include "stdafx.h"
+#include "log.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@ using namespace std;
 
 FILE *LogFile = NULL;
 bool gLogDebug = false;
+LogVerbosity gLogVerbosity = LogVerbosity::DISABLED;
 
 static vector<string> enumerateFiles(string pathName, string filter = "") {
 	vector<string> files;
@@ -34,8 +36,8 @@ static vector<string> enumerateFiles(string pathName, string filter = "") {
 	return files;
 }
 
-static vector<byte> readFile(string fileName) {
-	vector<byte> buffer;
+static vector<BYTE> readFile(string fileName) {
+	vector<BYTE> buffer;
 	FILE* f;
 	fopen_s(&f, fileName.c_str(), "rb");
 	if (f != NULL) {
@@ -89,8 +91,9 @@ int _tmain(int argc, _TCHAR* argv[])
 			for (DWORD i = 0; i < files.size(); i++) {
 				string fileName = files[i];
 
-				vector<byte> ASM;
-				disassembler(&readFile(fileName), &ASM, NULL);
+				auto bytecode = readFile(fileName);
+				vector<BYTE> ASM;
+				disassembler(&bytecode, &ASM, NULL);
 
 				fileName.erase(fileName.size() - 3, 3);
 				fileName.append("txt");
@@ -151,8 +154,9 @@ int _tmain(int argc, _TCHAR* argv[])
 			for (DWORD i = 0; i < files.size(); i++) {
 				string fileName = files[i];
 
-				vector<byte> ASM;
-				disassembler(&readFile(fileName), &ASM, NULL);
+				auto bytecode = readFile(fileName);
+				vector<BYTE> ASM;
+				disassembler(&bytecode, &ASM, NULL);
 
 				fileName.erase(fileName.size() - 3, 3);
 				fileName.append("txt");
