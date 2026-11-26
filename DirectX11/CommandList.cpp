@@ -9330,11 +9330,13 @@ size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool i
 	case PoolIndexType::FIFO:
 	{
 		// UID-based rolling FIFO indexing:
-		// 
-		// - New UIDs are assigned the next pool slot.
+		//
+		// - New UIDs take an unassigned slot (never used or expired) first.
 		// - Existing UIDs keep their assigned slot.
-		// - When the pool is full, the oldest slot assignment is overwritten.
-		// 
+		// - When every slot is assigned, the oldest slot assignment is overwritten.
+		//   With expiration, the least recently updated slot is overwritten instead,
+		//   so UIDs updated every frame stay mapped.
+		//
 		// For pool_size of 2 [ResourcePoolFoo_0, ResourcePoolFoo_1]:
 		//   ResourcePoolFoo[11] -> ResourcePoolFoo_0 (pool_index 0)
 		//   ResourcePoolFoo[22] -> ResourcePoolFoo_1 (pool_index 1)
@@ -9357,9 +9359,34 @@ size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool i
 		if (!allocate_slot_on_missing && !is_assignment)
 			return SIZE_MAX;
 
-		// Allocate next FIFO slot
-		pool_index = (last_replacement_index + 1) % pool_size;
-		last_replacement_index = pool_index;
+		pool_index = SIZE_MAX;
+		if (index_map->size() < pool_size)
+		{
+			for (size_t i = 1; i <= pool_size; ++i)
+			{
+				size_t slot = (last_replacement_index + i) % pool_size;
+				if (index_table[slot].key == UINT32_MAX)
+				{
+					pool_index = slot;
+					break;
+				}
+			}
+		}
+
+		if (pool_index == SIZE_MAX)
+		{
+			pool_index = (last_replacement_index + 1) % pool_size;
+			if (expiration_timeout_frames != UINT32_MAX)
+			{
+				for (size_t i = 2; i <= pool_size; ++i)
+				{
+					size_t slot = (last_replacement_index + i) % pool_size;
+					if (index_table[slot].last_update_frame < index_table[pool_index].last_update_frame)
+						pool_index = slot;
+				}
+			}
+			last_replacement_index = pool_index;
+		}
 
 		AssignSlot(pool_index, key, is_assignment);
 

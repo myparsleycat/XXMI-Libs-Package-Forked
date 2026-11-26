@@ -91,8 +91,10 @@ A read of an unknown UID does not allocate an element unless `pool_allocate_slot
 When assignment happens for UID:
 
 1. If UID already exists, assignment re-uses previously assigned element slot.
-2. If UID is new, assignment uses the next non-assigned element slot.
-3. When the pool is full, the oldest assigned UID is evicted and insertion writes emptied element slot.
+2. If UID is new, assignment uses a non-assigned element slot. Slots freed by [expiration](declaration.md/#element-expiration) count as non-assigned.
+3. When every slot is assigned, one UID is evicted and insertion writes the emptied element slot:
+   * Without expiration, the UID that was assigned to its slot first is evicted. Updating an existing UID does not change this order, so a UID that is still updated every frame can be evicted.
+   * With expiration, the UID that was updated least recently is evicted.
 
 ### Recycling
 

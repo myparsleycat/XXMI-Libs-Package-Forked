@@ -98,7 +98,7 @@ See [Static Indexing](indexing.md/#static-indexing) for more details.
 
 ### FIFO
 
-Provides map-like access with floating-point keys and evicts the oldest element when the pool is full.
+Provides map-like access with floating-point keys. New keys use unassigned or expired elements first. When the pool is full, the oldest assignment is evicted, or the least recently updated element if the pool uses [expiration](#element-expiration).
 
 Use `pool_index_type = fifo`:
 
