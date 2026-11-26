@@ -489,6 +489,7 @@ bool Dx12PresentBegin(Dx12SwapChain *swap_chain)
 	if (active) {
 		if (resolution_known)
 			dx12_shim->shim_context->RSSetViewports(1, &viewport);
+		Dx12ShimMakeComputePipelinesAhead();
 		frame_actions();
 		Dx12ShimFramePresented();
 		Dx12DrawPathFramePresented();

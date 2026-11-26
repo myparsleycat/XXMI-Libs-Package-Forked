@@ -1665,6 +1665,11 @@ static void reflect_shader(ShimShader *shader)
 	}
 }
 
+void ShimReflectShader(ShimShader *shader)
+{
+	reflect_shader(shader);
+}
+
 void ShimSetShaderDxil(ID3D11DeviceChild *shader, const void *bytecode, size_t length)
 {
 	ShimShader *dxbc = ShimShaderOf(shader), *dxil = new ShimShader();

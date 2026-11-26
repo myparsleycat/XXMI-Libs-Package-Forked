@@ -4790,6 +4790,7 @@ static void ParseCustomShaderSections()
 		ParseCommandList(shader_id->c_str(), &custom_shader->command_list, &custom_shader->post_command_list, CustomShaderIniKeys);
 		custom_shader->find_sampler_slots();
 	}
+	custom_shaders_generation++;
 }
 
 // "Explicit" means that this parses command lists sections that are

@@ -38,6 +38,7 @@ CustomResources customResources;
 CustomResourcePools customResourcePools;
 std::unordered_map<std::wstring, CustomResourcePool*> custom_resource_pool_path_keys;
 CustomShaders customShaders;
+std::atomic<unsigned> custom_shaders_generation;
 ResourceFilters resourceFilters;
 ExplicitCommandListSections explicitCommandListSections;
 CommandListVariables command_list_globals;

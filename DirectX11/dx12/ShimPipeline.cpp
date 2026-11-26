@@ -3,12 +3,16 @@
 #include <bit>
 
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <unordered_map>
 
 #include "ShimDevice.h"
 #include "util.h"
+#include "../CommandList.h"
 #include "../profiling.h"
 
 // The shaders of mods are D3D11 shaders: every stage has its own registers,
@@ -511,6 +515,14 @@ static bool bind_tables(const ShimState *state, const RootKey *key, const ShimSh
 	return true;
 }
 
+static void add_to_root_key(Dx12ShaderStage stage, const ShimShader *shader, RootKey *key)
+{
+	key->cbvs[stage] = (BYTE)shader->cbv_count;
+	key->srv_masks[stage] = {shader->srv_used[0], shader->srv_used[1]};
+	key->samplers[stage] = (BYTE)shader->sampler_count;
+	key->uavs = max(key->uavs, (BYTE)shader->uav_count);
+}
+
 static bool root_key(const ShimState *state, const Dx12ShaderStage *stages, size_t count, bool input_assembler, RootKey *key,
 		const ShimShader **shaders, UINT64 *uav_used)
 {
@@ -529,10 +541,7 @@ static bool root_key(const ShimState *state, const Dx12ShaderStage *stages, size
 			continue;
 		if (!Dx12ShimSupportsShaderBindings(shader))
 			return false;
-		key->cbvs[stages[i]] = (BYTE)shader->cbv_count;
-		key->srv_masks[stages[i]] = {shader->srv_used[0], shader->srv_used[1]};
-		key->samplers[stages[i]] = (BYTE)shader->sampler_count;
-		key->uavs = max(key->uavs, (BYTE)shader->uav_count);
+		add_to_root_key(stages[i], shader, key);
 		*uav_used |= shader->uav_used;
 	}
 	return true;
@@ -885,6 +894,183 @@ bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed)
 // -----------------------------------------------------------------------------
 // Compute
 
+// Compute pipelines of the CustomShader sections, made on a thread of their
+// own once a config is loaded. One made at its first dispatch held the shim
+// lock, and with it the game's threads that draw, for 5-60 ms (EFMI on
+// Vulkan, NVIDIA). By the hash of the bytecode: the shim shader of a section
+// is only made at its first use. Kept for the life of the process.
+struct AheadPipeline {
+	std::vector<BYTE> bytecode;
+	ID3D12RootSignature *signature;
+	// NULL if it could not be made
+	ID3D12PipelineState *pipeline;
+	bool made;
+};
+static std::mutex ahead_lock;
+static std::condition_variable ahead_made;
+static std::unordered_map<UINT64, AheadPipeline> ahead_pipelines;
+static std::deque<ID3DBlob*> ahead_queue;
+static bool ahead_worker;
+static unsigned ahead_generation;
+
+static void make_ahead(ID3DBlob *blob)
+{
+	const BYTE *data = (const BYTE*)blob->GetBufferPointer();
+	size_t size = blob->GetBufferSize();
+	ID3D12RootSignature *signature = NULL;
+	ID3D12PipelineState *pipeline = NULL;
+	ID3D12Device *device = NULL;
+	ShimShader shader{};
+	RootKey key = {};
+
+	// DXIL reflection goes through dxcompiler, which the presenting thread
+	// uses without a lock of its own
+	if (Dx12BytecodeIsDxil(data, size))
+		return;
+	shader.stage = DX12_STAGE_CS;
+	shader.hash = fnv_64_buf(data, size);
+	{
+		std::lock_guard<std::mutex> lock(ahead_lock);
+		if (ahead_pipelines.count(shader.hash))
+			return;
+	}
+	shader.bytecode.assign(data, data + size);
+	ShimReflectShader(&shader);
+
+	Dx12ShimLock();
+	if (dx12_shim && Dx12ShimSupportsShaderBindings(&shader)) {
+		add_to_root_key(DX12_STAGE_CS, &shader, &key);
+		signature = get_root_signature(&key);
+		device = dx12_shim->device;
+	}
+	Dx12ShimUnlock();
+	if (!signature)
+		return;
+
+	AheadPipeline *entry;
+	{
+		std::lock_guard<std::mutex> lock(ahead_lock);
+		auto inserted = ahead_pipelines.try_emplace(shader.hash);
+		if (!inserted.second)
+			return;
+		entry = &inserted.first->second;
+		entry->bytecode = std::move(shader.bytecode);
+		entry->signature = signature;
+		entry->pipeline = NULL;
+		entry->made = false;
+	}
+
+	D3D12_COMPUTE_PIPELINE_STATE_DESC desc = {};
+	desc.pRootSignature = signature;
+	desc.CS.pShaderBytecode = entry->bytecode.data();
+	desc.CS.BytecodeLength = entry->bytecode.size();
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"for a dispatch of a mod, made ahead");
+		if (FAILED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
+			pipeline = NULL;
+	}
+	{
+		std::lock_guard<std::mutex> lock(ahead_lock);
+		entry->pipeline = pipeline;
+		entry->made = true;
+	}
+	ahead_made.notify_all();
+}
+
+static DWORD WINAPI ahead_thread(LPVOID module)
+{
+	for (;;) {
+		ID3DBlob *blob;
+		{
+			std::lock_guard<std::mutex> lock(ahead_lock);
+			if (ahead_queue.empty() || dx12_unloading) {
+				ahead_worker = false;
+				break;
+			}
+			blob = ahead_queue.front();
+			ahead_queue.pop_front();
+		}
+		make_ahead(blob);
+		blob->Release();
+	}
+	FreeLibraryAndExitThread(static_cast<HMODULE>(module), 0);
+}
+
+void Dx12ShimMakeComputePipelinesAhead()
+{
+	unsigned generation = custom_shaders_generation.load();
+	std::vector<ID3DBlob*> blobs;
+	HMODULE module;
+	HANDLE thread;
+
+	if (generation == ahead_generation)
+		return;
+	ahead_generation = generation;
+
+	// A section gives its bytecode up when its shaders are made, which
+	// happens while a command list runs under the shim lock, as this does
+	for (auto &entry : customShaders) {
+		if (ID3DBlob *blob = entry.second.cs_bytecode) {
+			blob->AddRef();
+			blobs.push_back(blob);
+		}
+	}
+	if (blobs.empty())
+		return;
+
+	std::lock_guard<std::mutex> lock(ahead_lock);
+	ahead_queue.insert(ahead_queue.end(), blobs.begin(), blobs.end());
+	if (ahead_worker)
+		return;
+	// The thread holds a reference on this DLL until it exits, so an
+	// unload cannot unmap the code it is running
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&ahead_thread, &module))
+		return;
+	thread = CreateThread(NULL, 0, ahead_thread, module, 0, NULL);
+	if (!thread) {
+		FreeLibrary(module);
+		return;
+	}
+	CloseHandle(thread);
+	ahead_worker = true;
+}
+
+// The pipeline made ahead for a shader, with a reference for the caller,
+// waiting for it if it is being made. NULL if there is none to take.
+static ID3D12PipelineState* take_made_ahead(const ShimShader *shader, ID3D12RootSignature *signature)
+{
+	std::unique_lock<std::mutex> lock(ahead_lock);
+	auto found = ahead_pipelines.find(shader->hash);
+	if (found == ahead_pipelines.end())
+		return NULL;
+	AheadPipeline &entry = found->second;
+	if (entry.signature != signature || entry.bytecode != shader->bytecode)
+		return NULL;
+	if (!entry.made) {
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"for a dispatch of a mod, waiting for the one made ahead", shader->id);
+		ahead_made.wait(lock, [&] { return entry.made; });
+	}
+	if (entry.pipeline)
+		entry.pipeline->AddRef();
+	return entry.pipeline;
+}
+
+// So that the thread making them ahead skips one made at its dispatch
+static void note_made(const ShimShader *shader, ID3D12RootSignature *signature, ID3D12PipelineState *pipeline)
+{
+	std::lock_guard<std::mutex> lock(ahead_lock);
+	auto inserted = ahead_pipelines.try_emplace(shader->hash);
+	if (!inserted.second)
+		return;
+	AheadPipeline &entry = inserted.first->second;
+	entry.bytecode = shader->bytecode;
+	entry.signature = signature;
+	entry.pipeline = pipeline;
+	if (pipeline)
+		pipeline->AddRef();
+	entry.made = true;
+}
+
 bool Dx12ShimPrepareDispatch(const ShimState *state)
 {
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_PREPARE_DISPATCH);
@@ -911,13 +1097,16 @@ bool Dx12ShimPrepareDispatch(const ShimState *state)
 	if (found != compute_pipelines.end()) {
 		pipeline = found->second;
 	} else {
-		desc.pRootSignature = signature;
-		desc.CS.pShaderBytecode = shader->bytecode.data();
-		desc.CS.BytecodeLength = shader->bytecode.size();
-		pipeline = NULL;
-		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"for a dispatch of a mod, cs", shader->id);
-		if (FAILED(dx12_shim->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
-			Dx12LogInfo("*** Failed to create a compute pipeline state for shader %llu of a mod\n", shader->id);
+		pipeline = take_made_ahead(shader, signature);
+		if (!pipeline) {
+			desc.pRootSignature = signature;
+			desc.CS.pShaderBytecode = shader->bytecode.data();
+			desc.CS.BytecodeLength = shader->bytecode.size();
+			Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"for a dispatch of a mod, cs", shader->id);
+			if (FAILED(dx12_shim->device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pipeline))))
+				Dx12LogInfo("*** Failed to create a compute pipeline state for shader %llu of a mod\n", shader->id);
+			note_made(shader, signature, pipeline);
+		}
 		compute_pipelines[shader->id] = pipeline;
 	}
 	if (!pipeline)

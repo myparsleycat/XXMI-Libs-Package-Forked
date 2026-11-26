@@ -71,6 +71,10 @@ bool Dx12ShimSupportsShaderBindings(const ShimShader *shader);
 bool Dx12ShimPrepareDraw(const ShimState *state, bool indexed);
 bool Dx12ShimPrepareDispatch(const ShimState *state);
 
+// Under the shim lock, once a frame: after a config load, has the compute
+// pipelines of its CustomShader sections made on another thread
+void Dx12ShimMakeComputePipelinesAhead();
+
 // Drops the pipeline states made with a shader or input layout that is going
 // away
 void Dx12ShimForgetPipelines(UINT64 id);

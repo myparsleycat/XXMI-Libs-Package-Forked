@@ -517,6 +517,9 @@ struct ShimShader {
 };
 
 void ShimDestroyShader(ShimShader *shader);
+// What the bytecode of a shader with its stage and bytecode set binds. Needs no
+// lock for DXBC.
+void ShimReflectShader(ShimShader *shader);
 
 template <class Interface>
 class ShimShaderObject : public ShimChild<Interface>

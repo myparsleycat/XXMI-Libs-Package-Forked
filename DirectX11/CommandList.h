@@ -486,6 +486,8 @@ public:
 
 typedef std::unordered_map<std::wstring, class CustomShader> CustomShaders;
 extern CustomShaders customShaders;
+// Changes each time a config load has compiled the shaders of customShaders
+extern std::atomic<unsigned> custom_shaders_generation;
 
 class RunCustomShaderCommand : public CommandListCommand {
 public:
