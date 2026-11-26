@@ -15736,6 +15736,14 @@ static void SetShaderResourcesBatch(ID3D11DeviceContext1 *context, wchar_t shade
 void ShaderResourceBindBatch::run(CommandListState *state)
 {
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_BINDINGS);
+	if (null_only && !G->analyse_frame && gLogVerbosity < LogVerbosity::DEBUG) {
+		static ID3D11ShaderResourceView *const null_views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+		SetShaderResourcesBatch(state->mOrigContext1, shader_type, first_slot, count, null_views);
+		for (unsigned i = 0; i < count; i++)
+			state->mHackerContext->NoteCommandListSrv(shader_type, first_slot + i, false);
+		return;
+	}
+
 	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
 
 	// Only the slots of the batch are looked at:
@@ -16187,6 +16195,11 @@ static void emit_slot_batch(const std::vector<std::shared_ptr<ResourceCopyOperat
 	batch->first_slot = first;
 	batch->count = last - first + 1;
 	batch->prefetch_current_bindings = prefetch_current_bindings;
+	if (direction == BatchDirection::Bind && !prefetch_current_bindings)
+		static_cast<ShaderResourceBindBatch*>(batch.get())->null_only =
+			std::all_of(batch->operations.begin(), batch->operations.end(), [](const auto &op) {
+				return op->src.type == ResourceCopyTargetType::EMPTY;
+			});
 	// Shown in the frame analysis log in place of the individual lines:
 	batch->ini_line = batch->operations[0]->ini_line + L" ... +" + std::to_wstring(batch->operations.size() - 1);
 	out.push_back(batch);

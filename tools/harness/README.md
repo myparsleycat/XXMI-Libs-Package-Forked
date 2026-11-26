@@ -155,15 +155,18 @@ A `case/tests/<name>.want` file holds an extended regular expression that the
 reference picture of that test must match before the new DLL is compared.
 
 `vk/build_bindings.bat` and `vk/bin/bindings.exe --batched` compile the production
-SRV getter and Vulkan prefetch against local descriptor and reference fixtures.
-They check mixed game, mod and null bindings, descriptor updates and handle reuse
-between draws, slot bounds and COM references. Add `--timed` to check that hash
-statistics include descriptor and image lookup time, exclude cached answers and
-stop accumulating when disabled, using the production timer with a fixture clock.
-Pass saved `VkDrawPath.cpp` and
-`ShimContext.cpp` paths to the build script to compare an older implementation;
-omit `--batched` to omit the lock-count requirement. These CPU checks supplement
-the Vulkan rendering checks; they do not exercise driver or GPU synchronization.
+SRV getter, setter and Vulkan prefetch against local descriptor and reference
+fixtures. They check mixed game, mod and null bindings, descriptor updates and
+handle reuse between draws, slot bounds and COM references. Add `--timed` to check
+that hash statistics include descriptor and image lookup time, exclude cached
+answers and stop accumulating when disabled, using the production timer with a
+fixture clock. Add `--srv-changes` to check that SRV writes mark the shim scope
+changed only when they change the shim's SRV state. Pass saved `VkDrawPath.cpp`
+and `ShimContext.cpp` paths to the build script to compare an older implementation.
+Omit `--batched` if it lacks batched prefetch and `--srv-changes` if it marks
+repeated writes as changes.
+These CPU checks supplement the Vulkan rendering checks and do not exercise
+driver or GPU synchronization.
 
 Vulkan PS requests for multiple game SRVs resolve their descriptors under one
 lock. Spike SRV lookup counts include one call for each such batch, rather than

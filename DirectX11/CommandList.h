@@ -1640,6 +1640,7 @@ public:
 // "<stage>-tN = ref ResourceFoo" lines: one XXSetShaderResources
 class ShaderResourceBindBatch : public ShaderResourceBatch {
 public:
+	bool null_only = false;
 	void run(CommandListState*) override;
 };
 

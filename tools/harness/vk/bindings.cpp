@@ -102,34 +102,74 @@ static ID3D11ShaderResourceView* Dx12ScopeShaderResource(Dx12ShaderStage stage, 
 }
 struct ShimStageState {
 	ID3D11ShaderResourceView *srvs[SHIM_SRV_SLOTS] = {};
+	UINT srv_mask[4] = {};
 	UINT srv_unbound[4] = {};
 };
 struct ShimState { ShimStageState stages[DX12_STAGE_COUNT]; };
 struct ShimContext {
 	ShimState *mState;
+	bool mChanged = false;
+	ID3D11ShaderResourceView *output = nullptr;
+	bool IsOutput(const ID3D11ShaderResourceView *view) const { return view == output; }
+	void SetShaderResources(Dx12ShaderStage, UINT, UINT, ID3D11ShaderResourceView *const *);
 	void GetShaderResources(Dx12ShaderStage, UINT, UINT, ID3D11ShaderResourceView**);
 };
-template <class Object> static void get(Object *object, Object **out)
+static ID3D11ShaderResourceView* ShimViewOf(ID3D11ShaderResourceView *view)
 {
-	if (object)
-		object->AddRef();
-	*out = object;
+	return view;
 }
 
-// Compile the production getter and prefetch; all descriptors and COM references are per-test fixtures.
+// The production bindings operate on per-test descriptors and COM references.
 #define AcquireSRWLockShared acquire
 #define ReleaseSRWLockShared release
 #include "bin/bindings_impl.inc"
 #undef AcquireSRWLockShared
 #undef ReleaseSRWLockShared
 
+static void check_srv_writes(ID3D11ShaderResourceView *game_view, bool check_changes)
+{
+	ShimState state;
+	ShimContext context = { &state };
+	ID3D11ShaderResourceView replacement;
+	ID3D11ShaderResourceView *view = nullptr;
+	const auto stage = DX12_STAGE_PS;
+
+	context.GetShaderResources(stage, 0, 1, &view);
+	require(view == game_view, "an untouched slot inherits the game's binding");
+	view->Release();
+	context.SetShaderResources(stage, 0, 1, nullptr);
+	context.GetShaderResources(stage, 0, 1, &view);
+	require(!view, "explicit null must hide the inherited view");
+	require(!check_changes || context.mChanged, "explicitly clearing an inherited slot must mark the scope changed");
+
+	context.mChanged = false;
+	context.SetShaderResources(stage, 0, 1, nullptr);
+	require(!check_changes || !context.mChanged, "repeated explicit null must not trigger a scope reset");
+
+	view = &replacement;
+	context.SetShaderResources(stage, 0, 1, &view);
+	require(replacement.refs == 2, "new binding holds a reference");
+	require(!check_changes || context.mChanged, "a new binding must mark the scope changed");
+	context.mChanged = false;
+	context.SetShaderResources(stage, 0, 1, &view);
+	require(replacement.refs == 2, "rebinding the same view must preserve the reference count");
+	require(!check_changes || !context.mChanged, "the same view must not trigger a scope reset");
+
+	context.output = &replacement;
+	context.SetShaderResources(stage, 0, 1, &view);
+	context.GetShaderResources(stage, 0, 1, &view);
+	require(!view && replacement.refs == 1, "output conflict must still clear the binding");
+	require(!check_changes || context.mChanged, "clearing a conflicting binding must mark the scope changed");
+}
+
 int main(int argc, char **argv)
 {
 	try {
-		bool batched = false, timed = false;
+		bool batched = false, timed = false, srv_changes = false;
 		for (int i = 1; i < argc; i++) {
 			batched |= !strcmp(argv[i], "--batched");
 			timed |= !strcmp(argv[i], "--timed");
+			srv_changes |= !strcmp(argv[i], "--srv-changes");
 		}
 		ID3D11ShaderResourceView a, b, override_view;
 		auto first = (VkDescriptorSet)(uintptr_t)1, second = (VkDescriptorSet)(uintptr_t)2;
@@ -219,13 +259,14 @@ int main(int argc, char **argv)
 		context.GetShaderResources(DX12_STAGE_PS, 31, 2, edge);
 		require(edge[0] == &b && !edge[1], "32-slot prefetch boundary");
 		edge[0]->Release();
+		check_srv_writes(&a, srv_changes);
 		scope = nullptr;
 		locks = lookups = 0;
 		context.GetShaderResources(DX12_STAGE_PS, 0, 6, out);
 		require(!out[0] && out[1] == &override_view && !out[4] && !locks, "outside a Vulkan draw");
 		out[1]->Release();
 		require(a.refs == 1 && b.refs == 1 && override_view.refs == 1, "getter COM reference counts");
-		printf("PASS: mixed bindings, repeated reads, descriptor updates, handle reuse, slot bounds and references\n");
+		printf("PASS: mixed bindings, repeated reads and writes, descriptor updates, handle reuse, slot bounds and references\n");
 		return 0;
 	} catch (const std::exception &error) {
 		fprintf(stderr, "FAILED: %s\n", error.what());
