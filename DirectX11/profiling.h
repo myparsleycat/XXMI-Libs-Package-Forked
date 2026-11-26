@@ -134,6 +134,11 @@ namespace Profiling {
 			DX12_TEXTURE_HASH,
 			DX12_BUFFER_HASH,
 			DX12_UPLOAD_HASH_COPY,
+			VK_GAME_OBJECT,
+			VK_GAME_MEMORY,
+			VK_GAME_RECORD,
+			VK_GAME_SUBMIT,
+			VK_GAME_PRESENT,
 			// Nested inside the above (or inside each other):
 			RESOURCE_LOAD,
 			MOD_UPLOAD_AT_PRESENT,
@@ -232,6 +237,12 @@ namespace Profiling {
 		void note_dx12_spare(const wchar_t *event, UINT64 id, UINT64 width, UINT flags,
 				const wchar_t *status, const wchar_t *mod = nullptr);
 		void frame(bool mods_disabled = false);
+		// GPU time of a frame, known a few frames after its Present, on
+		// the queue that was busy longest: busy_ms is the time it spent
+		// on its submissions, span_ms the time from the start of the
+		// first to the end of the last
+		void gpu_frame(unsigned frame_no, double busy_ms, double span_ms, unsigned submissions,
+				unsigned queues, bool complete);
 		void configure_mod_state(const wchar_t *variable);
 		void sample_mod_state();
 
@@ -293,6 +304,30 @@ namespace Profiling {
 			}
 
 			void add_bytes(UINT64 count) { bytes += count; }
+
+			// Leaves the time it lives out of the scope, for a call to
+			// the driver in the middle of our part of a call
+			class Paused {
+				Scope &scope;
+				LARGE_INTEGER at;
+			public:
+				Paused(Scope &scope) : scope(scope)
+				{
+					at.QuadPart = 0;
+					if (scope.start.QuadPart)
+						QueryPerformanceCounter(&at);
+				}
+
+				~Paused()
+				{
+					LARGE_INTEGER now;
+
+					if (!at.QuadPart)
+						return;
+					QueryPerformanceCounter(&now);
+					scope.start.QuadPart += now.QuadPart - at.QuadPart;
+				}
+			};
 		};
 
 		const unsigned SAMPLED_INTERVAL = 16;

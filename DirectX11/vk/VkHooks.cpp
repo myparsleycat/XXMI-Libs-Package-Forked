@@ -6,12 +6,14 @@
 #include "VkCommon.h"
 #include "VkDrawPath.h"
 #include "VkDump.h"
+#include "VkGpuTiming.h"
 
 #include "util.h"
 #include "../D3D11Wrapper.h"
 #include "../DLLMainHook.h"
 #include "../Globals.h"
 #include "../ModLoading.h"
+#include "../profiling.h"
 #include "../dx12/Bridge.h"
 
 // The functions of a device we step into. All of them take a device, queue or
@@ -144,6 +146,7 @@ static void VKAPI_CALL Hooked_vkDestroyDevice(VkDevice device, const VkAllocatio
 		}
 		ReleaseSRWLockExclusive(&dispatch_lock);
 		VkModsForgetDevice(device);
+		VkGpuTimingForgetDevice(device);
 		AcquireSRWLockExclusive(&retained_lock);
 		release_retained(device);
 		ReleaseSRWLockExclusive(&retained_lock);
@@ -156,15 +159,19 @@ static void VKAPI_CALL Hooked_vkDestroyDevice(VkDevice device, const VkAllocatio
 static void VKAPI_CALL Hooked_vkGetDeviceQueue(VkDevice device, uint32_t family, uint32_t index, VkQueue *queue)
 {
 	next_GetDeviceQueue(device)(device, family, index, queue);
-	if (vk_mods_active && queue && *queue)
+	if (vk_mods_active && queue && *queue) {
 		VkModsQueue(device, *queue, family);
+		VkGpuTimingQueue(device, *queue, family);
+	}
 }
 
 static void VKAPI_CALL Hooked_vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2 *info, VkQueue *queue)
 {
 	next_GetDeviceQueue2(device)(device, info, queue);
-	if (vk_mods_active && info && queue && *queue)
+	if (vk_mods_active && info && queue && *queue) {
 		VkModsQueue(device, *queue, info->queueFamilyIndex);
+		VkGpuTimingQueue(device, *queue, info->queueFamilyIndex);
+	}
 }
 
 static VkResult VKAPI_CALL Hooked_vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *info,
@@ -173,6 +180,8 @@ static VkResult VKAPI_CALL Hooked_vkCreateShaderModule(VkDevice device, const Vk
 	VkResult result = next_CreateShaderModule(device)(device, info, allocator, module);
 
 	if (result == VK_SUCCESS && module && *module) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
 		if (vk_dump_active)
 			VkDumpShaderModule(*module, info);
 		if (vk_mods_active)
@@ -183,6 +192,8 @@ static VkResult VKAPI_CALL Hooked_vkCreateShaderModule(VkDevice device, const Vk
 
 static void VKAPI_CALL Hooked_vkDestroyShaderModule(VkDevice device, VkShaderModule module, const VkAllocationCallbacks *allocator)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
 	// Kept, like the two below: a pipeline of the game may be made again
 	// for the vertices of a mod, of what it was created from
 	if (retain_object(&retained_shaders, device, module, allocator, next_DestroyShaderModule(device)))
@@ -193,6 +204,7 @@ static void VKAPI_CALL Hooked_vkDestroyShaderModule(VkDevice device, VkShaderMod
 		VkDumpForgetShaderModule(module);
 	if (module)
 		VkModsForgetShaderModule(module);
+	Profiling::Spike::Scope::Paused driver(spike);
 	next_DestroyShaderModule(device)(device, module, allocator);
 }
 
@@ -200,6 +212,7 @@ static VkResult VKAPI_CALL Hooked_vkCreateGraphicsPipelines(VkDevice device, VkP
 		const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *allocator, VkPipeline *pipelines)
 {
 	VkResult result = next_CreateGraphicsPipelines(device)(device, cache, count, infos, allocator, pipelines);
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 	uint32_t i;
 
 	// Also where only some were created
@@ -229,10 +242,14 @@ static VkResult VKAPI_CALL Hooked_vkCreateComputePipelines(VkDevice device, VkPi
 
 static void VKAPI_CALL Hooked_vkDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *allocator)
 {
-	if (pipeline && vk_dump_active)
-		VkDumpForgetPipeline(pipeline);
-	if (pipeline && vk_mods_active)
-		VkModsForgetPipeline(pipeline);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
+		if (pipeline && vk_dump_active)
+			VkDumpForgetPipeline(pipeline);
+		if (pipeline && vk_mods_active)
+			VkModsForgetPipeline(pipeline);
+	}
 	next_DestroyPipeline(device)(device, pipeline, allocator);
 }
 
@@ -241,8 +258,10 @@ static VkResult VKAPI_CALL Hooked_vkCreatePipelineLayout(VkDevice device, const 
 {
 	VkResult result = next_CreatePipelineLayout(device)(device, info, allocator, layout);
 
-	if (result == VK_SUCCESS && layout && *layout && vk_mods_active)
+	if (result == VK_SUCCESS && layout && *layout && vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsPipelineLayout(*layout, info);
+	}
 	return result;
 }
 
@@ -272,6 +291,8 @@ static VkResult VKAPI_CALL Hooked_vkCreateBuffer(VkDevice device, const VkBuffer
 	VkResult result = next_CreateBuffer(device)(device, info, allocator, buffer);
 
 	if (result == VK_SUCCESS && buffer && *buffer) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
 		if (vk_dump_active)
 			VkDumpBufferCreated(*buffer, info);
 		if (vk_mods_active)
@@ -282,15 +303,21 @@ static VkResult VKAPI_CALL Hooked_vkCreateBuffer(VkDevice device, const VkBuffer
 
 static void VKAPI_CALL Hooked_vkDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks *allocator)
 {
-	if (buffer && vk_dump_active)
-		VkDumpForgetBuffer(buffer);
-	if (buffer && vk_mods_active)
-		VkModsForgetBuffer(buffer);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
+		if (buffer && vk_dump_active)
+			VkDumpForgetBuffer(buffer);
+		if (buffer && vk_mods_active)
+			VkModsForgetBuffer(buffer);
+	}
 	next_DestroyBuffer(device)(device, buffer, allocator);
 }
 
 static void buffer_bound(VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
 	if (vk_dump_active)
 		VkDumpBufferBound(buffer, memory, offset);
 	if (vk_mods_active)
@@ -323,8 +350,10 @@ static VkResult VKAPI_CALL Hooked_vkAllocateMemory(VkDevice device, const VkMemo
 		ModLoadNoteGameCreation();
 	VkResult result = next_AllocateMemory(device)(device, info, allocator, memory);
 
-	if (result == VK_SUCCESS && vk_mods_active && info && memory && *memory)
+	if (result == VK_SUCCESS && vk_mods_active && info && memory && *memory) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsMemoryAllocated(device, *memory, info);
+	}
 	return result;
 }
 
@@ -334,8 +363,10 @@ static SRWLOCK* lock_memory(VkDeviceMemory memory)
 {
 	SRWLOCK *lock = memory && vk_mods_active ? VkModsMapLock(memory) : NULL;
 
-	if (lock)
+	if (lock) {
+		Profiling::Spike::Scope spike(Profiling::Spike::LOCK_WAIT, L"memory the draw path reads (Vulkan)");
 		AcquireSRWLockExclusive(lock);
+	}
 	return lock;
 }
 
@@ -348,8 +379,14 @@ static void unlock_memory(SRWLOCK *lock)
 static VkResult VKAPI_CALL Hooked_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
 		VkDeviceSize size, VkMemoryMapFlags flags, void **data)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_MEMORY);
 	SRWLOCK *lock = lock_memory(memory);
-	VkResult result = next_MapMemory(device)(device, memory, offset, size, flags, data);
+	VkResult result;
+
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		result = next_MapMemory(device)(device, memory, offset, size, flags, data);
+	}
 
 	if (result == VK_SUCCESS && data && *data) {
 		if (vk_dump_active)
@@ -363,13 +400,17 @@ static VkResult VKAPI_CALL Hooked_vkMapMemory(VkDevice device, VkDeviceMemory me
 
 static void VKAPI_CALL Hooked_vkUnmapMemory(VkDevice device, VkDeviceMemory memory)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_MEMORY);
 	SRWLOCK *lock = lock_memory(memory);
 
 	if (vk_dump_active)
 		VkDumpMemoryUnmapped(memory);
 	if (vk_mods_active)
 		VkModsMemoryUnmapped(memory);
-	next_UnmapMemory(device)(device, memory);
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		next_UnmapMemory(device)(device, memory);
+	}
 	unlock_memory(lock);
 }
 
@@ -377,8 +418,14 @@ static void VKAPI_CALL Hooked_vkUnmapMemory(VkDevice device, VkDeviceMemory memo
 // Hooked_vkGetDeviceProcAddr
 static VkResult VKAPI_CALL Hooked_vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *info, void **data)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_MEMORY);
 	SRWLOCK *lock = lock_memory(info ? info->memory : VK_NULL_HANDLE);
-	VkResult result = next_MapMemory2KHR(device)(device, info, data);
+	VkResult result;
+
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		result = next_MapMemory2KHR(device)(device, info, data);
+	}
 
 	if (result == VK_SUCCESS && info && data && *data) {
 		if (vk_dump_active)
@@ -392,6 +439,7 @@ static VkResult VKAPI_CALL Hooked_vkMapMemory2KHR(VkDevice device, const VkMemor
 
 static VkResult VKAPI_CALL Hooked_vkUnmapMemory2KHR(VkDevice device, const VkMemoryUnmapInfoKHR *info)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_MEMORY);
 	SRWLOCK *lock = lock_memory(info ? info->memory : VK_NULL_HANDLE);
 	VkResult result;
 
@@ -399,7 +447,10 @@ static VkResult VKAPI_CALL Hooked_vkUnmapMemory2KHR(VkDevice device, const VkMem
 		VkDumpMemoryUnmapped(info->memory);
 	if (info && vk_mods_active)
 		VkModsMemoryUnmapped(info->memory);
-	result = next_UnmapMemory2KHR(device)(device, info);
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		result = next_UnmapMemory2KHR(device)(device, info);
+	}
 	// Still mapped, where is not known: nothing reads it, and it is not
 	// mapped again here
 	if (result != VK_SUCCESS && info && vk_mods_active)
@@ -410,23 +461,33 @@ static VkResult VKAPI_CALL Hooked_vkUnmapMemory2KHR(VkDevice device, const VkMem
 
 static void VKAPI_CALL Hooked_vkFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks *allocator)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_MEMORY);
 	SRWLOCK *lock = lock_memory(memory);
 
 	if (memory && vk_dump_active)
 		VkDumpMemoryUnmapped(memory);
 	if (memory && vk_mods_active)
 		VkModsMemoryFreed(memory);
-	next_FreeMemory(device)(device, memory, allocator);
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		next_FreeMemory(device)(device, memory, allocator);
+	}
 	unlock_memory(lock);
 }
 
 static VkResult VKAPI_CALL Hooked_vkBeginCommandBuffer(VkCommandBuffer cmd, const VkCommandBufferBeginInfo *info)
 {
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+	VkResult result;
+
 	if (vk_dump_active)
 		VkDumpBeginCommands(cmd);
 	if (vk_mods_active)
 		VkModsBeginCommands(cmd);
-	VkResult result = next_BeginCommandBuffer(cmd)(cmd, info);
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		result = next_BeginCommandBuffer(cmd)(cmd, info);
+	}
 	if (vk_mods_active && result == VK_SUCCESS)
 		VkModsCommandsBegun(cmd);
 	return result;
@@ -434,8 +495,12 @@ static VkResult VKAPI_CALL Hooked_vkBeginCommandBuffer(VkCommandBuffer cmd, cons
 
 static void VKAPI_CALL Hooked_vkCmdExecuteCommands(VkCommandBuffer cmd, uint32_t count, const VkCommandBuffer *cmds)
 {
-	if (vk_mods_active)
-		VkModsExecuteCommands(cmd, count, cmds);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_mods_active)
+			VkModsExecuteCommands(cmd, count, cmds);
+	}
 	next_CmdExecuteCommands(cmd)(cmd, count, cmds);
 }
 
@@ -444,8 +509,10 @@ static VkResult VKAPI_CALL Hooked_vkCreateImage(VkDevice device, const VkImageCr
 {
 	VkResult result = next_CreateImage(device)(device, info, allocator, image);
 
-	if (result == VK_SUCCESS && image && *image && vk_mods_active)
+	if (result == VK_SUCCESS && image && *image && vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsImageCreated(*image, info);
+	}
 	return result;
 }
 
@@ -454,38 +521,56 @@ static VkResult VKAPI_CALL Hooked_vkCreateImageView(VkDevice device, const VkIma
 {
 	VkResult result = next_CreateImageView(device)(device, info, allocator, view);
 
-	if (result == VK_SUCCESS && view && *view && vk_mods_active)
+	if (result == VK_SUCCESS && view && *view && vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsImageView(*view, info);
+	}
 	return result;
 }
 
 static void VKAPI_CALL Hooked_vkDestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks *allocator)
 {
-	if (view && vk_mods_active)
-		VkModsForgetImageView(view);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
+		if (view && vk_mods_active)
+			VkModsForgetImageView(view);
+	}
 	next_DestroyImageView(device)(device, view, allocator);
 }
 
 static void VKAPI_CALL Hooked_vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks *allocator)
 {
-	if (image && vk_mods_active)
-		VkModsForgetImage(image);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
+		if (image && vk_mods_active)
+			VkModsForgetImage(image);
+	}
 	next_DestroyImage(device)(device, image, allocator);
 }
 
 static void VKAPI_CALL Hooked_vkCmdCopyBufferToImage(VkCommandBuffer cmd, VkBuffer src, VkImage dst, VkImageLayout layout,
 		uint32_t count, const VkBufferImageCopy *regions)
 {
-	if (vk_mods_active)
-		VkModsCopyBufferToImage(src, dst, count, regions);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_mods_active)
+			VkModsCopyBufferToImage(src, dst, count, regions);
+	}
 	next_CmdCopyBufferToImage(cmd)(cmd, src, dst, layout, count, regions);
 }
 
 static void VKAPI_CALL Hooked_vkCmdCopyImage(VkCommandBuffer cmd, VkImage src, VkImageLayout src_layout, VkImage dst,
 		VkImageLayout dst_layout, uint32_t count, const VkImageCopy *regions)
 {
-	if (vk_mods_active)
-		VkModsCopyImage(src, dst, count, regions);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_mods_active)
+			VkModsCopyImage(src, dst, count, regions);
+	}
 	next_CmdCopyImage(cmd)(cmd, src, src_layout, dst, dst_layout, count, regions);
 }
 
@@ -507,10 +592,14 @@ static void VKAPI_CALL Hooked_vkCmdCopyImage2(VkCommandBuffer cmd, const VkCopyI
 
 static void VKAPI_CALL Hooked_vkCmdCopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, uint32_t count, const VkBufferCopy *regions)
 {
-	if (vk_dump_active)
-		VkDumpCopyBuffer(src, dst, count, regions);
-	if (vk_mods_active)
-		VkModsCopyBuffer(cmd, src, dst, count, regions);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_dump_active)
+			VkDumpCopyBuffer(src, dst, count, regions);
+		if (vk_mods_active)
+			VkModsCopyBuffer(cmd, src, dst, count, regions);
+	}
 	next_CmdCopyBuffer(cmd)(cmd, src, dst, count, regions);
 }
 
@@ -533,17 +622,25 @@ static void VKAPI_CALL Hooked_vkCmdCopyBuffer2(VkCommandBuffer cmd, const VkCopy
 
 static void VKAPI_CALL Hooked_vkCmdUpdateBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes, const void *data)
 {
-	if (vk_dump_active)
-		VkDumpUpdateBuffer(dst, bytes);
-	if (vk_mods_active)
-		VkModsUpdateBuffer(cmd, dst, offset, bytes, data);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_dump_active)
+			VkDumpUpdateBuffer(dst, bytes);
+		if (vk_mods_active)
+			VkModsUpdateBuffer(cmd, dst, offset, bytes, data);
+	}
 	next_CmdUpdateBuffer(cmd)(cmd, dst, offset, bytes, data);
 }
 
 static void VKAPI_CALL Hooked_vkCmdFillBuffer(VkCommandBuffer cmd, VkBuffer dst, VkDeviceSize offset, VkDeviceSize bytes, uint32_t data)
 {
-	if (vk_mods_active)
-		VkModsFillBuffer(cmd, dst, offset, bytes);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_mods_active)
+			VkModsFillBuffer(cmd, dst, offset, bytes);
+	}
 	next_CmdFillBuffer(cmd)(cmd, dst, offset, bytes, data);
 }
 
@@ -556,29 +653,41 @@ static VkResult VKAPI_CALL Hooked_vkFlushMappedMemoryRanges(VkDevice device, uin
 
 static void VKAPI_CALL Hooked_vkCmdBindPipeline(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkPipeline pipeline)
 {
-	if (vk_dump_active)
-		VkDumpBindPipeline(cmd, bind_point, pipeline);
-	if (vk_mods_active)
-		VkModsBindPipeline(cmd, bind_point, pipeline);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_dump_active)
+			VkDumpBindPipeline(cmd, bind_point, pipeline);
+		if (vk_mods_active)
+			VkModsBindPipeline(cmd, bind_point, pipeline);
+	}
 	next_CmdBindPipeline(cmd)(cmd, bind_point, pipeline);
 }
 
 static void VKAPI_CALL Hooked_vkCmdBindVertexBuffers(VkCommandBuffer cmd, uint32_t first, uint32_t count,
 		const VkBuffer *buffers, const VkDeviceSize *offsets)
 {
-	if (vk_dump_active)
-		VkDumpBindVertexBuffers(cmd, first, count, buffers, offsets);
-	if (vk_mods_active)
-		VkModsBindVertexBuffers(cmd, first, count, buffers, offsets);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_dump_active)
+			VkDumpBindVertexBuffers(cmd, first, count, buffers, offsets);
+		if (vk_mods_active)
+			VkModsBindVertexBuffers(cmd, first, count, buffers, offsets);
+	}
 	next_CmdBindVertexBuffers(cmd)(cmd, first, count, buffers, offsets);
 }
 
 static void VKAPI_CALL Hooked_vkCmdBindIndexBuffer(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkIndexType type)
 {
-	if (vk_dump_active)
-		VkDumpBindIndexBuffer(cmd, buffer, offset, type);
-	if (vk_mods_active)
-		VkModsBindIndexBuffer(cmd, buffer, offset, type);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_dump_active)
+			VkDumpBindIndexBuffer(cmd, buffer, offset, type);
+		if (vk_mods_active)
+			VkModsBindIndexBuffer(cmd, buffer, offset, type);
+	}
 	next_CmdBindIndexBuffer(cmd)(cmd, buffer, offset, type);
 }
 
@@ -587,8 +696,10 @@ static VkResult VKAPI_CALL Hooked_vkCreateDescriptorSetLayout(VkDevice device, c
 {
 	VkResult result = next_CreateDescriptorSetLayout(device)(device, info, allocator, layout);
 
-	if (result == VK_SUCCESS && layout && *layout && vk_mods_active)
+	if (result == VK_SUCCESS && layout && *layout && vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsSetLayout(*layout, info);
+	}
 	return result;
 }
 
@@ -610,16 +721,22 @@ static VkResult VKAPI_CALL Hooked_vkAllocateDescriptorSets(VkDevice device, cons
 {
 	VkResult result = next_AllocateDescriptorSets(device)(device, info, sets);
 
-	if (result == VK_SUCCESS && vk_mods_active)
+	if (result == VK_SUCCESS && vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsSetsAllocated(info, sets);
+	}
 	return result;
 }
 
 static void VKAPI_CALL Hooked_vkUpdateDescriptorSets(VkDevice device, uint32_t write_count, const VkWriteDescriptorSet *writes,
 		uint32_t copy_count, const VkCopyDescriptorSet *copies)
 {
-	if (vk_mods_active)
-		VkModsSetsUpdated(write_count, writes, copy_count, copies);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
+		if (vk_mods_active)
+			VkModsSetsUpdated(write_count, writes, copy_count, copies);
+	}
 	next_UpdateDescriptorSets(device)(device, write_count, writes, copy_count, copies);
 }
 
@@ -628,24 +745,34 @@ static VkResult VKAPI_CALL Hooked_vkCreateDescriptorUpdateTemplate(VkDevice devi
 {
 	VkResult result = next_CreateDescriptorUpdateTemplate(device)(device, info, allocator, update_template);
 
-	if (result == VK_SUCCESS && update_template && *update_template && vk_mods_active)
+	if (result == VK_SUCCESS && update_template && *update_template && vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
 		VkModsUpdateTemplate(*update_template, info);
+	}
 	return result;
 }
 
 static void VKAPI_CALL Hooked_vkUpdateDescriptorSetWithTemplate(VkDevice device, VkDescriptorSet set,
 		VkDescriptorUpdateTemplate update_template, const void *data)
 {
-	if (vk_mods_active)
-		VkModsSetUpdatedWithTemplate(set, update_template, data);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_OBJECT);
+
+		if (vk_mods_active)
+			VkModsSetUpdatedWithTemplate(set, update_template, data);
+	}
 	next_UpdateDescriptorSetWithTemplate(device)(device, set, update_template, data);
 }
 
 static void VKAPI_CALL Hooked_vkCmdBindDescriptorSets(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkPipelineLayout layout,
 		uint32_t first, uint32_t count, const VkDescriptorSet *sets, uint32_t dynamic_count, const uint32_t *dynamic_offsets)
 {
-	if (vk_mods_active)
-		VkModsBindDescriptorSets(cmd, bind_point, layout, first, count, sets, dynamic_count, dynamic_offsets);
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_RECORD);
+
+		if (vk_mods_active)
+			VkModsBindDescriptorSets(cmd, bind_point, layout, first, count, sets, dynamic_count, dynamic_offsets);
+	}
 	next_CmdBindDescriptorSets(cmd)(cmd, bind_point, layout, first, count, sets, dynamic_count, dynamic_offsets);
 }
 
@@ -761,6 +888,8 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit(VkQueue queue, uint32_t count, c
 	unsigned shown = 0, draws;
 	bool counted = false;
 	uint32_t i, j;
+	VkResult result;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_SUBMIT);
 
 	shown_cmds.clear();
 	if (vk_mods_active) {
@@ -781,8 +910,14 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit(VkQueue queue, uint32_t count, c
 	if (vk_mods_active) {
 		semaphore = VkModsBeforeSubmit(queue, can_wait_for_fence(count, submits) ? &value : NULL, !!shown);
 	}
-	if (!semaphore)
-		return submitted(queue, next_QueueSubmit(queue)(queue, count, submits, fence), shown_cmds);
+	if (!semaphore) {
+		submits = VkGpuTimingSubmit(queue, count, submits);
+		{
+			Profiling::Spike::Scope::Paused driver(spike);
+			result = next_QueueSubmit(queue)(queue, count, submits, fence);
+		}
+		return submitted(queue, result, shown_cmds);
+	}
 
 	waiting = *submits;
 	semaphores.assign(submits->pWaitSemaphores, submits->pWaitSemaphores + submits->waitSemaphoreCount);
@@ -803,7 +938,12 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit(VkQueue queue, uint32_t count, c
 	waiting.waitSemaphoreCount = (uint32_t)semaphores.size();
 	waiting.pWaitSemaphores = semaphores.data();
 	waiting.pWaitDstStageMask = stages.data();
-	return submitted(queue, next_QueueSubmit(queue)(queue, 1, &waiting, fence), shown_cmds);
+	submits = VkGpuTimingSubmit(queue, 1, &waiting);
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		result = next_QueueSubmit(queue)(queue, 1, submits, fence);
+	}
+	return submitted(queue, result, shown_cmds);
 }
 
 static VkResult VKAPI_CALL Hooked_vkQueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2 *submits, VkFence fence)
@@ -812,6 +952,8 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit2(VkQueue queue, uint32_t count, 
 	VkFrameEvent event = { "submit2", queue, 0, fence != VK_NULL_HANDLE, true, false, count };
 	unsigned draws;
 	uint32_t i, j;
+	VkResult result;
+	Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_SUBMIT);
 
 	shown_cmds.clear();
 	if (vk_mods_active) {
@@ -842,7 +984,12 @@ static VkResult VKAPI_CALL Hooked_vkQueueSubmit2(VkQueue queue, uint32_t count, 
 	}
 	if (vk_mods_active)
 		VkModsBeforeSubmit(queue, NULL, !!event.shown);
-	return submitted(queue, next_QueueSubmit2(queue)(queue, count, submits, fence), shown_cmds);
+	submits = VkGpuTimingSubmit2(queue, count, submits);
+	{
+		Profiling::Spike::Scope::Paused driver(spike);
+		result = next_QueueSubmit2(queue)(queue, count, submits, fence);
+	}
+	return submitted(queue, result, shown_cmds);
 }
 
 static VkResult VKAPI_CALL Hooked_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
@@ -862,8 +1009,11 @@ static VkResult VKAPI_CALL Hooked_vkQueuePresentKHR(VkQueue queue, const VkPrese
 		VkDumpFrameEvent(&event);
 		VkDumpPresent();
 	}
-	if (vk_mods_active)
+	if (vk_mods_active) {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_GAME_PRESENT);
 		VkModsPresent(queue);
+		VkGpuTimingPresent(queue, G->frame_no);
+	}
 	return check_lost(queue, next_QueuePresentKHR(queue)(queue, info));
 }
 
@@ -1208,6 +1358,22 @@ static void register_device(VkDevice device, VkPhysicalDevice physical_device, b
 			: (PFN_vkGetMemoryWin32HandlePropertiesKHR)get(device, "vkGetMemoryWin32HandlePropertiesKHR"),
 			!external_semaphore ? NULL
 			: (PFN_vkImportSemaphoreWin32HandleKHR)get(device, "vkImportSemaphoreWin32HandleKHR"));
+
+		VkGpuTimingApi timing = {};
+		timing.GetPhysicalDeviceProperties = api.GetPhysicalDeviceProperties;
+		timing.GetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)
+			NktHookLibHelpers::GetProcedureAddress(vulkan, "vkGetPhysicalDeviceQueueFamilyProperties");
+		timing.CreateQueryPool = (PFN_vkCreateQueryPool)get(device, "vkCreateQueryPool");
+		timing.DestroyQueryPool = (PFN_vkDestroyQueryPool)get(device, "vkDestroyQueryPool");
+		timing.GetQueryPoolResults = (PFN_vkGetQueryPoolResults)get(device, "vkGetQueryPoolResults");
+		timing.CreateCommandPool = api.CreateCommandPool;
+		timing.DestroyCommandPool = api.DestroyCommandPool;
+		timing.AllocateCommandBuffers = api.AllocateCommandBuffers;
+		timing.BeginCommandBuffer = api.BeginCommandBuffer;
+		timing.EndCommandBuffer = api.EndCommandBuffer;
+		timing.CmdResetQueryPool = (PFN_vkCmdResetQueryPool)get(device, "vkCmdResetQueryPool");
+		timing.CmdWriteTimestamp = (PFN_vkCmdWriteTimestamp)get(device, "vkCmdWriteTimestamp");
+		VkGpuTimingDevice(device, physical_device, &timing);
 	}
 }
 

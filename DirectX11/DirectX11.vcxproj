@@ -82,6 +82,7 @@
     <ClCompile Include="vk\SpirvTools.cpp" />
     <ClCompile Include="vk\VkDrawPath.cpp" />
     <ClCompile Include="vk\VkDump.cpp" />
+    <ClCompile Include="vk\VkGpuTiming.cpp" />
     <ClCompile Include="vk\VkHooks.cpp" />
     <ClCompile Include="FrameAnalysis.cpp" />
     <ClCompile Include="HackerContext.cpp" />
@@ -167,6 +168,7 @@
     <ClInclude Include="vk\VkCommon.h" />
     <ClInclude Include="vk\VkDrawPath.h" />
     <ClInclude Include="vk\VkDump.h" />
+    <ClInclude Include="vk\VkGpuTiming.h" />
     <ClInclude Include="vk\VkHooks.h" />
     <ClInclude Include="vk\VkObjectLifetime.h" />
     <ClInclude Include="vk\VkScope.h" />

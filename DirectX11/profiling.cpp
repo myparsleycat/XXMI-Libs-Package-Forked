@@ -581,6 +581,11 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"D3D12: hashing a texture the game uploads",
 	L"D3D12: hashing a buffer the game uploads",
 	L"D3D12: recording the GPU copy of uploads to readback memory",
+	L"Vulkan: our part of object creation, binding and destruction by the game",
+	L"Vulkan: our part of vkMapMemory, vkUnmapMemory and vkFreeMemory by the game",
+	L"Vulkan: our part of command recording by the game (begin, binds, copies, updates)",
+	L"Vulkan: our part of vkQueueSubmit by the game",
+	L"Vulkan: our part of vkQueuePresentKHR by the game",
 	L"custom resource creation ([Resource] files, copies)",
 	L"recording split mod uploads at Present (CPU)",
 	L"creating mod resources at Present",
@@ -737,6 +742,24 @@ static int spike_window_mod_state = -1;
 static bool spike_window_shim_disabled;
 static bool spike_mod_state_logged;
 
+struct SpikeGpuFrame {
+	unsigned frame_no;
+	double busy_ms;
+	double span_ms;
+	unsigned submissions;
+	unsigned queues;
+	bool complete;
+};
+// Filled by gpu_frame, under spike_events_lock
+static vector<SpikeGpuFrame> spike_gpu_frames;
+static unsigned spike_window_gpu_frames;
+static double spike_window_gpu_busy_ms;
+static double spike_window_gpu_worst_ms;
+// The frames logged as slow lately, for their GPU time to be written when it
+// is known
+static unsigned spike_slow_frames[64];
+static unsigned spike_slow_frames_next;
+
 void Profiling::Spike::configure_mod_state(const wchar_t *variable)
 {
 	if (spike_mod_variable != variable)
@@ -816,6 +839,7 @@ void Profiling::Spike::init(float threshold_ms, float relative, bool detail, con
 			L"  Nested measurements are inclusive; do not add them to their parent totals.\n"
 			L"  Byte counts describe work performed by that measurement, not GPU transfer bandwidth.\n"
 			L"  Mod state is sampled after frame actions and observed at the following Present.\n"
+			L"  Vulkan: GPU time of a slow frame on its busiest queue is written a few frames later, once known.\n"
 			L"Every %.0f seconds a summary of the frames since is written as well.\n\n",
 			spike_window_ms / 1000);
 	if (detail)
@@ -1014,6 +1038,11 @@ static void spike_log_window()
 			time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, spike_window_total_ms / 1000,
 			spike_mods_disabled ? L"OFF" : L"on", frames, spike_window_total_ms / frames,
 			frames * 1000.0 / spike_window_total_ms, percentile, worst, spike_window_spikes);
+	if (spike_window_gpu_frames) {
+		fwprintf(spike_log, L"  GPU, busiest queue of each frame (measured a few frames late): %u frames, "
+				L"busy %.2fms on average, worst %.2fms\n",
+				spike_window_gpu_frames, spike_window_gpu_busy_ms / spike_window_gpu_frames, spike_window_gpu_worst_ms);
+	}
 	for (int i = 0; i < NUM_CATEGORIES; i++) {
 		if (!spike_window_count[i][0] && !spike_window_count[i][1])
 			continue;
@@ -1047,13 +1076,50 @@ static void spike_log_window()
 	spike_window_frames.clear();
 	spike_window_total_ms = 0;
 	spike_window_spikes = 0;
+	spike_window_gpu_frames = 0;
+	spike_window_gpu_busy_ms = 0;
+	spike_window_gpu_worst_ms = 0;
 	memset(spike_window_ticks, 0, sizeof(spike_window_ticks));
 	memset(spike_window_count, 0, sizeof(spike_window_count));
 	memset(spike_window_bytes, 0, sizeof(spike_window_bytes));
 }
 
+void Profiling::Spike::gpu_frame(unsigned frame_no, double busy_ms, double span_ms, unsigned submissions,
+		unsigned queues, bool complete)
+{
+	if (!threshold)
+		return;
+	AcquireSRWLockExclusive(&spike_events_lock);
+	if (spike_gpu_frames.size() < 256)
+		spike_gpu_frames.push_back({frame_no, busy_ms, span_ms, submissions, queues, complete});
+	ReleaseSRWLockExclusive(&spike_events_lock);
+}
+
+static void spike_log_gpu_frames(const vector<SpikeGpuFrame> &frames)
+{
+	SYSTEMTIME time;
+
+	for (const SpikeGpuFrame &gpu : frames) {
+		if (gpu.complete) {
+			spike_window_gpu_frames++;
+			spike_window_gpu_busy_ms += gpu.busy_ms;
+			if (gpu.busy_ms > spike_window_gpu_worst_ms)
+				spike_window_gpu_worst_ms = gpu.busy_ms;
+		}
+		if (std::find(std::begin(spike_slow_frames), std::end(spike_slow_frames), gpu.frame_no) == std::end(spike_slow_frames))
+			continue;
+		GetLocalTime(&time);
+		fwprintf(spike_log, L"[%02u:%02u:%02u.%03u] GPU time of frame %u on its busiest queue: busy %.2fms, "
+				L"%.2fms from the start of its first submission there to the end of its last "
+				L"(%u queues, %u submissions in all%ls)\n\n",
+				time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, gpu.frame_no, gpu.busy_ms, gpu.span_ms,
+				gpu.queues, gpu.submissions, gpu.complete ? L"" : L", not all of them measured");
+	}
+}
+
 void Profiling::Spike::frame(bool mods_disabled)
 {
+	vector<SpikeGpuFrame> gpu_frames;
 	INT64 ticks[NUM_CATEGORIES][2];
 	unsigned count[NUM_CATEGORIES][2];
 	UINT64 bytes[NUM_CATEGORIES][2];
@@ -1103,9 +1169,11 @@ void Profiling::Spike::frame(bool mods_disabled)
 	spares.swap(dx12_spare_events);
 	spares_dropped = dx12_spare_events_dropped;
 	dx12_spare_events_dropped = 0;
+	gpu_frames.swap(spike_gpu_frames);
 	ReleaseSRWLockExclusive(&spike_events_lock);
 
 	spike_log_dx12_spares(spares, spares_dropped);
+	spike_log_gpu_frames(gpu_frames);
 
 	if (!spike_mod_state_logged || mods_disabled != spike_mods_disabled ||
 		mod_state != spike_window_mod_state || shim_disabled != spike_window_shim_disabled) {
@@ -1153,6 +1221,7 @@ void Profiling::Spike::frame(bool mods_disabled)
 		return;
 	}
 
+	spike_slow_frames[spike_slow_frames_next++ % ARRAYSIZE(spike_slow_frames)] = G->frame_no;
 	GetLocalTime(&time);
 	fwprintf(spike_log, L"[%02u:%02u:%02u.%03u] frame %u: %.2fms (recent average %.2fms)%ls\n",
 			time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
