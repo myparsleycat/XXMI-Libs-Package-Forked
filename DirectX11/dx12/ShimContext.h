@@ -38,6 +38,7 @@ public:
 	void SetShaderResources(Dx12ShaderStage stage, UINT start, UINT count, ID3D11ShaderResourceView *const *views);
 	void GetShaderResources(Dx12ShaderStage stage, UINT start, UINT count, ID3D11ShaderResourceView **views);
 	// Borrowed for immediate use under the shim lock, before another lookup or binding change.
+	ID3D11Resource *BorrowDx12PixelResource(UINT slot);
 	ID3D11Buffer *BorrowVertexBuffer(UINT slot, UINT *stride, UINT *offset);
 	ID3D11Buffer *BorrowIndexBuffer(DXGI_FORMAT *format, UINT *offset);
 	void SetSamplers(Dx12ShaderStage stage, UINT start, UINT count, ID3D11SamplerState *const *samplers);

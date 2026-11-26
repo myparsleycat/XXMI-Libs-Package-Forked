@@ -475,6 +475,18 @@ void STDMETHODCALLTYPE ShimContext::IASetVertexBuffers(UINT StartSlot, UINT NumB
 	mChanged = true;
 }
 
+ID3D11Resource *ShimContext::BorrowDx12PixelResource(UINT slot)
+{
+	if (slot >= SHIM_SRV_SLOTS)
+		return NULL;
+	const ShimStageState &state = mState->stages[DX12_STAGE_PS];
+	if (state.srvs[slot])
+		return ShimViewOf(state.srvs[slot])->resource11;
+	if (state.srv_unbound[slot / 32] & (1u << (slot & 31)))
+		return NULL;
+	return Dx12ScopePixelResource(slot);
+}
+
 ID3D11Buffer *ShimContext::BorrowVertexBuffer(UINT slot, UINT *stride, UINT *offset)
 {
 	bool valid = slot < ARRAYSIZE(mState->vbs);

@@ -1781,6 +1781,8 @@ struct SkinDispatch {
 // Where a D3D11 renderer has the bone weights bound for the draw that skins
 const UINT SKIN_BLEND_SLOT = 2;
 
+static constexpr UINT SCOPE_PIXEL_SRVS = 32;
+
 struct Dx12DrawScope {
 	Dx12GraphicsCommandList *list;
 	bool compute;
@@ -1796,6 +1798,8 @@ struct Dx12DrawScope {
 	// signature is NULL if the game's is not known.
 	const Dx12PipelineInfo *pipeline;
 	const Dx12RootSignatureInfo *signature;
+	UINT pixel_srvs_located;
+	const Dx12DescriptorSlot *pixel_srvs[SCOPE_PIXEL_SRVS];
 	// The shaders the next draw runs with: the game's, but for the stages
 	// a mod has given its own for a draw of its own, see apply_pipeline.
 	// Those are made up of the mod's ShimShader for the draw.
@@ -2068,16 +2072,9 @@ static Published* publish_register(Dx12ShaderStage stage, D3D12_DESCRIPTOR_RANGE
 	return publish_resource(view->resource);
 }
 
-ID3D11ShaderResourceView* Dx12ScopeShaderResource(Dx12ShaderStage stage, UINT slot)
+static Published* publish_scope_srv(Dx12ShaderStage stage, UINT slot, Dx12DescriptorSlot *view)
 {
-	const Dx12ShaderInfo *shader = scope ? scope->pipeline->shaders[stage] : NULL;
-	Dx12DescriptorSlot view;
-	Published *entry;
-	ShimShaderResourceView *srv;
-
-	if (!scope)
-		return VkScopeShaderResource(stage, slot);
-
+	const Dx12ShaderInfo *shader = scope->pipeline->shaders[stage];
 	// A table reaches as far as the root signature says, which goes for
 	// every shader it is used with. Past what this one declares the game
 	// need not have written anything, and what is there is left from
@@ -2085,7 +2082,48 @@ ID3D11ShaderResourceView* Dx12ScopeShaderResource(Dx12ShaderStage stage, UINT sl
 	if (shader && shader->reflected && !shader->unbounded_srv && slot < 128 && !(shader->srv[slot / 64] & (1ull << (slot % 64))))
 		return NULL;
 
-	entry = publish_register(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &view);
+	if (stage != DX12_STAGE_PS || slot >= SCOPE_PIXEL_SRVS)
+		return publish_register(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, view);
+	if (scope->compute || !scope->signature)
+		return NULL;
+
+	const UINT bit = 1u << slot;
+	if (!(scope->pixel_srvs_located & bit)) {
+		const Dx12CmdState &game = scope->list->mState;
+		Dx12RegisterLocation location;
+		const Dx12DescriptorSlot *descriptor = NULL;
+		if (Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location)
+		    && location.table && (game.graphics.set & (1ull << location.parameter)))
+			descriptor = Dx12SlotFromGpuHandle(game.view_heap, game.graphics.values[location.parameter], location.offset);
+		scope->pixel_srvs[slot] = descriptor;
+		scope->pixel_srvs_located |= bit;
+	}
+	// A volatile descriptor can be rewritten while the scope is open.
+	const Dx12DescriptorSlot *descriptor = scope->pixel_srvs[slot];
+	if (!descriptor || descriptor->kind == DX12_VIEW_NONE || !descriptor->resource)
+		return NULL;
+	*view = *descriptor;
+	return publish_resource(view->resource);
+}
+
+ID3D11Resource* Dx12ScopePixelResource(UINT slot)
+{
+	if (!scope)
+		return NULL;
+	Dx12DescriptorSlot view;
+	Published *entry = publish_scope_srv(DX12_STAGE_PS, slot, &view);
+	if (!entry)
+		return NULL;
+	remember_texture(view.resource, entry);
+	return entry->resource;
+}
+
+ID3D11ShaderResourceView* Dx12ScopeShaderResource(Dx12ShaderStage stage, UINT slot)
+{
+	if (!scope)
+		return VkScopeShaderResource(stage, slot);
+	Dx12DescriptorSlot view;
+	Published *entry = publish_scope_srv(stage, slot, &view);
 	if (!entry)
 		return NULL;
 	remember_texture(view.resource, entry);
@@ -2094,7 +2132,7 @@ ID3D11ShaderResourceView* Dx12ScopeShaderResource(Dx12ShaderStage stage, UINT sl
 	// another of the same description, a normal map to a colour texture
 	// for one, which differ in nothing but the format of their views. A
 	// mod that picks its textures by that format has to see this view's.
-	srv = static_cast<ShimShaderResourceView*>(entry->srv);
+	ShimShaderResourceView *srv = static_cast<ShimShaderResourceView*>(entry->srv);
 	if (srv && (srv->mDesc.Format != (DXGI_FORMAT)view.format || srv->mDesc.ViewDimension != (D3D11_SRV_DIMENSION)view.dimension)) {
 		entry->srv->Release();
 		entry->srv = NULL;
@@ -5577,6 +5615,7 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	opened->mod_skinned = false;
 	opened->pipeline = pipeline;
 	opened->signature = Dx12ListRootSignature(list, compute);
+	opened->pixel_srvs_located = 0;
 	memcpy(opened->shaders, pipeline->shaders, sizeof(opened->shaders));
 	opened->custom_stages = 0;
 	opened->patched_stages = 0;

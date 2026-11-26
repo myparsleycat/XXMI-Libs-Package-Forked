@@ -159,6 +159,7 @@ ID3D11Buffer* Dx12ScopeStreamOutput();
 ID3D11Buffer* Dx12ScopeIndexBuffer(DXGI_FORMAT *format);
 ID3D11Buffer* Dx12ScopeConstantBuffer(Dx12ShaderStage stage, UINT slot);
 ID3D11ShaderResourceView* Dx12ScopeShaderResource(Dx12ShaderStage stage, UINT slot);
+ID3D11Resource* Dx12ScopePixelResource(UINT slot);
 ID3D11UnorderedAccessView* Dx12ScopeUnorderedAccess(UINT slot);
 // For a compute shader of a mod that writes what the game has at the
 // register: a view of a buffer of ours that stands in for the game's. NULL if

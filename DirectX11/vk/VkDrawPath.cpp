@@ -4299,14 +4299,16 @@ struct GameImage {
 	ShimTexture2D *object;
 	ShimShaderResourceView *srv;
 	uint32_t shown_hash;
+	LONG shown_epoch;
+	bool used_by_format;
 };
 
 static SRWLOCK image_lock = SRWLOCK_INIT;
-static std::unordered_map<VkImage, GameImage> game_images;
+static std::unordered_map<VkImage, std::unique_ptr<GameImage>> game_images;
 static std::unordered_map<VkImageView, VkImage> game_views;
-// What the engine was shown of images that are gone. Let go of with the lock
-// of dx12/Bridge.h held.
-static std::vector<IUnknown*> retired_images;
+// Draw scopes borrow these records under the bridge lock, even when the SRV
+// has yet to be created. Release retired records between draws.
+static std::vector<std::unique_ptr<GameImage>> retired_images;
 static volatile LONG images_hashed, images_not_mapped;
 // Of the uploads hashed through a mapping of ours, see hash_unmapped
 struct MappedHere {
@@ -4318,7 +4320,7 @@ static MappedHere images_mapped_here;
 // time after, see shown_textures:
 static volatile LONG image_epoch;
 
-// With image_lock held exclusively, around a change of what game_texture()
+// With image_lock held exclusively, around a change of what find_game_image()
 // would find:
 static void images_changing()
 {
@@ -4328,6 +4330,12 @@ static void images_changing()
 static void images_changed()
 {
 	InterlockedIncrement(&image_epoch);
+}
+
+static void retire_image(std::unique_ptr<GameImage> &image)
+{
+	if (image && (image->srv || image->used_by_format))
+		retired_images.push_back(std::move(image));
 }
 
 void VkModsImageCreated(VkImage image, const VkImageCreateInfo *info)
@@ -4351,7 +4359,9 @@ void VkModsImageCreated(VkImage image, const VkImageCreateInfo *info)
 
 	AcquireSRWLockExclusive(&image_lock);
 	images_changing();
-	game_images[image] = created;
+	auto &entry = game_images[image];
+	retire_image(entry);
+	entry = std::make_unique<GameImage>(created);
 	images_changed();
 	ReleaseSRWLockExclusive(&image_lock);
 }
@@ -4362,10 +4372,7 @@ void VkModsForgetImage(VkImage image)
 	auto found = game_images.find(image);
 	if (found != game_images.end()) {
 		images_changing();
-		if (found->second.srv)
-			retired_images.push_back(found->second.srv);
-		if (found->second.object)
-			retired_images.push_back(found->second.object);
+		retire_image(found->second);
 		game_images.erase(found);
 		images_changed();
 	}
@@ -4395,13 +4402,17 @@ void VkModsForgetImageView(VkImageView view)
 // With the lock of dx12/Bridge.h held
 static void release_retired_images()
 {
-	std::vector<IUnknown*> gone;
+	std::vector<std::unique_ptr<GameImage>> gone;
 
 	AcquireSRWLockExclusive(&image_lock);
 	gone.swap(retired_images);
 	ReleaseSRWLockExclusive(&image_lock);
-	for (IUnknown *object : gone)
-		object->Release();
+	for (const auto &image : gone) {
+		if (image->srv)
+			image->srv->Release();
+		if (image->object)
+			image->object->Release();
+	}
 }
 
 // With vk_dump_hashes, for the report: once for each image, level and outcome
@@ -4494,7 +4505,7 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 		AcquireSRWLockShared(&image_lock);
 		auto found = game_images.find(dst);
 		if (found != game_images.end()) {
-			image = found->second;
+			image = *found->second;
 			known = true;
 		}
 		ReleaseSRWLockShared(&image_lock);
@@ -4514,9 +4525,9 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 	// too, to tell what it would have been
 	AcquireSRWLockShared(&image_lock);
 	auto found = game_images.find(dst);
-	if (found != game_images.end() && level < found->second.mips
-	    && (!found->second.hashed || level < found->second.level || diag)) {
-		image = found->second;
+	if (found != game_images.end() && level < found->second->mips
+	    && (!found->second->hashed || level < found->second->level || diag)) {
+		image = *found->second;
 		known = true;
 	}
 	ReleaseSRWLockShared(&image_lock);
@@ -4598,16 +4609,16 @@ void VkModsCopyBufferToImage(VkBuffer src, VkImage dst, uint32_t count, const Vk
 	AcquireSRWLockExclusive(&image_lock);
 	found = game_images.find(dst);
 	if (found != game_images.end()) {
-		had = found->second.hashed;
-		kept_hash = found->second.hash;
-		kept_level = found->second.level;
-		update = !found->second.hashed || level < found->second.level;
+		had = found->second->hashed;
+		kept_hash = found->second->hash;
+		kept_level = found->second->level;
+		update = !found->second->hashed || level < found->second->level;
 		if (update) {
 			images_changing();
-			found->second.level = level;
-			found->second.hashed = true;
-			found->second.data_hash = data_hash;
-			found->second.hash = hash;
+			found->second->level = level;
+			found->second->hashed = true;
+			found->second->data_hash = data_hash;
+			found->second->hash = hash;
 			images_changed();
 			InterlockedIncrement(&images_hashed);
 		}
@@ -4642,8 +4653,8 @@ void VkModsCopyImage(VkImage src, VkImage dst, uint32_t count, const VkImageCopy
 	auto to = game_images.find(dst);
 	bool known = to != game_images.end() && game_images.count(src);
 	if (known) {
-		width = to->second.width;
-		height = to->second.height;
+		width = to->second->width;
+		height = to->second->height;
 	}
 	ReleaseSRWLockShared(&image_lock);
 	if (!known)
@@ -4664,23 +4675,23 @@ void VkModsCopyImage(VkImage src, VkImage dst, uint32_t count, const VkImageCopy
 	to = game_images.find(dst);
 	auto from = game_images.find(src);
 	if (to != game_images.end() && from != game_images.end()
-	    && (to->second.hashed != from->second.hashed || to->second.data_hash != from->second.data_hash
-	        || to->second.level)) {
-		desc.Width = to->second.width;
-		desc.Height = to->second.height;
-		desc.MipLevels = to->second.mips;
-		desc.ArraySize = to->second.layers;
-		desc.Format = to->second.format->dxgi;
+	    && (to->second->hashed != from->second->hashed || to->second->data_hash != from->second->data_hash
+	        || to->second->level)) {
+		desc.Width = to->second->width;
+		desc.Height = to->second->height;
+		desc.MipLevels = to->second->mips;
+		desc.ArraySize = to->second->layers;
+		desc.Format = to->second->format->dxgi;
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		desc.MiscFlags = to->second.cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+		desc.MiscFlags = to->second->cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
 
 		images_changing();
-		to->second.level = 0;
-		to->second.hashed = from->second.hashed;
-		to->second.data_hash = from->second.hashed ? from->second.data_hash : 0;
-		to->second.hash = from->second.hashed ? CalcTexture2DDescHash(to->second.data_hash, &desc) : 0;
+		to->second->level = 0;
+		to->second->hashed = from->second->hashed;
+		to->second->data_hash = from->second->hashed ? from->second->data_hash : 0;
+		to->second->hash = from->second->hashed ? CalcTexture2DDescHash(to->second->data_hash, &desc) : 0;
 		images_changed();
 	}
 	ReleaseSRWLockExclusive(&image_lock);
@@ -6055,6 +6066,9 @@ struct Scope {
 	// The same of the buffers at the first t registers
 	UINT srvs_asked[DX12_STAGE_COUNT];
 	ID3D11ShaderResourceView *srvs[DX12_STAGE_COUNT][SCOPE_SRVS];
+	UINT original_formats_asked;
+	DXGI_FORMAT original_formats[SCOPE_SRVS];
+	GameImage *original_images[SCOPE_SRVS];
 	// One of those could not be shown. What a mod makes of nothing is not
 	// worth drawing.
 	bool srv_missing;
@@ -6364,42 +6378,37 @@ static void note_view(int stage, UINT slot, const SpirvBinding *view, VkDeviceSi
 		VkDumpNote("%s\n", text);
 }
 
-// What game_texture() answered for an image view, asked about for every
-// texture of every draw a mod checks. An entry holds while image_epoch is
-// what it was when the entry was made: nothing in game_images or game_views
-// has changed since, so the answer would be the same. With the lock of
-// dx12/Bridge.h held.
+// The image behind a view, cached for the current image_epoch under the bridge lock.
 struct ShownTexture {
 	VkImageView view;
 	LONG epoch;
-	ShimShaderResourceView *srv;
+	GameImage *image;
 };
 static ShownTexture shown_textures[1024];
 
-// With the lock of dx12/Bridge.h held: the texture of the game a shader samples
-// at one of its bindings, as an object the engine finds the hash of. There is
-// nothing behind it, a mod cannot read the texture or bind it elsewhere.
-static ID3D11ShaderResourceView* shown_texture(VkImageView bound)
+static ShownTexture* shown_texture_slot(VkImageView view)
 {
-	ID3D11ShaderResourceView *shown = NULL;
-	D3D11_TEXTURE2D_DESC desc = {};
-	GameImage *image;
+	return &shown_textures[((UINT64)(uintptr_t)view * 0x9e3779b97f4a7c15ull) >> 54];
+}
 
-	if (!bound)
-		return NULL;
+static bool shown_texture_current(const ShownTexture &memo, VkImageView view)
+{
+	const LONG epoch = image_epoch;
+	return !(epoch & 1) && memo.view == view && memo.epoch == epoch;
+}
 
-	ShownTexture *remembered = &shown_textures[((UINT64)(uintptr_t)bound * 0x9e3779b97f4a7c15ull) >> 54];
-	LONG epoch = image_epoch;
-	if (!(epoch & 1) && remembered->view == bound && remembered->epoch == epoch)
-		return remembered->srv;
-
-	AcquireSRWLockExclusive(&image_lock);
+static GameImage* find_game_image(VkImageView bound)
+{
 	auto view = game_views.find(bound);
-	auto found = view != game_views.end() ? game_images.find(view->second) : game_images.end();
-	// One that could not be hashed is shown all the same: what it is like
-	// tells a mod which of the textures of a shader it is
-	image = found != game_images.end() ? &found->second : NULL;
-	if (image && (!image->object || image->shown_hash != image->hash)) {
+	auto image = view != game_views.end() ? game_images.find(view->second) : game_images.end();
+	return image != game_images.end() ? image->second.get() : NULL;
+}
+
+// With the bridge and image locks held, publish metadata for texture matching.
+static void publish_game_texture(GameImage *image)
+{
+	D3D11_TEXTURE2D_DESC desc = {};
+	if (!image->object || image->shown_hash != image->hash) {
 		desc.Width = max(image->width >> image->level, 1u);
 		desc.Height = max(image->height >> image->level, 1u);
 		desc.MipLevels = image->mips - image->level;
@@ -6448,27 +6457,101 @@ static ID3D11ShaderResourceView* shown_texture(VkImageView bound)
 		ForgetTextureOverrideMiss(image->object);
 		image->shown_hash = image->hash;
 	}
-	if (image)
-		shown = image->srv;
-	// Even, as nothing changes them while the lock is held here
-	remembered->view = bound;
-	remembered->epoch = image_epoch;
-	remembered->srv = image ? image->srv : NULL;
-	ReleaseSRWLockExclusive(&image_lock);
-	return shown;
+	image->shown_epoch = image_epoch;
 }
 
-static ID3D11ShaderResourceView* game_texture(const SpirvBinding *slot)
+static ID3D11ShaderResourceView* shown_texture(GameImage *image)
+{
+	if (!image)
+		return NULL;
+	const LONG epoch = image_epoch;
+	if (!(epoch & 1) && image->srv && image->shown_epoch == epoch)
+		return image->srv;
+
+	AcquireSRWLockExclusive(&image_lock);
+	publish_game_texture(image);
+	ReleaseSRWLockExclusive(&image_lock);
+	return image->srv;
+}
+
+static ID3D11ShaderResourceView* shown_texture(VkImageView bound)
+{
+	if (!bound)
+		return NULL;
+	ShownTexture *remembered = shown_texture_slot(bound);
+	if (shown_texture_current(*remembered, bound))
+		return shown_texture(remembered->image);
+
+	AcquireSRWLockExclusive(&image_lock);
+	GameImage *image = find_game_image(bound);
+	if (image)
+		publish_game_texture(image);
+	*remembered = { bound, image_epoch, image };
+	ReleaseSRWLockExclusive(&image_lock);
+	return image ? image->srv : NULL;
+}
+
+static VkImageView game_texture_view(const SpirvBinding *slot)
 {
 	const CmdState *game = &scope->state;
 	VkImageView bound = VK_NULL_HANDLE;
 
 	if (slot->set >= MAX_SETS || !game->sets[slot->set])
-		return NULL;
+		return VK_NULL_HANDLE;
 	AcquireSRWLockShared(&descriptor_lock);
 	bound = bound_image(find_set(game->sets[slot->set]), slot->binding);
 	ReleaseSRWLockShared(&descriptor_lock);
-	return shown_texture(bound);
+	return bound;
+}
+
+static GameImage* original_texture(VkImageView bound)
+{
+	if (!bound)
+		return NULL;
+	ShownTexture *remembered = shown_texture_slot(bound);
+	if (!shown_texture_current(*remembered, bound)) {
+		AcquireSRWLockExclusive(&image_lock);
+		GameImage *image = find_game_image(bound);
+		if (image)
+			image->used_by_format = true;
+		*remembered = { bound, image_epoch, image };
+		ReleaseSRWLockExclusive(&image_lock);
+	}
+	return remembered->image;
+}
+
+DXGI_FORMAT VkScopeOriginalPixelFormat(UINT slot)
+{
+	if (!scope || slot >= SCOPE_SRVS)
+		return DXGI_FORMAT_UNKNOWN;
+	const UINT bit = 1u << slot;
+	if (scope->original_formats_asked & bit)
+		return scope->original_formats[slot];
+
+	DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+	GameImage *image = NULL;
+	if (scope->srvs_asked[DX12_STAGE_PS] & bit) {
+		auto view = static_cast<ShimShaderResourceView*>(scope->srvs[DX12_STAGE_PS][slot]);
+		if (view)
+			format = view->mDesc.Format;
+	} else {
+		Profiling::Spike::Scope spike(Profiling::Spike::VK_SRV_LOOKUP);
+		Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_VK_SRV);
+		Timed timed(TIMED_ANSWERS);
+		const ShaderLayout *shader = scope->state.pipeline->layouts[DX12_STAGE_PS];
+		if (shader && slot < shader->views.size()) {
+			const SpirvBinding &view = shader->views[slot];
+			if (view.kind == SPIRV_TEXTURE || view.kind == SPIRV_TEXTURE_SAMPLER) {
+				image = original_texture(game_texture_view(&view));
+				if (image)
+					format = image->format->dxgi;
+			}
+		}
+	}
+	scope->original_images[slot] = image;
+	scope->original_formats[slot] = format;
+	scope->original_formats_asked |= bit;
+	return format;
 }
 
 void VkScopePrefetchShaderResources(int stage, UINT slots)
@@ -6500,19 +6583,23 @@ void VkScopePrefetchShaderResources(int stage, UINT slots)
 	UINT found_sets = 0;
 	VkImageView images[SCOPE_SRVS] = {};
 
-	AcquireSRWLockShared(&descriptor_lock);
-	for (UINT pending = textures; _BitScanForward(&slot, pending); pending &= pending - 1) {
-		const SpirvBinding &view = shader->views[slot];
-		if (!(found_sets & (1u << view.set))) {
-			sets[view.set] = find_set(scope->state.sets[view.set]);
-			found_sets |= 1u << view.set;
+	const UINT known = textures & scope->original_formats_asked;
+	if (textures != known) {
+		AcquireSRWLockShared(&descriptor_lock);
+		for (UINT pending = textures & ~known; _BitScanForward(&slot, pending); pending &= pending - 1) {
+			const SpirvBinding &view = shader->views[slot];
+			if (!(found_sets & (1u << view.set))) {
+				sets[view.set] = find_set(scope->state.sets[view.set]);
+				found_sets |= 1u << view.set;
+			}
+			images[slot] = bound_image(sets[view.set], view.binding);
 		}
-		images[slot] = bound_image(sets[view.set], view.binding);
+		ReleaseSRWLockShared(&descriptor_lock);
 	}
-	ReleaseSRWLockShared(&descriptor_lock);
 
 	for (UINT pending = textures; _BitScanForward(&slot, pending); pending &= pending - 1) {
-		scope->srvs[stage][slot] = shown_texture(images[slot]);
+		scope->srvs[stage][slot] = (known & (1u << slot))
+			? shown_texture(scope->original_images[slot]) : shown_texture(images[slot]);
 		stats.textures_shown += !!scope->srvs[stage][slot];
 	}
 	scope->srvs_asked[stage] |= textures;
@@ -6545,7 +6632,8 @@ ID3D11ShaderResourceView* VkScopeShaderResource(int stage, UINT slot)
 	// before it, a storage buffer, which is where one is what moves a mesh.
 	if (stage == DX12_STAGE_PS) {
 		if (view->kind == SPIRV_TEXTURE || view->kind == SPIRV_TEXTURE_SAMPLER) {
-			scope->srvs[stage][slot] = game_texture(view);
+			scope->srvs[stage][slot] = (scope->original_formats_asked & (1u << slot))
+				? shown_texture(scope->original_images[slot]) : shown_texture(game_texture_view(view));
 			stats.textures_shown += !!scope->srvs[stage][slot];
 		}
 		return scope->srvs[stage][slot];
@@ -7002,13 +7090,13 @@ static void describe_game_view(const SpirvBinding *slot, char *text, size_t size
 	auto found = image_view != game_views.end() ? game_images.find(image_view->second) : game_images.end();
 	// An image without a hash by its handle, which the notes of its uploads
 	// name, and a hash not of the top level by the level it is of
-	if (found != game_images.end() && !found->second.hashed) {
+	if (found != game_images.end() && !found->second->hashed) {
 		_snprintf_s(text, size, _TRUNCATE, "s%ub%u %d/%u/none@%p", slot->set, slot->binding,
-			found->second.format ? found->second.format->dxgi : 0, found->second.width, found->first);
+			found->second->format ? found->second->format->dxgi : 0, found->second->width, found->first);
 	} else if (found != game_images.end()) {
-		_snprintf_s(text, size, _TRUNCATE, found->second.level ? "s%ub%u %d/%u/%08x:L%u" : "s%ub%u %d/%u/%08x",
-			slot->set, slot->binding, found->second.format ? found->second.format->dxgi : 0, found->second.width,
-			found->second.hash, found->second.level);
+		_snprintf_s(text, size, _TRUNCATE, found->second->level ? "s%ub%u %d/%u/%08x:L%u" : "s%ub%u %d/%u/%08x",
+			slot->set, slot->binding, found->second->format ? found->second->format->dxgi : 0, found->second->width,
+			found->second->hash, found->second->level);
 	}
 	ReleaseSRWLockShared(&image_lock);
 }
@@ -8428,6 +8516,7 @@ bool VkModsDraw(VkCommandBuffer cmd, bool indexed, uint32_t count, uint32_t inst
 	opened.mod_draws_failed = 0;
 	memset(opened.cbs_asked, 0, sizeof(opened.cbs_asked));
 	memset(opened.srvs_asked, 0, sizeof(opened.srvs_asked));
+	opened.original_formats_asked = 0;
 	opened.srv_missing = false;
 	opened.count = count;
 	opened.first = first;
@@ -8709,7 +8798,8 @@ void VkModsPresent(VkQueue queue)
 		return;
 	}
 
-	release_retired_images();
+	if (!scope)
+		release_retired_images();
 
 	if (!engine_reported) {
 		engine_reported = true;

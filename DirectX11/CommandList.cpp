@@ -3856,7 +3856,13 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 			bool resource_found;
 
 			const auto type = texture_filter_target.type;
-			if ((type == ResourceCopyTargetType::RENDER_TARGET || type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET)
+			if (type == ResourceCopyTargetType::SHADER_RESOURCE && texture_filter_target.shader_type == L'p'
+			    && dx12_shim && state->mOrigContext1 == dx12_shim->shim_context && !VkInDrawScope()) {
+				ID3D11Resource *resource = dx12_shim->shim_context->BorrowDx12PixelResource(texture_filter_target.ResolveSlot(state));
+				resource_found = !!resource;
+				if (resource)
+					texture_filter_target.FindTextureOverridesForResource(state, resource, 0, 0, DXGI_FORMAT_UNKNOWN, &matches);
+			} else if ((type == ResourceCopyTargetType::RENDER_TARGET || type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET)
 					&& !(dx12_shim && state->mOrigContext1 == dx12_shim->shim_context) && !VkInDrawScope())
 				resource_found = find_native_output_filter_overrides(texture_filter_target, state, &matches);
 			else
@@ -3994,13 +4000,8 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 		if (shader_target.shader_type != L'p' || !VkInDrawScope())
 			return -1.0f;
 		UINT slot = (UINT)shader_target.member_args[0].GetValue(state);
-		// Bypass the shim's replacement bindings when identifying a game's material slots.
-		ID3D11ShaderResourceView *view = VkScopeShaderResource(DX12_STAGE_PS, slot);
-		if (!view)
-			return -1.0f;
-		D3D11_SHADER_RESOURCE_VIEW_DESC desc;
-		view->GetDesc(&desc);
-		return desc.Format != DXGI_FORMAT_UNKNOWN ? (float)desc.Format : -1.0f;
+		DXGI_FORMAT format = VkScopeOriginalPixelFormat(slot);
+		return format != DXGI_FORMAT_UNKNOWN ? (float)format : -1.0f;
 	}
 
 	HackerContext *mHackerContext = state->mHackerContext;
