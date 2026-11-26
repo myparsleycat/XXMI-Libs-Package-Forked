@@ -98,7 +98,48 @@ struct ModLoadImpl : ModLoad
 	// epoch << 1 | allowed, for the draws of an epoch to agree
 	std::atomic<uint64_t> checked{0};
 	std::atomic<bool> waiting{false};
+	// Values of var_list a scan found every section ready with, newest
+	// first. A draw can leave a variable at another value for the next one
+	// (EFMI's $lod_level before the callback lists of a mod), which made
+	// nearly every draw scan again.
+	struct ReadyValues {
+		uint64_t hash;
+		unsigned from;
+		std::vector<uint32_t> bits;
+	};
+	std::mutex ready_lock;
+	std::vector<ReadyValues> ready_values;
 };
+
+const size_t READY_VALUES_KEPT = 8;
+
+uint64_t hash_values(const uint32_t *bits, unsigned count)
+{
+	uint64_t hash = 14695981039346656037ull;
+	for (unsigned i = 0; i < count; i++)
+		hash = (hash ^ bits[i]) * 1099511628211ull;
+	return hash;
+}
+
+bool ready_with(ModLoadImpl *load, const uint32_t *bits, uint64_t hash, unsigned epoch)
+{
+	std::lock_guard<std::mutex> lock(load->ready_lock);
+	for (auto &entry : load->ready_values) {
+		if (entry.hash == hash && entry.from <= epoch
+				&& !memcmp(entry.bits.data(), bits, load->var_count * sizeof(uint32_t)))
+			return true;
+	}
+	return false;
+}
+
+void note_ready_with(ModLoadImpl *load, const uint32_t *bits, uint64_t hash, unsigned epoch)
+{
+	std::lock_guard<std::mutex> lock(load->ready_lock);
+	auto &list = load->ready_values;
+	if (list.size() == READY_VALUES_KEPT)
+		list.pop_back();
+	list.insert(list.begin(), {hash, epoch, std::vector<uint32_t>(bits, bits + load->var_count)});
+}
 
 struct Job
 {
@@ -396,7 +437,10 @@ LoadNode* Builder::list(CommandList *command_list)
 {
 	if (!command_list)
 		return nullptr;
-	command_list = command_list->ResolveCommandList();
+	// What a "<list> = ref <source>" assigned last depends on the frames run
+	// so far; the source is reached from the assignment instead
+	if (!command_list->runtime_populated)
+		command_list = command_list->ResolveCommandList();
 
 	auto found = lists.find(command_list);
 	if (found != lists.end())
@@ -639,6 +683,12 @@ void Builder::commands(CommandList *command_list, LoadNode *node)
 			}
 		} else if (RunLinkedCommandList *linked = dynamic_cast<RunLinkedCommandList*>(cmd)) {
 			add_child(node, list(linked->link));
+		} else if (CopyCommandListCommand *assigned = dynamic_cast<CopyCommandListCommand*>(cmd)) {
+			// EFMI mods hand their draw lists to the core's callbacks this way
+			if (assigned->src) {
+				add_child(node, list(&assigned->src->command_list));
+				add_child(node, list(&assigned->src->post_command_list));
+			}
 		} else if (RunCustomShaderCommand *shader = dynamic_cast<RunCustomShaderCommand*>(cmd)) {
 			if (shader->custom_shader) {
 				add_child(node, list(&shader->custom_shader->command_list));
@@ -1731,7 +1781,13 @@ bool ModLoadCheck(ModLoad *base, unsigned epoch, ID3D11Device *device)
 		seen.resize(load->var_count);
 		for (unsigned i = 0; i < load->var_count; i++)
 			memcpy(&seen[i], load->vars[i], sizeof(uint32_t));
-		ready = scan_load(load, epoch, device);
+		uint64_t hash = hash_values(seen.data(), load->var_count);
+		ready = ready_with(load, seen.data(), hash, epoch);
+		if (!ready) {
+			ready = scan_load(load, epoch, device);
+			if (ready)
+				note_ready_with(load, seen.data(), hash, epoch);
+		}
 		finish_check(load, epoch, ready, seen.data());
 	}
 	if (!ready)
