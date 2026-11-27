@@ -165,9 +165,10 @@ static HRESULT HookD3D11(HINSTANCE our_dll)
 
 
 // ----------------------------------------------------------------------------
-static void RemoveHooks()
+static void RemoveHooks(bool process_terminating)
 {
-	remove_vtable_hooks();
+	if (!process_terminating)
+		remove_vtable_hooks();
 	cHookMgr.UnhookAll();
 }
 
@@ -379,7 +380,7 @@ BOOL WINAPI DllMain(
 			dx12_unloading = true;
 			DesktopChannelDetach(lpvReserved != NULL);
 			VkUnwatchUnloads();
-			RemoveHooks();
+			RemoveHooks(lpvReserved != NULL);
 			if (tls_idx != TLS_OUT_OF_INDEXES) {
 				// FIXME: If we are being dynamically unloaded
 				// (lpvReserved == NULL), we should delete the

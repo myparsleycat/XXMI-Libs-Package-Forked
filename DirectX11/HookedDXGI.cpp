@@ -1073,48 +1073,72 @@ struct VtblHook {
 };
 static VtblHook vtbl_hooks[16];
 static unsigned num_vtbl_hooks = 0;
+static SRWLOCK vtbl_hooks_lock = SRWLOCK_INIT;
+static bool vtbl_hooks_removing = false;
 static LONG vtbl_hooks_installed = 0;
+// Each retry makes a factory and logs, at every device creation
+static const LONG VTBL_HOOK_ATTEMPTS = 3;
+static LONG vtbl_hook_attempts = 0;
 
 void hook_vtable_slot(const char *name, LPVOID *slot, LPVOID hook, LPVOID *orig)
 {
-	HMODULE module = NULL;
-	wchar_t path[MAX_PATH] = L"?";
+	AcquireSRWLockExclusive(&vtbl_hooks_lock);
+	if (vtbl_hooks_removing) {
+		ReleaseSRWLockExclusive(&vtbl_hooks_lock);
+		return;
+	}
+
+	LPVOID target = slot ? *slot : nullptr;
+	const char *skip_reason = nullptr;
+	if (!target)
+		skip_reason = "no vtable slot";
+	else if (target == hook)
+		skip_reason = "already hooked";
+	else if (num_vtbl_hooks == ARRAYSIZE(vtbl_hooks))
+		skip_reason = "vtable hook registry is full";
+
+	if (skip_reason) {
+		ReleaseSRWLockExclusive(&vtbl_hooks_lock);
+		LogInfo("  *** %s: %s\n", name, skip_reason);
+		return;
+	}
+
 	DWORD old_protect = 0;
-
-	if (!slot || !*slot) {
-		LogInfo("  *** %s: no vtable slot\n", name);
-		return;
-	}
-
-	if (GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)*slot, &module))
-		GetModuleFileNameW(module, path, MAX_PATH);
-	LogInfo("  %s slot %p -> %p in %S, first byte %02x\n", name, slot, *slot, path, *(unsigned char*)*slot);
-
-	if (*slot == hook) {
-		LogInfo("  %s already hooked\n", name);
-		return;
-	}
-
 	if (!VirtualProtect(slot, sizeof(LPVOID), PAGE_READWRITE, &old_protect)) {
-		LogInfo("  *** VirtualProtect failed for %s: %u\n", name, GetLastError());
+		DWORD error = GetLastError();
+		ReleaseSRWLockExclusive(&vtbl_hooks_lock);
+		LogInfo("  *** VirtualProtect failed for %s: %u\n", name, error);
 		return;
 	}
-	*orig = *slot;
+	target = *slot;
+	if (!target || target == hook) {
+		VirtualProtect(slot, sizeof(LPVOID), old_protect, &old_protect);
+		ReleaseSRWLockExclusive(&vtbl_hooks_lock);
+		LogInfo("  *** %s: %s\n", name, target ? "already hooked" : "no vtable slot");
+		return;
+	}
+
+	*orig = target;
 	*slot = hook;
 	VirtualProtect(slot, sizeof(LPVOID), old_protect, &old_protect);
-	LogInfo("  Installed vtable hook for %s\n", name);
+	vtbl_hooks[num_vtbl_hooks++] = { name, slot, hook, target };
+	ReleaseSRWLockExclusive(&vtbl_hooks_lock);
 
-	if (num_vtbl_hooks < ARRAYSIZE(vtbl_hooks))
-		vtbl_hooks[num_vtbl_hooks++] = { name, slot, hook, *orig };
+	// D3D12 callers still hold vtbl_patch_lock here. Module queries can take the loader lock.
+	LogInfo("  Installed vtable hook for %s, slot %p -> %p\n", name, slot, target);
 }
 
 void remove_vtable_hooks()
 {
+	AcquireSRWLockExclusive(&vtbl_hooks_lock);
+	vtbl_hooks_removing = true;
+	const unsigned count = num_vtbl_hooks;
+	num_vtbl_hooks = 0;
+	ReleaseSRWLockExclusive(&vtbl_hooks_lock);
+
 	DWORD old_protect = 0;
-
-	for (unsigned i = 0; i < num_vtbl_hooks; i++) {
-		VtblHook *h = &vtbl_hooks[i];
-
+	for (unsigned i = 0; i < count; i++) {
+		const VtblHook *h = &vtbl_hooks[i];
 		// Only restore a slot we still own. If someone hooked on top of
 		// us they will call into our (soon unmapped) function regardless,
 		// but overwriting their pointer would break them for certain.
@@ -1128,7 +1152,6 @@ void remove_vtable_hooks()
 		VirtualProtect(h->slot, sizeof(LPVOID), old_protect, &old_protect);
 		LogInfo("  Restored vtable slot for %s\n", h->name);
 	}
-	num_vtbl_hooks = 0;
 }
 
 void maybe_install_outer_swap_chain_hooks()
@@ -1146,30 +1169,50 @@ void maybe_install_outer_swap_chain_hooks()
 	if (InterlockedCompareExchange(&vtbl_hooks_installed, 1, 0) != 0)
 		return;
 
+	const bool last_attempt = InterlockedIncrement(&vtbl_hook_attempts) >= VTBL_HOOK_ATTEMPTS;
+	const char *retry = last_attempt ? "giving up" : "will retry on the next device";
+
 	LogInfo("*** NvPresent64.dll is loaded, hooking IDXGIFactory vtable slots to stay in front of it\n");
 
 	// Every factory shares the class vtable, so a throwaway one is enough to
 	// find the slots. Use the trampoline so we don't run our own factory hook.
 	if (FAILED(fnOrigCreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory1)) || !factory1) {
-		LogInfo("  *** CreateDXGIFactory1 failed, cannot hook the vtable, will retry on the next device\n");
-		InterlockedExchange(&vtbl_hooks_installed, 0);
+		LogInfo("  *** CreateDXGIFactory1 failed, cannot hook the vtable, %s\n", retry);
+		if (!last_attempt)
+			InterlockedExchange(&vtbl_hooks_installed, 0);
 		return;
 	}
 
-	hook_vtable_slot("IDXGIFactory::CreateSwapChain", lpvtbl_slot_CreateSwapChain(factory1),
-		Vtbl_CreateSwapChain, (LPVOID*)&fnVtblOrigCreateSwapChain);
+	if (!fnVtblOrigCreateSwapChain)
+		hook_vtable_slot("IDXGIFactory::CreateSwapChain", lpvtbl_slot_CreateSwapChain(factory1),
+			Vtbl_CreateSwapChain, (LPVOID*)&fnVtblOrigCreateSwapChain);
 
-	if (SUCCEEDED(factory1->QueryInterface(IID_PPV_ARGS(&factory2)))) {
-		hook_vtable_slot("IDXGIFactory2::CreateSwapChainForHwnd", lpvtbl_slot_CreateSwapChainForHwnd(factory2),
-			Vtbl_CreateSwapChainForHwnd, (LPVOID*)&fnVtblOrigCreateSwapChainForHwnd);
-		hook_vtable_slot("IDXGIFactory2::CreateSwapChainForCoreWindow", lpvtbl_slot_CreateSwapChainForCoreWindow(factory2),
-			Vtbl_CreateSwapChainForCoreWindow, (LPVOID*)&fnVtblOrigCreateSwapChainForCoreWindow);
-		hook_vtable_slot("IDXGIFactory2::CreateSwapChainForComposition", lpvtbl_slot_CreateSwapChainForComposition(factory2),
-			Vtbl_CreateSwapChainForComposition, (LPVOID*)&fnVtblOrigCreateSwapChainForComposition);
+	bool installed = fnVtblOrigCreateSwapChain != nullptr;
+	HRESULT hr = factory1->QueryInterface(IID_PPV_ARGS(&factory2));
+	if (SUCCEEDED(hr)) {
+		if (!fnVtblOrigCreateSwapChainForHwnd)
+			hook_vtable_slot("IDXGIFactory2::CreateSwapChainForHwnd", lpvtbl_slot_CreateSwapChainForHwnd(factory2),
+				Vtbl_CreateSwapChainForHwnd, (LPVOID*)&fnVtblOrigCreateSwapChainForHwnd);
+		if (!fnVtblOrigCreateSwapChainForCoreWindow)
+			hook_vtable_slot("IDXGIFactory2::CreateSwapChainForCoreWindow", lpvtbl_slot_CreateSwapChainForCoreWindow(factory2),
+				Vtbl_CreateSwapChainForCoreWindow, (LPVOID*)&fnVtblOrigCreateSwapChainForCoreWindow);
+		if (!fnVtblOrigCreateSwapChainForComposition)
+			hook_vtable_slot("IDXGIFactory2::CreateSwapChainForComposition", lpvtbl_slot_CreateSwapChainForComposition(factory2),
+				Vtbl_CreateSwapChainForComposition, (LPVOID*)&fnVtblOrigCreateSwapChainForComposition);
+		installed = installed && fnVtblOrigCreateSwapChainForHwnd
+			&& fnVtblOrigCreateSwapChainForCoreWindow && fnVtblOrigCreateSwapChainForComposition;
 		factory2->Release();
+	} else if (hr != E_NOINTERFACE) {
+		installed = false;
 	}
 
 	factory1->Release();
+
+	if (!installed) {
+		LogInfo("  *** DXGI vtable hooks incomplete, %s\n", retry);
+		if (!last_attempt)
+			InterlockedExchange(&vtbl_hooks_installed, 0);
+	}
 }
 
 // -----------------------------------------------------------------------------
