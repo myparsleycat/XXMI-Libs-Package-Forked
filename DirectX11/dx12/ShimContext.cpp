@@ -487,6 +487,13 @@ ID3D11Resource *ShimContext::BorrowDx12PixelResource(UINT slot)
 	return Dx12ScopePixelResource(slot);
 }
 
+bool ShimContext::ReadGameConstant(Dx12ShaderStage stage, UINT slot, UINT byte_offset, UINT *bits)
+{
+	if (slot >= SHIM_CBV_SLOTS)
+		return false;
+	return Dx12ScopeReadConstant(stage, slot, byte_offset, mState->stages[stage].cbs[slot], bits);
+}
+
 ID3D11Buffer *ShimContext::BorrowVertexBuffer(UINT slot, UINT *stride, UINT *offset)
 {
 	bool valid = slot < ARRAYSIZE(mState->vbs);

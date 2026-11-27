@@ -45,6 +45,18 @@ The ordered draws are also retained in `results.json`.
 `scoped` verifies the shader itself works and there is
 no extra parent-range redraw. DX12 draw notes and per-case logs are retained.
 
+`dx12/cb` checks `cs-cb0->Uint(...)` and `->Float(...)` on five D3D12
+dispatches whose cb0 is laid out like WWMI's shape key loader. The fifth
+dispatch takes its cb0 from a default-heap buffer, which cannot be read. Its
+`Mods/core.ini` holds a patched copy of the batch selection in WWMI's
+`ShapeKeys.ini` that reads the game batch from cb0. The case also checks a read past the declared
+buffer size, a read while the ini has its own buffer bound, and the read after
+`cs-cb0 = null`. The result is 256 red when every value matches. It is 256
+green with a DLL that drops the `->Uint` lines: every batch then falls back to
+`THREAD_GROUP_COUNT_Y`. `dx11/cb` draws the red triangle only if
+`vs-cb0->Uint(0)` and `vs-cb0->Float(0)` return `-1` under D3D11. Run both
+cases alone with `--cb-only`.
+
 This is a narrow direct indexed-draw contract test. It does not cover
 bundles, indirect or mesh draws, multi-queue recording, arbitrary state
 overrides, capture hotkeys, config hot-reload, or any real game's rendering.

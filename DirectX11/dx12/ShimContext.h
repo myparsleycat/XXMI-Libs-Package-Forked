@@ -41,6 +41,8 @@ public:
 	ID3D11Resource *BorrowDx12PixelResource(UINT slot);
 	ID3D11Buffer *BorrowVertexBuffer(UINT slot, UINT *stride, UINT *offset);
 	ID3D11Buffer *BorrowIndexBuffer(DXGI_FORMAT *format, UINT *offset);
+	// False while a buffer other than the game's is bound at the slot.
+	bool ReadGameConstant(Dx12ShaderStage stage, UINT slot, UINT byte_offset, UINT *bits);
 	void SetSamplers(Dx12ShaderStage stage, UINT start, UINT count, ID3D11SamplerState *const *samplers);
 	void GetSamplers(Dx12ShaderStage stage, UINT start, UINT count, ID3D11SamplerState **samplers);
 

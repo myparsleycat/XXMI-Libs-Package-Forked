@@ -3952,6 +3952,12 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 
 		case ResourceCopyTargetEvaluationMode::RESOURCE_SPATIAL_HASH:
 			return texture_filter_target.GetResourceSpatialHash(state);
+
+		case ResourceCopyTargetEvaluationMode::RESOURCE_UINT:
+			return texture_filter_target.GetResourceConstant(state, false);
+
+		case ResourceCopyTargetEvaluationMode::RESOURCE_FLOAT:
+			return texture_filter_target.GetResourceConstant(state, true);
 			
 		case ResourceCopyTargetEvaluationMode::RESOURCE_SOURCE_STRIDE:
 		{
@@ -10266,9 +10272,15 @@ IniParserResult ResourceCopyTarget::ParseTargetMember(
 	static constexpr MemberInfo members[] = {
 		{ L"->mips",           6, ResourceCopyTargetEvaluationMode::RESOURCE_MIPS },
 		{ L"->size",           6, ResourceCopyTargetEvaluationMode::RESOURCE_SIZE },
+		{ L"->uint",           6, ResourceCopyTargetEvaluationMode::RESOURCE_UINT, {{
+			MemberArg::Type::Unsigned  // Byte Offset
+		}} },
 		{ L"->array",          7, ResourceCopyTargetEvaluationMode::RESOURCE_ARRAY },
 		{ L"->index",          7, ResourceCopyTargetEvaluationMode::POOL_INDEX },
 		{ L"->width",          7, ResourceCopyTargetEvaluationMode::RESOURCE_WIDTH },
+		{ L"->float",          7, ResourceCopyTargetEvaluationMode::RESOURCE_FLOAT, {{
+			MemberArg::Type::Unsigned  // Byte Offset
+		}} },
 		{ L"->offset",         8, ResourceCopyTargetEvaluationMode::RESOURCE_OFFSET },
 		{ L"->stride",         8, ResourceCopyTargetEvaluationMode::RESOURCE_STRIDE },
 		{ L"->format",         8, ResourceCopyTargetEvaluationMode::RESOURCE_FORMAT },
@@ -13851,6 +13863,32 @@ float ResourceCopyTarget::GetResourceRegionHash(CommandListState* state)
 		view->Release();
 
 	return ret;
+}
+
+float ResourceCopyTarget::GetResourceConstant(CommandListState* state, bool as_float)
+{
+	if (type != ResourceCopyTargetType::CONSTANT_BUFFER || !dx12_shim || state->mOrigContext1 != dx12_shim->shim_context)
+		return ResourcePropertyResult::UNKNOWN;
+
+	Dx12ShaderStage stage;
+	switch (shader_type) {
+		case L'v': stage = DX12_STAGE_VS; break;
+		case L'h': stage = DX12_STAGE_HS; break;
+		case L'd': stage = DX12_STAGE_DS; break;
+		case L'g': stage = DX12_STAGE_GS; break;
+		case L'p': stage = DX12_STAGE_PS; break;
+		case L'c': stage = DX12_STAGE_CS; break;
+		default: return ResourcePropertyResult::UNKNOWN;
+	}
+
+	const float offset = member_args[0].GetValue(state);
+	if (!(offset >= 0.0f && offset < 4294967296.0f))
+		return ResourcePropertyResult::UNKNOWN;
+
+	UINT bits;
+	if (!dx12_shim->shim_context->ReadGameConstant(stage, ResolveSlot(state), (UINT)offset, &bits))
+		return ResourcePropertyResult::UNKNOWN;
+	return as_float ? BitCastToFloat(bits) : (float)bits;
 }
 
 float ResourceCopyTarget::GetResourceSpatialHash(CommandListState* state)

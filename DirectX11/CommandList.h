@@ -1111,9 +1111,9 @@ enum class ResourceCopyTargetEvaluationMode : uint32_t {
 	RESOURCE_ARRAY            = 0b00000000000000000001000000000000,
 	RESOURCE_MIPS             = 0b00000000000000000010000000000000,
 	RESOURCE_BIND_FLAGS       = 0b00000000000000000100000000000000,
-	// Placeholder            = 0b00000000000000001000000000000000,
+	RESOURCE_UINT             = 0b00000000000000001000000000000000,
 	RESOURCE_HAMMING_DISTANCE = 0b00000000000000010000000000000000,
-	// Placeholder            = 0b00000000000000100000000000000000,
+	RESOURCE_FLOAT            = 0b00000000000000100000000000000000,
 	RESOURCE_MASK             = 0b00000000000000111111111111111111,
 
 	// POOL
@@ -1155,6 +1155,8 @@ static EnumName_t<const wchar_t*, ResourceCopyTargetEvaluationMode> ResourceCopy
 	{L"ResourceMips", ResourceCopyTargetEvaluationMode::RESOURCE_MIPS},
 	{L"ResourceHammingDistance", ResourceCopyTargetEvaluationMode::RESOURCE_HAMMING_DISTANCE},
 	{L"ResourceBindFlags", ResourceCopyTargetEvaluationMode::RESOURCE_BIND_FLAGS},
+	{L"ResourceUint", ResourceCopyTargetEvaluationMode::RESOURCE_UINT},
+	{L"ResourceFloat", ResourceCopyTargetEvaluationMode::RESOURCE_FLOAT},
 
 	{L"PoolIdentity", ResourceCopyTargetEvaluationMode::POOL_IDENTITY},
 	{L"PoolSize", ResourceCopyTargetEvaluationMode::POOL_SIZE},
@@ -1403,6 +1405,7 @@ public:
 	float GetResourceOffset(CommandListState* state);
 	float GetResourceRegionHash(CommandListState* state);
 	float GetResourceSpatialHash(CommandListState* state);
+	float GetResourceConstant(CommandListState* state, bool as_float);
 	float GetResourceFormat(CommandListState* state);
 	float GetResourceWidth(CommandListState* state);
 	float GetResourceHeight(CommandListState* state);

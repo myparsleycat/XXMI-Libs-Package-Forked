@@ -2061,6 +2061,46 @@ ID3D11Buffer* Dx12ScopeConstantBuffer(Dx12ShaderStage stage, UINT slot)
 	return buffer;
 }
 
+bool Dx12ScopeReadConstant(Dx12ShaderStage stage, UINT slot, UINT byte_offset, ID3D11Buffer *bound, UINT *bits)
+{
+	const Dx12ShaderInfo *shader;
+	Dx12DescriptorSlot view;
+	Dx12ResourceInfo info;
+	ID3D12Resource *resource;
+	UINT64 offset;
+
+	if (!scope || scope->compute != (stage == DX12_STAGE_CS))
+		return false;
+	shader = scope->pipeline->shaders[stage];
+	if (!shader || slot >= DX12_CB_SIZES || shader->cb_bytes[slot] < sizeof(UINT)
+	    || byte_offset > shader->cb_bytes[slot] - sizeof(UINT))
+		return false;
+	if (bound) {
+		const auto entry = published_constants.find((UINT64)stage << 40 | (UINT64)slot << 32 | shader->cb_bytes[slot]);
+		if (entry == published_constants.end() || entry->second.buffer != bound)
+			return false;
+	}
+	const UINT end = byte_offset + sizeof(UINT);
+	if (!scope->signature
+	    || !Dx12ResolveRegister(&scope->list->mState, scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_CBV, slot, &view)
+	    || view.kind != DX12_VIEW_CBV || !view.offset || (view.size && view.size < end)
+	    || !Dx12FindBuffer(view.offset, &resource, &offset) || !Dx12GetResourceInfo(resource, &info)
+	    || info.heap_type != D3D12_HEAP_TYPE_UPLOAD || !info.cpu_accessible
+	    || !info.va || info.va > view.offset || view.offset - info.va != offset
+	    || offset > info.desc.Width || info.desc.Width - offset < end || offset > SIZE_MAX - end)
+		return false;
+
+	D3D12_RANGE range = { (SIZE_T)(offset + byte_offset), (SIZE_T)(offset + end) };
+	D3D12_RANGE no_write = {};
+	void *mapped = nullptr;
+	if (FAILED(resource->Map(0, &range, &mapped)))
+		return false;
+	if (mapped)
+		memcpy(bits, static_cast<const BYTE*>(mapped) + offset + byte_offset, sizeof(UINT));
+	resource->Unmap(0, &no_write);
+	return mapped != nullptr;
+}
+
 static Published* publish_register(Dx12ShaderStage stage, D3D12_DESCRIPTOR_RANGE_TYPE type, UINT slot, Dx12DescriptorSlot *view)
 {
 	if (!scope || scope->compute != (stage == DX12_STAGE_CS))
