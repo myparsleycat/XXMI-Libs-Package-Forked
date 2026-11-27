@@ -22,7 +22,6 @@
 #include "dx12/HashDump.h"
 #include "dx12/PipelineRegistry.h"
 #include "desktop/Channel.h"
-#include "ModLoading.h"
 #include <chrono>
 #include <mutex>
 #include <atomic>
@@ -4940,9 +4939,6 @@ void LoadConfigFile()
 	wchar_t iniFile[MAX_PATH], logFilename[MAX_PATH];
 	wchar_t setting[MAX_PATH];
 
-	// Before the sections the loads refer to go
-	ModLoadsConfigCleared();
-
 	setlocale(LC_CTYPE, "en_US.UTF-8");
 
 	if (!GetModuleFileName(migoto_handle, iniFile, MAX_PATH))
@@ -5231,8 +5227,6 @@ void LoadConfigFile()
 	set_shader_regex_background(GetIniInt(L"Rendering", L"shader_regex_background", 0, NULL));
 	G->share_duplicate_resources = GetIniBool(L"Rendering", L"share_duplicate_resources", true, NULL);
 	G->prefetch_resource_files = GetIniBool(L"Rendering", L"prefetch_resource_files", true, NULL);
-	G->async_resource_loading = GetIniBool(L"Rendering", L"async_resource_loading", true, NULL);
-	G->async_resource_commit_mb = (unsigned)max(GetIniInt(L"Rendering", L"async_resource_commit_mb", 128, NULL), 1);
 	G->SCISSOR_DISABLE = GetIniBool(L"Rendering", L"rasterizer_disable_scissor", false, NULL);
 	G->track_texture_updates = GetIniBoolOrInt(L"Rendering", L"track_texture_updates", 0, NULL);
 	G->match_lower_mip_textures = GetIniBool(L"Rendering", L"match_lower_mip_textures", false, NULL);
@@ -5983,7 +5977,4 @@ void LoadSkippedIncludes()
 	LoadConfigFile();
 
 	G->current_unknown_settings_hash = HashUnknownSettings();
-
-	// Not optimised: the command lists are final as they are
-	ModLoadsConfigLoaded();
 }

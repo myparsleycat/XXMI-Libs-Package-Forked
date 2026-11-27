@@ -2,8 +2,6 @@
 
 #include <d3d11_1.h>
 
-struct ModLoad;
-
 // These values can now be exposed through draw_type and their values should
 // not be changed. Any additions should be added to the end of the list.
 enum class DrawCall {
@@ -31,17 +29,6 @@ struct DrawCallInfo
 	UINT args_offset;
 
 	bool skip, hunting_skip;
-
-	// ModLoadEpoch() when the draw started, 0 for none
-	unsigned load_epoch = 0;
-	// Whether the [TextureOverride] sections of a mod run in this draw, as
-	// decided the first time it was asked, so that the post command lists
-	// follow the pre ones even if a variable changed in between
-	struct LoadVerdict {
-		ModLoad *load;
-		bool ready;
-	} load_verdicts[8];
-	unsigned char load_verdict_count = 0;
 
 	DrawCallInfo() :
 		type(DrawCall::Invalid),

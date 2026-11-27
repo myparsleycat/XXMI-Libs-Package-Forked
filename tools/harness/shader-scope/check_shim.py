@@ -116,7 +116,6 @@ log_level = info
 unbuffered = true
 [Rendering]
 extended_rendering = true
-async_resource_loading = false
 """
         try:
             if mode == "draw-srv-overflow":

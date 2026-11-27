@@ -11,7 +11,6 @@
 #include "Dx12PipelineLibrary.h"
 #include "PipelineRegistry.h"
 #include "ResourceTracker.h"
-#include "../ModLoading.h"
 #include "../profiling.h"
 
 // {B7EFF590-BAC0-4B25-A617-9374404C9211}
@@ -475,31 +474,8 @@ void STDMETHODCALLTYPE Dx12Device::CreateDepthStencilView(ID3D12Resource *pResou
 	mOrig->CreateDepthStencilView(pResource, pDesc, Dx12OrigCpuHandle(DestDescriptor));
 }
 
-template <class Desc>
-static void note_resource_creation(const Desc *desc, void **resource)
-{
-	if (resource && desc && (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
-			? desc->Width >= MOD_LOAD_HEAVY_BYTES : ModLoadIsHeavyTexture(desc->Width, desc->Height, desc->DepthOrArraySize)))
-		ModLoadNoteGameCreation();
-}
-
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateHeap(const D3D12_HEAP_DESC *pDesc, REFIID riid, void **ppvHeap)
-{
-	if (ppvHeap && pDesc && pDesc->SizeInBytes >= MOD_LOAD_HEAVY_BYTES)
-		ModLoadNoteGameCreation();
-	return mOrig->CreateHeap(pDesc, riid, ppvHeap);
-}
-
-HRESULT STDMETHODCALLTYPE Dx12Device::CreateHeap1(const D3D12_HEAP_DESC *pDesc, ID3D12ProtectedResourceSession *pProtectedSession, REFIID riid, void **ppvHeap)
-{
-	if (ppvHeap && pDesc && pDesc->SizeInBytes >= MOD_LOAD_HEAVY_BYTES)
-		ModLoadNoteGameCreation();
-	return mOrig->CreateHeap1(pDesc, pProtectedSession, riid, ppvHeap);
-}
-
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource(const D3D12_HEAP_PROPERTIES *pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, REFIID riidResource, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateCommittedResource(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, riidResource, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -509,7 +485,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource(const D3D12_HEAP_P
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES *pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, REFIID riidResource, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateCommittedResource1(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -519,7 +494,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource1(const D3D12_HEAP_
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource2(const D3D12_HEAP_PROPERTIES *pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_RESOURCE_STATES InitialResourceState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, REFIID riidResource, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateCommittedResource2(pHeapProperties, HeapFlags, pDesc, InitialResourceState, pOptimizedClearValue, pProtectedSession, riidResource, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -531,7 +505,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource2(const D3D12_HEAP_
 // state tracking does not follow.
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource3(const D3D12_HEAP_PROPERTIES *pHeapProperties, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, UINT32 NumCastableFormats, const DXGI_FORMAT *pCastableFormats, REFIID riidResource, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateCommittedResource3(pHeapProperties, HeapFlags, pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riidResource, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -541,7 +514,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateCommittedResource3(const D3D12_HEAP_
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreatePlacedResource(ID3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, REFIID riid, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreatePlacedResource(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -551,7 +523,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreatePlacedResource(ID3D12Heap *pHeap, UI
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreatePlacedResource1(ID3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, REFIID riid, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreatePlacedResource1(pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -561,7 +532,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreatePlacedResource1(ID3D12Heap *pHeap, U
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreatePlacedResource2(ID3D12Heap *pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1 *pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE *pOptimizedClearValue, UINT32 NumCastableFormats, const DXGI_FORMAT *pCastableFormats, REFIID riid, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreatePlacedResource2(pHeap, HeapOffset, pDesc, InitialLayout, pOptimizedClearValue, NumCastableFormats, pCastableFormats, riid, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -571,7 +541,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreatePlacedResource2(ID3D12Heap *pHeap, U
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateReservedResource(const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, REFIID riid, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateReservedResource(pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -581,7 +550,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateReservedResource(const D3D12_RESOURC
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateReservedResource1(const D3D12_RESOURCE_DESC *pDesc, D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, REFIID riid, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateReservedResource1(pDesc, InitialState, pOptimizedClearValue, pProtectedSession, riid, ppvResource);
 
 	if (SUCCEEDED(hr))
@@ -591,7 +559,6 @@ HRESULT STDMETHODCALLTYPE Dx12Device::CreateReservedResource1(const D3D12_RESOUR
 
 HRESULT STDMETHODCALLTYPE Dx12Device::CreateReservedResource2(const D3D12_RESOURCE_DESC *pDesc, D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE *pOptimizedClearValue, ID3D12ProtectedResourceSession *pProtectedSession, UINT32 NumCastableFormats, const DXGI_FORMAT *pCastableFormats, REFIID riid, void **ppvResource)
 {
-	note_resource_creation(pDesc, ppvResource);
 	HRESULT hr = mOrig->CreateReservedResource2(pDesc, InitialLayout, pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats, riid, ppvResource);
 
 	if (SUCCEEDED(hr))

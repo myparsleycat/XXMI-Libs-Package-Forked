@@ -72,7 +72,6 @@
 #include "profiling.h"
 #include "GpuWatch.h"
 #include "ResourceLoading.h"
-#include "ModLoading.h"
 #include "dx12/Bridge.h"
 #include "vk/VkHooks.h"
 #include "desktop/Channel.h"
@@ -278,7 +277,6 @@ void HackerSwapChain::RunFrameActions()
 
 	G->gFPSCounter.Update(system_tick_count);
 	ReleaseIdleReadBuffers();
-	ModLoadsFrame(mHackerDevice->GetPassThroughOrigDevice1());
 
 	// Run the command list here, before drawing the overlay so that a
 	// custom shader on the present call won't remove the overlay. Also,

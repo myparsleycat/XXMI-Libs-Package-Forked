@@ -118,7 +118,7 @@ SHAPE_KEY_FIXTURES = [
 ]
 
 
-def prepare_cb_case(exe, dll, dependencies, directory, async_loading=False):
+def prepare_cb_case(exe, dll, dependencies, directory):
     directory.mkdir()
     shutil.copy2(dll, directory / "d3d11.dll")
     for name in ("dxcompiler.dll", "dxil.dll"):
@@ -135,7 +135,6 @@ skip_early_includes_load = false
 include_recursive = Mods
 [Rendering]
 extended_rendering = true
-async_resource_loading = {str(async_loading).lower()}
 shader_hash = 3dmigoto
 [Hunting]
 hunting = 0
@@ -170,77 +169,6 @@ endif
     check_cb_log(directory)
     print(f"dx11/cb: PASS {actual}", flush=True)
     return dict(api="dx11", mode="cb", pixels=actual, passed=True)
-
-
-# A structured buffer file of at least 8 MB is loaded on the loader thread and
-# copied in at present in parts. Its stride of 56 does not divide the 4 MB part
-# size, and D3D11 drops copies into a structured buffer at offsets that are not
-# a multiple of the stride. Element i holds the floats 16 * i + 0 .. 13.
-ASYNC_STRUCTURED_STRIDE = 56
-ASYNC_STRUCTURED_COUNT = 160000
-ASYNC_STRUCTURED_PROBES = (0, 74897, 74898, 74899, 149795, 149796, 149797, ASYNC_STRUCTURED_COUNT - 1)
-
-
-def check_async_structured_dx11(exe, dll, dependencies, output, vs):
-    directory = output / "dx11_async_structured"
-    prepare_cb_case(exe, dll, dependencies, directory, async_loading=True)
-    mod = directory / "Mods" / "Big"
-    mod.mkdir(parents=True)
-    floats = ASYNC_STRUCTURED_STRIDE // 4
-    data = bytearray()
-    for i in range(ASYNC_STRUCTURED_COUNT):
-        data += struct.pack(f"<{floats}f", *(16 * i + j for j in range(floats)))
-    (mod / "big.buf").write_bytes(data)
-    (mod / "mesh.buf").write_bytes(struct.pack("<6I", 0, 1, 2, 0, 0, 0))
-    checks = " && ".join(
-        f"big[{i}].v[0] == {16 * i} && big[{i}].v[{floats - 1}] == {16 * i + floats - 1}"
-        for i in ASYNC_STRUCTURED_PROBES)
-    text(mod / "big.hlsl", f"""struct Element {{ float v[{floats}]; }};
-StructuredBuffer<Element> big : register(t0);
-float4 main() : SV_Target {{ return ({checks}) ? float4(0,1,0,1) : float4(0,0,1,1); }}
-""")
-    text(mod / "mod.ini", f"""[ShaderOverrideVS]
-hash = {vs}
-checktextureoverride = ib
-
-[TextureOverrideMesh]
-match_type = Buffer
-match_byte_width = 24
-handling = skip
-ib = ResourceMesh
-run = CustomShaderBig
-
-[CustomShaderBig]
-ps = big.hlsl
-ps-t0 = ResourceBig
-drawindexed = 3, 0, 0
-
-[ResourceMesh]
-type = Buffer
-format = R32_UINT
-filename = mesh.buf
-
-[ResourceBig]
-type = StructuredBuffer
-stride = {ASYNC_STRUCTURED_STRIDE}
-filename = big.buf
-""")
-    actual = json.loads(execute(exe, ["dx11-frames", directory / "d3d11.dll", output / "shaders"], directory))
-    expected = dict(red=0, green=256, black=0, other=0)
-    if actual != expected:
-        raise AssertionError(
-            f"dx11/async_structured: expected green (every probed element of the loaded structured buffer "
-            f"matches the file); got {actual}. Other (blue): the mod drew with elements that do not match; "
-            f"red: the mod was never drawn")
-    check_cb_log(directory)
-    # Green also comes from a buffer made with its contents at its first use,
-    # which leaves the parts untested
-    log = (directory / "d3d11_log.txt").read_text(encoding="utf-8", errors="replace")
-    if ("Mod loading: 1 of 1 mods wait for 2 [Resource] sections" not in log
-            or re.search(r"Mod loading: \S*big loaded on use", log, re.IGNORECASE)):
-        raise AssertionError("dx11/async_structured: big.buf was not loaded on the loader thread")
-    print(f"dx11/async_structured: PASS {actual}", flush=True)
-    return dict(api="dx11", mode="async_structured", pixels=actual, passed=True)
 
 
 def check_constant_reads(exe, dll, dependencies, output, shaders, vs):
@@ -349,8 +277,6 @@ def main():
                         help="New, empty output directory (never overwritten)")
     parser.add_argument("--cb-only", action="store_true",
                         help="Run only the constant buffer read cases")
-    parser.add_argument("--async-only", action="store_true",
-                        help="Run only the asynchronously loaded structured buffer case")
     options = parser.parse_args()
     exe, dll, dependencies, output = (
         p.resolve() for p in (options.exe, options.dll, options.dependencies, options.output)
@@ -365,7 +291,7 @@ def main():
     vs = fnv64((shaders / "vs.bin").read_bytes())
     ps = fnv64((shaders / "ps.bin").read_bytes())
     cases = []
-    for api in (() if options.cb_only or options.async_only else ("dx11", "dx12")):
+    for api in (() if options.cb_only else ("dx11", "dx12")):
         for mode in ("native", "plain", "mesh", "late", "scoped", "scoped_off"):
             directory = output / f"{api}_{mode}"
             directory.mkdir()
@@ -386,7 +312,6 @@ skip_early_includes_load = false
 include_recursive = Mods
 [Rendering]
 extended_rendering = true
-async_resource_loading = false
 shader_hash = 3dmigoto
 [Hunting]
 hunting = 0
@@ -436,11 +361,8 @@ ib = ResourceMesh
             cases.append(dict(api=api, mode=mode, pixels=actual, notes=notes,
                               late_draws=late_draws, passed=True))
             print(f"{api}/{mode}: PASS {actual}", flush=True)
-    if not options.async_only:
-        cases.append(check_constant_reads_dx11(exe, dll, dependencies, output, shaders, vs))
-        cases.append(check_constant_reads(exe, dll, dependencies, output, shaders, vs))
-    if not options.cb_only:
-        cases.append(check_async_structured_dx11(exe, dll, dependencies, output, vs))
+    cases.append(check_constant_reads_dx11(exe, dll, dependencies, output, shaders, vs))
+    cases.append(check_constant_reads(exe, dll, dependencies, output, shaders, vs))
     summary = dict(passed=True, dll_sha256=hashlib.sha256(dll.read_bytes()).hexdigest(),
                    vs_hash=vs, ps_hash=ps, cases=cases)
     text(output / "results.json", json.dumps(summary, indent=2))

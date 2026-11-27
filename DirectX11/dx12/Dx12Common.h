@@ -102,7 +102,6 @@ struct Dx12Stats {
 	// Resources of mods given another D3D12 resource for a write, see
 	// ShimRenameResource
 	volatile LONG64 resources_renamed;
-	volatile LONG64 prepared_spares_used;
 	volatile LONG64 rename_allocations;
 	// Presents frame generation added: those that left [Present] out, as it
 	// did not use the swap chain's buffers, and those that ran it again

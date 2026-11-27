@@ -1,6 +1,5 @@
 #include "profiling.h"
 #include "globals.h"
-#include "ModLoading.h"
 #include "dx12/Bridge.h"
 
 #include <algorithm>
@@ -323,23 +322,6 @@ static void update_txt_summary(LARGE_INTEGER collection_duration, LARGE_INTEGER 
 	);
 	Profiling::text += buf;
 
-	ModLoadStats loading;
-	ModLoadGetStats(&loading);
-	if (loading.mods) {
-		_snwprintf_s(buf, ARRAYSIZE(buf), _TRUNCATE,
-				L"\n"
-				L"Mod resource loading (since launch):\n"
-				L"          Mods waiting for files: %4u of %u\n"
-				L"     Files loaded in background: %4u of %u queued (%.0f ms)\n"
-				L"       Files loaded at first use: %4u\n"
-				L"  TextureOverride runs held back: %4u\n",
-				loading.waiting_mods, loading.mods,
-				loading.loaded, loading.queued, loading.load_ms,
-				loading.loaded_on_use,
-				loading.held_draws);
-		Profiling::text += buf;
-	}
-
 	if (G->implicit_post_checktextureoverride_used && !Profiling::cto_warning.empty())
 		Profiling::text += L"\nImplicit post checktextureoverrides were not optimised out\n";
 }
@@ -586,9 +568,6 @@ static const wchar_t *spike_category_names[NUM_CATEGORIES] = {
 	L"Vulkan: our part of command recording by the game (begin, binds, copies, updates)",
 	L"Vulkan: our part of vkQueueSubmit by the game",
 	L"Vulkan: our part of vkQueuePresentKHR by the game",
-	L"custom resource creation ([Resource] files, copies)",
-	L"recording split mod uploads at Present (CPU)",
-	L"creating mod resources at Present",
 	L"creating mod resources and views on use",
 	L"creating CustomShader objects on first use",
 	L"shader creation: the driver's part",
@@ -704,18 +683,6 @@ static const size_t spike_max_events_logged = 16;
 static vector<SpikeEvent> spike_events;
 static unsigned spike_events_dropped;
 static SRWLOCK spike_events_lock = SRWLOCK_INIT;
-
-struct Dx12SpareEvent {
-	SYSTEMTIME time;
-	const wchar_t *event;
-	UINT64 id;
-	UINT64 width;
-	UINT flags;
-	const wchar_t *status;
-	wstring mod;
-};
-static vector<Dx12SpareEvent> dx12_spare_events;
-static unsigned dx12_spare_events_dropped;
 
 static FILE *spike_log;
 static INT64 spike_freq;
@@ -835,7 +802,6 @@ void Profiling::Spike::init(float threshold_ms, float relative, bool detail, con
 			L"  Included in the above: parts of those times worth singling out\n"
 			L"  Other threads: ran concurrently, only matters if the render thread waited on it\n"
 			L"  Slowest operations: individual operations that took at least 1ms\n"
-			L"  DX12 spare buffer events are logged even on frames below the spike threshold.\n"
 			L"  Nested measurements are inclusive; do not add them to their parent totals.\n"
 			L"  Byte counts describe work performed by that measurement, not GPU transfer bandwidth.\n"
 			L"  Mod state is sampled after frame actions and observed at the following Present.\n"
@@ -873,35 +839,6 @@ static void spike_add_event(SpikeEvent &&event)
 	else
 		spike_events_dropped++;
 	ReleaseSRWLockExclusive(&spike_events_lock);
-}
-
-void Profiling::Spike::note_dx12_spare(const wchar_t *event, UINT64 id, UINT64 width, UINT flags,
-		const wchar_t *status, const wchar_t *mod)
-{
-	if (!threshold)
-		return;
-	Dx12SpareEvent entry = {{}, event, id, width, flags, status, mod ? mod : L""};
-	GetLocalTime(&entry.time);
-	AcquireSRWLockExclusive(&spike_events_lock);
-	if (dx12_spare_events.size() < 256)
-		dx12_spare_events.push_back(std::move(entry));
-	else
-		dx12_spare_events_dropped++;
-	ReleaseSRWLockExclusive(&spike_events_lock);
-}
-
-static void spike_log_dx12_spares(const vector<Dx12SpareEvent> &events, unsigned dropped)
-{
-	for (const auto &entry : events) {
-		const auto &time = entry.time;
-		fwprintf(spike_log, L"[%02u:%02u:%02u.%03u] DX12 spare buffer: %ls id=%llu width=0x%llx flags=0x%x status=%ls%ls%ls\n",
-				time.wHour, time.wMinute, time.wSecond, time.wMilliseconds, entry.event, entry.id, entry.width,
-				entry.flags, entry.status, entry.mod.empty() ? L"" : L" mod=", entry.mod.c_str());
-	}
-	if (dropped)
-		fwprintf(spike_log, L"DX12 spare buffer: dropped %u events\n", dropped);
-	if (!events.empty() || dropped)
-		fflush(spike_log);
 }
 
 void Profiling::Spike::add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes)
@@ -966,7 +903,7 @@ static double spike_ms(INT64 ticks)
 }
 
 void Profiling::Spike::add_dx12_rename(INT64 start, UINT64 width, bool keep_contents, bool succeeded,
-		size_t spares_before, size_t busy_spares_checked, bool prepared_spare, const Dx12ResourceCreationTiming &creation)
+		size_t spares_before, size_t busy_spares_checked, const Dx12ResourceCreationTiming &creation)
 {
 	LARGE_INTEGER end;
 	wchar_t details[320];
@@ -981,9 +918,9 @@ void Profiling::Spike::add_dx12_rename(INT64 start, UINT64 width, bool keep_cont
 	const wchar_t *spare_status = spare_reused ? L"reused" : spares_before ? L"all_busy" : L"empty";
 	_snwprintf_s(details, ARRAYSIZE(details), _TRUNCATE,
 			L"bytes or texels wide %016I64x, spare_reused=%ls, spare_status=%ls, spares_before=%Iu, "
-			L"busy_spares_checked=%Iu, prepared_spare=%ls, keep_contents=%ls, result=%ls",
+			L"busy_spares_checked=%Iu, keep_contents=%ls, result=%ls",
 			width, spare_reused ? L"yes" : L"no", spare_status, spares_before, busy_spares_checked,
-			prepared_spare ? L"yes" : L"no", keep_contents ? L"yes" : L"no", succeeded ? L"success" : L"failed");
+			keep_contents ? L"yes" : L"no", succeeded ? L"success" : L"failed");
 	SpikeEvent event = {DX12_RENAME, other_thread, ticks, details};
 	if (creation.create_calls) {
 		_snwprintf_s(details, ARRAYSIZE(details), _TRUNCATE,
@@ -1126,9 +1063,7 @@ void Profiling::Spike::frame(bool mods_disabled)
 	unsigned counters[ARRAYSIZE(spike_counters)];
 	LONG reasons[NUM_REASONS];
 	vector<SpikeEvent> events;
-	vector<Dx12SpareEvent> spares;
 	unsigned events_dropped;
-	unsigned spares_dropped;
 	LARGE_INTEGER now;
 	SYSTEMTIME time;
 
@@ -1166,13 +1101,9 @@ void Profiling::Spike::frame(bool mods_disabled)
 	events.swap(spike_events);
 	events_dropped = spike_events_dropped;
 	spike_events_dropped = 0;
-	spares.swap(dx12_spare_events);
-	spares_dropped = dx12_spare_events_dropped;
-	dx12_spare_events_dropped = 0;
 	gpu_frames.swap(spike_gpu_frames);
 	ReleaseSRWLockExclusive(&spike_events_lock);
 
-	spike_log_dx12_spares(spares, spares_dropped);
 	spike_log_gpu_frames(gpu_frames);
 
 	if (!spike_mod_state_logged || mods_disabled != spike_mods_disabled ||

@@ -314,9 +314,6 @@ struct TextureOverride {
 
 	CommandList command_list;
 	CommandList post_command_list;
-	// What the command lists wait for, shared by the sections of the
-	// namespace, see ModLoading.h. NULL for none.
-	struct ModLoad *mod_load = nullptr;
 
 	TextureOverride() :
 		format(-1),
@@ -602,8 +599,6 @@ struct Globals
 	bool gForceDetectColorSpace;
 	bool share_duplicate_resources;
 	bool prefetch_resource_files;
-	bool async_resource_loading;
-	unsigned async_resource_commit_mb;
 
 	CRITICAL_SECTION mCriticalSection;
 
@@ -882,8 +877,6 @@ struct Globals
 		gForceDetectColorSpace(false),
 		share_duplicate_resources(true),
 		prefetch_resource_files(true),
-		async_resource_loading(true),
-		async_resource_commit_mb(128),
 		dump_all_profiles(false),
 		gSystemTickCount(0),
 		gTime(0),

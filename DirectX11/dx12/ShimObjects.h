@@ -135,7 +135,6 @@ struct ShimResource {
 	// rewritten between draws correct whatever order command lists are
 	// executed in.
 	bool cpu_only;
-	bool prepare_spares_on_pin = false;
 	// Contents as last written through Map or UpdateSubresource. Always
 	// there for cpu_only buffers, otherwise only for what the engine may
 	// map: subresource 0 with tightly packed rows.
@@ -221,26 +220,6 @@ struct ShimResource {
 	};
 	std::vector<Spare> spares;
 	size_t spare_index;
-
-	// The loader fills this without the shim lock. At present the shim
-	// counts the resource on its first copy and keeps it staged until all
-	// copies have been recorded.
-	struct Staged {
-		Dx12StagedUpload upload;
-		UINT64 allocated;
-		UINT64 residency;
-		UINT64 copy_fence;
-		bool counted;
-		std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
-		std::vector<UINT> rows;
-		std::vector<UINT64> row_sizes;
-		std::vector<bool> written;
-		UINT next_subresource;
-		UINT next_band;
-		UINT64 buffer_bytes;
-		UINT64 buffer_offset;
-	};
-	Staged *staged = nullptr;
 };
 
 // Not to be used for now, though it may be later: evicted and not made

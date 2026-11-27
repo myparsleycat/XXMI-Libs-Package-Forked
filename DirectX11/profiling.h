@@ -140,9 +140,6 @@ namespace Profiling {
 			VK_GAME_SUBMIT,
 			VK_GAME_PRESENT,
 			// Nested inside the above (or inside each other):
-			RESOURCE_LOAD,
-			MOD_UPLOAD_AT_PRESENT,
-			MOD_RESOURCE_AT_PRESENT,
 			MOD_RESOURCE_ON_USE,
 			MOD_SHADER_ON_USE,
 			SHADER_CREATE_DRIVER,
@@ -221,7 +218,7 @@ namespace Profiling {
 
 			NUM_CATEGORIES, // Must be last
 		};
-		const Category FIRST_NESTED = RESOURCE_LOAD;
+		const Category FIRST_NESTED = MOD_RESOURCE_ON_USE;
 
 		// In QueryPerformanceCounter ticks, 0 while disabled:
 		extern INT64 threshold;
@@ -232,10 +229,8 @@ namespace Profiling {
 		void init(float threshold_ms, float relative, bool detail, const wchar_t *log_dir);
 		void add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes = 0);
 		void add_dx12_rename(INT64 start, UINT64 width, bool keep_contents, bool succeeded,
-				size_t spares_before, size_t busy_spares_checked, bool prepared_spare,
+				size_t spares_before, size_t busy_spares_checked,
 				const Dx12ResourceCreationTiming &creation);
-		void note_dx12_spare(const wchar_t *event, UINT64 id, UINT64 width, UINT flags,
-				const wchar_t *status, const wchar_t *mod = nullptr);
 		void frame(bool mods_disabled = false);
 		// GPU time of a frame, known a few frames after its Present, on
 		// the queue that was busy longest: busy_ms is the time it spent

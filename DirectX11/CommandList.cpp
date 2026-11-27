@@ -5,9 +5,7 @@
 #include "CommandList.h"
 
 #include <DDSTextureLoader.h>
-#include <DirectXTex.h>
 #include "ResourceLoading.h"
-#include "ModLoading.h"
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -652,8 +650,6 @@ void optimise_command_lists(HackerDevice *device)
 	LogInfo("Command List Optimiser finished after %ums\n", GetTickCount() - start);
 	registered_command_lists.clear();
 	dynamically_allocated_command_lists.clear();
-
-	ModLoadsConfigLoaded();
 }
 
 static bool AddCommandToList(CommandListCommand *command,
@@ -786,10 +782,8 @@ static bool ParseCheckTextureOverride(const wchar_t *section,
 		// checked custom resource:
 		if (operation->target.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
 			CustomResource* checked = operation->target.GetCustomResource(nullptr);
-			if (checked) {
+			if (checked)
 				checked->written_by_command_list = true;
-				checked->command_list_assignments++;
-			}
 		}
 
 		// If the user indicated an explicit command list we will run the pre
@@ -1587,32 +1581,6 @@ void CheckTextureOverrideCommand::RunRange(CommandListState *state)
 	}
 }
 
-// A section of a mod whose files are still loading runs neither its pre nor
-// its post commands, see ModLoading.h
-static inline bool texture_override_loaded(CommandListState *state, TextureOverride *to)
-{
-	ModLoad *load = to->mod_load;
-	DrawCallInfo *info = state->call_info;
-	bool ready;
-
-	if (!load)
-		return true;
-	if (load->present_pending.load(std::memory_order_relaxed))
-		ModLoadQueuePresent(load, state->mOrigDevice1);
-	if (load->has_present_spares)
-		ModLoadRefreshPresentSpares(load, state->mOrigDevice1);
-	if (info) {
-		for (unsigned i = 0; i < info->load_verdict_count; i++) {
-			if (info->load_verdicts[i].load == load)
-				return info->load_verdicts[i].ready;
-		}
-	}
-	ready = ModLoadAllows(load, info ? info->load_epoch : 0, state->mOrigDevice1);
-	if (info && info->load_verdict_count < ARRAYSIZE(info->load_verdicts))
-		info->load_verdicts[info->load_verdict_count++] = {load, ready};
-	return ready;
-}
-
 void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOverrideMatches &matches, ResourceCopyTarget *checked)
 {
 	ResourceCopyTarget *saved_this = NULL;
@@ -1624,20 +1592,14 @@ void CheckTextureOverrideCommand::RunMatches(CommandListState *state, TextureOve
 	if (run_pre_and_post_together) {
 		saved_post = state->post;
 		state->post = false;
-		for (i = 0; i < matches.size(); i++) {
-			if (texture_override_loaded(state, matches[i]))
-				_RunCommandList(&matches[i]->command_list, state);
-		}
+		for (i = 0; i < matches.size(); i++)
+			_RunCommandList(&matches[i]->command_list, state);
 		state->post = true;
-		for (i = 0; i < matches.size(); i++) {
-			if (texture_override_loaded(state, matches[i]))
-				_RunCommandList(&matches[i]->post_command_list, state);
-		}
+		for (i = 0; i < matches.size(); i++)
+			_RunCommandList(&matches[i]->post_command_list, state);
 		state->post = saved_post;
 	} else {
 		for (i = 0; i < matches.size(); i++) {
-			if (!texture_override_loaded(state, matches[i]))
-				continue;
 			if (state->post)
 				_RunCommandList(&matches[i]->post_command_list, state);
 			else
@@ -3893,19 +3855,11 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 			// this (and checktextureoverride) to limit the check to sections
 			// appearing in the same namespace or with a given prefix (but we don't
 			// want to do string processing on the namespace here - the candidates
-			// should already be narrowed down during ini parsing). A section
-			// held back by the loading of its mod's files counts as no match,
-			// as its command lists do not run either:
-			bool any_loaded = false;
+			// should already be narrowed down during ini parsing):
 			for (rit = matches.rbegin(); rit != matches.rend(); rit++) {
-				if (!texture_override_loaded(state, *rit))
-					continue;
-				any_loaded = true;
 				if ((*rit)->filter_index != FLT_MAX)
 					return (*rit)->filter_index;
 			}
-			if (!any_loaded)
-				return 0.0f;
 
 			// No match had a filter_index, but there was at least one match:
 			return 1.0f;
@@ -7950,9 +7904,6 @@ CustomResource::CustomResource() :
 	view(NULL),
 	is_null(true),
 	substantiated(false),
-	load_state(0),
-	async_loaded(false),
-	load_reach(0),
 	written_by_command_list(false),
 	bind_flags((D3D11_BIND_FLAG)0),
 	misc_flags((D3D11_RESOURCE_MISC_FLAG)0),
@@ -8088,16 +8039,14 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 	// we could end up reloading it again if it is later set to null. Also
 	// prevents us from endlessly retrying to load a custom resource from a
 	// file that doesn't exist:
-	if (substantiated || !ModLoadClaim(this))
+	if (substantiated)
 		return;
 	substantiated = true;
 
 	// If this custom resource has already been set through other means we
 	// won't overwrite it:
-	if (resource || view) {
-		ModLoadResourceDone(this);
+	if (resource || view)
 		return;
-	}
 
 	InterlockedIncrement((volatile LONG*)&Profiling::resources_created);
 	Profiling::Spike::Scope spike(Profiling::Spike::MOD_RESOURCE_ON_USE, filename.empty() ? name.c_str() : filename.c_str());
@@ -8124,7 +8073,6 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 	if (!filename.empty()) {
 		CustomResourceFileLoad load;
 
-		ModLoadNoteLoadOnUse(this);
 		LoadFile(mOrigDevice1, this->bind_flags, this->misc_flags, &load);
 		ApplyFileLoad(&load);
 	} else {
@@ -8148,7 +8096,6 @@ void CustomResource::Substantiate(ID3D11Device *mOrigDevice1,
 	}
 
 	UnlockResourceCreationMode();
-	ModLoadResourceDone(this);
 }
 
 bool CustomResource::ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags)
@@ -8209,107 +8156,6 @@ void CustomResource::BufferDesc(D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_
 	OverrideBufferDesc(desc);
 }
 
-bool CustomResource::DeclaredTypedBuffer(D3D11_BUFFER_DESC *desc)
-{
-	if (command_list_assignments || override_type != CustomResourceType::BUFFER
-			|| override_format == (DXGI_FORMAT)-1 || override_format == DXGI_FORMAT_UNKNOWN
-			|| (!filename.empty() && override_byte_width <= 0 && override_array <= 0))
-		return false;
-	BufferDesc(bind_flags, misc_flags, (DWORD)initial_data_size, desc);
-	return desc->ByteWidth && !(desc->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED);
-}
-
-// Smaller files are made with their contents, see CustomResourceFileLoad::may_defer_contents
-static const size_t deferred_contents_bytes = 8 << 20;
-
-static constexpr uint32_t dds_fourcc(char a, char b, char c, char d)
-{
-	return (uint32_t)(uint8_t)a | (uint32_t)(uint8_t)b << 8 | (uint32_t)(uint8_t)c << 16 | (uint32_t)(uint8_t)d << 24;
-}
-
-// Makes the 2D texture of a DDS file without its contents and points
-// *contents at the subresources inside the file data instead. S_FALSE for a
-// file this does not handle, which DirectXTK then loads with its contents.
-// Only DX10 headers and the block compressed FourCCs are taken: for those the
-// file data is the texture data as it is, the way DirectXTK reads it.
-static HRESULT CreateDDSTextureWithoutContents(ID3D11Device *device, const uint8_t *data, size_t size,
-		D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags, DirectX::DDS_LOADER_FLAGS load_flags,
-		ID3D11Resource **texture, std::vector<D3D11_SUBRESOURCE_DATA> *contents)
-{
-	static const uint32_t block_fourccs[] = {
-		dds_fourcc('D', 'X', 'T', '1'), dds_fourcc('D', 'X', 'T', '2'), dds_fourcc('D', 'X', 'T', '3'),
-		dds_fourcc('D', 'X', 'T', '4'), dds_fourcc('D', 'X', 'T', '5'),
-		dds_fourcc('A', 'T', 'I', '1'), dds_fourcc('B', 'C', '4', 'U'), dds_fourcc('B', 'C', '4', 'S'),
-		dds_fourcc('A', 'T', 'I', '2'), dds_fourcc('B', 'C', '5', 'U'), dds_fourcc('B', 'C', '5', 'S'),
-	};
-	DirectX::TexMetadata meta;
-	DirectX::DDSMetaData pixel_format;
-	D3D11_TEXTURE2D_DESC desc = {};
-	size_t offset, end, width, height, row_pitch, slice_pitch;
-	ID3D11Texture2D *tex = nullptr;
-	HRESULT hr;
-
-	if (FAILED(DirectX::GetMetadataFromDDSMemoryEx(data, size, DirectX::DDS_FLAGS_NONE, meta, &pixel_format)))
-		return S_FALSE;
-	if (!pixel_format.IsDX10() && std::find(std::begin(block_fourccs), std::end(block_fourccs), pixel_format.fourCC) == std::end(block_fourccs))
-		return S_FALSE;
-	if (meta.dimension != DirectX::TEX_DIMENSION_TEXTURE2D || meta.depth != 1
-			|| meta.mipLevels > D3D11_REQ_MIP_LEVELS
-			|| meta.arraySize > D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION
-			|| meta.width > (meta.IsCubemap() ? D3D11_REQ_TEXTURECUBE_DIMENSION : D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
-			|| meta.height > (meta.IsCubemap() ? D3D11_REQ_TEXTURECUBE_DIMENSION : D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION))
-		return S_FALSE;
-
-	// Magic, DDS_HEADER and, for DX10, DDS_HEADER_DXT10
-	offset = pixel_format.IsDX10() ? 148 : 128;
-	contents->clear();
-	contents->reserve(meta.arraySize * meta.mipLevels);
-	for (size_t item = 0; item < meta.arraySize; item++) {
-		width = meta.width;
-		height = meta.height;
-		for (size_t mip = 0; mip < meta.mipLevels; mip++) {
-			if (FAILED(DirectX::ComputePitch(meta.format, width, height, row_pitch, slice_pitch))
-					|| row_pitch > UINT_MAX || slice_pitch > UINT_MAX) {
-				contents->clear();
-				return S_FALSE;
-			}
-			end = offset + slice_pitch;
-			if (end < offset || end > size) {
-				contents->clear();
-				return S_FALSE;
-			}
-			contents->push_back({data + offset, (UINT)row_pitch, (UINT)slice_pitch});
-			offset = end;
-			width = std::max<size_t>(width / 2, 1);
-			height = std::max<size_t>(height / 2, 1);
-		}
-	}
-
-	desc.Width = (UINT)meta.width;
-	desc.Height = (UINT)meta.height;
-	desc.MipLevels = (UINT)meta.mipLevels;
-	desc.ArraySize = (UINT)meta.arraySize;
-	desc.Format = meta.format;
-	if (load_flags & DirectX::DDS_LOADER_FORCE_SRGB)
-		desc.Format = DirectX::MakeSRGB(desc.Format);
-	else if (load_flags & DirectX::DDS_LOADER_IGNORE_SRGB)
-		desc.Format = DirectX::MakeLinear(desc.Format);
-	desc.SampleDesc.Count = 1;
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = bind_flags;
-	desc.MiscFlags = misc_flags & ~D3D11_RESOURCE_MISC_TEXTURECUBE;
-	if (meta.IsCubemap())
-		desc.MiscFlags |= D3D11_RESOURCE_MISC_TEXTURECUBE;
-
-	hr = device->CreateTexture2D(&desc, nullptr, &tex);
-	if (FAILED(hr)) {
-		contents->clear();
-		return hr;
-	}
-	*texture = tex;
-	return S_OK;
-}
-
 void CustomResource::LoadBufferFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_flags,
 		D3D11_RESOURCE_MISC_FLAG misc_flags, CustomResourceFileLoad *load)
 {
@@ -8367,8 +8213,6 @@ void CustomResource::LoadBufferFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG 
 
 	load->set_buf_size = true;
 	load->buf_size = (UINT)file.size;
-	if (!load->subresources.empty())
-		load->contents = std::make_unique<FileContents>(std::move(file));
 }
 
 bool CustomResource::HasPNGsRGBChunk(const uint8_t *data, size_t size)
@@ -8519,19 +8363,10 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 
 	if (dds) {
 		LogInfoW(L"Loading custom resource %s as DDS, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
-		hr = S_FALSE;
-		if (load->may_defer_contents && file.size >= deferred_contents_bytes) {
-			hr = CreateDDSTextureWithoutContents(mOrigDevice1, file.data, file.size,
-					bind_flags, misc_flags, dds_flags, &load->resource, &load->subresources);
-			if (hr == S_OK)
-				load->contents = std::make_unique<FileContents>(std::move(file));
-		}
-		if (hr == S_FALSE) {
-			hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
-					file.data, file.size, 0,
-					D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
-					dds_flags, &load->resource, NULL, NULL);
-		}
+		hr = DirectX::CreateDDSTextureFromMemoryEx(mOrigDevice1,
+				file.data, file.size, 0,
+				D3D11_USAGE_DEFAULT, bind_flags, 0, misc_flags,
+				dds_flags, &load->resource, NULL, NULL);
 	} else {
 		LogInfoW(L"Loading custom resource %s as WIC, bind_flags=0x%03x\n", filename.c_str(), bind_flags);
 		hr = DirectX::CreateWICTextureFromMemoryEx(mOrigDevice1,
@@ -8575,10 +8410,7 @@ void CustomResource::CreateBuffer(ID3D11Device *mOrigDevice1, const D3D11_BUFFER
 		}
 	}
 
-	if (load->may_defer_contents && share_file && size >= deferred_contents_bytes && desc.ByteWidth == size
-			&& !(desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER)) {
-		load->subresources.push_back({data, size, size});
-	} else if (desc.ByteWidth > 0) {
+	if (desc.ByteWidth > 0) {
 		// An override may make the buffer larger than the data; the
 		// remainder is zero filled:
 		if (desc.ByteWidth > size) {
@@ -8609,7 +8441,6 @@ void CustomResource::CreateBuffer(ID3D11Device *mOrigDevice1, const D3D11_BUFFER
 			load->identity = share_file->identity;
 		}
 	} else {
-		load->subresources.clear();
 		LogOverlayW(LOG_NOTICE, L"Failed to substantiate custom %ls [%ls]: 0x%x\n",
 				lookup_enum_name(CustomResourceTypeNames, override_type), name.c_str(), hr);
 		LogResourceDesc(&desc);
@@ -8839,8 +8670,6 @@ void CustomResource::ResetRuntimeState()
 
 	is_null = false;
 	substantiated = false;
-	async_loaded = false;
-	InterlockedExchange(&load_state, 0);
 
 	copies_this_frame = 0;
 	frame_no = 0;
@@ -9231,7 +9060,6 @@ void CustomResource::expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOr
 		resource = new_resource;
 		device = mOrigDevice1;
 		substantiated = true;
-		ModLoadResourceDone(this);
 	}
 	else {
 		// Inter-device copy failed / skipped. Flag resource for
@@ -11436,10 +11264,8 @@ static CommandListCommand* parse_resource_copy_operation(
 
 	if (dst.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
 		CustomResource* dst_custom_resource = dst.GetCustomResource(nullptr);
-		if (dst_custom_resource) {
+		if (dst_custom_resource)
 			dst_custom_resource->written_by_command_list = true;
-			dst_custom_resource->command_list_assignments++;
-		}
 	}
 
 	ResourceCopyOperation* operation = new ResourceCopyOperation();
@@ -12205,8 +12031,6 @@ static float evaluate_condition(CommandListExpression *expression, CommandListSt
 void IfCommand::run(CommandListState *state)
 {
 	if (evaluate_condition(&expression, state)) {
-		if (present_load && !state->post && !ModLoadPresentReady(present_load, state->mOrigDevice1))
-			return;
 		COMMAND_LIST_LOG(state, "%S: true {\n", ini_line.c_str());
 		state->extra_indent++;
 		if (state->post)
@@ -12620,13 +12444,6 @@ ID3D11Resource *ResourceCopyTarget::GetResource(
 
 			if (dst)
 				bind_flags = dst->BindFlags(state, &misc_flags);
-
-			// Loaded on the loader thread with the flags its uses were expected to need,
-			// see ModLoading.h: made again here, as on its first use, for
-			// a use that needs more
-			if (custom_resource->async_loaded
-			    && ((bind_flags & ~custom_resource->bind_flags) || (misc_flags & ~custom_resource->misc_flags)))
-				custom_resource->ResetRuntimeState();
 
 			custom_resource->Substantiate(mOrigDevice1, bind_flags, misc_flags);
 

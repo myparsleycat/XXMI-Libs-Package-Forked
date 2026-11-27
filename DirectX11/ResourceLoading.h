@@ -31,16 +31,6 @@ public:
 
 	FileContents(const FileContents&) = delete;
 	FileContents& operator=(const FileContents&) = delete;
-	FileContents(FileContents &&other) noexcept :
-		data(other.data), size(other.size), error(other.error), identity(other.identity),
-		file(other.file), path(other.path), buffer(other.buffer), capacity(other.capacity)
-	{
-		other.data = nullptr;
-		other.size = 0;
-		other.file = INVALID_HANDLE_VALUE;
-		other.buffer = nullptr;
-		other.capacity = 0;
-	}
 
 	// Opens the file and fills in identity, false with error set on failure
 	bool open(const wchar_t *path);
@@ -106,21 +96,8 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 // since, with the same key except for the content, which is left unset.
 // AddRef()ed for the caller.
 ID3D11Resource* FindSharedFileResourceByIdentity(const SharedResourceKey &key, const FileIdentity &identity);
-// A provisional entry is for a resource that may not be used yet (made on
-// the loader thread of ModLoading.h): only threads inside a
-// SharedProvisionalScope find it. Sharing the same resource again without
-// provisional makes the entry a normal one.
 void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity,
-		ID3D11Resource *resource, bool provisional = false);
-// Removes the provisional entry of a resource that was never given to its
-// section, if there is one
-void DropProvisionalShare(ID3D11Resource *resource);
-class SharedProvisionalScope
-{
-public:
-	SharedProvisionalScope();
-	~SharedProvisionalScope();
-};
+		ID3D11Resource *resource);
 // Drops the registry's references, all of them or those on one device:
 void ReleaseSharedFileResources(ID3D11Device *device = nullptr);
 

@@ -719,12 +719,6 @@ struct CustomResourceFileLoad
 	bool share = false;
 	SharedResourceKey share_key;
 	FileIdentity identity;
-	// Set by the loader thread of ModLoading.h: a large 2D texture from a DDS
-	// file or a large buffer is then made without its contents, which are
-	// left in subresources, pointing into contents
-	bool may_defer_contents = false;
-	std::unique_ptr<FileContents> contents;
-	std::vector<D3D11_SUBRESOURCE_DATA> subresources;
 
 	CustomResourceFileLoad() {}
 	~CustomResourceFileLoad();
@@ -763,18 +757,10 @@ public:
 
 	wstring filename;
 	bool substantiated;
-	// A ModLoadState (ModLoading.h), changed with Interlocked functions
-	volatile LONG load_state;
-	// Given its resource by the loader of ModLoading.h, with the flags its
-	// uses were expected to need rather than those of its first use
-	bool async_loaded;
-	// How the loader of ModLoading.h reaches it, for the log of a load on use
-	unsigned char load_reach;
 	// Set while parsing for every resource some command list assigns,
 	// copies or clears into. Such a resource may not share a GPU resource
 	// loaded from a file with another section, see ShareableFromFile():
 	bool written_by_command_list;
-	unsigned command_list_assignments = 0;
 
 	// Used to override description when copying or synthesise resources
 	// from scratch:
@@ -810,7 +796,6 @@ public:
 	void SetHandleInfo(ID3D11Resource* source, size_t offset, size_t data_size);
 	ResourceHandleInfo* GetHandleInfo();
 	void Substantiate(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags);
-	bool DeclaredTypedBuffer(D3D11_BUFFER_DESC *desc);
 	void OverrideBufferDesc(D3D11_BUFFER_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE1D_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE2D_DESC *desc);
@@ -820,15 +805,11 @@ public:
 	void CopyMetadataFrom(const CustomResource& src);
 	void expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOrigContext1);
 
-	// Loads filename with the given flags into load, without changing the
-	// section, so that the loader thread can do it while the section is in
-	// use. Reads only what parsing the config set.
+private:
 	void LoadFile(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags,
 			CustomResourceFileLoad *load);
 	// Gives the section what LoadFile() made
 	void ApplyFileLoad(CustomResourceFileLoad *load);
-
-private:
 	bool HasPNGsRGBChunk(const uint8_t *data, size_t size);
 	DirectX::WIC_LOADER_FLAGS GetWICFlags(const uint8_t *data, size_t size);
 	DirectX::DDS_LOADER_FLAGS GetDDSFlags();
@@ -2225,7 +2206,6 @@ public:
 	bool pre_finalised, post_finalised;
 	bool has_nested_else_if;
 	wstring section;
-	const struct PresentLoad *present_load = nullptr;
 
 	bool static_evaluated = false;
 	bool is_static = false;

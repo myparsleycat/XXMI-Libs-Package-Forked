@@ -151,7 +151,6 @@
     <ClCompile Include="BindingProxy.cpp" />
     <ClCompile Include="GpuWatch.cpp" />
     <ClCompile Include="ResourceLoading.cpp" />
-    <ClCompile Include="ModLoading.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Globals.h" />
@@ -306,7 +305,6 @@
     <ClInclude Include="BindingProxy.h" />
     <ClInclude Include="GpuWatch.h" />
     <ClInclude Include="ResourceLoading.h" />
-    <ClInclude Include="ModLoading.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="DirectX11.rc" />

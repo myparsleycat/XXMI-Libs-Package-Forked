@@ -4209,7 +4209,7 @@ static bool skin_output_buffer(SkinOutput *output, UINT64 bytes, UINT stride)
 	desc.SampleDesc.Count = 1;
 	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer, nullptr))) {
+	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer))) {
 		output->buffer = NULL;
 		return false;
 	}
@@ -7073,8 +7073,7 @@ void Dx12DrawPathFramePresented()
 			InterlockedExchange64(&dx12_stats.upload_pages_created, 0),
 			InterlockedExchange64(&dx12_stats.upload_pages_released, 0),
 			InterlockedExchange64(&dx12_stats.resources_renamed, 0));
-		Dx12DumpNote("  DX12 buffer replacements used %lld prepared buffer spares and made %lld synchronous allocation attempts\n",
-			InterlockedExchange64(&dx12_stats.prepared_spares_used, 0),
+		Dx12DumpNote("  DX12 buffer replacements made %lld synchronous allocation attempts\n",
 			InterlockedExchange64(&dx12_stats.rename_allocations, 0));
 		note_memory();
 		stats = {};

@@ -12,7 +12,6 @@
 #include "../D3D11Wrapper.h"
 #include "../DLLMainHook.h"
 #include "../Globals.h"
-#include "../ModLoading.h"
 #include "../profiling.h"
 #include "../dx12/Bridge.h"
 
@@ -346,8 +345,6 @@ static VkResult VKAPI_CALL Hooked_vkBindBufferMemory2(VkDevice device, uint32_t 
 static VkResult VKAPI_CALL Hooked_vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *info,
 		const VkAllocationCallbacks *allocator, VkDeviceMemory *memory)
 {
-	if (info && info->allocationSize >= MOD_LOAD_HEAVY_BYTES)
-		ModLoadNoteGameCreation();
 	VkResult result = next_AllocateMemory(device)(device, info, allocator, memory);
 
 	if (result == VK_SUCCESS && vk_mods_active && info && memory && *memory) {

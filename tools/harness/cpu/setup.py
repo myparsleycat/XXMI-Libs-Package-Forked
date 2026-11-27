@@ -132,11 +132,8 @@ def main():
     # A check compares frames call for call. With shader_regex_background = 1
     # a ShaderRegex takes effect whenever its background job ends, which
     # differs from run to run, so xh.sh check uses 2: the draw waits for it.
-    # async_resource_loading likewise has a mod drawn from whenever its files
-    # are loaded, so a check turns it off.
-    check = re.sub(r'(?im)^(\s*shader_regex_background\s*=\s*)1\b', r'\g<1>2', text)
-    check = set_value(check, 'Rendering', 'async_resource_loading', '0')
-    variants = {'d3dx.ini': text, 'd3dx.ini.game': text, 'd3dx.ini.check': check}
+    variants = {'d3dx.ini': text, 'd3dx.ini.game': text,
+                'd3dx.ini.check': re.sub(r'(?im)^(\s*shader_regex_background\s*=\s*)1\b', r'\g<1>2', text)}
     for file, content in variants.items():
         with open(os.path.join(run, file), 'w', encoding='utf-8', errors='surrogateescape', newline='') as f:
             f.write(content)

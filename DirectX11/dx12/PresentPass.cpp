@@ -3,7 +3,6 @@
 #include <time.h>
 
 #include "../ResourceLoading.h"
-#include "../ModLoading.h"
 #include "Bridge.h"
 #include "DeviceRemoved.h"
 #include "DrawPath.h"
@@ -409,7 +408,6 @@ static void frame_actions()
 	G->gSystemTickCount = ticks;
 	G->gFPSCounter.Update(ticks);
 	ReleaseIdleReadBuffers();
-	ModLoadsFrame(dx12_shim && dx12_shim->hacker_device ? dx12_shim->hacker_device->GetPassThroughOrigDevice1() : nullptr);
 
 	present_repeated = repeat && present_seen_valid && params_seen.size() == G->iniParams.size() && !dx12_mods_disabled;
 	frame_writes_open = false;

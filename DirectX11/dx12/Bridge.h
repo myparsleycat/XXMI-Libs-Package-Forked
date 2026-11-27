@@ -158,16 +158,6 @@ bool Dx12ShimReclaimRetired();
 // Memory the GPU can read, valid for the commands of this submission. *buffer
 // and *offset say where it is for a copy, *va for a view.
 BYTE* Dx12ShimUpload(UINT64 size, UINT64 alignment, ID3D12Resource **buffer, UINT64 *offset, UINT64 *va);
-struct Dx12StagedUpload {
-	ID3D12Resource *buffer;
-	BYTE *cpu;
-	UINT64 capacity;
-};
-// Mapped upload memory for the contents of a staged resource, from a pool.
-// Acquiring it and returning it with no copy fence need no shim lock;
-// returning it with the fence of the copies out of it needs the shim lock.
-bool Dx12ShimAcquireStagedUpload(UINT64 size, Dx12StagedUpload *upload);
-void Dx12ShimRecycleStagedUpload(const Dx12StagedUpload &upload, UINT64 copy_fence);
 
 // Descriptors a shader can be given, valid for the commands of this
 // submission. Both make their heap one of the two current ones, which the
@@ -222,13 +212,9 @@ struct Dx12ResourceCreationTiming {
 // A committed resource of the default heap in the common state, which may
 // only become resident on the GPU's time: whatever executes it on a queue
 // calls Dx12ShimResidencyWait for that queue first. A list of the game can
-// only use it with a pin on it (Dx12ShimPin), so only those wait. Given
-// residency, the value to wait for is returned there and the caller passes it
-// to Dx12ShimNeedResidency before recording a use; otherwise that is done here.
+// only use it with a pin on it (Dx12ShimPin), so only those wait.
 HRESULT Dx12ShimCreateResource(const D3D12_RESOURCE_DESC *desc, ID3D12Resource **resource,
-		UINT64 *residency, Dx12ResourceCreationTiming *timing = nullptr);
-HRESULT Dx12ShimCreateResidentSpare(const D3D12_RESOURCE_DESC &desc, ID3D12Resource **resource);
-void Dx12ShimNeedResidency(UINT64 value);
+		Dx12ResourceCreationTiming *timing = nullptr);
 void Dx12ShimResidencyWait(ID3D12CommandQueue *queue);
 // For a resource of the game that a list of ours is about to read, see
 // Dx12GameEvict: has it made resident if the game has it evicted, on the

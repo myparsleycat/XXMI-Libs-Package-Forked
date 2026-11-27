@@ -396,23 +396,11 @@ struct SharedEntry
 	std::wstring path;
 	FileIdentity identity;
 	ID3D11Resource *resource;
-	bool provisional;
 };
 
 static std::mutex shared_resources_lock;
 // Bucketed by file size:
 static std::unordered_map<uint64_t, std::vector<SharedEntry>> shared_resources;
-static thread_local bool provisional_visible;
-
-SharedProvisionalScope::SharedProvisionalScope()
-{
-	provisional_visible = true;
-}
-
-SharedProvisionalScope::~SharedProvisionalScope()
-{
-	provisional_visible = false;
-}
 
 // Read a part at a time into a small reused buffer: a whole second copy of a
 // large file would take a large buffer of its own, allocated afresh each time
@@ -447,6 +435,7 @@ static bool FileContentsEqual(const std::wstring &path, const void *data, size_t
 ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size)
 {
 	std::vector<SharedEntry> candidates;
+	ID3D11Resource *match = nullptr;
 	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_SHARE, L"bytes", size);
 
 	// Hashed from the data the caller is about to upload, never from the
@@ -463,34 +452,24 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 			return nullptr;
 
 		for (const SharedEntry &entry : bucket->second) {
-			if (entry.key == key && (!entry.provisional || provisional_visible))
+			if (entry.key == key) {
+				entry.resource->AddRef();
 				candidates.push_back(entry);
+			}
 		}
 	}
 
 	// The hash only selects candidates. A candidate is shared once its
 	// file still compares equal byte for byte; one whose file has since
 	// changed or disappeared is simply not shared with:
-	for (const SharedEntry &candidate : candidates) {
-		if (!FileContentsEqual(candidate.path, data, size))
-			continue;
-
-		// A rejected candidate must not take its last reference to the
-		// loader thread while present is dropping a partially copied load.
-		std::lock_guard<std::mutex> lock(shared_resources_lock);
-		auto bucket = shared_resources.find(key.size);
-		if (bucket == shared_resources.end())
-			break;
-		for (const SharedEntry &entry : bucket->second) {
-			if (entry.resource == candidate.resource && entry.identity == candidate.identity && entry.path == candidate.path
-					&& entry.key == key && (!entry.provisional || provisional_visible)) {
-				entry.resource->AddRef();
-				return entry.resource;
-			}
-		}
+	for (const SharedEntry &entry : candidates) {
+		if (!match && FileContentsEqual(entry.path, data, size))
+			match = entry.resource;
+		else
+			entry.resource->Release();
 	}
 
-	return nullptr;
+	return match;
 }
 
 ID3D11Resource* FindSharedFileResourceByIdentity(const SharedResourceKey &key, const FileIdentity &identity)
@@ -505,7 +484,6 @@ ID3D11Resource* FindSharedFileResourceByIdentity(const SharedResourceKey &key, c
 	// written since, so it holds the same bytes:
 	for (const SharedEntry &entry : bucket->second) {
 		if (entry.identity == identity
-				&& (!entry.provisional || provisional_visible)
 				&& entry.key.device == key.device
 				&& entry.key.loader == key.loader
 				&& entry.key.bind_flags == key.bind_flags
@@ -521,47 +499,12 @@ ID3D11Resource* FindSharedFileResourceByIdentity(const SharedResourceKey &key, c
 }
 
 void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity,
-		ID3D11Resource *resource, bool provisional)
+		ID3D11Resource *resource)
 {
 	std::lock_guard<std::mutex> lock(shared_resources_lock);
-	std::vector<SharedEntry> &bucket = shared_resources[key.size];
 
-	if (!provisional) {
-		for (SharedEntry &entry : bucket) {
-			if (entry.resource == resource && entry.provisional) {
-				entry.provisional = false;
-				return;
-			}
-		}
-	}
 	resource->AddRef();
-	bucket.push_back(SharedEntry{key, path, identity, resource, provisional});
-}
-
-void DropProvisionalShare(ID3D11Resource *resource)
-{
-	ID3D11Resource *released = nullptr;
-
-	{
-		std::lock_guard<std::mutex> lock(shared_resources_lock);
-
-		for (auto bucket = shared_resources.begin(); !released && bucket != shared_resources.end(); bucket++) {
-			std::vector<SharedEntry> &entries = bucket->second;
-			for (auto entry = entries.begin(); entry != entries.end(); entry++) {
-				if (entry->resource == resource && entry->provisional) {
-					released = resource;
-					entries.erase(entry);
-					break;
-				}
-			}
-			if (released && entries.empty()) {
-				shared_resources.erase(bucket);
-				break;
-			}
-		}
-	}
-	if (released)
-		released->Release();
+	shared_resources[key.size].push_back(SharedEntry{key, path, identity, resource});
 }
 
 void ReleaseSharedFileResources(ID3D11Device *device)

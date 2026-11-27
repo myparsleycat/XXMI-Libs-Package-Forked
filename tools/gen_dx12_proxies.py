@@ -43,7 +43,6 @@ CLASSES = {
         'CreateCommandQueue', 'CreateCommandQueue1',
         'CreateCommandList', 'CreateCommandList1',
         'CreateDescriptorHeap', 'CopyDescriptors', 'CopyDescriptorsSimple',
-        'CreateHeap', 'CreateHeap1',
         'MakeResident', 'Evict', 'EnqueueMakeResident', 'SetResidencyPriority',
         'CreateCommittedResource', 'CreateCommittedResource1', 'CreateCommittedResource2',
         'CreateCommittedResource3', 'CreatePlacedResource', 'CreatePlacedResource1',
