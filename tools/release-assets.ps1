@@ -1,8 +1,8 @@
 # Lists the files a release uploads as assets: d3d11.dll, d3dx.ini,
 # runtime-dependencies.json and every library that names, after checking it
 # against the rules of docs/runtime-dependencies.md. Fails if a file is missing.
-# .github/workflows/zip-release.yml uploads these to the draft release it
-# creates for a pushed tag.
+# .github/workflows/zip-release.yml attests these with the build provenance and
+# uploads them to the draft release it creates for a pushed tag.
 param(
 	[string]$Dll = 'x64/Release/d3d11.dll'
 )

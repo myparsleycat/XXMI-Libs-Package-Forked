@@ -38,12 +38,26 @@ jobs:
         -property:Platform=x64
         -verbosity:minimal
 
+    # Launchers check the d3dx.ini, the dependency manifest and the libraries it
+    # lists against this provenance too, so they are attested with the DLL under
+    # the names the release gives them.
+    - name: List attested files
+      shell: pwsh
+      env:
+        CHECKSUMS: ${{ runner.temp }}/release-checksums.txt
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
+        $files = @(./tools/release-assets.ps1) + @((Resolve-Path x64/Release/d3d11.pdb).Path)
+        $lines = foreach ($file in $files) {
+          '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant(), (Split-Path -Leaf $file)
+        }
+        Set-Content -LiteralPath $env:CHECKSUMS -Value $lines -Encoding ascii
+
     - name: Generate build provenance
       uses: actions/attest@v4
       with:
-        subject-path: |
-          x64/Release/d3d11.dll
-          x64/Release/d3d11.pdb
+        subject-checksums: ${{ runner.temp }}/release-checksums.txt
 
     - name: Upload DLL and symbols
       uses: actions/upload-artifact@v4
