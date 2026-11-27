@@ -36,9 +36,10 @@ static HWND window() {
     HWND w = CreateWindowW(wc.lpszClassName, L"Offline scope reproduction", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
     if (!w) throw std::runtime_error("CreateWindow"); return w;
 }
-static ComPtr<ID3D12Resource> buffer(ID3D12Device *d, UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state) {
+static ComPtr<ID3D12Resource> buffer(ID3D12Device *d, UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state,
+        D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
     D3D12_HEAP_PROPERTIES h = {}; h.Type = type; h.CreationNodeMask = h.VisibleNodeMask = 1;
-    D3D12_RESOURCE_DESC r = {}; r.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; r.Width = bytes; r.Height = 1; r.DepthOrArraySize = r.MipLevels = 1; r.SampleDesc.Count = 1; r.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_RESOURCE_DESC r = {}; r.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; r.Width = bytes; r.Height = 1; r.DepthOrArraySize = r.MipLevels = 1; r.SampleDesc.Count = 1; r.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; r.Flags = flags;
     ComPtr<ID3D12Resource> p; check(d->CreateCommittedResource(&h, D3D12_HEAP_FLAG_NONE, &r, state, nullptr, IID_PPV_ARGS(&p))); return p;
 }
 static void upload(ID3D12Resource *r, const void *b, size_t n) { void *p; D3D12_RANGE empty = {}; check(r->Map(0, &empty, &p)); memcpy(p, b, n); r->Unmap(0, nullptr); }
@@ -61,7 +62,75 @@ static Pixels pixels(const unsigned char *data, UINT pitch) {
     }
     return p;
 }
-static Pixels dx12(HWND w, const fs::path &dir) {
+
+struct ConstantDispatches {
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Resource> constants, unreadable, offsets;
+
+    void record(ID3D12Device *device, ID3D12GraphicsCommandList *list, const fs::path &shader) {
+        D3D12_DESCRIPTOR_RANGE range = {};
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        range.NumDescriptors = 1;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {1, &range};
+        D3D12_ROOT_SIGNATURE_DESC desc = {2, params};
+        ComPtr<ID3DBlob> signature;
+        check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, nullptr));
+        check(device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&root)));
+
+        const auto cs = read(shader);
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = root.Get();
+        pso.CS = {cs.data(), cs.size()};
+        check(device->CreateComputePipelineState(&pso, IID_PPV_ARGS(&pipeline)));
+
+        constexpr size_t stride = 1280 / sizeof(UINT);
+        constexpr size_t base = 256 / sizeof(UINT);
+        UINT words[base + 4 * stride] = {};
+        for (UINT i = 0; i < 4; i++) {
+            UINT *cb = words + base + i * stride;
+            cb[0] = 10;
+            cb[1] = 11;
+            cb[2] = 12;
+            cb[3] = i == 2 ? 56 : 21;
+            cb[4] = 0x40200000; // 2.5f
+            cb[65 * 4 + 1] = 701 + i;
+        }
+        constants = buffer(device, sizeof(words), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        upload(constants.Get(), words, sizeof(words));
+        unreadable = buffer(device, stride * sizeof(UINT), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        offsets = buffer(device, 64, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap_desc.NumDescriptors = 1;
+        heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+        uav.Format = DXGI_FORMAT_R32_UINT;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav.Buffer.NumElements = 16;
+        device->CreateUnorderedAccessView(offsets.Get(), nullptr, &uav, heap->GetCPUDescriptorHandleForHeapStart());
+        ID3D12DescriptorHeap *heaps[] = {heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetPipelineState(pipeline.Get());
+        list->SetComputeRootSignature(root.Get());
+        list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+        for (UINT i = 0; i < 5; i++) {
+            const auto address = i == 4 ? unreadable->GetGPUVirtualAddress()
+                : constants->GetGPUVirtualAddress() + (base + i * stride) * sizeof(UINT);
+            list->SetComputeRootConstantBufferView(0, address);
+            list->Dispatch(i + 1, 24, 1);
+        }
+    }
+};
+
+static Pixels dx12(HWND w, const fs::path &dir, bool constants = false) {
     ComPtr<IDXGIFactory4> f; check(CreateDXGIFactory2(0, IID_PPV_ARGS(&f)));
     ComPtr<IDXGIAdapter> a; check(f->EnumWarpAdapter(IID_PPV_ARGS(&a)));
     ComPtr<ID3D12Device> d; check(D3D12CreateDevice(a.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d)));
@@ -91,6 +160,11 @@ static Pixels dx12(HWND w, const fs::path &dir) {
     auto ib = buffer(d.Get(), sizeof(original), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     ComPtr<ID3D12CommandAllocator> alloc; check(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)));
     ComPtr<ID3D12GraphicsCommandList> l; check(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), pso.Get(), IID_PPV_ARGS(&l)));
+    ConstantDispatches dispatches;
+    if (constants) {
+        dispatches.record(d.Get(), l.Get(), dir / "cb_cs.bin");
+        l->SetPipelineState(pso.Get());
+    }
     l->CopyBufferRegion(ib.Get(), 0, up.Get(), 0, sizeof(original)); transition(l.Get(), ib.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     l->SetGraphicsRootSignature(root.Get()); D3D12_VIEWPORT vp = {0, 0, 16, 16, 0, 1}; D3D12_RECT sc = {0, 0, 16, 16}; l->RSSetViewports(1, &vp); l->RSSetScissorRects(1, &sc); l->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     float clear[] = {0, 0, 0, 1}; l->ClearRenderTargetView(rtv, clear, 0, nullptr); l->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST); D3D12_INDEX_BUFFER_VIEW iv = {ib->GetGPUVirtualAddress(), sizeof(original), DXGI_FORMAT_R32_UINT}; l->IASetIndexBuffer(&iv);
@@ -132,8 +206,9 @@ int wmain(int argc, wchar_t **argv) { try {
         shim_probe(argv[1] + 5, argv[2], argv[3]);
         return 0;
     }
-    if (wcscmp(argv[1], L"dx11") && wcscmp(argv[1], L"dx12")) throw std::runtime_error("API must be dx11 or dx12");
+    const bool constants = !wcscmp(argv[1], L"dx12-cb");
+    if (!constants && wcscmp(argv[1], L"dx11") && wcscmp(argv[1], L"dx12")) throw std::runtime_error("API must be dx11 or dx12");
     if (wcscmp(argv[2], L"none") && !LoadLibraryExW(argv[2], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) throw std::runtime_error("DLL load");
-    HWND w = window(); Pixels p = !wcscmp(argv[1], L"dx12") ? dx12(w, argv[3]) : dx11(w, argv[3]); DestroyWindow(w);
+    HWND w = window(); Pixels p = constants || !wcscmp(argv[1], L"dx12") ? dx12(w, argv[3], constants) : dx11(w, argv[3]); DestroyWindow(w);
     std::cout << "{\"red\":" << p.red << ",\"green\":" << p.green << ",\"black\":" << p.black << ",\"other\":" << p.other << "}\n"; return 0;
 } catch (const std::exception &e) { std::cerr << e.what() << "\n"; return 1; } }

@@ -184,6 +184,22 @@ The same data caching rules as for [`HashRegion`](#hashregionbyte_offset-byte_si
 
 > **Experimental:** `->SpatialHash(...)` is experimental and its behavior may change. **Only CB regions** are really tested.
 
+### `Uint($byte_offset)` and `Float($byte_offset)`
+
+Return the 32-bit value at `$byte_offset` of a constant buffer the game bound, read as an unsigned integer or as a float.
+
+```ini
+$vertex_offset = cs-cb0->Uint(65 * 16 + 4) ; cb0[65].y
+$scale = vs-cb1->Float(12)                 ; cb1[0].w
+```
+
+* Direct3D 12 only. The value is read on the CPU from the game's upload memory while the call is recorded, so there is no GPU wait. Data the game writes to that memory after recording the call is not seen.
+* Only constant buffer slots (`<stage>-cb0` to `<stage>-cb13`) of the current draw or dispatch are supported, and only while the slot still holds the game's buffer.
+* `$byte_offset` is relative to the start of the buffer view and must lie within the buffer size the shader declares.
+* `Uint` values above `16777216` are rounded to the nearest float.
+
+Both return `-1` when the value cannot be read: under Direct3D 11 or Vulkan, when the buffer is not in upload memory, or when the slot holds a buffer of the ini. A `Float` read can also return `-1` as data, so check readability with `Uint` when that matters. A DLL without these attributes drops the whole line when loading the ini, so assign them to a variable declared with a default of `-1` rather than naming them in an `if`.
+
 ### `HammingDistance(FilterReferenceTexture)`
 
 Returns the [Hamming distance](../filters/texture-filtering-advanced.md/#2-what-is-hamming-distance) between the dHash of the target texture and `match_dhash` of [FilterTexture](../filters/README.md).

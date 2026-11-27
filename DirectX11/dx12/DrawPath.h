@@ -152,6 +152,12 @@ bool Dx12FilterOnlyChecks(const Dx12DrawFilter *filter, Dx12DrawFilter *worked_o
 // For the shim context. All but the first are only for while a scope is open,
 // and what they return is not referenced.
 bool Dx12InDrawScope();
+
+// Four bytes of the game's constant buffer at the register, read on the CPU
+// while the call is recorded. False unless the buffer is in upload memory, the
+// bytes lie within the size the shader declares for it, and `bound` (what the
+// shim context has at the slot) is null or the buffer published for it.
+bool Dx12ScopeReadConstant(Dx12ShaderStage stage, UINT slot, UINT byte_offset, ID3D11Buffer *bound, UINT *bits);
 // Whether the game's pipeline has a shader for the stage
 bool Dx12ScopeHasShader(Dx12ShaderStage stage);
 ID3D11Buffer* Dx12ScopeVertexBuffer(UINT slot, UINT *stride);
