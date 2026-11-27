@@ -57,6 +57,15 @@ green with a DLL that drops the `->Uint` lines: every batch then falls back to
 `vs-cb0->Uint(0)` and `vs-cb0->Float(0)` return `-1` under D3D11. Run both
 cases alone with `--cb-only`.
 
+`dx11/async_structured` loads an 8.96 MB `StructuredBuffer` with a stride of
+56 through `async_resource_loading`, which copies files of 8 MB or more in at
+present in parts. D3D11 drops copies into a structured buffer at offsets that
+are not a multiple of its stride. The harness draws up to 300 frames, and the
+mod's pixel shader compares elements at both ends and at the part boundaries
+with the file. The result is 256 green when they all match, 256 blue
+(`other`) when the mod draws with elements that were not copied in, and 256
+red when the mod is never drawn. Run it alone with `--async-only`.
+
 This is a narrow direct indexed-draw contract test. It does not cover
 bundles, indirect or mesh draws, multi-queue recording, arbitrary state
 overrides, capture hotkeys, config hot-reload, or any real game's rendering.

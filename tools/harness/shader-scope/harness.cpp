@@ -177,7 +177,9 @@ static Pixels dx12(HWND w, const fs::path &dir, bool constants = false) {
     void *mapped; D3D12_RANGE range = {0, (SIZE_T)bytes}; check(rb->Map(0, &range, &mapped)); Pixels result = pixels((unsigned char *)mapped + foot.Offset, foot.Footprint.RowPitch); D3D12_RANGE empty = {}; rb->Unmap(0, &empty);
     check(swap->Present(0, 0)); wait(q.Get(), fence.Get(), ++tick, event.get()); return result;
 }
-static Pixels dx11(HWND w, const fs::path &dir) {
+// frames > 1: draws and presents until the picture is all green or frames
+// have been presented, for mods loaded on the DLL's loader thread
+static Pixels dx11(HWND w, const fs::path &dir, unsigned frames = 1) {
     DXGI_SWAP_CHAIN_DESC sd = {}; sd.BufferDesc.Width = sd.BufferDesc.Height = 32; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.OutputWindow = w; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     ComPtr<IDXGISwapChain> swap; ComPtr<ID3D11Device> d; ComPtr<ID3D11DeviceContext> c;
     check(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &swap, &d, nullptr, &c)); check(swap->Present(0, 0));
@@ -187,9 +189,16 @@ static Pixels dx11(HWND w, const fs::path &dir) {
     td.BindFlags = 0; td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; ComPtr<ID3D11Texture2D> rb; check(d->CreateTexture2D(&td, nullptr, &rb));
     unsigned original[] = {0, 0, 0, 0, 1, 2}; D3D11_BUFFER_DESC bd = {}; bd.ByteWidth = sizeof(original); bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_INDEX_BUFFER; D3D11_SUBRESOURCE_DATA initial = {original, 0, 0}; ComPtr<ID3D11Buffer> ib; check(d->CreateBuffer(&bd, &initial, &ib));
     D3D11_RASTERIZER_DESC rs = {}; rs.FillMode = D3D11_FILL_SOLID; rs.CullMode = D3D11_CULL_NONE; rs.DepthClipEnable = TRUE; ComPtr<ID3D11RasterizerState> raster; check(d->CreateRasterizerState(&rs, &raster)); c->RSSetState(raster.Get());
-    D3D11_VIEWPORT vp = {0, 0, 16, 16, 0, 1}; c->RSSetViewports(1, &vp); ID3D11RenderTargetView *rtvs[] = {rtv.Get()}; c->OMSetRenderTargets(1, rtvs, nullptr); float clear[] = {0, 0, 0, 1}; c->ClearRenderTargetView(rtv.Get(), clear);
-    c->VSSetShader(vs.Get(), nullptr, 0); c->PSSetShader(ps.Get(), nullptr, 0); c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST); c->IASetIndexBuffer(ib.Get(), DXGI_FORMAT_R32_UINT, 0); c->DrawIndexedInstanced(3, 1, 3, 0, 0);
-    c->CopyResource(rb.Get(), target.Get()); D3D11_MAPPED_SUBRESOURCE mapped = {}; check(c->Map(rb.Get(), 0, D3D11_MAP_READ, 0, &mapped)); Pixels result = pixels((unsigned char *)mapped.pData, mapped.RowPitch); c->Unmap(rb.Get(), 0); check(swap->Present(0, 0)); check(d->GetDeviceRemovedReason()); return result;
+    Pixels result;
+    for (unsigned frame = 0; frame < frames; frame++) {
+        if (frame) Sleep(10);
+        c->RSSetState(raster.Get());
+        D3D11_VIEWPORT vp = {0, 0, 16, 16, 0, 1}; c->RSSetViewports(1, &vp); ID3D11RenderTargetView *rtvs[] = {rtv.Get()}; c->OMSetRenderTargets(1, rtvs, nullptr); float clear[] = {0, 0, 0, 1}; c->ClearRenderTargetView(rtv.Get(), clear);
+        c->VSSetShader(vs.Get(), nullptr, 0); c->PSSetShader(ps.Get(), nullptr, 0); c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST); c->IASetIndexBuffer(ib.Get(), DXGI_FORMAT_R32_UINT, 0); c->DrawIndexedInstanced(3, 1, 3, 0, 0);
+        c->CopyResource(rb.Get(), target.Get()); D3D11_MAPPED_SUBRESOURCE mapped = {}; check(c->Map(rb.Get(), 0, D3D11_MAP_READ, 0, &mapped)); result = pixels((unsigned char *)mapped.pData, mapped.RowPitch); c->Unmap(rb.Get(), 0); check(swap->Present(0, 0)); check(d->GetDeviceRemovedReason());
+        if (result.green == 256) break;
+    }
+    return result;
 }
 #include "shim.inc"
 
@@ -207,8 +216,9 @@ int wmain(int argc, wchar_t **argv) { try {
         return 0;
     }
     const bool constants = !wcscmp(argv[1], L"dx12-cb");
-    if (!constants && wcscmp(argv[1], L"dx11") && wcscmp(argv[1], L"dx12")) throw std::runtime_error("API must be dx11 or dx12");
+    const bool frames = !wcscmp(argv[1], L"dx11-frames");
+    if (!constants && !frames && wcscmp(argv[1], L"dx11") && wcscmp(argv[1], L"dx12")) throw std::runtime_error("API must be dx11, dx11-frames or dx12");
     if (wcscmp(argv[2], L"none") && !LoadLibraryExW(argv[2], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) throw std::runtime_error("DLL load");
-    HWND w = window(); Pixels p = constants || !wcscmp(argv[1], L"dx12") ? dx12(w, argv[3], constants) : dx11(w, argv[3]); DestroyWindow(w);
+    HWND w = window(); Pixels p = constants || !wcscmp(argv[1], L"dx12") ? dx12(w, argv[3], constants) : dx11(w, argv[3], frames ? 300 : 1); DestroyWindow(w);
     std::cout << "{\"red\":" << p.red << ",\"green\":" << p.green << ",\"black\":" << p.black << ",\"other\":" << p.other << "}\n"; return 0;
 } catch (const std::exception &e) { std::cerr << e.what() << "\n"; return 1; } }

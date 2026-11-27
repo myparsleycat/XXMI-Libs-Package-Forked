@@ -1389,9 +1389,17 @@ bool make_parts(Job *job)
 	if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
 		const D3D11_SUBRESOURCE_DATA &contents = job->load.subresources[0];
 		UINT size = contents.SysMemPitch;
+		UINT step = (UINT)UPLOAD_PART_BYTES;
+		D3D11_BUFFER_DESC desc;
 
-		for (UINT start = 0; start < size; start += (UINT)UPLOAD_PART_BYTES) {
-			UINT end = (UINT)std::min<UINT64>(size, start + UPLOAD_PART_BYTES);
+		// D3D11 drops copies into a structured buffer whose offset or
+		// size is not a multiple of its structure stride
+		((ID3D11Buffer*)resource)->GetDesc(&desc);
+		if ((desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && desc.StructureByteStride)
+			step = std::max<UINT>(desc.StructureByteStride, step / desc.StructureByteStride * desc.StructureByteStride);
+
+		for (UINT start = 0; start < size; start += step) {
+			UINT end = (UINT)std::min<UINT64>(size, (UINT64)start + step);
 
 			job->parts.push_back({0, {start, 0, 0, end, 1, 1}, (const uint8_t*)contents.pSysMem + start, 0, 0, end - start, nullptr});
 		}
@@ -1964,7 +1972,8 @@ ID3D11Resource* touch_target(ID3D11Device *device, D3D11_RESOURCE_DIMENSION dime
 
 	if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
 		D3D11_BUFFER_DESC desc = {};
-		desc.ByteWidth = 16;
+		// One element of a structured buffer, of the largest stride
+		desc.ByteWidth = D3D11_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		device->CreateBuffer(&desc, NULL, (ID3D11Buffer**)&target);
 	} else {
@@ -1990,7 +1999,11 @@ bool touch(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Resource *r
 	if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
 		D3D11_BUFFER_DESC desc;
 		((ID3D11Buffer*)resource)->GetDesc(&desc);
-		box.right = std::min<UINT>(16, desc.ByteWidth);
+		// A copy out of a structured buffer has to take whole elements
+		if ((desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) && desc.StructureByteStride)
+			box.right = desc.StructureByteStride;
+		else
+			box.right = std::min<UINT>(16, desc.ByteWidth);
 		target = touch_target(device, dimension, DXGI_FORMAT_UNKNOWN, 0);
 	} else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
 		D3D11_TEXTURE2D_DESC desc;
